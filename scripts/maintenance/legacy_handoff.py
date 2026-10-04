@@ -241,7 +241,7 @@ def verify_result_directories(current, old):
 def verify_no_recreation(run, workspace):
     old = read(run/'inventory.json')
     current = maintenance.inventory(require_running=True)
-    offline.include_runtime_inventory(current)
+    offline.include_runtime_inventory(current, require_running=True)
     require(current['old_pointer'] != old['old_pointer'], 'old_release_restored')
     lineage = []
     databases, results, roots = expected_storage(run, lineage=lineage)
@@ -285,13 +285,25 @@ def verify_cutover(run, expected=None):
         require(seals == expected, 'cutover_evidence_changed')
     require(plan.get('mode') == 'fresh_generation' and journal.get('phase') == 'succeeded' and not journal.get('source_recreation_detected'), 'fresh_cutover_not_succeeded')
     require(journal['plan_hash'] == seals['plan.json'] and plan['inventory_hash'] == seals['inventory.json'] and journal['backup_index_hash'] == seals['backup/index.json'], 'cutover_seal_mismatch')
+    inventory = read(run/'inventory.json')
+    source_runtime = inventory.get('plists', {}).get(offline.RUNTIME_LABEL)
+    source_databases = inventory['databases']
+    database_count = 5 if source_runtime is not None else 4
+    if source_runtime is not None:
+        require(source_runtime.get('Label') == offline.RUNTIME_LABEL and len(source_databases) == 5 and
+                source_databases[4] == str(Path(inventory['policy']['control_root'])/'runtime.sqlite3'),
+                'cutover_runtime_storage_mismatch')
+    # 移行前がHerdrでも、App Serverを導入するrunnerは4サービスを停止・抑止する。
+    labels = set(maintenance.LABELS)
+    if source_runtime is not None or runtime_database(plan, run) is not None:
+        labels.add(offline.RUNTIME_LABEL)
     receipt = journal.get('source_stop_receipt', {})
     require(isinstance(receipt.get('processes'), list) and receipt.get('verified_at') and
             (journal.get('source_stop_guard') or {}).get('phase') == 'committed' and
             receipt.get('herdr_session') == 'dona' and
             receipt.get('herdr_config_sha256') == plan.get('bundle', {}).get('herdr-config.toml') and
             isinstance(receipt.get('herdr_config_sha256'), str) and
-            set(receipt.get('launch_agents', [])) == {'dev.dona.dispatcher', 'dev.dona.slack-adapter', 'dev.dona.updater'}, 'cutover_stop_evidence_missing')
+            set(receipt.get('launch_agents', [])) == labels, 'cutover_stop_evidence_missing')
     rows = subprocess.check_output(['/bin/ps', '-axo', 'pid=,uid=,lstart=,stat='], text=True).splitlines()
     processes = {}
     for row in rows:
@@ -303,8 +315,7 @@ def verify_cutover(run, expected=None):
         require(not current or current[:2] != (old['uid'], old['start']) or 'Z' in current[2], 'old_process_still_alive')
     entries = read(run/'backup/index.json')
     databases = [item for item in entries if not item.get('directory')]
-    source_databases = read(run/'inventory.json')['databases']
-    require(len(databases) == len(source_databases) == 4 and len(set(source_databases)) == 4 and
+    require(len(databases) == len(source_databases) == database_count and len(set(source_databases)) == database_count and
             [item.get('source') for item in databases] == source_databases, 'old_database_backup_incomplete')
     for item in databases:
         require(item.get('exists') is True and isinstance(item.get('backup'), str) and
@@ -313,7 +324,7 @@ def verify_cutover(run, expected=None):
         require(backup.is_file() and not backup.is_symlink(), 'old_database_backup_incomplete')
         require(maintenance.file_digest(backup) == item['hash'], 'old_database_backup_changed')
     directories = [item for item in entries if item.get('directory')]
-    source_results = read(run/'inventory.json')['old_results']
+    source_results = inventory['old_results']
     require(len(directories) == len(source_results) == 2 and len(set(source_results)) == 2 and
             [item.get('source') for item in directories] == source_results, 'old_result_backup_incomplete')
     for item in directories:
