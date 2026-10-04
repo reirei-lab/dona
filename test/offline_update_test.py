@@ -618,6 +618,19 @@ class FreshGenerationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):runner.assert_source_stopped()
         self.assertEqual(runner.journal['source_recreation_services'],list(m.LABELS))
 
+    def test_stops_orphan_group_when_app_server_root_already_exited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'runtime.sqlite3').touch()
+            runner=FakeRunner('prepared');runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+            runner.policy['control_root']=str(root);runner.node='node';runner.plan={'release':str(root)}
+            child={**proc(800002),'group':800001}
+            with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]), \
+                 patch.object(m,'process_table',return_value={800002:child}), patch.object(m,'ProcessStop') as stop, \
+                 patch.object(m.common,'NodeDatabase') as database, patch.object(runner,'switch_disabled'):
+                database.return_value.read.return_value=[(800001,'old-root')]
+                m.Runner.stop(runner)
+                self.assertEqual(stop.return_value.stop.call_args.args[0],[child])
+
     def test_stopping_resume_keeps_previous_stop_receipt(self):
         runner=FakeRunner('stopping');runner.live=unittest.mock.Mock()
         runner.live.observe.return_value=None

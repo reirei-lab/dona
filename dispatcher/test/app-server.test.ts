@@ -100,3 +100,28 @@ test("承認は現在の要求に一度だけ返し、session全体へ拡張し�
   await manager.stop(agent.name,agent.generation);
  }finally{const row=store.agent("worker-test");if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+test("質問待ちで接続を失ったgenerationの要求を失効させる",async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-app-server-disconnect-")),script=path.join(root,"fake.mjs");await fs.writeFile(script,fake);
+ const store=new RuntimeStore(path.join(root,"runtime.db"));let rpc:AppServerRpc;
+ const manager=new AppServerManager(store,(_args,cwd)=>rpc=new AppServerRpc(process.execPath,[script],cwd));
+ try{
+  const agent=await manager.start({name:"worker-test",role:"worker",cwd:root,release:root,args:[],threadConfig:{}});
+  await manager.prompt(agent.name,"question-disconnect","質問");await until(()=>store.questions(agent.name).length===1);
+  const q=store.questions(agent.name)[0]!;rpc!.child.kill("SIGKILL");
+  await until(()=>store.agent(agent.name)?.state==="unknown");
+  assert.equal(store.question(q.question_id)?.state,"expired");assert.equal(store.questions(agent.name).length,0);
+  await assert.rejects(manager.answer(agent.name,q.question_id,{choice:{answers:["A"]}}),/not_current/);
+ }finally{if(rpc!.child.exitCode===null&&rpc!.child.signalCode===null)rpc!.child.kill("SIGKILL");store.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("対話経路のないjobではnative質問を拒否してpending要求を作らない",async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-app-server-no-question-")),script=path.join(root,"fake.mjs");
+ await fs.writeFile(script,fake.replace("if(r.id==='question-1'&&r.result)","if(r.id==='question-1'&&r.error)send({method:'turn/completed',params:{threadId:'thread-test',turn:{id:'turn-test',status:'completed'}}});\nif(r.id==='question-1'&&r.result)"));
+ const store=new RuntimeStore(path.join(root,"runtime.db")),manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));
+ try{
+  const agent=await manager.start({name:"worker-test",role:"worker",cwd:root,release:root,args:[],threadConfig:{config:{"features.default_mode_request_user_input":false}}});
+  await manager.prompt(agent.name,"no-question","質問");await until(()=>store.agent(agent.name)?.state==="idle");
+  assert.equal(store.questions(agent.name).length,0);await manager.stop(agent.name,agent.generation);
+ }finally{const row=store.agent("worker-test");if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
+});

@@ -15,7 +15,8 @@ import {scheduledExecutablePaths,verifyScheduledSandbox} from "../scheduled-sand
 
 export function runtimeSocket(config:DispatcherConfig):string{return process.env.DONA_APP_SERVER_SOCKET??path.join(path.dirname(config.updaterSocketPath),"runtime.sock");}
 function result(row:AgentRecord|null,error?:string):HerdrCommandResult {
-  const ok=!!row&&row.state!=="stopped";
+  const ok=!!row&&["idle","working","waiting","interrupted"].includes(row.state);
+  if(row&&!["stopped","idle","working","waiting","interrupted"].includes(row.state))error="runtime_observation_unknown";
   const state=row?.state==="working"?"working":row?.state==="waiting"?"blocked":["idle","interrupted"].includes(row?.state??"")?"idle":"unknown";
   return {ok:ok&&!error,stdout:row?JSON.stringify({result:{type:"agent_info",name:row.name,agent_name:row.name,workspace_id:row.name,pane_id:row.name,agent_session:{kind:"id",value:JSON.stringify([row.generation,row.thread_id])},status:state}}):"",stderr:error??"",exitCode:ok&&!error?0:1,timedOut:false,aborted:false,
     ...(error||!ok?{errorCode:error??"agent_not_running"}:row?.state==="waiting"?{errorCode:"runtime_question_pending"}:{}),agentStatus:state,
@@ -48,7 +49,7 @@ export class AppServerAgentClient implements HerdrClient {
 /** legacyのDB列名は履歴保持のため残すが、値はApp Server agent/thread identity。 */
 export class AppServerJobRuntime implements JobAgentRuntime {
   readonly client:RuntimeClient;
-  constructor(private readonly config:DispatcherConfig,private progressEnabled=true,private readonly expectedSession?:(jobId:string)=>string|undefined){this.client=new RuntimeClient(runtimeSocket(config),95_000);}
+  constructor(private readonly config:DispatcherConfig,private progressEnabled=true,private readonly expectedSession?:(jobId:string)=>string|undefined,private readonly taskOwned:(jobId:string)=>boolean=()=>false){this.client=new RuntimeClient(runtimeSocket(config),95_000);}
   private matchesSession(row:JobRow,agent:AgentRecord):boolean {
     if(!this.expectedSession)return true;
     const expected=this.expectedSession(row.job_id);
@@ -89,10 +90,11 @@ export class AppServerJobRuntime implements JobAgentRuntime {
     // --add-dir はTUI/exec専用。App Serverではthread configの追加rootとして渡す。
     const serverArgs:string[]=disabledMcpServers.flatMap(name=>["-c",`mcp_servers.${name}.enabled=false`]),writeRoots:string[]=[];
     for(let i=0;i<args.length;i++){if(args[i]==="--add-dir"){writeRoots.push(args[++i]!);}else if(["--model","-C","--ask-for-approval"].includes(args[i]!)){i++;}else serverArgs.push(args[i]!);}
-    serverArgs.push("-c","features.default_mode_request_user_input=true");
+    const interactive=row.source!=="dona_schedule"&&this.taskOwned(row.job_id);
+    serverArgs.push("-c",`features.default_mode_request_user_input=${interactive}`);
     let agent:AgentRecord;
     try {agent=await this.client.start({name:row.agent_name,role:"worker",cwd:row.workspace_path,release:path.resolve(import.meta.dirname,"../../.."),args:serverArgs,
-      threadConfig:{model:"gpt-6.1-sol",approvalsReviewer:"auto_review",...(row.source==="dona_schedule"?{approvalPolicy:"never"}:{}),config:{"sandbox_workspace_write.writable_roots":writeRoots,"features.default_mode_request_user_input":true},developerInstructions:"あなたはDonaのworkerです。必要な質問はrequest_user_inputで親Donaへ送れます。hostが質問を親に届けるため、ユーザーへの直接連絡やSlack操作は行わないでください。回答を待つ間も独立した作業は進められます。質問待ちは失敗ではなく、質問のためにfailed Resultを公開しないでください。"}});
+      threadConfig:{model:"gpt-6.1-sol",approvalsReviewer:"auto_review",...(row.source==="dona_schedule"?{approvalPolicy:"never"}:{}),config:{"sandbox_workspace_write.writable_roots":writeRoots,"features.default_mode_request_user_input":interactive},developerInstructions:!interactive?"このjobには対話回答の経路がありません。native request_user_inputは使わず、承認済みscopeで進められない場合は不足情報をblocked Resultへ記録してください。":"あなたはDonaのworkerです。必要な質問はrequest_user_inputで親Donaへ送れます。hostが質問を親に届けるため、ユーザーへの直接連絡やSlack操作は行わないでください。回答を待つ間も独立した作業は進められます。質問待ちは失敗ではなく、質問のためにfailed Resultを公開しないでください。"}});
     } catch {throw new PreparedWorkspaceCleanupError("App Server preparation requires runtime reconciliation",row.agent_name,row.agent_name);}
     if(!agent.thread_id)throw new PreparedWorkspaceCleanupError("App Server thread identity missing",row.agent_name,row.agent_name);
     return {herdrWorkspaceId:agent.name,herdrPaneId:agent.name,herdrAgentSessionId:JSON.stringify([agent.generation,agent.thread_id])};

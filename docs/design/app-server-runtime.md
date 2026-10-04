@@ -8,7 +8,7 @@
 - Runtime hostはローカルのCodex App Server接続、thread/turn、質問request、実processの生存を管理する。Dispatcherの再起動だけではworkerを再生成しない。
 - agentごとのApp Server processを独立させる。mainとworkerの停止範囲を分離し、別workerを巻き添えにしない。
 - mainの質問もユーザー画面へ直接表示せず、イベントの元スレッドへ戻す。workerの質問はまずmainへ渡す。親が既存依頼で回答できる場合は回答し、利用者の判断・承認が必要な場合だけSlackへ確認する。
-- question、approval、MCP elicitationは別種の要求とする。通常の質問に対する回答を、実行権限の追加承認へ流用しない。
+- Taskのない旧Jobとscheduleにはnative質問の回答経路を公開せず、入力不足は既存のblocked Resultで返す。question、approval、MCP elicitationは別種の要求とする。通常の質問に対する回答を、実行権限の追加承認へ流用しない。
 
 ## 永続化と復旧
 
@@ -28,6 +28,6 @@ Result Envelopeは引き続き成果物の確定契約である。turn完了だ�
 
 MCP elicitationは機密情報や任意schemaを含み得るためSlackへ転送せず、App Serverへcancelを返す。接続認証はMac上で整える。mainのnative質問・承認要求は拒否し、Slack上のイベント処理へ戻す。workerの通常質問と実行承認は別のAPIを使い、実行承認には要求後に届いた同じownerのSlackイベントが必要である。session全体の承認は行わない。
 
-Runtime hostは安定したcontrolディレクトリに置く。Dispatcher再起動では接続を保つが、host自体を更新する場合は外部保守更新で管理対象processを停止する。Mac上で既に別serviceへ委託された処理やdaemon化した任意processについて、App Server停止だけで停止済みとは主張しない。
+Runtime hostは安定したcontrolディレクトリに置く。Dispatcher再起動では接続を保つが、host自体を更新する場合は外部保守更新で管理対象processを停止する。更新前にrootがcrashした場合も、保存済みidentityと元process groupの不在を検証し、残ったgroup内の子は外部更新で停止する。rootの不在だけを停止証拠にはしない。Mac上で既に別serviceへ委託された処理やdaemon化した任意processについて、App Server停止だけで停止済みとは主張しない。
 
 初回移行とruntime host更新は`dona-update`の既存DB保持経路を使う。通常self-updateのworker safety判定は従来どおり保守的であり、worker履歴がある環境では外部更新を使う。

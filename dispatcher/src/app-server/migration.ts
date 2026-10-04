@@ -16,14 +16,16 @@ export function migrateStoppedRuntime(dispatcherFile:string,runtimeFile:string,r
   store.db.transaction(()=>{
    if(store.db.prepare("SELECT 1 FROM sqlite_master WHERE name='host_owner'").get()) {
     const owner=store.db.prepare("SELECT identity_json FROM host_owner WHERE singleton=1").get() as {identity_json:string}|undefined;
-    if(owner){const old=JSON.parse(owner.identity_json) as ProcessIdentity;if(!receipt.processes.some(p=>same(p,old)))throw Error("runtime_migration_host_stop_missing");}
+    if(owner){const old=JSON.parse(owner.identity_json) as ProcessIdentity;if(!receipt.processes.some(p=>same(p,old))&&sample.some(p=>same(p,old)&&!p.state.includes("Z")))throw Error("runtime_migration_host_stop_missing");}
     store.db.prepare("DELETE FROM host_owner").run();
    }
    // 古いApp Server要求は旧stdio接続に束縛されている。新接続へ回答を移植しない。
    store.db.prepare("UPDATE questions SET state='expired' WHERE state IN ('pending','answering')").run();
    for(const agent of store.agents()) {
     if(agent.state==="stopped")continue;
-    if(!receipt.processes.some(p=>p.pid===agent.pid&&p.start===agent.process_start))throw Error("runtime_migration_agent_stop_missing");
+    // rootの消失だけでは子の停止証明にならない。detached App Serverの
+    // process groupも残っていないことを、全writer停止後のsampleで確認する。
+    if(!agent.pid||!agent.process_start||sample.some(p=>!p.state.includes("Z")&&((p.pid===agent.pid&&p.start===agent.process_start)||p.group===agent.pid)))throw Error("runtime_migration_agent_stop_missing");
     store.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopped') ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,processes_json=excluded.processes_json,state='stopped'").run(agent.name,agent.generation,JSON.stringify(receipt.processes));
     store.change(agent.name,agent.generation,{state:"stopped",turn_id:null});
    }

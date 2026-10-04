@@ -243,6 +243,7 @@ def render(run, plan, inv):
             values.update(DONA_RELEASE_MANIFEST_PATH=str(Path(policy['current_pointer'])/'release-manifest.json'),
                           DONA_CODEX_PATH=policy['executables']['codex'],
                           DONA_UPDATER_SOCKET_PATH=str(g/'control/updater.sock'),
+                          DONA_APP_SERVER_SOCKET=str(g/'control/runtime.sock'),
                           DONA_UPDATE_INTERNAL_TOKEN_PATH=policy['dispatcher_internal_token_file'])
             file = g/'config'/(key+'.env')
             atomic(file, common.dotenv(values).encode())
@@ -583,6 +584,12 @@ class Runner:
                 if observed and observed['start'] == started:
                     require(observed['uid']==os.getuid(), 'runtime_process_owner')
                     roots.append(observed)
+                elif observed is None:
+                    # rootのcrash後も元のprocess groupに残る子を停止対象へ含める。
+                    for child in table.values():
+                        if child['group'] == pid:
+                            require(child['uid']==os.getuid(), 'runtime_process_owner')
+                            roots.append(child)
         ancestor = os.getpid()
         while ancestor in table:
             require(all(ancestor != p['pid'] for p in roots), 'run_from_terminal_outside_dona')

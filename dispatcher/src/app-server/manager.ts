@@ -45,7 +45,11 @@ export class AppServerManager {
       row.pid=pid;row.process_start=processIdentity.start;this.store.put(row);
       rpc.on("request",(message:RpcMessage)=>this.onRequest(row,message));
       rpc.on("notification",(message:RpcMessage)=>this.onNotification(row,message));
-      rpc.on("disconnect",()=>{if(this.store.db.open&&this.store.agent(row.name)?.state!=="stopped")this.store.change(row.name,row.generation,{state:"unknown"});});
+      rpc.on("disconnect",()=>{
+        if(!this.store.db.open||this.store.agent(row.name)?.generation!==row.generation)return;
+        this.store.db.prepare("UPDATE questions SET state='expired' WHERE agent=? AND generation=? AND state IN ('pending','answering')").run(row.name,row.generation);
+        if(this.store.agent(row.name)?.state!=="stopped")this.store.change(row.name,row.generation,{state:"unknown"});
+      });
       try {
         await rpc.initialize();
         const params={...input.threadConfig,cwd:input.cwd,...(row.thread_id?{threadId:row.thread_id,excludeTurns:true}:{})};
@@ -87,6 +91,10 @@ export class AppServerManager {
     if(!kind){this.connections.get(agent.name)?.reject(message.id);return;}
     if(agent.role==="main") {
       this.connections.get(agent.name)?.reject(message.id,"Dona main must ask the user through the configured Slack tools, publish its event Result, and handle the reply as a new event.");return;
+    }
+    const settings=object(object(JSON.parse(current.config_json)).threadConfig);
+    if(kind==="question"&&object(settings.config)["features.default_mode_request_user_input"]===false) {
+      this.connections.get(agent.name)?.reject(message.id,"This job has no interactive question channel. Continue within the authorized scope or publish a blocked Result explaining the missing input.");return;
     }
     if(kind==="question"&&Array.isArray(p.questions)&&p.questions.some(q=>object(q).isSecret===true)) {
       this.connections.get(agent.name)?.reject(message.id,"Secrets cannot be requested through Dona. Ask the parent to arrange local authentication without transmitting credentials.");return;
