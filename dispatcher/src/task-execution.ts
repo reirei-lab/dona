@@ -97,6 +97,10 @@ export class TaskRepository {
         previous_error TEXT NOT NULL,result_sha256 TEXT NOT NULL,result_json TEXT NOT NULL,
         checkpoint_sha256 TEXT NOT NULL,request_sha256 TEXT NOT NULL,request_json TEXT NOT NULL,
         stop_evidence_json TEXT NOT NULL,created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS task_preparation_retries(
+        attempt_id TEXT PRIMARY KEY REFERENCES task_attempts(attempt_id),task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        successor_id TEXT NOT NULL REFERENCES task_attempts(attempt_id),source_event_id TEXT NOT NULL REFERENCES events(event_id),
+        request_sha256 TEXT NOT NULL,request_json TEXT NOT NULL,created_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS tasks_recovery ON tasks(state,next_check_at);
       CREATE TRIGGER IF NOT EXISTS task_attempt_completion AFTER UPDATE OF status ON jobs
       WHEN NEW.status IN ('completed','failed','cancelled') AND EXISTS(SELECT 1 FROM tasks WHERE current_attempt_id=NEW.job_id)
@@ -220,7 +224,7 @@ export class TaskRepository {
       attempt_number:task.attempt_number,max_attempts:task.max_attempts,worker_state:current.status,steer_event_id:current.steer_event_id,steer_state:current.steer_state,
       notification_target:JSON.parse(this.dispatcher.get(task.source_event_id)!.reply_target_json!),
       project_state:task.project_json?task.project_state:"not_configured",
-      attempts:this.sql.prepare("SELECT a.attempt_id,a.number,a.outcome,a.created_at,a.ended_at,r.result_sha256 AS reconciled_result_sha256 FROM task_attempts a LEFT JOIN task_attempt_result_recoveries r ON r.attempt_id=a.attempt_id WHERE a.task_id=? ORDER BY a.number").all(task.task_id),
+      attempts:this.sql.prepare("SELECT a.attempt_id,a.number,a.outcome,a.created_at,a.ended_at,r.result_sha256 AS reconciled_result_sha256,p.successor_id AS preparation_retry_successor_id FROM task_attempts a LEFT JOIN task_attempt_result_recoveries r ON r.attempt_id=a.attempt_id LEFT JOIN task_preparation_retries p ON p.attempt_id=a.attempt_id WHERE a.task_id=? ORDER BY a.number").all(task.task_id),
       ...(includeResult&&current.result_json?{result:JSON.parse(current.result_json)}:{})};
   }
   list(eventId:string):TaskRow[] {
@@ -304,6 +308,49 @@ export class TaskRepository {
       this.sql.prepare("UPDATE tasks SET max_attempts=?,state='waiting',wait_reason='resume_requested',next_check_at=?,revision=revision+1 WHERE task_id=?")
         .run(maxAttempts,new Date().toISOString(),id);
       this.sql.prepare("INSERT INTO task_controls(task_id,source_event_id,request_sha256) VALUES(?,?,?)").run(id,eventId,digest);return this.get(id)!;
+    }).immediate();
+  }
+  /** Explicit retry of a definitive pre-worker failure; never infer a stopped worker. */
+  retryPreparation(id:string,eventId:string,revision:number,maxAttempts:number,attemptId:string,resultDir:string):TaskRow {
+    return this.sql.transaction(()=>{
+      const task=this.assertOwner(id,eventId);
+      if(this.dispatcher.get(eventId)?.source!=="slack")throw Error("task_control_requires_slack");
+      const request={source_event_id:eventId,revision,max_attempts:maxAttempts,attempt_id:attemptId},digest=hash(request);
+      const prior=this.sql.prepare("SELECT task_id,request_sha256 FROM task_preparation_retries WHERE attempt_id=?").get(attemptId) as {task_id:string;request_sha256:string}|undefined;
+      if(prior){if(prior.task_id!==id||prior.request_sha256!==digest)throw Error("task_control_conflict");return task;}
+      if(task.revision!==revision||task.current_attempt_id!==attemptId)throw Error("task_revision_conflict");
+      const old=this.dispatcher.getJob(attemptId)!;
+      if(task.state!=="failed"||task.desired_state!=="running"||task.stop_state!=="none"||task.steer_pending_event_id||
+        old.status!=="failed"||old.last_error_code!=="job_preparation_failed"||old.attempt_count<1||
+        !["runtime_mcp_inventory_failed","runtime_start_not_sent"].includes(old.last_error_message??"")||
+        old.dispatch_started_at||old.prompt_accepted_at||old.herdr_workspace_id||old.herdr_pane_id||
+        old.steer_event_id||old.steer_state||this.dispatcher.getJobLiveSessionIdentity(attemptId))throw Error("task_retry_requires_preparation_failure");
+      if(!Number.isSafeInteger(maxAttempts)||maxAttempts<task.max_attempts||maxAttempts<=task.attempt_number||maxAttempts>10)throw Error("task_retry_budget_invalid");
+      if(old.result_json)throw Error("task_result_requires_reconciliation");
+      try{fs.lstatSync(old.result_path);throw Error("task_result_requires_reconciliation");}
+      catch(error){if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error;}
+      // Never race a pending/in-flight/ambiguous failure notification. Keep its history.
+      const group=this.dispatcher.getJobGroup(old.source_event_id);
+      for(const event of new Set([old.completion_event_id,group?.attention_event_id,group?.all_terminal_event_id])) {
+        if(event&&this.dispatcher.get(event)?.status!=="completed")throw Error("task_prior_notification_requires_reconciliation");
+      }
+      const next=`job_${ulid().toLowerCase()}`,number=task.attempt_number+1,now=new Date().toISOString();
+      const workspace={...JSON.parse(old.workspace_json),_dona_task:{task_id:id,attempt_id:next,attempt_number:number},
+        _dona_handoff:{predecessor_job_id:old.job_id,workspace_job_id:workspaceJobId(old)}};
+      // No work ran in the failed preparation: retain the full effective objective,
+      // including earlier reconciliation/checkpoint context, without duplicating it.
+      this.sql.prepare(`INSERT INTO jobs(job_id,source_event_id,job_key,source,workspace_id,channel_id,thread_ts,actor_id,objective,workspace_json,status,available_at,workspace_path,result_path,agent_name,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,'queued',?,?,?,?,?,?)`).run(next,old.source_event_id,`attempt.${hash(id).slice(0,32)}.${number}`,old.source,old.workspace_id,old.channel_id,old.thread_ts,old.actor_id,old.objective,JSON.stringify(workspace),new Date(Date.now()+task.retry_delay_ms).toISOString(),old.workspace_path,path.join(resultDir,next,"result.json"),next,now,now);
+      this.sql.prepare("INSERT INTO job_owner_bindings SELECT ?,source_event_id,owner_json,destination_json FROM job_owner_bindings WHERE job_id=?").run(next,old.job_id);
+      this.sql.prepare("INSERT INTO job_terminal_worker_cleanups(job_id,outcome,updated_at) VALUES(?,'pending',?)").run(next,now);
+      this.sql.prepare("INSERT INTO task_attempts(attempt_id,task_id,number,created_at) VALUES(?,?,?,?)").run(next,id,number,now);
+      this.sql.prepare("UPDATE tasks SET current_attempt_id=?,attempt_number=?,max_attempts=?,revision=revision+1,state='active',wait_reason=NULL,next_check_at=NULL,observation_failures=0,updated_at=? WHERE task_id=?")
+        .run(next,number,maxAttempts,now,id);
+      this.sql.prepare("UPDATE job_groups SET all_terminal_event_id=NULL WHERE source_event_id=?").run(old.source_event_id);
+      // Separate, attempt-scoped receipt: a prior pause/resume on the same source
+      // event is preserved and cannot mask this explicit retry or be overwritten.
+      this.sql.prepare("INSERT INTO task_preparation_retries VALUES(?,?,?,?,?,?,?)").run(attemptId,id,next,eventId,digest,JSON.stringify(request),now);
+      return this.get(id)!;
     }).immediate();
   }
   wait(task:TaskRow,reason:string,delayMs=30_000):void {

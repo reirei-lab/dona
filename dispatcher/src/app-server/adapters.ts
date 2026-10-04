@@ -113,7 +113,10 @@ export class AppServerJobRuntime implements JobAgentRuntime {
     }
     const baseline=codexAgentArguments(row,this.config,[],this.progressEnabled,executablePaths);
     const trust=baseline.find(value=>value.startsWith("projects = "))!;
-    const listed=await runProcess(this.config.codexPath,["-c",trust,"mcp","list","--json"],this.config.jobCommandTimeoutMs,signal,false,"",row.workspace_path);
+    // launchd may omit Node from PATH even though this process uses a pinned Node.
+    // Codex's npm entrypoint has an /usr/bin/env node shebang.
+    const inventoryEnv={...process.env,PATH:[path.dirname(process.execPath),process.env.PATH].filter(Boolean).join(path.delimiter)};
+    const listed=await runProcess(this.config.codexPath,["-c",trust,"mcp","list","--json"],this.config.jobCommandTimeoutMs,signal,false,"",row.workspace_path,inventoryEnv);
     if(!listed.ok)throw Error("runtime_mcp_inventory_failed");
     disabledMcpServers=parseScheduledMcpInventory(JSON.parse(listed.stdout)).filter(name=>row.source==="dona_schedule"||["dona_slack","dona_dispatcher"].includes(name));
     const args=baseline;

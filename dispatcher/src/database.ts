@@ -3660,7 +3660,7 @@ export class DispatcherDatabase {
   ): JobGroupSnapshot {
     const counts = this.db.prepare(`
       SELECT status, COUNT(*) AS count
-      FROM jobs WHERE source_event_id = ? AND job_id NOT IN (SELECT attempt_id FROM task_attempts WHERE outcome='interrupted') GROUP BY status
+      FROM jobs WHERE source_event_id = ? AND job_id NOT IN (SELECT a.attempt_id FROM task_attempts a JOIN tasks t ON t.task_id=a.task_id WHERE a.attempt_id<>t.current_attempt_id) GROUP BY status
     `).all(sourceEventId) as Array<{ status: JobStatus; count: number }>;
     const statusCounts: Partial<Record<JobStatus, number>> = {};
     let total = 0;
@@ -3685,7 +3685,7 @@ export class DispatcherDatabase {
 
     const jobs = (this.db.prepare(`
       SELECT job_id, job_key, status FROM jobs
-      WHERE source_event_id = ? AND job_id NOT IN (SELECT attempt_id FROM task_attempts WHERE outcome='interrupted') ORDER BY created_at, job_id LIMIT ?
+      WHERE source_event_id = ? AND job_id NOT IN (SELECT a.attempt_id FROM task_attempts a JOIN tasks t ON t.task_id=a.task_id WHERE a.attempt_id<>t.current_attempt_id) ORDER BY created_at, job_id LIMIT ?
     `).all(sourceEventId, jobGroupSnapshotJobLimit) as JobGroupSnapshot["jobs"]).map(job=>{
       const task=this.tasks.forAttempt(job.job_id);
       return {...job,...(task?{task_id:task.task_id}:{})};
