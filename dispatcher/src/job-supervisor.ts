@@ -268,7 +268,7 @@ export class JobSupervisor {
     const result=this.database.readTaskRecoveryResult(job.job_id),checkpoint=checkpointSnapshot(job,id);
     return {task_id:id,revision:task.revision,attempt_id:job.job_id,worker_state:observed.state,
       cause:job.last_error_code,result_sha256:result.sha256,unaccepted_result:result.result,
-      checkpoint_sha256:checkpoint.sha256,checkpoint:checkpoint.checkpoint??null,persisted_checkpoint:this.database.tasks.latestCheckpoint(id)??null,
+      checkpoint_sha256:checkpoint.sha256,checkpoint:checkpoint.checkpoint??null,persisted_checkpoint:this.database.tasks.attemptCheckpoint(job.job_id)??null,
       reconciliation:this.database.tasks.resultRecovery(job.job_id)??null};
   }
   async reconcileTaskResult(id:string,value:unknown):Promise<Record<string,unknown>> {

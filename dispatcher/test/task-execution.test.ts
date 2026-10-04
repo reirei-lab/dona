@@ -608,3 +608,17 @@ test("回復検査は観測・checkpointをDBへ書き込まない",async()=>{
     await f.input();assert.equal(f.db.getWorkerObservation(f.job),undefined);assert.equal(f.db.tasks.latestCheckpoint(f.task.task_id),undefined);
   }finally{await f.dispose();}
 });
+
+test("前Attemptだけのcheckpointは現在Attemptのfile欠落として拒否しない",async()=>{
+  const f=await fixture();try{
+    f.start();const previous=f.db.getJob(f.task.current_attempt_id)!;
+    f.db.tasks.checkpoint(previous,{schema_version:1,task_id:f.task.task_id,attempt_id:previous.job_id,sequence:1,summary:"前回成果",remaining:[],artifacts:[],unresolved_operations:[],waiting:"none"});
+    f.interrupt();await f.supervisor().reconcileTasks();const second=f.db.getJob(f.db.tasks.get(f.task.task_id)!.current_attempt_id)!;f.start(second.job_id);
+    f.db.markJobNeedsReview(second.job_id,"steer_acceptance_unknown","unknown");await fs.mkdir(path.dirname(second.result_path),{recursive:true});await fs.writeFile(second.result_path,JSON.stringify({schema_version:1,job_id:second.job_id,status:"failed",summary:"続きが必要",completed_at:new Date().toISOString()}));
+    f.db.tasks.wait(f.db.tasks.get(f.task.task_id)!,"result_reconciliation_required",-1);f.setObserved({state:"stopped"});f.setStopped(true);
+    const event=f.db.enqueue(eventEnvelope("reconcile-second")).row,inspected=await f.supervisor().inspectTaskRecovery(f.task.task_id,event.event_id);
+    assert.equal(inspected.checkpoint_sha256,"missing");assert.equal(inspected.persisted_checkpoint,null);
+    await f.supervisor().reconcileTaskResult(f.task.task_id,{source_event_id:event.event_id,revision:inspected.revision,attempt_id:second.job_id,result_sha256:inspected.result_sha256,checkpoint_sha256:"missing",reason:"現Attemptの成果を照合",steer_resolution:"not_delivered",evidence:[{reference:"receipt",finding:"送信前拒否"}]});
+    assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,3);assert.ok(f.db.tasks.attemptCheckpoint(previous.job_id));
+  }finally{await f.dispose();}
+});

@@ -116,6 +116,10 @@ export class TaskRepository {
       if(checkpoint.sequence===previous.sequence){if(stableStringify(checkpoint)!==stableStringify(previous))throw new Error("task_checkpoint_conflict");return;}}
     this.sql.prepare("UPDATE task_attempts SET checkpoint_json=? WHERE attempt_id=?").run(JSON.stringify(checkpoint),job.job_id);
   }
+  attemptCheckpoint(attemptId:string):TaskCheckpoint|undefined {
+    const row=this.sql.prepare("SELECT checkpoint_json FROM task_attempts WHERE attempt_id=?").get(attemptId) as {checkpoint_json:string|null}|undefined;
+    return row?.checkpoint_json?JSON.parse(row.checkpoint_json):undefined;
+  }
   latestCheckpoint(id:string):TaskCheckpoint|undefined {
     const row=this.sql.prepare("SELECT checkpoint_json FROM task_attempts WHERE task_id=? AND checkpoint_json IS NOT NULL ORDER BY number DESC LIMIT 1").get(id) as {checkpoint_json:string}|undefined;
     return row?JSON.parse(row.checkpoint_json):undefined;
@@ -410,8 +414,8 @@ export class TaskRepository {
     const snapshot=checkpointSnapshot(job,taskId);
     if(snapshot.sha256!==expected)throw Error("task_result_recovery_drift");
     if(snapshot.checkpoint)this.checkpoint(job,snapshot.checkpoint);
-    else if(this.latestCheckpoint(taskId))throw Error("task_checkpoint_missing_after_persistence");
-    const effective=this.latestCheckpoint(taskId);
+    else if(this.attemptCheckpoint(job.job_id))throw Error("task_checkpoint_missing_after_persistence");
+    const effective=this.attemptCheckpoint(job.job_id);
     if(effective?.waiting==="external_effect_unknown"||effective?.unresolved_operations.length)throw Error("task_external_effect_reconciliation_required");
   }
   private recoveryContext(attemptId:string):string {
