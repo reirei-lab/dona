@@ -68,11 +68,19 @@ export class ApprovalOperations {
   /** operator専用projection。cursorは開示権限を与えず、毎pageで認可する。
    * filterで空pageでも走査cursorを進め、候補数を成功件数と解釈しない。 */
   listRequests(policies: OperationsPolicyRepository, input: OperationsListInput): OperationsListPage {
+    return this.listAuthorizedRequests(policies, input, "read");
+  }
+  /** 内部sweepだけのexpiry projection。公開listのread grantは緩めない。 */
+  listExpiryRequests(policies: OperationsPolicyRepository, input: OperationsListInput): OperationsListPage {
+    return this.listAuthorizedRequests(policies, input, "expire");
+  }
+  private listAuthorizedRequests(policies: OperationsPolicyRepository, input: OperationsListInput, action: "read" | "expire"): OperationsListPage {
     try {
       assertSynchronousResult(input); const parsed = listSchema.parse(input);
+      if (action === "expire" && (parsed.filter.state !== "all" || !parsed.filter.due_only)) throw Error();
       if (!policies.matchesContext(this.db, this.scope)) throw Error();
       return this.audit.readVerifiedState(state => {
-        const mark = this.observation(state), grant = policies.authorize(state, mark, "read");
+        const mark = this.observation(state), grant = policies.authorize(state, mark, action);
         let after: string | null = null;
         if (parsed.cursor !== null) {
           const raw = Buffer.from(parsed.cursor, "base64url");

@@ -53,6 +53,7 @@ test("実Slack adapterの署名/custodyからexact durable recordをbrokerへ通
   assert.equal(f.evidence.read("evidence").observation.candidates.length, 1);
   const result = f.resolve(); assert.equal(result.status, "updated"); assert.equal(f.attempt().row.state, "succeeded");
   const records = f.db.prepare("SELECT record_json FROM security_audit_records ORDER BY sequence DESC LIMIT 1").pluck().get() as string;
+  assert.deepEqual(JSON.parse(records).event.actor, { kind: "operator", id: "local_operator" });
   assert.equal(records.includes("operator confirmed provider record"), false); assert.equal(records.includes("orc_"), true);
   assert.equal(fs.readFileSync(path.join(f.directory, "evidence.json"), "utf8").includes("fixture_only_private_draft"), false);
 });
@@ -136,6 +137,8 @@ test("通知のprovider証拠はimmutable送信fenceを照合し、recovery後�
   assert.equal(broker.resolve("notification_resolve", { notification_handle: row.notification_attempt_id,
     expected_fence: 2, authority_ref: "notification_evidence" }).status, "updated");
   assert.equal(f.notification("approval_card").row.state, "sent");
+  const audited = f.db.prepare("SELECT record_json FROM security_audit_records WHERE transaction_id='notification_resolve'").pluck().get() as string;
+  assert.deepEqual(JSON.parse(audited).event.actor, { kind: "operator", id: "local_operator" });
   assert.equal(broker.claim("never_resend", { notification_handle: row.notification_attempt_id,
     expected_fence: 3, authority_ref: "notification_evidence" }).status, "denied");
 });

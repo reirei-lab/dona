@@ -109,7 +109,7 @@ export function runOperationsTick(connection: OperationsFrontendConnection, poli
     connection.operations.authorizedObservation(connection.policies, "expire", (_state, _mark, principal) => {
       if (principal.policy_revision !== policyRevision) throw Error(); return null;
     });
-    const selected = connection.operations.listRequests(connection.policies, { limit: 100, cursor: expiry, filter: { state: "all", due_only: true } });
+    const selected = connection.operations.listExpiryRequests(connection.policies, { limit: 100, cursor: expiry, filter: { state: "all", due_only: true } });
     for (const request of selected.requests) connection.expiry.expire(transaction(), request.handle, request.revision, policyRevision);
     expiry = selected.has_more ? selected.cursor : null; if (!selected.has_more) break;
   }

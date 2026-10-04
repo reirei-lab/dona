@@ -185,11 +185,12 @@ static void approval_metadata_backup(sqlite3_context *context, int argc, sqlite3
   if (lstat(filename, &after) != 0 || after.st_dev != before.st_dev || after.st_ino != before.st_ino || after.st_size != 0) goto cleanup;
   if (sqlite3_open_v2(filename, &output, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK
     || copy_database(output, memory) != SQLITE_OK
-    || sqlite3_exec(output, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL", NULL, NULL, NULL) != SQLITE_OK
+    || sqlite3_exec(output, "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL", NULL, NULL, NULL) != SQLITE_OK
     || sqlite3_db_cacheflush(output) != SQLITE_OK) goto cleanup;
   moved = -1;
   if (sqlite3_file_control(output, "main", SQLITE_FCNTL_HAS_MOVED, &moved) != SQLITE_OK || moved != 0) goto cleanup;
-  if (sqlite3_close(output) != SQLITE_OK) goto cleanup; output = NULL;
+  if (sqlite3_close(output) != SQLITE_OK) goto cleanup;
+  output = NULL;
   if (lstat(filename, &after) != 0 || after.st_dev != before.st_dev || after.st_ino != before.st_ino
     || after.st_nlink != 1 || !S_ISREG(after.st_mode) || (after.st_mode & 077) != 0) goto cleanup;
   ok = 1;

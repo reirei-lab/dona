@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { z } from "zod";
-import { assertSecurityDurability } from "../audit/durability.js";
+import { assertSecurityReadAdmission } from "../audit/durability.js";
 import { verifyOpenDatabaseFile } from "../audit/file-identity.js";
 import { assertSynchronousResult } from "../audit/synchronous.js";
 import { verifyApprovalPayloadSchema } from "./schema.js";
@@ -41,7 +41,7 @@ export class ApprovalPayloadSql {
     try{
       assertSynchronousResult(scopeInput);this.scope=Object.freeze(scopeSchema.parse(scopeInput));
       if(db.inTransaction)throw Error();
-      assertSecurityDurability(db);verifyOpenDatabaseFile(db);verifyApprovalPayloadSchema(db);
+      assertSecurityReadAdmission(db);verifyOpenDatabaseFile(db);verifyApprovalPayloadSchema(db);
     }catch{throw new ApprovalPayloadSqlError();}
   }
   private guarded<T>(operation:()=>T):T {
@@ -112,6 +112,7 @@ export class ApprovalPayloadSql {
   /** 同じ共有監査mutationでroot更新と合わせて使い、例外を捕捉してcommitしない。 */
   stage(input:readonly ApprovalPayloadChange[]):void {
     this.guarded(()=>{
+      if(this.db.readonly)throw new ApprovalPayloadSqlError();
       for(const change of this.checked(input)){
         const m=change.next.metadata,b=m.binding;
         if(change.previous===null){

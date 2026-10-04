@@ -67,9 +67,9 @@ healthは`live`と`ready`を分離する。expiry lag、stale claim、execution/
 
 ## backupとrestore continuity
 
-backupは同じ認可済み監査snapshotからSQLite Online Backupを使用する。sourceをmemory SQLiteへ写し、memory内でsecret tableを空にしてVACUUMした後、metadataのみをprivate destinationへ写す。ciphertext envelopeもbackupのdiskへ一時保存しない。元DBを変更せず、同directoryの一時fileをfsync後、上書き不可のlinkで公開する。[SQLite Online Backup](https://www.sqlite.org/backup.html)のsnapshot契約を使用する。
+backupは単一instance/workspaceの専用DBだけを対象とし、別scopeのroot・row・監査eventや無関係なtableがある場合は拒否する。同じ認可済み監査snapshotからSQLite Online Backupを使用する。sourceをmemory SQLiteへ写し、memory内でsecret tableを空にしてVACUUMした後、metadataのみをprivate destinationへ写す。ciphertext envelopeもbackupのdiskへ一時保存しない。digestは固定サイズのchunkで計算する。元DBを変更せず、同directoryの一時fileをfsync後、上書き不可のlinkで公開する。[SQLite Online Backup](https://www.sqlite.org/backup.html)のsnapshot契約を使用する。
 
-backupはcredential・Keychain head・used-node storeを含まず、runtimeを自動復旧するbundleではない。active本文は復元できない。`restore-check`はcurrent operator認可の後、候補DBのschema/FK/quick_check、同じinstance/workspace、current binding/policy generation、保護clock/boot、外部audit anchor、全record/linkとmarker continuityを有界走査する。検査は業務rowを変更せず、DB置換・anchor巻戻し・repair・再送・enablementをしない。
+backupはcredential・Keychain head・used-node storeを含まず、runtimeを自動復旧するbundleではない。active本文は復元できない。`restore-check`はcurrent operator認可の後、standalone DELETE-journal形式の候補DBをread-onlyで開き、schema/FK/quick_check、同じinstance/workspace、current binding/policy generation、保護clock/boot、外部audit anchor、全record/linkとmarker continuityを有界走査する。WAL/SHM/hot journalを伴う候補は回復せずneeds_reviewへ送る。decision/consumeの保存時刻、request/attemptのpayload binding、notification/executionのMACと保持鍵も照合する。検査は候補fileやsidecarを変更せず、DB置換・anchor巻戻し・repair・再送・enablementをしない。
 
 古いbackup、binding/boot不一致、欠落したactive本文、unknownな履歴、検証上限到達は`needs_review`と`safe_ready: false`にする。完全一致したmetadataだけでも`continuity_verified`はsafe readinessや復元完了を意味しない。復元後のunknown acceptanceと永久fenceを保持し、再配送を開始しない。安全な復元手順とlive証明は#25のruntime gateで判断する。
 

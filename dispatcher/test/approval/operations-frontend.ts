@@ -3,6 +3,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { operationsPolicyFixture } from "./fixtures/operations.js";
+import type Database from "better-sqlite3";
+import { openSecurityReadOnlyDatabase, withSecurityTransactionLock } from "../../src/audit/coordination.js";
+import { ApprovalRecordSql } from "../../src/approval/record-sql.js";
+import { ApprovalRecordRepository } from "../../src/approval/record-repository.js";
+import { ApprovalPayloadRepository } from "../../src/approval/payload-repository.js";
+import { attachOperationsPolicy } from "./fixtures/operations.js";
+import { executionFixture } from "./fixtures/execution.js";
+import { executionKey } from "./fixtures/execution.js";
 import { scope, content, wrapping, notification } from "./fixtures/broker.js";
 import { ApprovalOperations, ApprovalOperationsError } from "../../src/approval/operations.js";
 import { ApprovalDecisionBroker } from "../../src/approval/decision-broker.js";
@@ -23,17 +31,19 @@ function frontendFixture(t: { after(fn: () => void): void }, requests = 0) {
     () => content, () => wrapping, () => notification, undefined, f.policies);
   const retention = new ApprovalRetention(f.db, f.providers, scope, f.policies);
   const operations = new ApprovalOperations(f.db, f.providers, scope, undefined, (state, mark) => retention.countInState(state, mark));
+  let restoreWasReadonly = false;
   const recovery = new ApprovalBackupRestore(f.db, f.providers, scope, operations, f.policies, candidate => {
+    restoreWasReadonly = candidate.readonly;
     const binding = new SupervisorBindingRepository(candidate, f.providers.auditAnchors, f.providers.auditKeys, scope, f.bindingGenerations);
     return new OperationsPolicyRepository(candidate, f.providers, scope, binding, f.policyGenerations);
-  });
+  }, { notification: () => notification, execution: () => executionKey });
   const config: OperationsConnectionConfig = { codec_version: 1, enabled: true, scope, workspace_alias: "fixture",
     database: f.filename, used_nodes_database: path.join(path.dirname(f.filename), "not_a_production_store"), evidence_directory: path.dirname(f.filename),
     ledger_id: "fixture", access_group: "ABCDEFGHIJ.lab.reirei.dona", audit_key_version: 1, provider_author: { user_id: "Ubot", bot_id: "Bbot" },
     sweep_interval_ms: 1000, sweep_page_budget: 1 };
   const connection: OperationsFrontendConnection = { db: f.db, providers: f.providers, config, policies: f.policies,
     operations, expiry, retention, recovery, reconcile: () => { throw Error("not used by expiry fixture"); } };
-  return { ...f, connection, operations, expiry, recovery, retention };
+  return { ...f, connection, operations, expiry, recovery, retention, restoreReadonly: () => restoreWasReadonly };
 }
 
 test("CLI parserはbounded limit/dry-runを既定にし、actor/outcome/重複flagを拒否する", () => {
@@ -206,4 +216,129 @@ test("restoreはboot不一致やbinding世代不一致でsafe-offを維持する
       supervisor_user_id: "replacement", reason: null, reason_digest: null, operation_scope_digest: null, target_scope_digest: null, expires_at: null });
     assert.deepEqual(f.recovery.verifyRestore(destination), { status: "needs_review", safe_ready: false });
   }
+});
+
+
+test("least privilegeのbackup-onlyとexpire/retention-onlyをread grantへ拡大しない", t => {
+  const f = frontendFixture(t, 1);
+  f.operator.change("sweep_only", { active: true, expires_at: f.proposal.expires_at,
+    grants: [{ principal_id: "local_operator", uid: process.getuid!(), actions: ["expire", "retention"] }] });
+  assert.throws(() => f.operations.listRequests(f.policies, { limit: 1, cursor: null, filter: { state: "all", due_only: false } }));
+  const sweep = { action: "sweep" as const, apply: false, confirm: null };
+  const preview = executeOperationsCommand(f.connection, sweep) as { confirmation: string };
+  assert.equal((executeOperationsCommand(f.connection, { ...sweep, apply: true, confirm: preview.confirmation }) as { status: string }).status, "sweep_authorized");
+  f.setNow("2026-09-19T00:15:00.000Z");
+  runOperationsTick(f.connection, 2, { expiry: null, request_retention: null, attempt_retention: null });
+  assert.equal(f.records.read("request", f.requestIds[0]!)?.row.state, "expired");
+  f.operator.change("backup_only", { active: true, expires_at: f.proposal.expires_at,
+    grants: [{ principal_id: "local_operator", uid: process.getuid!(), actions: ["backup"] }] });
+  const command = { action: "backup" as const, destination: path.join(path.dirname(f.filename), "least.sqlite"), apply: false, confirm: null };
+  const backup = executeOperationsCommand(f.connection, command) as { confirmation: string };
+  assert.equal((executeOperationsCommand(f.connection, { ...command, apply: true, confirm: backup.confirmation }) as { status: string }).status, "backed_up");
+});
+
+test("restore-checkはread-onlyで候補とdirectoryを変更せず、hot journalを回復しない", t => {
+  const f = frontendFixture(t), directory = path.dirname(f.filename), candidate = path.join(directory, "readonly.sqlite");
+  f.recovery.backup(candidate, 1);
+  const bytes = fs.readFileSync(candidate), files = fs.readdirSync(directory).sort();
+  assert.equal(f.recovery.verifyRestore(candidate).status, "continuity_verified");
+  assert.equal(f.restoreReadonly(), true); assert.deepEqual(fs.readFileSync(candidate), bytes); assert.deepEqual(fs.readdirSync(directory).sort(), files);
+  fs.writeFileSync(candidate + "-journal", "fixture hot journal", { mode: 0o600 });
+  assert.equal(f.recovery.verifyRestore(candidate).status, "needs_review");
+  assert.equal(fs.readFileSync(candidate + "-journal", "utf8"), "fixture hot journal"); assert.deepEqual(fs.readFileSync(candidate), bytes);
+});
+
+test("backupは別scopeの監査recordや無関係なtableをcurrent scope認可だけで持ち出さない", t => {
+  for (const unrelated of [false, true]) {
+    const f = frontendFixture(t), candidate = path.join(path.dirname(f.filename), "forbidden.sqlite");
+    if (unrelated) f.db.exec("CREATE TABLE unrelated_private_context(body TEXT)");
+    else f.audit.append("foreign_audit", 1, { occurred_at: "2026-09-19T00:00:00.000Z",
+      scope: { instance_id: scope.instance_id, tenant_id: "another_workspace" }, actor: { kind: "system" as const, id: "fixture" },
+      action: "retention" as const, operation: "audit.retain.v1" as const, resource_id: "foreign", outcome: "succeeded" as const,
+      reason: "none" as const, session_ref: null, receipt_id: null, attempt_id: null, policy_revision: 1, binding_revision: 1, authz_revision: 1 },
+      () => null);
+    assert.throws(() => f.recovery.backup(candidate, 1)); assert.equal(fs.existsSync(candidate), false);
+  }
+});
+
+test("backup digestはfile全体のBuffer読込に依存しない", t => {
+  const f = frontendFixture(t), destination = path.join(path.dirname(f.filename), "chunked.sqlite"), read = fs.readFileSync;
+  fs.readFileSync = ((file: Parameters<typeof read>[0], ...args: unknown[]) => {
+    if (typeof file === "string" && path.basename(file).startsWith(".approval-backup-")) throw Error("fixture disallows unbounded read");
+    return (read as (...values: unknown[]) => unknown)(file, ...args);
+  }) as typeof read;
+  try { assert.equal(f.recovery.backup(destination, 1).status, "backed_up"); }
+  finally { fs.readFileSync = read; }
+});
+
+function terminalRestoreFixture(t: { after(fn: () => void): void }) {
+  const base = executionFixture(t); base.execution.start("start", base.executionCommand()); base.execution.resolve("settle", base.executionCommand());
+  const f = attachOperationsPolicy(base); f.provision(); const operations = new ApprovalOperations(f.db, f.providers, scope);
+  const recovery = new ApprovalBackupRestore(f.db, f.providers, scope, operations, f.policies, candidate => {
+    const binding = new SupervisorBindingRepository(candidate, f.providers.auditAnchors, f.providers.auditKeys, scope, f.bindingGenerations);
+    return new OperationsPolicyRepository(candidate, f.providers, scope, binding, f.policyGenerations);
+  }, { notification: () => notification, execution: () => executionKey });
+  const candidate = path.join(path.dirname(f.filename), "terminal.sqlite"); recovery.backup(candidate, 1);
+  assert.equal(recovery.verifyRestore(candidate).status, "continuity_verified");
+  return { ...f, recovery, candidate };
+}
+
+test("restoreはverified readerが返したdecision/consumeの保存時刻も独立して履歴へ照合する", t => {
+  const execution = terminalRestoreFixture(t), expired = frontendFixture(t, 1), read = ApprovalRecordRepository.prototype.readListPageInState;
+  expired.setNow("2026-09-19T00:15:00.000Z"); expired.expiry.expire("expire_for_history", expired.requestIds[0]!, 1, 1);
+  const expiryCandidate = path.join(path.dirname(expired.filename), "expired.sqlite"); expired.recovery.backup(expiryCandidate, 1);
+  assert.equal(expired.recovery.verifyRestore(expiryCandidate).status, "continuity_verified");
+  for (const kind of ["decision", "consume"] as const) {
+    const f = kind === "decision" ? { recovery: expired.recovery, candidate: expiryCandidate } : execution;
+    // Fault injection at the repository boundary models an authenticated legacy
+    // image with valid clock references but mismatched owner timestamps.
+    ApprovalRecordRepository.prototype.readListPageInState = function (...args) {
+      const page = read.apply(this, args);
+      if (!(this as unknown as { db: Database.Database }).db.readonly) return page;
+      return { ...page, records: page.records.map(record => record.kind !== kind ? record : { ...record,
+        row: { ...record.row, ...(record.kind === "decision" ? { decided_at: "2026-09-19T00:00:00.001Z" } : { claimed_at: "2026-09-19T00:00:00.001Z" }) } }) } as typeof page;
+    };
+    try { assert.equal(f.recovery.verifyRestore(f.candidate).status, "needs_review"); }
+    finally { ApprovalRecordRepository.prototype.readListPageInState = read; }
+  }
+});
+
+test("restoreはtombstoneもrequest/attemptのpayload bindingへ照合する", t => {
+  const f = terminalRestoreFixture(t), inspect = ApprovalPayloadRepository.prototype.inspectInState;
+  for (const kind of ["request", "attempt"] as const) {
+    ApprovalPayloadRepository.prototype.inspectInState = function (...args) {
+      const payload = inspect.apply(this, args);
+      if (!(this as unknown as { db: Database.Database }).db.readonly || args[1] !== kind || payload === null) return payload;
+      return { ...payload, metadata: { ...payload.metadata, binding: { ...payload.metadata.binding, semantic_hash: "0".repeat(64) } } };
+    };
+    try { assert.equal(f.recovery.verifyRestore(f.candidate).status, "needs_review"); }
+    finally { ApprovalPayloadRepository.prototype.inspectInState = inspect; }
+  }
+});
+
+test("restoreはnotification/execution markerの欠落・失効・取り違え鍵をsafe-offにする", t => {
+  const f = terminalRestoreFixture(t);
+  for (const kind of ["notification", "execution"] as const) for (const fault of ["missing", "revoked", "wrong"] as const) {
+    const recovery = new ApprovalBackupRestore(f.db, f.providers, scope, new ApprovalOperations(f.db, f.providers, scope), f.policies, candidate => {
+      const binding = new SupervisorBindingRepository(candidate, f.providers.auditAnchors, f.providers.auditKeys, scope, f.bindingGenerations);
+      return new OperationsPolicyRepository(candidate, f.providers, scope, binding, f.policyGenerations);
+    }, { notification: () => { if (kind === "notification" && fault === "missing") throw Error();
+      return { ...notification, ...(kind === "notification" ? fault === "revoked" ? { state: "revoked" as const } : fault === "wrong" ? { secret: Buffer.alloc(32) } : {} : {}) }; },
+      execution: () => { if (kind === "execution" && fault === "missing") throw Error();
+        return { ...executionKey, ...(kind === "execution" ? fault === "revoked" ? { state: "revoked" as const } : fault === "wrong" ? { secret: Buffer.alloc(32) } : {} : {}) }; } });
+    assert.equal(recovery.verifyRestore(f.candidate).status, "needs_review");
+  }
+});
+
+
+test("read-only admissionはwrite lockや同内容stageの許可へ転用できない", t => {
+  const f = frontendFixture(t, 1); f.setNow("2026-09-19T00:15:00.000Z"); f.expiry.expire("expire_for_readonly", f.requestIds[0]!, 1, 1);
+  const destination = path.join(path.dirname(f.filename), "read_admission.sqlite"); f.recovery.backup(destination, 1);
+  const candidate = openSecurityReadOnlyDatabase(destination), before = fs.readFileSync(destination);
+  try {
+    const sql = new ApprovalRecordSql(candidate, scope), row = f.records.read("request", f.requestIds[0]!)!;
+    assert.throws(() => withSecurityTransactionLock(candidate, () => null));
+    assert.throws(() => candidate.transaction(() => sql.stage([{ previous: row, next: row }]))());
+    assert.deepEqual(fs.readFileSync(destination), before);
+  } finally { candidate.close(); }
 });

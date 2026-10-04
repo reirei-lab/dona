@@ -147,8 +147,9 @@ export class NativeOperationsConnection {
           new KeychainBindingGenerations(scope, this.config.access_group, this.native));
         return new OperationsPolicyRepository(candidate, this.providers, scope, candidateBinding,
           new KeychainBindingGenerations(scope, this.config.access_group, this.native, "policy_generation"));
-      });
-      this.operations.authorizedObservation(this.policies, "read", () => null);
+      }, { notification: version => this.keys.read("approval_notification_marker", version) as ApprovalNotificationKey,
+        execution: version => this.keys.read("approval_execution_marker", version) as ApprovalExecutionMarkerKey });
+      // current commandのactionで認可する。constructorでread grantを追加要求しない。
     } catch {
       for (const resource of opened.reverse()) { try { resource.close(); } catch { /* preserve redaction */ } }
       throw Error("approval_operations_safe_off");

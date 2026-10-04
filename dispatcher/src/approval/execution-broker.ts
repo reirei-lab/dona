@@ -149,6 +149,8 @@ export class ApprovalExecutionBroker {
         if (grant.status === "denied") return this.denied(base, grant.reason);
         if (!this.matches(grant, attempt)) return this.denied(base, "scope_mismatch");
         const event = { ...this.event(request, attempt, grant.consumer_id),
+          actor: grant.proof_kind !== "reconcile" ? this.event(request, attempt, grant.consumer_id).actor
+            : { kind: "operator" as const, id: grant.consumer_id },
           session_ref: grant.operator_context_ref ?? null, authz_revision: grant.operator_revision ?? 0 };
         if (command.expected_fence !== attempt.row.fence || grant.execution_fence !== attempt.row.fence) return this.denied(event, "revision_mismatch");
         this.clock(request, attempt, mark, state);
