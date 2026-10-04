@@ -176,3 +176,16 @@ for(const detached of [false,true])test(`GitHub継続は${detached?"detached HEA
   assert.equal(git(old.workspace_path,"status","--porcelain"),before);assert.equal(git(old.workspace_path,"rev-parse","HEAD"),head);assert.equal(git(old.workspace_path,"rev-parse","--abbrev-ref","HEAD"),branch);assert.equal(await fs.readFile(path.join(old.workspace_path,"keep"),"utf8"),"unfinished work");
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+test("launchdの最小PATHでもnpm版CodexのMCP inventoryを取得する",async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath),runtime=new AppServerJobRuntime(config),saved=process.env.PATH;
+ try{
+  config.jobCommandTimeoutMs=5000;config.codexPath=path.join(root,"codex-node");
+  await fs.writeFile(config.codexPath,"#!/usr/bin/env node\nprocess.stdout.write('[]');\n",{mode:0o700});
+  const event=db.enqueue(eventEnvelope("minimal-path")).row;
+  const job=db.createJob({source_event_id:event.event_id,objective:"test",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+  let starts=0;runtime.client.start=async input=>{starts++;return {name:input.name,generation:"g",thread_id:"t",state:"idle"} as AgentRecord;};
+  process.env.PATH="/usr/bin:/bin:/usr/sbin:/sbin";
+  await runtime.prepare(job);assert.equal(starts,1);assert.equal(process.env.PATH,"/usr/bin:/bin:/usr/sbin:/sbin");
+ }finally{if(saved===undefined)delete process.env.PATH;else process.env.PATH=saved;db.close();await fs.rm(root,{recursive:true,force:true});}
+});

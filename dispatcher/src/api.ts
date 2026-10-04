@@ -702,7 +702,12 @@ export class DispatcherApi {
           if(typeof input.question_id!=="string"||!input.answers||typeof input.answers!=="object"||Array.isArray(input.answers))throw Error("task_answer_invalid");
           sendJson(response,200,await this.jobs.answerTaskQuestion(id,input.source_event_id,input.revision as number,input.question_id,input.answers as Record<string,{answers:string[]}>));this.jobs.wake();return;
         }
-        if(action==="retry")this.database.tasks.retry(id,input.source_event_id,input.revision as number,input.max_attempts as number);
+        if(action==="retry") {
+          if(input.attempt_id!==undefined) {
+            if(typeof input.attempt_id!=="string"||!/^job_[0-9a-hjkmnp-tv-z]{26}$/.test(input.attempt_id))throw Error("task_control_invalid");
+            this.database.tasks.retryPreparation(id,input.source_event_id,input.revision as number,input.max_attempts as number,input.attempt_id,this.config.jobResultsDir);
+          } else this.database.tasks.retry(id,input.source_event_id,input.revision as number,input.max_attempts as number);
+        }
         else if(action==="steer") {
           const task=this.database.tasks.assertOwner(id,input.source_event_id);
           if(typeof input.instruction!=="string"||!input.instruction.trim())throw new Error("task_control_invalid");

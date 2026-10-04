@@ -692,9 +692,11 @@ function pendingHandoffSql(source: string): string {
         JOIN job_handoffs h ON h.state='accepted' AND (h.job_id=endpoint.job_id OR h.successor_job_id=endpoint.job_id)
         JOIN jobs neighbor ON neighbor.job_id=CASE WHEN h.job_id=endpoint.job_id THEN h.successor_job_id ELSE h.job_id END
     ) SELECT 1 FROM linked_groups g JOIN jobs successor ON successor.source_event_id=g.source_event_id
-      WHERE successor.status NOT IN ('completed','failed','cancelled') OR
+      WHERE NOT EXISTS (SELECT 1 FROM task_attempts a JOIN tasks t ON t.task_id=a.task_id
+        WHERE a.attempt_id=successor.job_id AND a.attempt_id<>t.current_attempt_id) AND (
+        successor.status NOT IN ('completed','failed','cancelled') OR
         (successor.status='failed' AND NOT EXISTS (SELECT 1 FROM job_attention_resolutions r
-          WHERE r.job_id=successor.job_id AND r.source_event_id=successor.source_event_id AND r.status_at_resolution='failed'))
+          WHERE r.job_id=successor.job_id AND r.source_event_id=successor.source_event_id AND r.status_at_resolution='failed')))
   )`;
 }
 
@@ -1526,6 +1528,8 @@ export class DispatcherDatabase {
       JOIN job_owner_bindings b ON b.job_id=j.job_id
       LEFT JOIN job_groups g ON g.source_event_id=j.source_event_id
       WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review')
+        AND NOT EXISTS (SELECT 1 FROM task_attempts a JOIN tasks t ON t.task_id=a.task_id
+          WHERE a.attempt_id=j.job_id AND a.attempt_id<>t.current_attempt_id)
         AND NOT EXISTS (SELECT 1 FROM job_handoffs h WHERE h.job_id=j.job_id AND h.state='accepted') AND (
         (json_extract(b.owner_json,'$.kind')='schedule' AND j.completion_event_id IS NULL
           AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id AND c.job_status=j.status))
@@ -1540,8 +1544,12 @@ export class DispatcherDatabase {
               AND (g.attention_event_id IS NOT NULL OR EXISTS (SELECT 1 FROM jobs original JOIN job_handoffs h ON (h.job_id=original.job_id OR h.successor_job_id=original.job_id)
                 WHERE original.source_event_id=j.source_event_id AND h.state='accepted'))
               AND NOT EXISTS (SELECT 1 FROM jobs sibling WHERE sibling.source_event_id=j.source_event_id
+                AND NOT EXISTS (SELECT 1 FROM task_attempts a JOIN tasks t ON t.task_id=a.task_id
+                  WHERE a.attempt_id=sibling.job_id AND a.attempt_id<>t.current_attempt_id)
                 AND sibling.status NOT IN ('completed','failed','cancelled'))
               AND NOT EXISTS (SELECT 1 FROM jobs unresolved WHERE unresolved.source_event_id=j.source_event_id
+                AND NOT EXISTS (SELECT 1 FROM task_attempts a JOIN tasks t ON t.task_id=a.task_id
+                  WHERE a.attempt_id=unresolved.job_id AND a.attempt_id<>t.current_attempt_id)
                 AND unresolved.status='failed' AND NOT EXISTS (
                   SELECT 1 FROM job_attention_resolutions r WHERE r.job_id=unresolved.job_id
                     AND r.source_event_id=j.source_event_id AND r.status_at_resolution='failed')))
@@ -3660,7 +3668,7 @@ export class DispatcherDatabase {
   ): JobGroupSnapshot {
     const counts = this.db.prepare(`
       SELECT status, COUNT(*) AS count
-      FROM jobs WHERE source_event_id = ? AND job_id NOT IN (SELECT attempt_id FROM task_attempts WHERE outcome='interrupted') GROUP BY status
+      FROM jobs WHERE source_event_id = ? AND job_id NOT IN (SELECT a.attempt_id FROM task_attempts a JOIN tasks t ON t.task_id=a.task_id WHERE a.attempt_id<>t.current_attempt_id) GROUP BY status
     `).all(sourceEventId) as Array<{ status: JobStatus; count: number }>;
     const statusCounts: Partial<Record<JobStatus, number>> = {};
     let total = 0;
@@ -3685,7 +3693,7 @@ export class DispatcherDatabase {
 
     const jobs = (this.db.prepare(`
       SELECT job_id, job_key, status FROM jobs
-      WHERE source_event_id = ? AND job_id NOT IN (SELECT attempt_id FROM task_attempts WHERE outcome='interrupted') ORDER BY created_at, job_id LIMIT ?
+      WHERE source_event_id = ? AND job_id NOT IN (SELECT a.attempt_id FROM task_attempts a JOIN tasks t ON t.task_id=a.task_id WHERE a.attempt_id<>t.current_attempt_id) ORDER BY created_at, job_id LIMIT ?
     `).all(sourceEventId, jobGroupSnapshotJobLimit) as JobGroupSnapshot["jobs"]).map(job=>{
       const task=this.tasks.forAttempt(job.job_id);
       return {...job,...(task?{task_id:task.task_id}:{})};
@@ -3703,6 +3711,17 @@ export class DispatcherDatabase {
     };
   }
 
+  assertTaskRetryNotificationsSettled(jobId:string):void {
+    const job=this.getJobRequired(jobId),group=this.getJobGroup(job.source_event_id);
+    for(const id of new Set([job.completion_event_id,group?.attention_event_id,group?.all_terminal_event_id])) {
+      if(!id)continue;
+      const event=this.getRequired(id),result=event.result_json?JSON.parse(event.result_json) as ResultEnvelope:undefined;
+      if(event.status!=="completed"||result?.actions?.some(action=>action&&typeof action==="object"&&(action as Record<string,unknown>).ambiguous===true))throw Error("task_prior_notification_requires_reconciliation");
+    }
+    if((group?.attention_event_id&&!this.attentionNotificationSettled(this.getRequired(group.attention_event_id)))||
+      this.db.prepare("SELECT 1 FROM job_attention_delivery_claims WHERE source_event_id=? LIMIT 1").get(job.source_event_id))throw Error("task_prior_notification_requires_reconciliation");
+  }
+
   private groupCanClaimAllTerminal(sourceEventId: string, group: JobGroupRow): boolean {
     if (group.notification_mode !== "grouped" || !group.sealed_at || group.all_terminal_event_id) return false;
     if (this.db.prepare(`SELECT 1 WHERE ${pendingHandoffSql('?')}`).get(sourceEventId)) return false;
@@ -3710,7 +3729,9 @@ export class DispatcherDatabase {
       .get(sourceEventId)) return false;
     if (group.attention_event_id && !this.attentionNotificationSettled(this.getRequired(group.attention_event_id))) return false;
     const unresolved = this.db.prepare(`
-      SELECT 1 FROM jobs j WHERE j.source_event_id=? AND (
+      SELECT 1 FROM jobs j WHERE j.source_event_id=?
+      AND NOT EXISTS (SELECT 1 FROM task_attempts a JOIN tasks t ON t.task_id=a.task_id
+        WHERE a.attempt_id=j.job_id AND a.attempt_id<>t.current_attempt_id) AND (
         j.status NOT IN ('completed','failed','cancelled') OR
         (j.status='failed' AND NOT EXISTS (
           SELECT 1 FROM job_attention_resolutions r WHERE r.job_id=j.job_id
@@ -3766,13 +3787,13 @@ export class DispatcherDatabase {
       action.ambiguous !== true && action.success !== false && action.ok !== false && !("error" in action);
     const sessionActions=actions.filter((action): action is Record<string, unknown> =>
       !!action && typeof action==="object" &&
-      (action as Record<string, unknown>).tool==="dona_slack.set_agent_session_status" &&
+      ["dona_slack.set_agent_session_status","mcp__dona_slack__set_agent_session_status"].includes(String((action as Record<string, unknown>).tool)) &&
       (action as Record<string, unknown>).workspace_id===target.workspace_id &&
       (action as Record<string, unknown>).channel_id===target.channel_id &&
       (action as Record<string, unknown>).thread_ts===target.thread_ts);
     const lastConfirmedSessionAction=sessionActions.filter(actionSucceeded).at(-1);
     return actions.some(action => action && typeof action === "object" &&
-      (action as Record<string, unknown>).tool === "dona_slack.post_message" &&
+      ["dona_slack.post_message","mcp__dona_slack__post_message"].includes(String((action as Record<string, unknown>).tool)) &&
       typeof (action as Record<string, unknown>).message_ts === "string" &&
       /^\d+\.\d+$/.test((action as Record<string, unknown>).message_ts as string) &&
       (action as Record<string, unknown>).workspace_id === target.workspace_id &&
@@ -3820,9 +3841,13 @@ export class DispatcherDatabase {
     if(this.db.prepare("SELECT 1 FROM job_attention_delivery_claims WHERE attention_event_id=?")
       .get(attentionEventId)) return;
     const cause=this.getJob(causeJobId);
+    const task=this.tasks.forAttempt(causeJobId);
+    const superseded=task!==undefined&&task.current_attempt_id!==causeJobId;
     if(!cause || cause.source_event_id!==sourceEventId ||
-        !(cause.status==="completed" || cause.status==="cancelled" || this.jobAttentionResolved(cause))) return;
+        !(superseded || cause.status==="completed" || cause.status==="cancelled" || this.jobAttentionResolved(cause))) return;
     const unresolvedSibling = this.db.prepare(`SELECT 1 FROM jobs j WHERE j.source_event_id=? AND j.job_id<>?
+      AND NOT EXISTS (SELECT 1 FROM task_attempts a JOIN tasks t ON t.task_id=a.task_id
+        WHERE a.attempt_id=j.job_id AND a.attempt_id<>t.current_attempt_id)
       AND (j.status IN ('blocked','needs_review') OR (j.status='failed' AND NOT EXISTS (
         SELECT 1 FROM job_attention_resolutions r WHERE r.job_id=j.job_id
           AND r.source_event_id=j.source_event_id AND r.status_at_resolution='failed'

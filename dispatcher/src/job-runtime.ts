@@ -176,9 +176,10 @@ export function runProcess(
   settleBeforeClose = false,
   stdin = "",
   cwd?: string,
+  env?: NodeJS.ProcessEnv,
 ): Promise<HerdrCommandResult> {
   return new Promise((resolve) => {
-    const child = spawn(executable, args, { shell: false, stdio: ["pipe", "pipe", "pipe"], ...(cwd?{cwd}:{}) });
+    const child = spawn(executable, args, { shell: false, stdio: ["pipe", "pipe", "pipe"], ...(cwd?{cwd}:{}), ...(env?{env}:{}) });
     let stdout = "";
     let stderr = "";
     let timedOut = false;

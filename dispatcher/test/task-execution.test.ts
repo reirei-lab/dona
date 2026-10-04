@@ -1,4 +1,5 @@
 import { once } from "node:events";
+import Database from "better-sqlite3";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -674,5 +675,107 @@ for(const code of ["command_failed","command_timeout"])test(`未起動Attemptの
   const after=f.db.getJob(before.job_id)!;assert.equal(after.status,"cancelled");assert.equal(after.last_error_code,null);assert.equal(after.last_error_message,null);assert.equal(after.updated_at,after.completed_at);assert.notEqual(after.updated_at,before.updated_at);
   f.db.sealJobGroup(f.event.event_id);const notice=f.db.enqueueJobNotification(after.job_id).row,payload=JSON.parse(notice.payload_json);
   assert.equal(payload.job_status,"cancelled");assert.equal(payload.error,undefined);
+ }finally{await f.dispose();}
+});
+
+async function failedPreparationFixture(){
+ const f=await fixture();const id=f.task.current_attempt_id;
+ f.db.beginJobPreparation(id);f.db.recordJobPreparationFailure(id,"job_preparation_failed","runtime_mcp_inventory_failed",1);
+ const task=f.db.tasks.get(f.task.task_id)!;
+ const retry=(revision=task.revision,max=task.max_attempts,event=f.event.event_id)=>f.db.tasks.retryPreparation(task.task_id,event,revision,max,id,f.config.jobResultsDir);
+ return {...f,failed:task,retry};
+}
+
+test("起動前失敗の明示retryは履歴・成果・既存controlを保ち、応答喪失後も次Attemptを一度だけ作る",async()=>{
+ const f=await failedPreparationFixture();try{
+  const old=f.db.getJob(f.failed.current_attempt_id)!;
+  await fs.mkdir(old.workspace_path,{recursive:true});await fs.writeFile(path.join(old.workspace_path,"changes"),"keep");
+  // An earlier operation on the same event must not be overwritten by retry.
+  const sql=new Database(f.config.databasePath);sql.prepare("INSERT INTO task_controls(task_id,source_event_id,request_sha256) VALUES(?,?,?)").run(f.task.task_id,f.event.event_id,"earlier-pause");sql.close();
+  f.db.sealJobGroup(f.event.event_id);
+  const first=f.retry();assert.equal(first.state,"active");assert.equal(first.attempt_number,2);assert.equal(first.stop_state,"none");
+  assert.equal(f.retry().current_attempt_id,first.current_attempt_id);assert.throws(()=>f.retry(f.failed.revision,4),/task_control_conflict/);
+  const next=f.db.getJob(first.current_attempt_id)!;assert.equal(next.status,"queued");assert.equal(next.objective,old.objective);assert.equal(next.workspace_path,old.workspace_path);assert.notEqual(next.result_path,old.result_path);
+  assert.deepEqual(f.db.getJob(old.job_id),old);assert.equal(await fs.readFile(path.join(next.workspace_path,"changes"),"utf8"),"keep");
+  const after=new Database(f.config.databasePath);assert.equal((after.prepare("SELECT request_sha256 FROM task_controls WHERE task_id=?").get(first.task_id) as {request_sha256:string}).request_sha256,"earlier-pause");after.close();
+  const attempts=f.db.tasks.projection(first).attempts as Array<Record<string,unknown>>;assert.equal(attempts[0]!.outcome,"failed");assert.equal(attempts[0]!.preparation_retry_successor_id,next.job_id);
+  f.start(next.job_id);f.db.saveJobResult(next.job_id,{schema_version:1,job_id:next.job_id,status:"completed",summary:"done",completed_at:new Date().toISOString()},next.result_path);
+  const notification=f.db.enqueueJobNotification(next.job_id).row;assert.equal(JSON.parse(notification.payload_json).group.total,1);assert.equal(JSON.parse(notification.payload_json).group.transition,"all_terminal");assert.equal(f.db.tasks.get(first.task_id)!.state,"completed");
+ }finally{await f.dispose();}
+});
+
+for(const guard of ["revision","budget","owner","runtime","dispatch","prompt","result","result_file","result_symlink","stale","ambiguous","unknown_preparation","paused","steer","identity"] as const)test(`起動前retryは${guard}の競合・未確認状態を拒否`,async()=>{
+ const f=await failedPreparationFixture();try{
+  const old=f.db.getJob(f.failed.current_attempt_id)!;let event=f.event.event_id,revision=f.failed.revision,max=f.failed.max_attempts;
+  const sql=new Database(f.config.databasePath);
+  if(guard==="revision")revision--;
+  if(guard==="budget")max=1;
+  if(guard==="owner"){const e=eventEnvelope("foreign");e.subject.actor_id="U_OTHER";event=f.db.enqueue(e).row.event_id;}
+  if(guard==="runtime")sql.prepare("UPDATE jobs SET herdr_pane_id='worker' WHERE job_id=?").run(old.job_id);
+  if(guard==="dispatch")sql.prepare("UPDATE jobs SET dispatch_started_at=? WHERE job_id=?").run(new Date().toISOString(),old.job_id);
+  if(guard==="prompt")sql.prepare("UPDATE jobs SET prompt_accepted_at=? WHERE job_id=?").run(new Date().toISOString(),old.job_id);
+  if(guard==="result")sql.prepare("UPDATE jobs SET result_json='{}' WHERE job_id=?").run(old.job_id);
+  if(guard==="result_file"||guard==="result_symlink"){await fs.mkdir(path.dirname(old.result_path),{recursive:true});if(guard==="result_file")await fs.writeFile(old.result_path,"{}");else await fs.symlink(path.join(f.root,"missing"),old.result_path);}
+  if(guard==="stale"||guard==="ambiguous")sql.prepare("UPDATE jobs SET last_error_code=? WHERE job_id=?").run(guard==="stale"?"stale_preparing":"runtime_preparation_unknown",old.job_id);
+  if(guard==="unknown_preparation")sql.prepare("UPDATE jobs SET last_error_message='unclassified error after worker start' WHERE job_id=?").run(old.job_id);
+  if(guard==="paused")sql.prepare("UPDATE tasks SET desired_state='paused' WHERE task_id=?").run(f.task.task_id);
+  if(guard==="steer")sql.prepare("UPDATE jobs SET steer_state='dispatching' WHERE job_id=?").run(old.job_id);
+  if(guard==="identity")sql.prepare("INSERT INTO job_live_session_identities(job_id,identity_version,herdr_agent_session_id,herdr_workspace_id,herdr_pane_id,agent_name,recorded_at,generation_nonce) VALUES(?,1,'session','w','p','a',?,'nonce')").run(old.job_id,new Date().toISOString());
+  sql.close();assert.throws(()=>f.retry(revision,max,event));assert.equal(f.db.tasks.get(f.task.task_id)!.current_attempt_id,old.job_id);
+  assert.equal(f.db.listEventJobs(f.event.event_id).length,1);
+ }finally{await f.dispose();}
+});
+
+for(const status of ["queued","dispatching","needs_review","completed","mcp_completed","ambiguous_completed"] as const)test(`失敗通知${status}と起動前retryの順序を保つ`,async()=>{
+ const f=await failedPreparationFixture();try{
+  f.db.sealJobGroup(f.event.event_id);const notification=f.db.enqueueJobNotification(f.failed.current_attempt_id).row;
+  if(status==="completed"||status==="mcp_completed"||status==="ambiguous_completed") {
+    const resultPath=path.join(f.config.resultsDir,"attention.json"),target=JSON.parse(notification.reply_target_json!);
+    f.db.beginDispatch(notification.event_id,resultPath);f.db.markWaiting(notification.event_id);
+    f.db.saveCompleted(notification.event_id,{schema_version:1,event_id:notification.event_id,status:"completed",summary:"delivered",completed_at:new Date().toISOString(),actions:[
+      {tool:status==="mcp_completed"?"mcp__dona_slack__post_message":"dona_slack.post_message",...target,message_ts:"123.456",ambiguous:status==="ambiguous_completed"},
+      {tool:status==="mcp_completed"?"mcp__dona_slack__set_agent_session_status":"dona_slack.set_agent_session_status",...target,status:"suspended"}
+    ]},resultPath);
+  }else {const sql=new Database(f.config.databasePath);sql.prepare("UPDATE events SET status=? WHERE event_id=?").run(status,notification.event_id);sql.close();}
+  if(status!=="completed"&&status!=="mcp_completed")assert.throws(()=>f.retry(),/task_prior_notification_requires_reconciliation/);
+  else {
+    const task=f.retry();assert.equal(f.db.get(notification.event_id)!.status,"completed");assert.equal(f.db.getJobGroup(f.event.event_id)!.all_terminal_event_id,null);
+    f.start(task.current_attempt_id);f.db.saveJobResult(task.current_attempt_id,{schema_version:1,job_id:task.current_attempt_id,status:"completed",summary:"done",completed_at:new Date().toISOString()},f.db.getJob(task.current_attempt_id)!.result_path);
+    const final=f.db.enqueueJobNotification(task.current_attempt_id).row;assert.notEqual(final.event_id,notification.event_id);
+    assert.equal(JSON.parse(final.payload_json).group.transition,"all_terminal");assert.equal(JSON.parse(final.payload_json).group.attention_resolution_state,"resolved");
+  }
+ }finally{await f.dispose();}
+});
+
+for(const status of ["failed","needs_review","blocked"] as const)test(`旧attention配送後の後継${status}を新しいattentionとして通知する`,async()=>{
+ const f=await failedPreparationFixture();try{
+  f.db.sealJobGroup(f.event.event_id);const notification=f.db.enqueueJobNotification(f.failed.current_attempt_id).row;
+  const resultPath=path.join(f.config.resultsDir,"attention.json"),target=JSON.parse(notification.reply_target_json!);
+  f.db.beginDispatch(notification.event_id,resultPath);f.db.markWaiting(notification.event_id);
+  f.db.saveCompleted(notification.event_id,{schema_version:1,event_id:notification.event_id,status:"completed",summary:"delivered",completed_at:new Date().toISOString(),actions:[
+    {tool:"dona_slack.post_message",...target,message_ts:"123.456"},
+    {tool:"dona_slack.set_agent_session_status",...target,status:"suspended"}
+  ]},resultPath);
+  const oldNotice=f.db.get(notification.event_id),oldJob=f.db.getJob(f.failed.current_attempt_id);
+  const task=f.retry();f.start(task.current_attempt_id);const job=f.db.getJob(task.current_attempt_id)!;
+  if(status==="failed")f.db.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"failed",summary:"failed again",completed_at:new Date().toISOString()},job.result_path);
+  else if(status==="needs_review")f.db.markJobNeedsReview(job.job_id,"invalid_result","review needed");
+  else f.db.markJobBlocked(job.job_id,"input needed");
+  assert.ok(f.db.listJobsNeedingNotification().some(row=>row.job_id===job.job_id));
+  const next=f.db.enqueueJobNotification(job.job_id).row,group=JSON.parse(next.payload_json).group;
+  assert.notEqual(next.event_id,notification.event_id);assert.equal(group.transition,"attention");assert.equal(group.total,1);assert.equal(group.jobs[0].job_id,job.job_id);
+  assert.equal(f.db.getJobGroup(f.event.event_id)!.attention_event_id,next.event_id);assert.deepEqual(f.db.get(notification.event_id),oldNotice);assert.deepEqual(f.db.getJob(f.failed.current_attempt_id),oldJob);
+  if(status==="blocked") {
+    const nextPath=path.join(f.config.resultsDir,"next-attention.json");f.db.beginDispatch(next.event_id,nextPath);f.db.markWaiting(next.event_id);
+    f.db.saveCompleted(next.event_id,{schema_version:1,event_id:next.event_id,status:"completed",summary:"delivered",completed_at:new Date().toISOString(),actions:[
+      {tool:"dona_slack.post_message",...target,message_ts:"123.457"},{tool:"dona_slack.set_agent_session_status",...target,status:"suspended"}
+    ]},nextPath);
+    const answer=f.db.enqueue(eventEnvelope("answer-after-retry")).row;
+    f.db.tasks.prepareSteer(task.task_id,answer.event_id,f.db.tasks.get(task.task_id)!.revision,"回答して続行");
+    f.db.beginJobSteer(job.job_id,answer.event_id);f.db.markJobSteerAccepted(job.job_id,answer.event_id);f.db.tasks.finishSteer(task.task_id,answer.event_id);
+    f.db.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"answered and done",completed_at:new Date().toISOString()},job.result_path);
+    assert.deepEqual(f.db.listJobsNeedingNotification().map(row=>row.job_id),[job.job_id]);
+    const final=f.db.enqueueJobNotification(job.job_id).row;assert.equal(JSON.parse(final.payload_json).group.transition,"all_terminal");
+  }
  }finally{await f.dispose();}
 });

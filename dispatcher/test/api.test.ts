@@ -696,3 +696,20 @@ test("Issue lookupから別threadのTaskを取得し制御、外部ownerを拒�
   assert.equal(database.listEventJobs(event.event_id).length,0);
  }finally{await api.stop();database.close();}
 });
+
+test("retry APIはexact準備失敗Attemptを同じTaskへ引継ぎ、再送を重複作成しない",async()=>{
+ const {root,config}=await tempConfig();roots.push(root);const database=new DispatcherDatabase(config.databasePath);
+ const event=database.enqueue(eventEnvelope("preparation-retry-api")).row;
+ const task=database.tasks.create({source_event_id:event.event_id,task_key:"retry",objective:"work",workspace:{kind:"scratch"},policy:{max_attempts:3,retry_delay_ms:1000}},config.jobsWorkspaceRoot,config.jobResultsDir).task;
+ database.beginJobPreparation(task.current_attempt_id);database.recordJobPreparationFailure(task.current_attempt_id,"job_preparation_failed","runtime_mcp_inventory_failed",1);
+ const revision=database.tasks.get(task.task_id)!.revision,input={source_event_id:event.event_id,revision,max_attempts:3,attempt_id:task.current_attempt_id};
+ const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger);await api.start();try{
+  const route=`/v1/tasks/${task.task_id}/retry`;
+  assert.equal((await request(config.socketPath,"POST",route,{...input,attempt_id:42})).status,409);
+  const first=await request(config.socketPath,"POST",route,input);assert.equal(first.status,200,JSON.stringify(first.body));
+  const successor=(first.body.task as {current_attempt_id:string}).current_attempt_id;assert.notEqual(successor,task.current_attempt_id);
+  assert.equal(((await request(config.socketPath,"POST",route,input)).body.task as {current_attempt_id:string}).current_attempt_id,successor);
+  assert.equal(database.getJob(task.current_attempt_id)!.status,"failed");assert.equal(database.getJob(successor)!.status,"queued");
+  assert.equal((await request(config.socketPath,"POST",route,{...input,max_attempts:4})).status,409);
+ }finally{await api.stop();database.close();}
+});
