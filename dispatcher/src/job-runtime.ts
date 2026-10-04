@@ -22,6 +22,11 @@ export class PreparedWorkspaceCleanupError extends Error {
 }
 
 export interface JobAgentRuntime {
+  recoveryHint?(row:JobRow):Promise<import("./app-server/store.js").AgentRecord["recovery_hint"]>;
+  pendingQuestions?(): Promise<import("./app-server/store.js").QuestionRecord[]>;
+  questions?(name:string,includeResolved?:boolean): Promise<import("./app-server/store.js").QuestionRecord[]>;
+  approveRequest?(name:string,id:string,accepted:boolean):Promise<import("./app-server/store.js").QuestionRecord>;
+  answerQuestion?(name:string,id:string,answers:Record<string,{answers:string[]}>): Promise<import("./app-server/store.js").QuestionRecord>;
   observeWorker?(row: JobRow, signal?: AbortSignal): Promise<WorkerObservation>;
   retireWorker?(row: JobRow, signal?: AbortSignal): Promise<void>;
   workerRetired?(row: JobRow, evidence: WorkerObservation, signal?: AbortSignal): Promise<boolean>;
@@ -29,7 +34,7 @@ export interface JobAgentRuntime {
   prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime>;
   get(agentName: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult>;
   listAgents?(signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult>;
-  prompt(agentName: string, text: string, signal?: AbortSignal, timeoutMs?: number, submissionOnly?: boolean): Promise<HerdrCommandResult>;
+  prompt(agentName: string, text: string, signal?: AbortSignal, timeoutMs?: number, submissionOnly?: boolean, operationKey?: string): Promise<HerdrCommandResult>;
   wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   closeAgent?(agentName:string,signal?:AbortSignal):Promise<HerdrCommandResult>;
@@ -159,16 +164,17 @@ function resultFromProcess(base: Omit<HerdrCommandResult, "errorCode" | "agentSt
   };
 }
 
-function runProcess(
+export function runProcess(
   executable: string,
   args: string[],
   timeoutMs: number,
   signal?: AbortSignal,
   settleBeforeClose = false,
   stdin = "",
+  cwd?: string,
 ): Promise<HerdrCommandResult> {
   return new Promise((resolve) => {
-    const child = spawn(executable, args, { shell: false, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(executable, args, { shell: false, stdio: ["pipe", "pipe", "pipe"], ...(cwd?{cwd}:{}) });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -223,7 +229,7 @@ function runProcess(
   });
 }
 
-function resolveCommitPrefix(
+export function resolveCommitPrefix(
   executable: string,
   args: string[],
   prefix: string,
@@ -277,26 +283,26 @@ function resolveCommitPrefix(
   });
 }
 
-function commandError(label: string, result: HerdrCommandResult): Error {
+export function commandError(label: string, result: HerdrCommandResult): Error {
   const detail = (result.stderr || result.stdout || "command failed").trim().slice(0, 2_000);
   const error = new Error(`${label}: ${detail}`);
   (error as Error & { code?: string }).code = result.errorCode ?? (result.timedOut ? "command_timeout" : "command_failed");
   return error;
 }
 
-function safeCommandError(label: string, result: Pick<HerdrCommandResult, "timedOut"> & Partial<Pick<HerdrCommandResult, "errorCode">>): Error {
+export function safeCommandError(label: string, result: Pick<HerdrCommandResult, "timedOut"> & Partial<Pick<HerdrCommandResult, "errorCode">>): Error {
   const error = new Error(label);
   (error as Error & { code?: string }).code = result.errorCode ?? (result.timedOut ? "command_timeout" : "command_failed");
   return error;
 }
 
-function normalizedRepository(value: string): string | undefined {
+export function normalizedRepository(value: string): string | undefined {
   const stripped = value.trim().replace(/\.git$/, "");
   const match = /(?:github\.com[/:])([^/]+\/[^/]+)$/.exec(stripped);
   return match?.[1]?.toLowerCase();
 }
 
-async function exists(filePath: string): Promise<boolean> {
+export async function exists(filePath: string): Promise<boolean> {
   try {
     await fs.access(filePath);
     return true;

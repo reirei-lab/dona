@@ -14,6 +14,7 @@ import {
 
 export interface DispatcherJobClient {
   createTask?(input:unknown):Promise<Record<string,unknown>>;
+  getTaskQuestions?(id:string,eventId:string):Promise<Record<string,unknown>>;
   getTask?(id:string,eventId:string):Promise<Record<string,unknown>>;
   listTasks?(eventId:string):Promise<Record<string,unknown>>;
   controlTask?(id:string,action:string,input:unknown):Promise<Record<string,unknown>>;
@@ -192,6 +193,12 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     async({task_id,source_event_id})=>{try{if(!client.getTask)throw new Error("task_api_unavailable");return success(await client.getTask(task_id,source_event_id));}catch(error){return failure(error,logger,"get_task");}});
   server.registerTool("list_tasks",{description:"現在のSlack threadと依頼者のTaskを最大100件取得します。上限に達した場合、全件確認済みと扱いません。",inputSchema:{source_event_id:eventId},annotations:{readOnlyHint:true}},
     async({source_event_id})=>{try{if(!client.listTasks)throw new Error("task_api_unavailable");return success(await client.listTasks(source_event_id));}catch(error){return failure(error,logger,"list_tasks");}});
+  server.registerTool("get_task_questions",{description:"Taskの現行workerからDona宛の質問と回答受付状態を取得します。ユーザーの質問への返答ではsteer_taskより先に確認してください。承認要求は通常の質問と別です。",inputSchema:{task_id:taskIdSchema,source_event_id:eventId},annotations:{readOnlyHint:true}},
+    async({task_id,source_event_id})=>{try{if(!client.getTaskQuestions)throw Error("task_api_unavailable");return success(await client.getTaskQuestions(task_id,source_event_id));}catch(error){return failure(error,logger,"get_task_questions");}});
+  server.registerTool("answer_task_question",{description:"現行workerの質問にDonaとして回答します。既存の依頼から判断できることは親が答え、不明な利用者の希望だけを元Slack threadで質問します。回答は質問IDへ結び付け、同じ内容の再送を重複適用しません。承認の代用には使えません。",inputSchema:{task_id:taskIdSchema,source_event_id:eventId,revision:z.number().int().positive(),question_id:z.string().uuid(),answers:z.record(z.string(),z.object({answers:z.array(z.string().max(16384)).min(1).max(10)}).strict())},annotations:{readOnlyHint:false,idempotentHint:true}},
+    async({task_id,...input})=>{try{if(!client.controlTask)throw Error("task_api_unavailable");return success(await client.controlTask(task_id,"answer",input));}catch(error){return failure(error,logger,"answer_task_question");}});
+  server.registerTool("respond_task_approval",{description:"workerの実行承認要求に、同じSlack threadの依頼者による要求発生後の明示的な承認・拒否を返します。get_task_questionsで対象と内容を確認し、親の独断や通常の質問回答で承認しません。許可はその要求だけ（permissions要求はturn内）で、session全体には拡張しません。",inputSchema:{task_id:taskIdSchema,source_event_id:eventId,revision:z.number().int().positive(),question_id:z.string().uuid(),accepted:z.boolean()},annotations:{readOnlyHint:false,idempotentHint:true}},
+    async({task_id,...input})=>{try{if(!client.controlTask)throw Error("task_api_unavailable");return success(await client.controlTask(task_id,"approve",input));}catch(error){return failure(error,logger,"respond_task_approval");}});
   for(const action of ["pause","resume","cancel","steer","retry"] as const)server.registerTool(`${action}_task`,{
     description:`Taskの${action}。直前に取得したrevisionを渡します。pauseは安全な停止を待ち、resumeは同じ権限・残予算で続行します。cancelは自動再開を禁止します。retryは停止確認済みの再試行上限待ちでだけ、明示された総Attempt数上限を増やします。曖昧な応答はget_taskで照合します。`,
     inputSchema:{task_id:taskIdSchema,source_event_id:eventId,revision:z.number().int().positive(),...(action==="steer"?{instruction:jobObjective}:{}),...(action==="retry"?{max_attempts:z.number().int().min(2).max(10)}:{})},

@@ -1,10 +1,11 @@
+import {stableStringify} from "./validation.js";
 import { readCheckpoint } from "./task-checkpoint.js";
 import { TaskProjector, githubQuery } from "./task-github.js";
 import { taskRecoveryReason, type TaskRow } from "./task-execution.js";
 import { jobSnapshot, publicObservation, type WorkerObservation } from "./job-handoff.js";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import type { DispatcherConfig } from "./config.js";
 import type { DispatcherDatabase } from "./database.js";
@@ -208,6 +209,54 @@ export class JobSupervisor {
   }
 
 
+  async reconcileQuestions():Promise<void> {
+    if(!this.runtime.pendingQuestions)return;
+    try {
+      for(const question of await this.runtime.pendingQuestions()) {
+        const job=this.database.getJobByAgent(question.agent);
+        if(job)this.database.enqueueWorkerQuestion(job.job_id,question);
+      }
+    } catch {this.logger.warn("Worker question reconciliation deferred",{error_code:"runtime_questions_unavailable"});}
+  }
+  async taskQuestions(id:string,eventId:string):Promise<unknown> {
+    const task=this.database.tasks.assertOwner(id,eventId),job=this.database.getJob(task.current_attempt_id)!;
+    if(!this.runtime.questions)throw Error("task_questions_unavailable");
+    const questions=await this.runtime.questions(job.agent_name,true);
+    const fresh=this.database.tasks.assertOwner(id,eventId);
+    if(fresh.current_attempt_id!==job.job_id)throw Error("task_revision_conflict");
+    return {task_id:id,revision:fresh.revision,questions:questions.filter(q=>JSON.stringify([q.generation,q.thread_id])===this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id).map(q=>({question_id:q.question_id,kind:q.kind,state:q.state,request:JSON.parse(q.payload_json)}))};
+  }
+  async approveTaskRequest(id:string,eventId:string,revision:number,questionId:string,accepted:boolean):Promise<unknown> {
+    const initial=this.database.tasks.assertOwner(id,eventId);
+    return this.serialized(initial.current_attempt_id,async()=>{
+      if(!this.runtime.questions||!this.runtime.approveRequest)throw Error("task_approval_unavailable");
+      const job=this.database.getJob(initial.current_attempt_id)!,request=(await this.runtime.questions(job.agent_name,true)).find(q=>q.question_id===questionId);
+      const task=this.database.tasks.assertOwner(id,eventId),event=this.database.get(eventId)!;
+      if(!request||request.kind!=="approval"||JSON.stringify([request.generation,request.thread_id])!==this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id||task.current_attempt_id!==job.job_id)throw Error("task_approval_not_current");
+      if(event.source!=="slack"||Date.parse(event.occurred_at)<Date.parse(request.created_at))throw Error("task_approval_requires_user_reply");
+      if(request.answer_hash===createHash("sha256").update(stableStringify({accepted})).digest("hex")&&["answering","resolved"].includes(request.state))return {task_id:id,question_id:questionId,state:request.state};
+      if(task.revision!==revision||task.desired_state!=="running"||task.stop_state!=="none"||!["active","waiting"].includes(task.state))throw Error("task_approval_not_current");
+      const response=await this.runtime.approveRequest(job.agent_name,questionId,accepted);
+      return {task_id:id,question_id:questionId,state:response.state};
+    });
+  }
+  async answerTaskQuestion(id:string,eventId:string,revision:number,questionId:string,answers:Record<string,{answers:string[]}>):Promise<unknown> {
+    const initial=this.database.tasks.assertOwner(id,eventId);
+    return this.serialized(initial.current_attempt_id,async()=>{
+      let task=this.database.tasks.assertOwner(id,eventId);const job=this.database.getJob(task.current_attempt_id)!;
+      const old= (await this.runtime.questions?.(job.agent_name,true))?.find(q=>q.question_id===questionId);
+      task=this.database.tasks.assertOwner(id,eventId);
+      if(task.current_attempt_id!==job.job_id)throw Error("task_revision_conflict");
+      if(old&&JSON.stringify([old.generation,old.thread_id])===this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id&&old.answer_hash===createHash("sha256").update(stableStringify(answers)).digest("hex")&&["answering","resolved"].includes(old.state))return {task_id:id,question_id:questionId,state:old.state};
+      if(!old||JSON.stringify([old.generation,old.thread_id])!==this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id)throw Error("task_question_not_current");
+      if(task.revision!==revision||task.current_attempt_id!==initial.current_attempt_id)throw Error("task_revision_conflict");
+      if(task.desired_state!=="running"||task.stop_state!=="none"||!["active","waiting"].includes(task.state))throw Error("task_question_not_current");
+      if(!this.runtime.answerQuestion)throw Error("task_questions_unavailable");
+      const response=await this.runtime.answerQuestion(job.agent_name,questionId,answers);
+      return {task_id:id,question_id:response.question_id,state:response.state};
+    });
+  }
+
   async reconcileTasks(): Promise<void> {
     for (const task of this.database.tasks.candidates().slice(0,1)) {
       if(this.stopping) return;
@@ -232,13 +281,22 @@ export class JobSupervisor {
     } catch(error) {
       if(!(error instanceof JobResultNotFoundError)) {this.database.tasks.wait(task,"result_conflict");return;}
     }
+    if(job.last_error_code==="runtime_question_pending"&&task.desired_state==="running"&&task.stop_state==="none"&&this.runtime.questions) {
+      const pending=await this.runtime.questions(job.agent_name);
+      if(pending.length){this.database.tasks.wait(task,"human_input");return;}
+      const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
+      if(observed.ok&&["working","idle","done"].includes(observed.agentStatus??"")){this.database.tasks.reconnect(task);this.wake();return;}
+    }
     if(task.wait_reason==="steer_acceptance_unknown") {this.database.tasks.wait(task,"steer_acceptance_unknown",60_000);return;}
     const checkpoint=await readCheckpoint(job,task.task_id);
-    let capacityWait=false;
+    const recovery=await this.runtime.recoveryHint?.(job);
+    if(task.desired_state==="running"&&task.wait_reason!=="resume_requested"&&recovery&&recovery.reason!=="capacity_wait"){this.database.tasks.wait(task,"human_input");return;}
+    let capacityWait=task.desired_state==="running"&&task.wait_reason!=="resume_requested"&&recovery?.reason==="capacity_wait";
+    if(capacityWait&&recovery?.retry_after&&Date.parse(recovery.retry_after)>Date.now()) {this.database.tasks.wait(task,"capacity_wait",Math.min(Date.parse(recovery.retry_after)-Date.now(),86_400_000));return;}
     if(checkpoint) {
       this.database.tasks.checkpoint(job,checkpoint);
       if(task.desired_state==="running"&&["human_input","external_effect_unknown"].includes(checkpoint.waiting)&&!this.database.tasks.checkpointAnswered(job,checkpoint)) {this.database.tasks.wait(task,checkpoint.waiting);return;}
-      capacityWait=checkpoint.waiting==="usage_limit"&&!this.database.tasks.checkpointAnswered(job,checkpoint);
+      capacityWait=capacityWait||checkpoint.waiting==="usage_limit"&&!this.database.tasks.checkpointAnswered(job,checkpoint);
       if(task.desired_state==="running"&&capacityWait&&checkpoint.retry_after&&Date.parse(checkpoint.retry_after)>Date.now()) {
         this.database.tasks.wait(task,"capacity_wait",Math.min(Date.parse(checkpoint.retry_after)-Date.now(),86_400_000));return;
       }
@@ -246,7 +304,7 @@ export class JobSupervisor {
     if(task.stop_state==="stopped") {this.database.tasks.replaceStopped(task.task_id,this.config.jobResultsDir);this.wake();return;}
     if(task.desired_state==="running"&&task.stop_state==="none") {
       const reason=taskRecoveryReason(job);
-      if(reason!=="observation_unknown"&&task.wait_reason!=="resume_requested"&&!capacityWait) {this.database.tasks.wait(task,reason);return;}
+      if(reason!=="observation_unknown"&&job.last_error_code!=="runtime_question_pending"&&task.wait_reason!=="resume_requested"&&!capacityWait) {this.database.tasks.wait(task,reason);return;}
     }
     if(!this.runtime.observeWorker||!this.runtime.retireWorker||!this.runtime.workerRetired){this.database.tasks.wait(task,"observation_unknown");return;}
     if(task.stop_state==="none"||task.stop_state==="not_sent") {
@@ -257,7 +315,7 @@ export class JobSupervisor {
       if(this.database.getJob(job.job_id)?.updated_at!==job.updated_at)return;
       if(task.stop_state==="none"&&task.desired_state==="running") {
         const fresh=await this.observeWorker(job);
-        if(!["inactive","stopped"].includes(fresh.state)||JSON.stringify(fresh.process_ids)!==JSON.stringify(observed.process_ids)||JSON.stringify(fresh.process_groups)!==JSON.stringify(observed.process_groups)) {
+        if(!["inactive","stopped","unreachable"].includes(fresh.state)||JSON.stringify(fresh.process_ids)!==JSON.stringify(observed.process_ids)||JSON.stringify(fresh.process_groups)!==JSON.stringify(observed.process_groups)) {
           this.database.tasks.wait(task,"observation_unknown");return;
         }
       }
@@ -473,7 +531,7 @@ export class JobSupervisor {
       const begun = this.database.beginJobSteer(jobId, sourceEventId);
       if (begun.duplicate) return begun;
       // Steer acceptance is the CLI submission response, not a later worker state change.
-      const prompted = await this.runtime.prompt(begun.row.agent_name, instruction, this.abortController.signal, undefined, true);
+      const prompted = await this.runtime.prompt(begun.row.agent_name, instruction, this.abortController.signal, undefined, true, `steer:${sourceEventId}`);
       if (prompted.ok) {
         this.database.markJobSteerAccepted(jobId, sourceEventId);
         return { row: this.database.getJob(jobId)!, duplicate: false };
@@ -708,6 +766,7 @@ export class JobSupervisor {
       // A name-based Herdr read, including idle/done or agent_not_found, does not
       // prove that the saved agent session was stopped. Keep terminal workers in
       // the update drain gate until an exact-identity stop receipt is available.
+      await this.reconcileQuestions();
       await this.reconcileTasks();
       this.publishNotifications();
       try {
@@ -1003,6 +1062,8 @@ export class JobSupervisor {
       buildJobPrompt(dispatching, this.progress !== undefined),
       this.abortController.signal,
       this.config.jobPromptTimeoutMs,
+      true,
+      `attempt:${row.job_id}`,
     );
     if (this.database.getJob(row.job_id)?.status !== "dispatching") return;
     if (prompted.aborted || this.stopping) {
@@ -1134,7 +1195,7 @@ export class JobSupervisor {
       if (progressed && ["working", "idle", "done", "blocked"].includes(observed.agentStatus ?? "")) {
         this.database.markJobRunning(row.job_id);
         if (observed.agentStatus === "blocked") {
-          this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
+          this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input",["running"],observed.errorCode??"agent_blocked");
           return;
         }
         await this.monitor(this.database.getJob(row.job_id)!);
@@ -1220,7 +1281,7 @@ export class JobSupervisor {
       return;
     }
     if (waited.agentStatus === "blocked") {
-      this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
+      this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input",["running"],waited.errorCode??"agent_blocked");
       return;
     }
     if (["idle", "done"].includes(waited.agentStatus ?? "")) {

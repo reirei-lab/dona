@@ -1239,6 +1239,28 @@ export class DispatcherDatabase {
     return changed === 1;
   }
 
+  getJobByAgent(name:string):JobRow|undefined {
+    return this.db.prepare("SELECT * FROM jobs WHERE agent_name=? ORDER BY created_at DESC LIMIT 1").get(name) as JobRow|undefined;
+  }
+  enqueueWorkerQuestion(jobId:string,question:import("./app-server/store.js").QuestionRecord):void {
+    this.db.transaction(()=>{
+      const job=this.getJob(jobId),task=this.tasks.forAttempt(jobId);
+      if(!job||!task||task.current_attempt_id!==jobId||task.desired_state!=="running"||task.stop_state!=="none"||
+        !["running","blocked"].includes(job.status)||question.agent!==job.agent_name||JSON.stringify([question.generation,question.thread_id])!==this.getJobLiveSessionIdentity(jobId)?.herdr_agent_session_id)return;
+      const source=this.getRequired(job.source_event_id),binding=readEventJobBinding(this.db,job.source_event_id);
+      if(!binding||binding.owner.kind!=="slack_thread")return;
+      const envelope:EventEnvelope={schema_version:1,source:"dona_job",type:"worker_question",external_event_id:`question:${question.question_id}`,
+        occurred_at:question.created_at,subject:{job_id:jobId,source_event_id:job.source_event_id,workspace_id:job.workspace_id!,channel_id:job.channel_id!,thread_ts:job.thread_ts!,actor_id:job.actor_id!},
+        payload:{task_id:task.task_id,question_id:question.question_id,request_kind:question.kind},
+        reply_target:JSON.parse(source.reply_target_json!),trace:{job_id:jobId,source_event_id:job.source_event_id}};
+      const result=this.enqueue(envelope,new Date(question.created_at));
+      if(result.payloadMismatch)throw Error("task_question_notification_conflict");
+      insertEventJobBinding(this.db,result.row.event_id,binding);
+      this.db.prepare("UPDATE jobs SET status='blocked',last_error_code='runtime_question_pending',last_error_message='Worker requested input through Dona' WHERE job_id=?").run(jobId);
+      this.tasks.wait(task,"human_input");
+    }).immediate();
+  }
+
   getJob(jobId: string): JobRow | undefined {
     return this.db.prepare("SELECT * FROM jobs WHERE job_id = ?").get(jobId) as JobRow | undefined;
   }
@@ -2301,9 +2323,9 @@ export class DispatcherDatabase {
     });
   }
 
-  markJobBlocked(jobId: string, message: string, from: JobStatus[] = ["running"]): void {
+  markJobBlocked(jobId: string, message: string, from: JobStatus[] = ["running"], code="agent_blocked"): void {
     this.updateJob(jobId, from, "blocked", {
-      last_error_code: "agent_blocked",
+      last_error_code: code,
       last_error_message: message,
     });
   }
@@ -2401,7 +2423,7 @@ export class DispatcherDatabase {
           this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE job_id=?").run(jobId);
         }
         if(recoverAmbiguous&&binding?.owner.kind==="schedule") this.scheduler.recoverWorkRunForResult(binding.owner.run_id,jobId,job.source_event_id,new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
-        this.updateJob(jobId, recoverAmbiguous?["needs_review"]:["running","cancelling"], status, {
+        this.updateJob(jobId, recoverAmbiguous?["needs_review"]:managedAttempt&&job.status==="blocked"&&job.last_error_code==="runtime_question_pending"?["blocked"]:["running","cancelling"], status, {
           result_json: stableStringify(result), result_path: resultPath, completed_at: completedAt.toISOString(),
           last_error_code: job.status === "cancelling" && job.last_error_code !== "cancel_worker_stopped"
             ? "cancel_worker_unverified" : job.steer_state === "dispatching" || job.steer_state === "accepted"

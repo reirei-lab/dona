@@ -175,7 +175,7 @@ export class DispatcherWorker {
     const dispatching = this.database.beginDispatch(row.event_id, resultPath);
     if(dispatching.status==="completed") return;
     const prompt = buildEventPrompt(row.event_id, resultPath, envelopeFromRow(row));
-    const prompted = await this.herdr.prompt(prompt, this.abortController.signal);
+    const prompted = await this.herdr.prompt(prompt, this.abortController.signal, `event:${row.event_id}`);
     const afterPrompt=this.database.get(row.event_id);
     if(!afterPrompt||!["dispatching","waiting_agent"].includes(afterPrompt.status)) return;
     if (prompted.aborted || this.stopping) {

@@ -1,0 +1,33 @@
+# App ServerによるDona実行管理
+
+ユーザーとの対話をdona-mainへ集約し、workerの質問を失敗として扱わず、同じTask・Attemptへ回答を返す。mainとworkerの通常実行からHerdr依存を外す。Mac上の作業ディレクトリ、認証、Xcode等の利用は維持する。
+
+## 責務
+
+- DispatcherはTask、Attempt、Issue claim、通知先と回答権限を管理する。
+- Runtime hostはローカルのCodex App Server接続、thread/turn、質問request、実processの生存を管理する。Dispatcherの再起動だけではworkerを再生成しない。
+- agentごとのApp Server processを独立させる。mainとworkerの停止範囲を分離し、別workerを巻き添えにしない。
+- mainの質問もユーザー画面へ直接表示せず、イベントの元スレッドへ戻す。workerの質問はまずmainへ渡す。親が既存依頼で回答できる場合は回答し、利用者の判断・承認が必要な場合だけSlackへ確認する。
+- question、approval、MCP elicitationは別種の要求とする。通常の質問に対する回答を、実行権限の追加承認へ流用しない。
+
+## 永続化と復旧
+
+Runtime identityはagent、thread、turn、process開始identityを含む。送信前のintentと受理receiptを保存し、応答喪失時に同じ操作を無条件で再送しない。質問にはagent/thread/turn/requestの識別子と解決状態を保存する。回答は対象質問へ一度だけ送る。解決済み・期限切れ・別generationの質問へ再送しない。非同期requestはturn完了後も有効な場合があり、serverRequest/resolvedまたは接続消失を終端とする。
+
+質問待ちはTaskの正常なwaiting状態であり、Attemptを終了・交換しない。無関係な仕事が続けられる非同期質問も記録する。回答受付と質問解決通知を区別する。Runtime接続やprocessを失った場合、質問が回答可能であると仮定せず、停止・会話履歴・外部操作を照合する。
+
+Result Envelopeは引き続き成果物の確定契約である。turn完了だけでTask完了にはしない。App Serverのinterrupt応答もOS子processの全停止証明にはしない。
+
+## 移行と検証
+
+既存DB・Task・worktree・Resultを保持する。旧Herdr workerの実停止を確認した外部更新の記録を使い、旧Attemptと新runtimeの対応を明示する。旧native質問への回答を新requestへ推測で移植しない。
+
+必須検証は実App Serverでの起動、質問の取得、親への通知、回答、同一thread継続、Dispatcher再起動、Runtime切断、遅延回答、二重送信拒否、process停止である。mockだけの成功を本番移行完了としない。
+
+## 現時点の境界
+
+MCP elicitationは機密情報や任意schemaを含み得るためSlackへ転送せず、App Serverへcancelを返す。接続認証はMac上で整える。mainのnative質問・承認要求は拒否し、Slack上のイベント処理へ戻す。workerの通常質問と実行承認は別のAPIを使い、実行承認には要求後に届いた同じownerのSlackイベントが必要である。session全体の承認は行わない。
+
+Runtime hostは安定したcontrolディレクトリに置く。Dispatcher再起動では接続を保つが、host自体を更新する場合は外部保守更新で管理対象processを停止する。Mac上で既に別serviceへ委託された処理やdaemon化した任意processについて、App Server停止だけで停止済みとは主張しない。
+
+初回移行とruntime host更新は`dona-update`の既存DB保持経路を使う。通常self-updateのworker safety判定は従来どおり保守的であり、worker履歴がある環境では外部更新を使う。

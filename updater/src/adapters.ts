@@ -25,6 +25,7 @@ import type {
   OutboxRow,
   SchemaRollout,
 } from "./types.js";
+import {AppServerMain} from "./app-server-main.js";
 import { fullSha, parseCompatibilityMetadata, sha256 } from "./validation.js";
 
 const mainAgentStartupPrompt =
@@ -753,6 +754,7 @@ export class RealRuntime implements RuntimePort {
   }
 
   async waitForMainAgentIdle(): Promise<MainAgentObservation> {
+    if(this.policy.main_agent.runtime==="app_server")return new AppServerMain(this.policy).waitIdle();
     if (!(await this.herdrVersionSupported())) return missingMainAgent("unsupported_herdr_version");
     const result = await this.herdr([
       "--session", this.policy.main_agent.session,
@@ -764,6 +766,7 @@ export class RealRuntime implements RuntimePort {
   }
 
   async stopMainAgent(expected: MainAgentObservation): Promise<MainAgentStopResult> {
+    if(this.policy.main_agent.runtime==="app_server")return new AppServerMain(this.policy).stop(expected);
     if (!expected.exists || !expected.pane_id || !expected.session_id || !["idle", "done"].includes(expected.status ?? "") ||
       expected.name !== this.policy.main_agent.name || expected.kind !== "codex") {
       return { outcome: "rejected", pane_id: expected.pane_id, error_code: "main_agent_not_idle" };
@@ -797,6 +800,7 @@ export class RealRuntime implements RuntimePort {
   }
 
   async startMainAgent(paneId: string, releasePath: string, previousSessionId?: string): Promise<MainAgentStartResult> {
+    if(this.policy.main_agent.runtime==="app_server")return new AppServerMain(this.policy).start(paneId,releasePath,previousSessionId);
     if (!/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,63}$/.test(paneId)) {
       return { outcome: "rejected", observation: missingMainAgent("invalid_main_agent_pane"), error_code: "invalid_main_agent_pane" };
     }
@@ -908,6 +912,7 @@ export class RealRuntime implements RuntimePort {
   }
 
   async mainAgentStatus(releasePath: string): Promise<MainAgentObservation> {
+    if(this.policy.main_agent.runtime==="app_server")return new AppServerMain(this.policy).status(releasePath);
     if (!(await this.herdrVersionSupported())) return missingMainAgent("unsupported_herdr_version");
     return this.readMainAgent(releasePath);
   }

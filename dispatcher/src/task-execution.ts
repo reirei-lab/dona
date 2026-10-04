@@ -47,7 +47,7 @@ export interface TaskRow {
   objective:string;steer_pending_event_id:string|null;project_json:string|null;project_state:string;created_at:string;updated_at:string;
 }
 export interface VerifiedTaskIssue {node_id:string;repository:string;number:number;project?:Record<string,unknown>;}
-const automaticReasons = new Set(["result_missing","agent_wait_failed","transport_failure","agent_not_found","agent_not_running","prompt_acceptance_unknown","prompt_interrupted","prompt_acceptance_unproven","prompt_reconcile_timeout","prompt_reconcile_transient_failures","prompt_reconcile_transport_failure","ambiguous_prompt_acceptance"]);
+const automaticReasons = new Set(["result_missing","agent_wait_failed","runtime_observation_unknown","transport_failure","agent_not_found","agent_not_running","prompt_acceptance_unknown","prompt_interrupted","prompt_acceptance_unproven","prompt_reconcile_timeout","prompt_reconcile_transient_failures","prompt_reconcile_transport_failure","ambiguous_prompt_acceptance"]);
 export function taskRecoveryReason(job:JobRow):string {
   if(job.status==="blocked")return "human_input";
   if(job.last_error_code?.includes("cancel"))return "cancellation_unknown";
@@ -211,8 +211,8 @@ export class TaskRepository {
       if(old){if(old.request_sha256!==digest)throw new Error("task_control_conflict");return task;}
       if(task.revision!==revision)throw new Error("task_revision_conflict");
       if(["completed","failed","cancelled"].includes(task.state))throw new Error("task_terminal");
-      if(action==="resume"&&task.state!=="paused")throw new Error("task_resume_requires_paused");
-      if(action==="pause"&&this.dispatcher.getJob(task.current_attempt_id)?.status==="blocked")throw new Error("task_human_input_pending");
+      if(action==="resume"&&!["paused","waiting"].includes(task.state))throw new Error("task_resume_requires_waiting_or_paused");
+      if(action==="pause"&&this.dispatcher.getJob(task.current_attempt_id)?.status==="blocked"&&this.dispatcher.getJob(task.current_attempt_id)?.last_error_code!=="runtime_question_pending")throw new Error("task_human_input_pending");
       const state=action==="pause"?"paused":action==="resume"?"waiting":"waiting";
       const reason=action==="cancel"?"cancel_requested":action==="pause"?"pause_requested":"resume_requested";
       this.sql.prepare("UPDATE tasks SET state=?,desired_state=?,wait_reason=?,next_check_at=?,revision=revision+1,updated_at=? WHERE task_id=?")
@@ -290,6 +290,7 @@ export class TaskRepository {
       ORDER BY COALESCE(t.next_check_at,t.created_at),t.task_id LIMIT 8`).all(at.toISOString()) as TaskRow[];
   }
   mayNotify(job:JobRow):boolean {
+    if(job.last_error_code==="runtime_question_pending")return false;
     const task=this.forAttempt(job.job_id);if(!task)return true;
     if(task.current_attempt_id!==job.job_id)return false;
     if(["completed","failed","cancelled"].includes(task.state))return true;
@@ -308,7 +309,7 @@ export class TaskRepository {
     return this.sql.transaction(()=>{
       const fresh=this.get(task.task_id)!;if(fresh.revision!==task.revision||fresh.current_attempt_id!==task.current_attempt_id)throw new Error("task_revision_conflict");
       if(fresh.stop_state!=="none")return fresh;
-      if(!evidence.process_ids.length||!evidence.process_groups.length||!(fresh.desired_state!=="running"?["working","waiting","inactive","stopped"]:["inactive","stopped"]).includes(evidence.state))throw new Error("task_stop_evidence_missing");
+      if(!evidence.process_ids.length||!evidence.process_groups.length||!(fresh.desired_state!=="running"?["working","waiting","inactive","stopped","unreachable"]:["inactive","stopped","unreachable"]).includes(evidence.state))throw new Error("task_stop_evidence_missing");
       const job=this.dispatcher.getJob(task.current_attempt_id)!;
       if(job.result_json||fs.existsSync(job.result_path)||job.steer_state==="dispatching")throw new Error("task_reconciliation_required");
       this.sql.prepare("UPDATE jobs SET status='needs_review',last_error_code='task_stop_pending' WHERE job_id=?").run(job.job_id);

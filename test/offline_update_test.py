@@ -75,6 +75,7 @@ class FakeRunner(m.Runner):
     def __init__(self, phase='prepared', fail=None):
         self.journal={'phase':phase,'steps':[]}
         self.policy={'executables':{'herdr':'herdr'}}
+        self.inv={}
         self.calls=[]
         self.fail=fail
     def hit(self,name):
@@ -178,7 +179,7 @@ class SourceFreezeTests(unittest.TestCase):
         self.assertEqual(signals,[signal.SIGSTOP,signal.SIGCONT])
         runner.live.stop.assert_not_called()
         self.assertEqual(runner.journal['phase'],'aborted')
-        self.assertEqual(commands[-3:],[[ '/bin/launchctl','disable' if label=='dev.dona.slack-adapter' else 'enable','gui/fixture/'+label] for label in m.LABELS])
+        self.assertEqual(commands[-len(m.LABELS):],[[ '/bin/launchctl','disable' if label=='dev.dona.slack-adapter' else 'enable','gui/fixture/'+label] for label in m.LABELS])
         self.assertFalse(runner.journal['processes']);self.assertIsNone(runner.journal['source_stop_guard'])
 
     def test_crash_during_freeze_is_undone_before_source_preflight(self):
@@ -234,7 +235,7 @@ class RollbackPreparationTests(unittest.TestCase):
 
     def test_rollback_main_start_uses_current_node_and_adapter_with_old_release(self):
         runner=FakeRunner();runner.run=Path('/fixture/run');runner.g=Path('/fixture/g')
-        runner.node='/new/node';runner.inv={'old_pointer':'/old/release','policy':{'executables':{'node':'/old/node'}}}
+        runner.node='/new/node';runner.inv={'old_pointer':'/old/release','policy':{'main_agent':{},'executables':{'node':'/old/node'}}}
         runner.policy['executables']={'herdr':'/fixture/herdr'}
         runner.journal['old_main']={'pane':'wBR:p1'}
         runner.ensure_herdr=lambda:None
@@ -325,13 +326,13 @@ class RenderTests(unittest.TestCase):
     def test_manifest_and_mcp_follow_the_next_current_pointer(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);g=root/'generation';release=g/'runtime/releases/first'
-            (release/'config').mkdir(parents=True);(release/'updater').mkdir()
+            (release/'config').mkdir(parents=True);(release/'updater').mkdir();(release/'dispatcher').mkdir()
             (release/'config/release-compatibility.json').write_text('{}')
             (release/'config/update-compatibility-transitions.json').write_text('{"transitions":[]}')
             (release/'release-manifest.json').write_text('first')
             token=root/'token';token.write_text('fixture-token')
             run=root/'run';run.mkdir()
-            policy={'executables':{},'dispatcher_internal_token_file':str(token)}
+            policy={'executables':{},'main_agent':{},'dispatcher_internal_token_file':str(token)}
             configs={'dispatcher':{'values':{},'config':{k:'fixture' for k in ('databasePath','resultsDir','jobResultsDir','jobProgressDatabasePath','updateNotificationDatabasePath','socketPath')}},
                      'slack':{'values':{},'config':{k:'fixture' for k in ('healthSocketPath','dispatcherSocketPath')}}}
             inv={'policy':policy,'configs':configs,'plists':{label:{'EnvironmentVariables':{}} for label in m.LABELS}}
@@ -670,11 +671,11 @@ class FreshGenerationTests(unittest.TestCase):
     def test_fresh_render_uses_isolated_state_and_preserves_source_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);g=root/'new';release=g/'runtime/releases/target'
-            (release/'updater').mkdir(parents=True);(release/'config').mkdir()
+            (release/'updater').mkdir(parents=True);(release/'config').mkdir();(release/'dispatcher').mkdir()
             m.atomic(release/'config/release-compatibility.json',m.encode({'schema_version':1,'app_schema_write':4}))
             m.atomic(release/'config/update-compatibility-transitions.json',m.encode({'transitions':[]}))
             run=root/'run';run.mkdir();(run/'main_bridge.mjs').write_text('fixture')
-            inv={'policy':{'executables':{'node':'/old-node','codex':'/old-codex'}},
+            inv={'policy':{'main_agent':{},'executables':{'node':'/old-node','codex':'/old-codex'}},
                  'configs':{key:{'values':{'DONA_DATABASE_PATH':'/old/db'}} for key in ('dispatcher','slack')},
                  'databases':['/old/db'], 'old_results':['/old/results'],
                  'plists':{label:{'EnvironmentVariables':{}} for label in m.LABELS}}
