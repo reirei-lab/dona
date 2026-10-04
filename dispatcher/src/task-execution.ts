@@ -248,7 +248,7 @@ export class TaskRepository {
       const job=this.dispatcher.getJob(task.current_attempt_id)!;
       // preparation失敗が確定し、runtime identityもdispatch intentもないAttemptは停止対象を作っていない。
       // stale_preparing等の受理不明はこの経路に含めない。再開しても同じAttemptと準備予算を使う。
-      const preparationNotStarted=job.status==="retryable_failed"&&job.last_error_code==="job_preparation_failed"&&!job.herdr_workspace_id&&task.stop_state==="none";
+      const preparationNotStarted=job.status==="retryable_failed"&&job.last_error_code!=="stale_preparing"&&!job.herdr_workspace_id&&task.stop_state==="none";
       if(!job.dispatch_started_at&&!job.herdr_pane_id&&(["queued","blocked"].includes(job.status)||preparationNotStarted)) {
         if(action==="cancel")this.sql.prepare("UPDATE jobs SET status='cancelled',completed_at=? WHERE job_id=?").run(new Date().toISOString(),job.job_id);
         else {

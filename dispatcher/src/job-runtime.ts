@@ -1,3 +1,4 @@
+import {assertLinkedWorktreeRegistration} from "./job-worktree-identity.js";
 import { workspaceJobId, processGroups, type WorkerObservation } from "./job-handoff.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
@@ -1024,6 +1025,12 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     const expectedCommonDir = await fs.realpath(path.join(repositoryPath, ".git")).catch(() => "");
     if (!actualCommonDir || actualCommonDir !== expectedCommonDir) {
       throw new Error(`Git worktree repository mismatch for dona/${row.job_id}`);
+    }
+    if (mode === "continuation") {
+      const gitDirectory = await runProcess(this.config.gitPath,
+        ["-C", row.workspace_path, "rev-parse", "--path-format=absolute", "--git-dir"], this.config.jobCommandTimeoutMs, signal);
+      if (!gitDirectory.ok) throw new Error("handoff_worktree_registration_unavailable");
+      await assertLinkedWorktreeRegistration(row.workspace_path, gitDirectory.stdout.trim(), expectedCommonDir);
     }
   }
 }

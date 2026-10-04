@@ -623,10 +623,10 @@ test("前Attemptだけのcheckpointは現在Attemptのfile欠落として拒否�
   }finally{await f.dispose();}
 });
 
-for(const action of ["resume","cancel"] as const)test(`worker未作成の準備失敗をpause後${action}し、同じAttemptと準備回数を保持する`,async()=>{
+for(const code of ["job_preparation_failed","command_failed","command_timeout","EACCES"])for(const action of ["resume","cancel"] as const)test(`worker未作成の${code}をpause後${action}し、同じAttemptと準備回数を保持する`,async()=>{
  const f=await fixture();try{
   f.db.beginJobPreparation(f.task.current_attempt_id);
-  f.db.recordJobPreparationFailure(f.task.current_attempt_id,"job_preparation_failed","Git worktree branch mismatch",5);
+  f.db.recordJobPreparationFailure(f.task.current_attempt_id,code,"preparation failed",5);
   const job=f.db.getJob(f.task.current_attempt_id)!;
   f.runtime.observeWorker=async()=>{throw Error("worker was never created");};
   const pause=f.db.enqueue(eventEnvelope("pause-preparation")).row;

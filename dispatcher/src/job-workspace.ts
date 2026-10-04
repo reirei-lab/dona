@@ -1,3 +1,4 @@
+import {assertLinkedWorktreeRegistration} from "./job-worktree-identity.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type {DispatcherConfig} from "./config.js";
@@ -488,6 +489,12 @@ export class JobWorkspace {
     const expectedCommonDir = await fs.realpath(path.join(repositoryPath, ".git")).catch(() => "");
     if (!actualCommonDir || actualCommonDir !== expectedCommonDir) {
       throw new Error(`Git worktree repository mismatch for dona/${row.job_id}`);
+    }
+    if (mode === "continuation") {
+      const gitDirectory = await runProcess(this.config.gitPath,
+        ["-C", row.workspace_path, "rev-parse", "--path-format=absolute", "--git-dir"], this.config.jobCommandTimeoutMs, signal);
+      if (!gitDirectory.ok) throw new Error("handoff_worktree_registration_unavailable");
+      await assertLinkedWorktreeRegistration(row.workspace_path, gitDirectory.stdout.trim(), expectedCommonDir);
     }
   }
 }

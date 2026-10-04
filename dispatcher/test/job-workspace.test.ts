@@ -54,7 +54,7 @@ for(const scenario of ["branch_only","different_base","registered_elsewhere"] as
  }finally{await fs.rm(root,{recursive:true,force:true});}
 });
 
-for(const scenario of ["branch","detached","foreign_repository","wrong_origin","symlink"] as const)test(`継続worktreeの${scenario}を照合し作業状態を保持する`,async()=>{
+for(const scenario of ["branch","detached","foreign_repository","wrong_origin","symlink","copied_gitfile","moved_worktree"] as const)test(`継続worktreeの${scenario}を照合し作業状態を保持する`,async()=>{
  const {root,config}=await tempConfig(),origin="job_"+"0".repeat(26),repo=path.join(config.jobsWorkspaceRoot,"github","owner","repo","repository"),worktree=path.join(path.dirname(repo),"worktrees",origin);
  config.jobCommandTimeoutMs=10000;
  const git=(cwd:string,...args:string[])=>execFileSync(config.gitPath,["-C",cwd,...args],{encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
@@ -67,6 +67,12 @@ for(const scenario of ["branch","detached","foreign_repository","wrong_origin","
   if(scenario==="detached")git(worktree,"checkout","--detach");
   await fs.writeFile(path.join(worktree,"tracked"),"committed");git(worktree,"add","tracked");git(worktree,"commit","-m","progress");
   await fs.writeFile(path.join(worktree,"tracked"),"staged");git(worktree,"add","tracked");await fs.writeFile(path.join(worktree,"tracked"),"unstaged");await fs.writeFile(path.join(worktree,"untracked"),"keep");
+  const other=path.join(root,"another-worktree");
+  if(scenario==="copied_gitfile"||scenario==="moved_worktree") {
+   git(repo,"worktree","add","-b","other-attempt",other);
+   if(scenario==="copied_gitfile")await fs.copyFile(path.join(other,".git"),path.join(worktree,".git"));
+   else {await fs.rename(worktree,path.join(root,"preserved-original"));await fs.rename(other,worktree);}
+  }
   const head=git(worktree,"rev-parse","HEAD"),branch=git(worktree,"rev-parse","--abbrev-ref","HEAD"),status=git(worktree,"status","--porcelain"),index=git(worktree,"diff","--cached"),diff=git(worktree,"diff");
   const row={job_id:"job_"+"1".repeat(26),workspace_path:worktree,workspace_json:JSON.stringify({kind:"github",repository:"owner/repo",_dona_handoff:{workspace_job_id:origin}})} as JobRow;
   const provider=new JobWorkspace(config);
@@ -75,8 +81,9 @@ for(const scenario of ["branch","detached","foreign_repository","wrong_origin","
   if(scenario==="foreign_repository")await assert.rejects(provider.verifyContinuationWorktree(row,"owner/repo"),/repository mismatch/);
   else if(scenario==="wrong_origin")await assert.rejects(provider.verifyContinuationWorktree(row,"owner/repo"),/handoff_repository_mismatch/);
   else if(scenario==="symlink")await assert.rejects(provider.verifyContinuationWorktree(row,"owner/repo"),/handoff_workspace_identity_invalid/);
+  else if(scenario==="copied_gitfile"||scenario==="moved_worktree")await assert.rejects(provider.verifyContinuationWorktree(row,"owner/repo"),/handoff_worktree_registration_mismatch/);
   else await provider.verifyContinuationWorktree(row,"owner/repo");
   assert.equal(git(worktree,"rev-parse","HEAD"),head);assert.equal(git(worktree,"rev-parse","--abbrev-ref","HEAD"),branch);assert.equal(git(worktree,"status","--porcelain"),status);assert.equal(git(worktree,"diff","--cached"),index);assert.equal(git(worktree,"diff"),diff);
-  assert.equal(await fs.readFile(path.join(worktree,"untracked"),"utf8"),"keep");
+  assert.equal(await fs.readFile(path.join(scenario==="moved_worktree"?path.join(root,"preserved-original"):worktree,"untracked"),"utf8"),"keep");
  }finally{await fs.rm(root,{recursive:true,force:true});}
 });
