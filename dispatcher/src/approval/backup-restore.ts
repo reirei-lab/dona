@@ -131,8 +131,11 @@ export class ApprovalBackupRestore {
                 }
                 if (payload?.metadata.state === "active" && payload.secret.status !== "present"
                   || record.row.state === "claimed" && (payload?.metadata.state !== "active" || payload.secret.status !== "present")) throw Error();
-                if (record.row.state !== "claimed") {
-                  const sealed = markers.readInState(state, record.row.attempt_id); if (sealed === null) throw Error();
+                const sealed = markers.readInState(state, record.row.attempt_id);
+                // start前の拒否はfence 2のneeds_reviewとなり、send markerを生成しない。
+                if (sealed === null && record.row.state !== "claimed"
+                  && !(record.row.state === "needs_review" && record.row.fence === 2)) throw Error();
+                if (sealed !== null) {
                   verifyApprovalExecutionMarker(sealed, this.markerKeys.execution(sealed.marker.key_version));
                   const sent = history.readInState(state, sealed.marker.clock_transaction_id);
                   if (sent === null || sent.effective_utc !== sealed.marker.created_at || sent.boot_id !== mark.boot_id

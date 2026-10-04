@@ -57,7 +57,9 @@ function preview(connection: OperationsFrontendConnection, command: Extract<Oper
     const base = { scope: connection.config.scope, policy_revision: principal.policy_revision, binding_revision: principal.binding_revision };
     if (command.action === "expire") {
       const request = records.readInState(state, "request", command.handle); if (request === null) throw Error();
-      return { ...base, revision: request.row.revision, fence: null, metadata_digest: null, eligible: true };
+      return { ...base, revision: request.row.revision, fence: null, metadata_digest: null, eligible:
+        request.row.state === "approved" ? request.row.consume_expires_at !== null && request.row.consume_expires_at <= mark.effective_utc
+          : ["requested", "delivery_pending", "delivery_unknown", "sent"].includes(request.row.state) && request.row.expires_at <= mark.effective_utc };
     }
     if (command.action === "reconcile") {
       const attempt = records.readInState(state, command.kind === "execution" ? "execution" : "notification", command.handle); if (attempt === null) throw Error();
@@ -88,7 +90,10 @@ export function executeOperationsCommand(connection: OperationsFrontendConnectio
     if (!command.apply) return { dry_run: true as const, confirmation, eligible: observed.eligible,
       policy_revision: observed.policy_revision, revision: observed.revision, fence: observed.fence };
     if (command.confirm !== confirmation) throw Error();
-    if (command.action === "expire") return connection.expiry.expire(transaction(), command.handle, observed.revision!, observed.policy_revision);
+    if (command.action === "expire") {
+      if (!observed.eligible) return { status: "not_due" as const };
+      return connection.expiry.expire(transaction(), command.handle, observed.revision!, observed.policy_revision);
+    }
     if (command.action === "retention") {
       if (observed.metadata_digest === null) return { status: "protected" as const };
       return connection.retention.retain(transaction(), { owner_kind: command.owner_kind, owner_handle: command.handle,
@@ -110,7 +115,9 @@ export function runOperationsTick(connection: OperationsFrontendConnection, poli
       if (principal.policy_revision !== policyRevision) throw Error(); return null;
     });
     const selected = connection.operations.listExpiryRequests(connection.policies, { limit: 100, cursor: expiry, filter: { state: "all", due_only: true } });
-    for (const request of selected.requests) connection.expiry.expire(transaction(), request.handle, request.revision, policyRevision);
+    for (const request of selected.requests) {
+      if (connection.expiry.expire(transaction(), request.handle, request.revision, policyRevision).status === "denied") throw new OperationsCommandError();
+    }
     expiry = selected.has_more ? selected.cursor : null; if (!selected.has_more) break;
   }
   const next = { expiry, request_retention: cursors.request_retention, attempt_retention: cursors.attempt_retention };
@@ -121,7 +128,9 @@ export function runOperationsTick(connection: OperationsFrontendConnection, poli
         if (principal.policy_revision !== policyRevision) throw Error();
         return connection.retention.pageInState(state, mark, kind, next[key], 100);
       });
-      for (const candidate of selected.candidates) connection.retention.retain(transaction(), { ...candidate, policy_revision: policyRevision });
+      for (const candidate of selected.candidates) {
+        if (connection.retention.retain(transaction(), { ...candidate, policy_revision: policyRevision }).status === "denied") throw new OperationsCommandError();
+      }
       next[key] = selected.has_more ? selected.next_after : null; if (!selected.has_more) break;
     }
   }

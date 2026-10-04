@@ -342,3 +342,66 @@ test("read-only admissionはwrite lockや同内容stageの許可へ転用でき�
     assert.deepEqual(fs.readFileSync(destination), before);
   } finally { candidate.close(); }
 });
+
+test("期限前のexpire確認値は期限到達後に再利用できない", t => {
+  const f = frontendFixture(t, 1), command = { action: "expire" as const, handle: f.requestIds[0]!, apply: false, confirm: null };
+  const before = executeOperationsCommand(f.connection, command) as { eligible: boolean; confirmation: string };
+  assert.equal(before.eligible, false);
+  f.setNow("2026-09-19T00:15:00.000Z");
+  assert.throws(() => executeOperationsCommand(f.connection, { ...command, apply: true, confirm: before.confirmation }), OperationsCommandError);
+  assert.equal(f.records.read("request", command.handle)?.row.state, "delivery_pending");
+  const due = executeOperationsCommand(f.connection, command) as { eligible: boolean; confirmation: string };
+  assert.equal(due.eligible, true); assert.notEqual(due.confirmation, before.confirmation);
+});
+
+test("sweepは最初のexpire認可拒否で停止し、次の候補を実行しない", t => {
+  const f = frontendFixture(t, 2); f.setNow("2026-09-19T00:15:00.000Z"); let calls = 0;
+  const expire = f.expiry.expire.bind(f.expiry);
+  f.expiry.expire = (...args) => {
+    calls++; f.operator.change("revoke_in_tick", { active: false, expires_at: f.proposal.expires_at,
+      grants: [{ principal_id: "local_operator", uid: process.getuid!(), actions: ["read", "expire", "retention"] }] });
+    return expire(...args);
+  };
+  assert.throws(() => runOperationsTick(f.connection, 1, { expiry: null, request_retention: null, attempt_retention: null }), OperationsCommandError);
+  assert.equal(calls, 1); assert.equal(f.requestIds.filter(id => f.records.read("request", id)?.row.state === "expired").length, 0);
+});
+
+test("sweepは最初のretention拒否で停止し、次の候補を実行しない", t => {
+  const f = frontendFixture(t, 2); let calls = 0;
+  f.retention.pageInState = () => ({ candidates: f.requestIds.map(owner_handle => ({ owner_kind: "request" as const,
+    owner_handle, metadata_digest: "0".repeat(64) })), has_more: false, next_after: null });
+  const retain = f.retention.retain.bind(f.retention);
+  f.retention.retain = (...args) => {
+    calls++; f.operator.change("revoke_retention_in_tick", { active: false, expires_at: f.proposal.expires_at,
+      grants: [{ principal_id: "local_operator", uid: process.getuid!(), actions: ["read", "expire", "retention"] }] });
+    return retain(...args);
+  };
+  assert.throws(() => runOperationsTick(f.connection, 1, { expiry: null, request_retention: null, attempt_retention: null }), OperationsCommandError);
+  assert.equal(calls, 1);
+});
+
+test("start前にneeds_reviewとなった未送信attemptはmarkerなしで復元検証できる", t => {
+  const base = executionFixture(t); base.setNow(base.attempt().row.execution_expires_at);
+  base.execution.start("expired_start", base.executionCommand());
+  assert.equal(base.attempt().row.state, "needs_review"); assert.equal(base.attempt().row.fence, 2);
+  assert.equal(base.markerStore.read(base.claim.attempt_handle), null);
+  const f = attachOperationsPolicy(base); f.provision(); const operations = new ApprovalOperations(f.db, f.providers, scope);
+  const recovery = new ApprovalBackupRestore(f.db, f.providers, scope, operations, f.policies, candidate => {
+    const binding = new SupervisorBindingRepository(candidate, f.providers.auditAnchors, f.providers.auditKeys, scope, f.bindingGenerations);
+    return new OperationsPolicyRepository(candidate, f.providers, scope, binding, f.policyGenerations);
+  }, { notification: () => notification, execution: () => executionKey });
+  const candidate = path.join(path.dirname(f.filename), "unsent.sqlite"); recovery.backup(candidate, 1);
+  assert.equal(recovery.verifyRestore(candidate).status, "continuity_verified");
+});
+
+
+test("期限前applyはpreview直後に期限へ達してもexpiryを実行しない", t => {
+  const f = frontendFixture(t, 1), command = { action: "expire" as const, handle: f.requestIds[0]!, apply: false, confirm: null };
+  const before = executeOperationsCommand(f.connection, command) as { confirmation: string };
+  const observe = f.operations.authorizedObservation.bind(f.operations);
+  f.operations.authorizedObservation = ((...args: Parameters<typeof observe>) => {
+    const result = observe(...args); f.setNow("2026-09-19T00:15:00.000Z"); return result;
+  }) as typeof f.operations.authorizedObservation;
+  assert.deepEqual(executeOperationsCommand(f.connection, { ...command, apply: true, confirm: before.confirmation }), { status: "not_due" });
+  assert.equal(f.records.read("request", command.handle)?.row.state, "delivery_pending");
+});
