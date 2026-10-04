@@ -13,10 +13,11 @@ test("App Server mainを新generationで起動し、照合済みidleだけ停止
  for(const file of ["dispatcher.env","slack.env","mcp-dispatcher.mjs","mcp-slack.mjs"])await fs.writeFile(path.join(policy.config_root,file),"",{mode:0o600});
  const release=await fs.realpath(await installRelease(policy,targetSha));
  let agent={name:"dona-main",generation:"new",thread_id:"thread",state:"idle",cwd:release,release};
- let stopCount=0;const starts:Array<Record<string,unknown>>=[];
+ let startupFails=false;let stopCount=0;const starts:Array<Record<string,unknown>>=[];
  const server=http.createServer(async(req,res)=>{
   let data="";for await(const part of req)data+=part;const p=JSON.parse(data);
   if(p.action==="start"){starts.push(p.input);agent={...agent,state:"idle"};}
+  if(p.action==="prompt"&&startupFails)agent={...agent,state:"interrupted"};
   if(p.action==="stop"){assert.equal(p.generation,agent.generation);stopCount++;agent={...agent,state:"stopped"};}
   res.setHeader("content-type","application/json");res.end(JSON.stringify({result:p.action==="prompt"?{turnId:"startup"}:agent}));
  });
@@ -27,6 +28,8 @@ test("App Server mainを新generationで起動し、照合済みidleだけ停止
   const observation=await main.status(release);
   assert.equal((await main.stop({...observation,session_id:"stale"})).outcome,"rejected");assert.equal(stopCount,0);
   assert.equal((await main.stop(observation)).outcome,"stopped");assert.equal(stopCount,1);
-  agent={...agent,state:"interrupted"};assert.equal((await main.start("dona-main",release,"new")).outcome,"accepted_unknown");
+  startupFails=true;const failed=await main.start("dona-main",release,"old");assert.equal(failed.outcome,"accepted_unknown");
+  assert.equal(failed.observation.interactive_ready,false);assert.notEqual(failed.observation.status,"idle");
+  const reconciled=await main.status(release);assert.equal(reconciled.interactive_ready,false);assert.notEqual(reconciled.status,"idle");
  }finally{await new Promise<void>(resolve=>server.close(()=>resolve()));await fs.rm(root,{recursive:true,force:true});}
 });

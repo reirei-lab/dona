@@ -54,7 +54,15 @@ export class AppServerJobRuntime implements JobAgentRuntime {
     if(!this.expectedSession)return true;
     const expected=this.expectedSession(row.job_id);
     const legacy=JSON.parse(agent.config_json).legacyPaneId;
-    return expected!==undefined&&expected===(legacy?agent.thread_id:JSON.stringify([agent.generation,agent.thread_id]));
+    if(expected===undefined)return false;
+    if(legacy)return expected===agent.thread_id;
+    const identity=JSON.parse(expected) as unknown;
+    return Array.isArray(identity)&&identity[0]===agent.generation&&(identity[1]===agent.thread_id||identity[1]===null);
+  }
+  async reconcilePreparation(row:JobRow):Promise<PreparedJobRuntime|undefined>{
+    const agent=await this.client.status(row.agent_name);
+    if(!agent||agent.name!==row.agent_name||agent.role!=="worker"||agent.cwd!==row.workspace_path||JSON.parse(agent.config_json).attemptId!==row.job_id)return;
+    return {herdrWorkspaceId:agent.name,herdrPaneId:agent.name,herdrAgentSessionId:JSON.stringify([agent.generation,agent.thread_id])};
   }
   async recoveryHint(row:JobRow){const agent=await this.client.status(row.agent_name);return agent&&this.matchesSession(row,agent)?agent.recovery_hint:undefined;}
   pendingQuestions(){return this.client.call<import("./store.js").QuestionRecord[]>("pendingQuestions");}
@@ -97,10 +105,15 @@ export class AppServerJobRuntime implements JobAgentRuntime {
     const interactive=row.source!=="dona_schedule"&&this.taskOwned(row.job_id);
     serverArgs.push("-c",`features.default_mode_request_user_input=${interactive}`);
     let agent:AgentRecord;
-    try {agent=await this.client.start({name:row.agent_name,role:"worker",cwd:row.workspace_path,release:path.resolve(import.meta.dirname,"../../.."),args:serverArgs,
+    try {agent=await this.client.start({attemptId:row.job_id,name:row.agent_name,role:"worker",cwd:row.workspace_path,release:path.resolve(import.meta.dirname,"../../.."),args:serverArgs,
       threadConfig:{model:"gpt-6.1-sol",approvalsReviewer:"auto_review",...(row.source==="dona_schedule"?{approvalPolicy:"never"}:{}),config:{"sandbox_workspace_write.writable_roots":writeRoots,"features.default_mode_request_user_input":interactive},developerInstructions:!interactive?"このjobには対話回答の経路がありません。native request_user_inputは使わず、承認済みscopeで進められない場合は不足情報をblocked Resultへ記録してください。":"あなたはDonaのworkerです。必要な質問はrequest_user_inputで親Donaへ送れます。hostが質問を親に届けるため、ユーザーへの直接連絡やSlack操作は行わないでください。回答を待つ間も独立した作業は進められます。質問待ちは失敗ではなく、質問のためにfailed Resultを公開しないでください。"}});
-    } catch {throw new PreparedWorkspaceCleanupError("App Server preparation requires runtime reconciliation",row.agent_name,row.agent_name);}
-    if(!agent.thread_id)throw new PreparedWorkspaceCleanupError("App Server thread identity missing",row.agent_name,row.agent_name);
+    } catch(error) {
+      // 接続前の失敗だけが未送信。応答喪失ではstartを再送せず、永続Attempt bindingを照合する。
+      if(["ECONNREFUSED","ENOENT"].includes((error as NodeJS.ErrnoException).code??""))throw Error("runtime_start_not_sent");
+      const recovered=await this.reconcilePreparation(row).catch(()=>undefined);
+      throw new PreparedWorkspaceCleanupError("App Server preparation requires runtime reconciliation",row.agent_name,row.agent_name,recovered?.herdrAgentSessionId,"runtime_preparation_unknown");
+    }
+    if(!agent.thread_id)throw new PreparedWorkspaceCleanupError("App Server thread identity missing",row.agent_name,row.agent_name,JSON.stringify([agent.generation,null]),"runtime_preparation_unknown");
     return {herdrWorkspaceId:agent.name,herdrPaneId:agent.name,herdrAgentSessionId:JSON.stringify([agent.generation,agent.thread_id])};
   }
   async get(name:string):Promise<HerdrCommandResult>{return new AppServerAgentClient(runtimeSocket(this.config),name,this.config.agentWaitTimeoutMs).get();}
@@ -115,7 +128,20 @@ export class AppServerJobRuntime implements JobAgentRuntime {
     catch{return result(null,"cancel_acceptance_unknown");}
   }
   async closeAgent(name:string):Promise<HerdrCommandResult>{return this.cancel(name);}
-  async cleanup(row:JobRow):Promise<HerdrCommandResult>{return this.cancel(row.agent_name);}
+  async cleanup(row:JobRow):Promise<HerdrCommandResult>{
+    if(row.source!=="dona_schedule"||workspaceFromJob(row).kind!=="scratch"||!["completed","failed","cancelled"].includes(row.status))throw Error("runtime_cleanup_scope_invalid");
+    const expected=path.join(this.config.jobsWorkspaceRoot,"scratch",workspaceJobId(row));
+    const canonicalExpected=path.join(await fs.realpath(this.config.jobsWorkspaceRoot),"scratch",workspaceJobId(row));
+    if(row.workspace_path!==expected||await fs.realpath(path.dirname(expected))!==path.dirname(canonicalExpected))throw Error("runtime_cleanup_path_invalid");
+    const stat=await fs.lstat(expected).catch(error=>{if(error.code==="ENOENT")return null;throw error;});
+    if(stat&&(!stat.isDirectory()||stat.isSymbolicLink()))throw Error("runtime_cleanup_path_invalid");
+    await this.retireWorker(row);
+    if(!await this.workerRetired(row))throw Error("runtime_cleanup_stop_unconfirmed");
+    // stop receiptは再照合可能なので、削除途中の再実行も同じ世代へ束縛される。
+    if(stat&&await fs.realpath(expected)!==canonicalExpected)throw Error("runtime_cleanup_path_invalid");
+    await fs.rm(expected,{recursive:true,force:true});
+    return {ok:true,stdout:"{}",stderr:"",exitCode:0,timedOut:false,aborted:false};
+  }
   async observeWorker(row:JobRow):Promise<WorkerObservation>{
     const unknown=(reason:string):WorkerObservation=>({state:"unknown",reason,observed_at:new Date().toISOString(),process_ids:[],process_groups:[]});
     try {

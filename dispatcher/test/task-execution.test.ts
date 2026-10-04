@@ -407,3 +407,16 @@ test("Task停止の事前照会だけ失敗した場合は未送信として再�
   f.runtime.retireWorker=stop;f.due();await f.supervisor().reconcileTasks();assert.equal(f.sends(),1);assert.equal(f.db.tasks.get(f.task.task_id)?.attempt_number,2);
  }finally{await f.dispose();}
 });
+
+test("start応答と直後のstatus喪失でも、後日のAttempt照合を永続化して停止・引継ぐ",async()=>{
+ const f=await fixture();try{
+  const job=f.db.getJob(f.task.current_attempt_id)!;f.db.beginJobPreparation(job.job_id);f.db.setJobRuntime(job.job_id,"w","p");
+  f.db.markJobNeedsReview(job.job_id,"runtime_preparation_unknown","response lost");
+  f.runtime.reconcilePreparation=async()=>{throw Error("socket offline");};
+  await f.supervisor().reconcileTasks();assert.equal(f.sends(),0);assert.equal(f.db.getJobLiveSessionIdentity(job.job_id),undefined);
+  f.due();f.runtime.reconcilePreparation=async()=>({herdrWorkspaceId:"w",herdrPaneId:"p",herdrAgentSessionId:JSON.stringify(["generation",null])});
+  f.runtime.retireWorker=async()=>{assert.equal(f.db.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id,JSON.stringify(["generation",null]));f.setStopped(true);};
+  await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,2);
+  assert.throws(()=>f.db.reconcileJobPreparationRuntime(job.job_id,"w","p","other"),/identity_changed/);
+ }finally{await f.dispose();}
+});

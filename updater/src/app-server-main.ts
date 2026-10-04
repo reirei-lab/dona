@@ -22,7 +22,7 @@ export class AppServerMain {
   try {
    const agent=await this.call<RuntimeAgent|null>("status",{name:this.policy.main_agent.name});
    if(!agent||agent.state==="stopped")return absent("agent_not_running");
-   if(!["idle","working","waiting","interrupted"].includes(agent.state)||!agent.thread_id)return absent("runtime_observation_unknown");
+   if(!["idle","working","waiting"].includes(agent.state)||!agent.thread_id)return absent("runtime_observation_unknown");
    return {exists:true,name:agent.name,kind:"codex",pane_id:agent.name,status:agent.state==="waiting"?"blocked":agent.state==="working"?"working":"idle",interactive_ready:true,
     working_directory:agent.cwd,session_id:agent.generation,matches_release:release===undefined||agent.release===release,error_code:null};
   }catch{return absent("runtime_observation_unknown");}

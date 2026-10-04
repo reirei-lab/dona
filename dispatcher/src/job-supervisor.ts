@@ -270,7 +270,12 @@ export class JobSupervisor {
   private async reconcileTask(snapshot:TaskRow):Promise<void> {
     let task=this.database.tasks.get(snapshot.task_id)!;
     if(task.revision!==snapshot.revision||task.current_attempt_id!==snapshot.current_attempt_id)return;
-    const job=this.database.getJob(task.current_attempt_id)!;
+    let job=this.database.getJob(task.current_attempt_id)!;
+    if(job.last_error_code==="runtime_preparation_unknown"&&!this.database.getJobLiveSessionIdentity(job.job_id)&&this.runtime.reconcilePreparation) {
+      const recovered=await this.runtime.reconcilePreparation(job);
+      if(recovered?.herdrAgentSessionId)this.database.reconcileJobPreparationRuntime(job.job_id,recovered.herdrWorkspaceId,recovered.herdrPaneId,recovered.herdrAgentSessionId);
+      job=this.database.getJob(task.current_attempt_id)!;
+    }
     if(task.wait_reason==="steer_acceptance_unknown"&&job.steer_state==="accepted"&&job.steer_event_id&&task.steer_pending_event_id===job.steer_event_id) {
       this.database.tasks.finishSteer(task.task_id,job.steer_event_id);return;
     }
@@ -1023,8 +1028,8 @@ export class JobSupervisor {
       prepared = await this.runtime.prepare(preparing, this.abortController.signal);
     } catch (error) {
       if(error instanceof PreparedWorkspaceCleanupError) {
-        this.database.setJobRuntime(row.job_id,error.herdrWorkspaceId,error.herdrPaneId);
-        this.database.markJobNeedsReview(row.job_id,"workspace_cleanup_failed",error.message);
+        this.database.setJobRuntime(row.job_id,error.herdrWorkspaceId,error.herdrPaneId,error.herdrAgentSessionId);
+        this.database.markJobNeedsReview(row.job_id,error.errorCode,error.message);
         return;
       }
       if (this.stopping) return;

@@ -14,7 +14,7 @@ import {JobSupervisor} from "../src/job-supervisor.js";
 const {root,config}=await tempConfig();
 Object.assign(config,{codexPath:process.env.DONA_SMOKE_CODEX??"/opt/homebrew/bin/codex",jobCommandTimeoutMs:30_000,agentWaitTimeoutMs:10_000,jobPromptTimeoutMs:30_000,queuePollMs:250});
 const host=await serveRuntime({socket:runtimeSocket(config),database:root+"/runtime.sqlite3",codex:config.codexPath,buildSha:"smoke"});
-const db=new DispatcherDatabase(config.databasePath),runtime=new AppServerJobRuntime(config,false,undefined,id=>!!db.tasks.forAttempt(id)),client=new RuntimeClient(runtimeSocket(config));
+const db=new DispatcherDatabase(config.databasePath),runtime=new AppServerJobRuntime(config,false,id=>db.getJobLiveSessionIdentity(id)?.herdr_agent_session_id??undefined,id=>!!db.tasks.forAttempt(id)),client=new RuntimeClient(runtimeSocket(config));
 const log={debug(){},info(){},warn(message:string){console.log(message);},error(message:string){console.log(message);}};
 const supervisor=new JobSupervisor(db,runtime,config,log,()=>{}),api=new DispatcherApi(db,{isRunning:()=>true,wake(){}},supervisor,config,log);
 let succeeded=false;

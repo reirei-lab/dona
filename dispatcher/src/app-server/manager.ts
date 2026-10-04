@@ -7,7 +7,7 @@ import { RuntimeStore,type AgentRecord,type QuestionRecord } from "./store.js";
 import { identity,processes,same,stopScope,type ProcessIdentity } from "./process.js";
 
 export const hash=(value:unknown)=>createHash("sha256").update(stableStringify(value)).digest("hex");
-export interface StartAgent {name:string;role:"main"|"worker";cwd:string;release:string;args:string[];threadConfig:Record<string,unknown>}
+export interface StartAgent {attemptId?:string;name:string;role:"main"|"worker";cwd:string;release:string;args:string[];threadConfig:Record<string,unknown>}
 export type RpcFactory=(args:string[],cwd:string)=>AppServerRpc;
 const object=(x:unknown):Record<string,unknown>=>x!==null&&typeof x==="object"&&!Array.isArray(x)?x as Record<string,unknown>:{};
 

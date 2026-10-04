@@ -1643,6 +1643,15 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
+  reconcileJobPreparationRuntime(jobId:string,workspaceId:string,paneId:string,sessionId:string):void {
+    this.db.transaction(()=>{
+      const row=this.getJob(jobId);
+      if(!row||row.status!=="needs_review"||row.last_error_code!=="runtime_preparation_unknown"||this.getJobLiveSessionIdentity(jobId)||workspaceId!==row.herdr_workspace_id||paneId!==row.herdr_pane_id||sessionId.length>512)throw Error("runtime_preparation_identity_changed");
+      this.db.prepare(`INSERT INTO job_live_session_identities(job_id,identity_version,herdr_agent_session_id,herdr_workspace_id,herdr_pane_id,agent_name,recorded_at,generation_nonce) VALUES(?,1,?,?,?,?,?,?)`)
+        .run(jobId,sessionId,workspaceId,paneId,row.agent_name,new Date().toISOString(),randomUUID());
+    }).immediate();
+  }
+
   getJobLiveSessionIdentity(jobId: string): LiveSessionIdentityRow | undefined {
     return this.db.prepare("SELECT * FROM job_live_session_identities WHERE job_id=?").get(jobId) as LiveSessionIdentityRow | undefined;
   }

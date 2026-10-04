@@ -20,10 +20,11 @@ export interface PreparedJobRuntime {
 export class WorkerStopNotSentError extends Error {}
 
 export class PreparedWorkspaceCleanupError extends Error {
-  constructor(message:string,readonly herdrWorkspaceId:string,readonly herdrPaneId:string) { super(message);this.name="PreparedWorkspaceCleanupError"; }
+  constructor(message:string,readonly herdrWorkspaceId:string,readonly herdrPaneId:string,readonly herdrAgentSessionId?:string,readonly errorCode="workspace_cleanup_failed") { super(message);this.name="PreparedWorkspaceCleanupError"; }
 }
 
 export interface JobAgentRuntime {
+  reconcilePreparation?(row:JobRow):Promise<PreparedJobRuntime|undefined>;
   recoveryHint?(row:JobRow):Promise<import("./app-server/store.js").AgentRecord["recovery_hint"]>;
   pendingQuestions?(): Promise<import("./app-server/store.js").QuestionRecord[]>;
   questions?(name:string,includeResolved?:boolean): Promise<import("./app-server/store.js").QuestionRecord[]>;
