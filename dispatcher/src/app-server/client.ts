@@ -2,6 +2,10 @@ import http from "node:http";
 import type {AgentRecord,QuestionRecord} from "./store.js";
 import type {StartAgent} from "./manager.js";
 
+export class RuntimeResponseError extends Error {
+  constructor(readonly code:string,readonly status:number){super(code);}
+}
+
 export class RuntimeClient {
   constructor(readonly socket:string,private readonly timeoutMs=30_000){}
   call<T>(action:string,params:Record<string,unknown>={}):Promise<T> {
@@ -9,7 +13,7 @@ export class RuntimeClient {
       const body=JSON.stringify({action,...params});
       const request=http.request({socketPath:this.socket,path:"/control",method:"POST",headers:{"content-type":"application/json","content-length":Buffer.byteLength(body)}},response=>{
         let text="";response.setEncoding("utf8");response.on("data",(chunk:string)=>{text+=chunk;if(Buffer.byteLength(text)>2_097_152)response.destroy(Error("runtime_response_limit"));});
-        response.on("error",reject);response.on("end",()=>{try{const value=JSON.parse(text) as {result:T;error?:string};if(response.statusCode!==200)throw Error(value.error??"runtime_request_failed");resolve(value.result);}catch(error){reject(error);}});
+        response.on("error",reject);response.on("end",()=>{try{const value=JSON.parse(text) as {result:T;error?:string};if(response.statusCode!==200)throw new RuntimeResponseError(value.error??"runtime_request_failed",response.statusCode??0);resolve(value.result);}catch(error){reject(error);}});
       });
       request.setTimeout(this.timeoutMs,()=>request.destroy(Error("runtime_response_unknown")));request.on("error",reject);request.end(body);
     });

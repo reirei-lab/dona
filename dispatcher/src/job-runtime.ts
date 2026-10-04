@@ -228,7 +228,8 @@ export function runProcess(
     child.once("close", (code) => {
       finish({ ok: code === 0 && !timedOut && !aborted, stdout, stderr, exitCode: code, timedOut, aborted });
     });
-    child.stdin.end(stdin);
+    // 空文字のwriteでも終了済みの子にはEPIPEになり得る。入力なしはEOFだけを送る。
+    if(stdin.length)child.stdin.end(stdin);else child.stdin.end();
   });
 }
 

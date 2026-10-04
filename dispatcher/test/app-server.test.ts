@@ -152,7 +152,7 @@ for(const stopped of [false,true])test(`mainの復旧intentを${stopped?"停止�
  try{
   const input={name:"dona-main",role:"main" as const,cwd:root,release:root,args:[],threadConfig:{}};
   const old=await manager.start(input);assert.equal(manager.status(old.name)?.startup_ready,false);
-  if(stopped){store.db.prepare("INSERT INTO main_recoveries VALUES(?,?,?)").run(old.name,old.generation,JSON.stringify(input));await manager.stop(old.name,old.generation);}
+  if(stopped){await manager.stop(old.name,old.generation);store.db.prepare("INSERT INTO main_recoveries VALUES(?,?,?)").run(old.name,old.generation,JSON.stringify(input));}
   manager=new AppServerManager(store,factory);await manager.recover();
   const fresh=manager.status(old.name)!;assert.equal(fresh.state,"idle");assert.notEqual(fresh.generation,old.generation);assert.equal(fresh.startup_ready,false);
   const {identity}=await import("../src/app-server/process.js");assert.ok(!identity(old.pid!)||identity(old.pid!)!.state.includes("Z"));
@@ -199,4 +199,33 @@ test("mainのready証拠はそのgenerationの応答完了後だけ成立する"
   await manager.stop(agent.name,agent.generation);const fresh=await manager.start(input);assert.notEqual(fresh.generation,agent.generation);assert.equal(manager.status(fresh.name)?.startup_ready,false);
   await manager.stop(fresh.name,fresh.generation);
  }finally{const row=store.agent(input.name);if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+for(const cancelled of [false,true])test(`main復旧中のspawn失敗後も${cancelled?"明示停止を尊重する":"復旧intentを引継ぎ再生成する"}`,async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-main-recovery-spawn-")),script=path.join(root,"fake.mjs");await fs.writeFile(script,fake);
+ const store=new RuntimeStore(path.join(root,"runtime.db")),factory=(_args:string[],cwd:string)=>new AppServerRpc(process.execPath,[script],cwd);
+ let manager=new AppServerManager(store,factory);
+ try{
+  const input={name:"main",role:"main" as const,cwd:root,release:root,args:[],threadConfig:{}};
+  const old=await manager.start(input);
+  manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(path.join(root,"missing"),[],cwd));await manager.recover();
+  const failed=manager.status(old.name)!;assert.equal(failed.state,"stopped");assert.notEqual(failed.generation,old.generation);
+  assert.equal((store.db.prepare("SELECT generation FROM main_recoveries WHERE agent=?").get(old.name) as {generation:string}).generation,failed.generation);
+  if(cancelled)await manager.stop(failed.name,failed.generation);
+  manager=new AppServerManager(store,factory);await manager.recover();const fresh=manager.status(old.name)!;
+  assert.equal(fresh.state,cancelled?"stopped":"idle");assert.equal(fresh.generation===failed.generation,cancelled);
+  assert.equal(store.db.prepare("SELECT 1 FROM main_recoveries WHERE agent=?").get(old.name),undefined);
+  await manager.stop(fresh.name,fresh.generation);
+ }finally{const row=store.agent("main");if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("対話経路のないworkerの承認要求をpendingへ取り残さない",async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-no-approval-")),script=path.join(root,"fake.mjs");
+ await fs.writeFile(script,fake.replace("method:'item/tool/requestUserInput'","method:'item/permissions/requestApproval'").replace("questions:[{id:'choice',question:'どちら？',isSecret:false,options:null}]","permissions:{network:{enabled:true}}").replace("if(r.id==='question-1'&&r.result)","if(r.id==='question-1'&&r.error)send({method:'turn/completed',params:{threadId:'thread-test',turn:{id:'turn-test',status:'completed'}}});\nif(r.id==='question-1'&&r.result)"));
+ const store=new RuntimeStore(path.join(root,"runtime.db")),manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));
+ try{
+  const agent=await manager.start({name:"worker",role:"worker",cwd:root,release:root,args:[],threadConfig:{config:{"features.default_mode_request_user_input":false}}});
+  await manager.prompt(agent.name,"approval","実行");await until(()=>store.agent(agent.name)?.state==="idle");assert.equal(store.questions(agent.name).length,0);
+  await manager.stop(agent.name,agent.generation);
+ }finally{const row=store.agent("worker");if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
 });

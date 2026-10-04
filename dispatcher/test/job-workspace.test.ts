@@ -3,6 +3,7 @@ import {execFileSync} from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {test} from "node:test";
+import {runProcess} from "../src/job-runtime.js";
 import {JobWorkspace} from "../src/job-workspace.js";
 import type {JobRow} from "../src/types.js";
 import {tempConfig} from "./helpers.js";
@@ -22,4 +23,13 @@ test("Herdrを起動せずGit worktreeを作り、既存の変更を保持する
   git("remote","set-url","origin","https://github.com/owner/other.git");
   await assert.rejects(provider.createGitHubWorktree(row,"owner/repo",undefined),/origin does not match/);
  }finally{await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("入力なしの即時終了をEPIPEで失敗扱いせず、実入力の送信失敗は保持する",async()=>{
+ for(let i=0;i<30;i++){
+  const result=await runProcess("/bin/sh",["-c","exec 0<&-; printf ready"],5000);
+  assert.equal(result.ok,true,result.stderr);assert.equal(result.stdout,"ready");
+ }
+ const sent=await runProcess("/bin/sh",["-c","exec 0<&-; sleep 0.05"],5000,undefined,false,"input".repeat(1000000));
+ assert.equal(sent.ok,false);assert.match(sent.stderr,/EPIPE|pipe|closed/i);
 });

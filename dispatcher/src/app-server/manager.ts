@@ -33,7 +33,7 @@ export class AppServerManager {
   async start(input:StartAgent):Promise<AgentRecord> {
     return this.serialized(input.name,()=>this.startAgent(input));
   }
-  private async startAgent(input:StartAgent):Promise<AgentRecord> {
+  private async startAgent(input:StartAgent,recoveryGeneration?:string):Promise<AgentRecord> {
       if(!/^[a-zA-Z0-9_-]{1,128}$/.test(input.name)||!path.isAbsolute(input.cwd)||!path.isAbsolute(input.release)||!fs.statSync(input.cwd).isDirectory())throw Error("runtime_start_scope");
       const requestHash=hash(input),prior=this.store.agent(input.name);
       if(prior&&prior.state!=="stopped") {
@@ -43,7 +43,10 @@ export class AppServerManager {
       }
       const row:AgentRecord={name:input.name,generation:randomUUID(),role:input.role,cwd:input.cwd,release:input.release,
         thread_id:input.role==="worker"?(prior?.thread_id??null):null,turn_id:null,pid:null,process_start:null,state:"starting",request_hash:requestHash,config_json:JSON.stringify(input),sequence:0};
-      this.store.put(row);
+      this.store.db.transaction(()=>{
+        this.store.put(row);
+        if(recoveryGeneration)this.store.db.prepare("UPDATE main_recoveries SET generation=? WHERE agent=? AND generation=?").run(row.generation,row.name,recoveryGeneration);
+      }).immediate();
       let rpc:AppServerRpc;
       try {
         rpc=this.factory(input.args,input.cwd);this.connections.set(input.name,rpc);
@@ -110,8 +113,8 @@ export class AppServerManager {
       this.connections.get(agent.name)?.reject(message.id,"Dona main must ask the user through the configured Slack tools, publish its event Result, and handle the reply as a new event.");return;
     }
     const settings=object(object(JSON.parse(current.config_json)).threadConfig);
-    if(kind==="question"&&object(settings.config)["features.default_mode_request_user_input"]===false) {
-      this.connections.get(agent.name)?.reject(message.id,"This job has no interactive question channel. Continue within the authorized scope or publish a blocked Result explaining the missing input.");return;
+    if(["question","approval"].includes(kind)&&object(settings.config)["features.default_mode_request_user_input"]===false) {
+      this.connections.get(agent.name)?.reject(message.id,"This job has no interactive question or approval channel. Continue within the authorized scope or publish a blocked Result explaining the missing input.");return;
     }
     if(kind==="question"&&Array.isArray(p.questions)&&p.questions.some(q=>object(q).isSecret===true)) {
       this.connections.get(agent.name)?.reject(message.id,"Secrets cannot be requested through Dona. Ask the parent to arrange local authentication without transmitting credentials.");return;
@@ -215,6 +218,7 @@ export class AppServerManager {
     // queue待機中のhost crashでもintentを失わない。generationに束縛して保存する。
     const row=this.store.agent(name);
     if(!row||row.generation!==generation)throw Error("runtime_stop_identity_changed");
+    this.store.db.prepare("DELETE FROM main_recoveries WHERE agent=? AND generation=?").run(name,generation);
     if(row.state!=="stopped") {
       if(!row.pid||!row.process_start)throw Error("runtime_process_stop_evidence_missing");
       const root:ProcessIdentity={pid:row.pid,parent:0,group:row.pid,uid:process.getuid!(),start:row.process_start,state:"unknown"};
@@ -257,8 +261,9 @@ export class AppServerManager {
           this.store.db.prepare("INSERT INTO main_recoveries VALUES(?,?,?) ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,input_json=excluded.input_json").run(current.name,current.generation,recovery.input_json);
         }
         if(current.state!=="stopped")await this.stopAgent(current.name,current.generation);
-        await this.startAgent(JSON.parse(recovery.input_json) as StartAgent);
-        this.store.db.prepare("DELETE FROM main_recoveries WHERE agent=? AND generation=?").run(current.name,current.generation);
+        if(!this.store.db.prepare("SELECT 1 FROM main_recoveries WHERE agent=? AND generation=?").get(current.name,current.generation))return;
+        const started=await this.startAgent(JSON.parse(recovery.input_json) as StartAgent,current.generation);
+        this.store.db.prepare("DELETE FROM main_recoveries WHERE agent=? AND generation=?").run(current.name,started.generation);
       }).catch(()=>{});
     }
   }

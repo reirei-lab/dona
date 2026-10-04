@@ -354,9 +354,9 @@ test("steer受理直後の再起動はexact eventのreceiptだけで復旧する
   }finally{await f.dispose();}
 });
 
-test("worker質問を親eventへ一度だけ届け、回答後に同じAttemptへ戻る",async()=>{
+for(const crashed of [false,true])test(`worker質問を${crashed?"prompt送信直後のDispatcher再起動後も":""}親eventへ一度だけ届け、回答後に同じAttemptへ戻る`,async()=>{
  const f=await fixture();try{
-  const job=f.db.getJob(f.task.current_attempt_id)!;f.db.beginJobPreparation(job.job_id,new Date(job.available_at));f.db.setJobRuntime(job.job_id,"w","p",JSON.stringify(["generation","thread-question"]));f.db.beginJobDispatch(job.job_id);f.db.markJobRunning(job.job_id);
+  const job=f.db.getJob(f.task.current_attempt_id)!;f.db.beginJobPreparation(job.job_id,new Date(job.available_at));f.db.setJobRuntime(job.job_id,"w","p",JSON.stringify(["generation","thread-question"]));f.db.beginJobDispatch(job.job_id);if(crashed){f.db.recoverStaleJobs();assert.equal(f.db.getJob(job.job_id)?.status,"needs_review");}else f.db.markJobRunning(job.job_id);
   const question:import("../src/app-server/store.js").QuestionRecord={question_id:"550e8400-e29b-41d4-a716-446655440000",agent:job.agent_name,generation:"generation",thread_id:"thread-question",turn_id:"turn",rpc_id_json:'"request"',kind:"question",payload_json:JSON.stringify({questions:[{id:"choice",question:"どちら？"}]}),state:"pending",answer_hash:null,created_at:new Date().toISOString()};
   let pending=true,answers=0;
   f.runtime.pendingQuestions=async()=>pending?[question]:[];f.runtime.questions=async()=>pending?[question]:[];
@@ -438,5 +438,13 @@ test("質問回答後の失敗turnをrunningへ戻さず利用上限の解除を
   f.runtime.recoveryHint=async()=>({reason:"capacity_wait",retry_after:new Date(Date.now()+3600000).toISOString()});
   await f.supervisor().reconcileTasks();const t=f.db.tasks.get(f.task.task_id)!;
   assert.equal(t.state,"waiting");assert.equal(t.wait_reason,"capacity_wait");assert.equal(t.attempt_number,1);assert.equal(f.sends(),0);
+ }finally{await f.dispose();}
+});
+
+for(const reason of ["invalid_result","cancel_acceptance_unknown","ambiguous_steer_acceptance"])test(`${reason}は質問通知で解除しない`,async()=>{
+ const f=await fixture();try{
+  const job=f.db.getJob(f.task.current_attempt_id)!;f.db.beginJobPreparation(job.job_id);f.db.setJobRuntime(job.job_id,"w","p",JSON.stringify(["g","t"]));f.db.beginJobDispatch(job.job_id);f.db.markJobRunning(job.job_id);f.db.markJobNeedsReview(job.job_id,reason,"unresolved");
+  f.db.enqueueWorkerQuestion(job.job_id,{question_id:"q",agent:job.agent_name,generation:"g",thread_id:"t",turn_id:"turn",rpc_id_json:"1",kind:"question",payload_json:"{}",state:"pending",answer_hash:null,created_at:new Date().toISOString()});
+  assert.equal(f.db.getJob(job.job_id)?.last_error_code,reason);assert.equal(f.db.list().filter(e=>e.event_type==="worker_question").length,0);
  }finally{await f.dispose();}
 });

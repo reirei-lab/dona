@@ -18,6 +18,8 @@ test("hostの二重起動を拒否し、既存socketと所有権を壊さない"
  try{
   await assert.rejects(serveRuntime(config),/already_running/);
   assert.deepEqual(await new RuntimeClient(config.socket).list(),[]);
+  const prompted=await new AppServerAgentClient(config.socket,"dona-main",100).submit("未送信","event");
+  assert.equal(prompted.ok,false);assert.equal(prompted.errorCode,"agent_not_running");
  }finally{await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));await fs.rm(root,{recursive:true,force:true});}
 });
 

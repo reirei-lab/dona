@@ -1246,7 +1246,7 @@ export class DispatcherDatabase {
     this.db.transaction(()=>{
       const job=this.getJob(jobId),task=this.tasks.forAttempt(jobId);
       if(!job||!task||task.current_attempt_id!==jobId||task.desired_state!=="running"||task.stop_state!=="none"||
-        !["running","blocked"].includes(job.status)||question.agent!==job.agent_name||JSON.stringify([question.generation,question.thread_id])!==this.getJobLiveSessionIdentity(jobId)?.herdr_agent_session_id)return;
+        !(["running","blocked"].includes(job.status)||(job.status==="needs_review"&&taskMayAcceptLateResult(job)))||question.state!=="pending"||question.agent!==job.agent_name||JSON.stringify([question.generation,question.thread_id])!==this.getJobLiveSessionIdentity(jobId)?.herdr_agent_session_id)return;
       const source=this.getRequired(job.source_event_id),binding=readEventJobBinding(this.db,job.source_event_id);
       if(!binding||binding.owner.kind!=="slack_thread")return;
       const envelope:EventEnvelope={schema_version:1,source:"dona_job",type:"worker_question",external_event_id:`question:${question.question_id}`,

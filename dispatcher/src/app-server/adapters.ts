@@ -7,7 +7,7 @@ import {JobWorkspace} from "../job-workspace.js";
 import {workspaceJobId,processGroups,type WorkerObservation} from "../job-handoff.js";
 import {jobProgressPath,workspaceFromJob} from "../job-prompt.js";
 import type {JobRow} from "../types.js";
-import {RuntimeClient} from "./client.js";
+import {RuntimeClient,RuntimeResponseError} from "./client.js";
 
 import type {AgentRecord} from "./store.js";
 import {processes} from "./process.js";
@@ -31,7 +31,10 @@ export class AppServerAgentClient implements HerdrClient {
   async submit(text:string,key?:string):Promise<HerdrCommandResult>{
     if(!key)return result(null,"runtime_operation_key_required");
     let receipt:{turnId:string};
-    try{receipt=await this.client.prompt(this.name,key,text);}catch{return result(null,"steer_acceptance_unknown");}
+    try{receipt=await this.client.prompt(this.name,key,text);}catch(error){
+      const unsent=(error instanceof RuntimeResponseError&&error.status===409&&error.code==="runtime_not_ready")||["ECONNREFUSED","ENOENT"].includes((error as NodeJS.ErrnoException).code??"");
+      return result(null,unsent?"agent_not_running":"steer_acceptance_unknown");
+    }
     // 受理済みreceiptを、その後のstatus照会失敗で受付不明へ戻さない。
     try{return {...result(await this.client.status(this.name)),ok:true};}
     catch{return {ok:true,stdout:JSON.stringify(receipt),stderr:"",exitCode:0,timedOut:false,aborted:false,agentStatus:"working"};}
@@ -54,9 +57,9 @@ export class AppServerJobRuntime implements JobAgentRuntime {
   private matchesSession(row:JobRow,agent:AgentRecord):boolean {
     if(!this.expectedSession)return true;
     const expected=this.expectedSession(row.job_id);
-    const legacy=JSON.parse(agent.config_json).legacyPaneId;
+    const legacy=JSON.parse(agent.config_json);
+    if(legacy.legacyPaneId)return expected===agent.thread_id||(expected===undefined&&agent.thread_id===null&&agent.state==="stopped"&&agent.request_hash==="legacy-stopped"&&agent.name===row.agent_name&&legacy.legacyWorkspaceId===row.herdr_workspace_id&&legacy.legacyPaneId===row.herdr_pane_id);
     if(expected===undefined)return false;
-    if(legacy)return expected===agent.thread_id;
     const identity=JSON.parse(expected) as unknown;
     return Array.isArray(identity)&&identity[0]===agent.generation&&(identity[1]===agent.thread_id||identity[1]===null);
   }
@@ -107,7 +110,7 @@ export class AppServerJobRuntime implements JobAgentRuntime {
     serverArgs.push("-c",`features.default_mode_request_user_input=${interactive}`);
     let agent:AgentRecord;
     try {agent=await this.client.start({attemptId:row.job_id,name:row.agent_name,role:"worker",cwd:row.workspace_path,release:path.resolve(import.meta.dirname,"../../.."),args:serverArgs,
-      threadConfig:{model:"gpt-6.1-sol",approvalsReviewer:"user",...(row.source==="dona_schedule"?{approvalPolicy:"never"}:{}),config:{"sandbox_workspace_write.writable_roots":writeRoots,"features.default_mode_request_user_input":interactive},developerInstructions:!interactive?"このjobには対話回答の経路がありません。native request_user_inputは使わず、承認済みscopeで進められない場合は不足情報をblocked Resultへ記録してください。":"あなたはDonaのworkerです。必要な質問はrequest_user_inputで親Donaへ送れます。hostが質問を親に届けるため、ユーザーへの直接連絡やSlack操作は行わないでください。回答を待つ間も独立した作業は進められます。質問待ちは失敗ではなく、質問のためにfailed Resultを公開しないでください。"}});
+      threadConfig:{model:"gpt-6.1-sol",approvalsReviewer:"user",...(!interactive?{approvalPolicy:"never"}:{}),config:{"sandbox_workspace_write.writable_roots":writeRoots,"features.default_mode_request_user_input":interactive},developerInstructions:!interactive?"このjobには対話回答の経路がありません。native request_user_inputは使わず、承認済みscopeで進められない場合は不足情報をblocked Resultへ記録してください。":"あなたはDonaのworkerです。必要な質問はrequest_user_inputで親Donaへ送れます。hostが質問を親に届けるため、ユーザーへの直接連絡やSlack操作は行わないでください。回答を待つ間も独立した作業は進められます。質問待ちは失敗ではなく、質問のためにfailed Resultを公開しないでください。"}});
     } catch(error) {
       // 接続前の失敗だけが未送信。応答喪失ではstartを再送せず、永続Attempt bindingを照合する。
       if(["ECONNREFUSED","ENOENT"].includes((error as NodeJS.ErrnoException).code??""))throw Error("runtime_start_not_sent");
@@ -130,7 +133,7 @@ export class AppServerJobRuntime implements JobAgentRuntime {
   }
   async closeAgent(name:string):Promise<HerdrCommandResult>{return this.cancel(name);}
   async cleanup(row:JobRow):Promise<HerdrCommandResult>{
-    if(row.source!=="dona_schedule"||workspaceFromJob(row).kind!=="scratch"||!["completed","failed","cancelled"].includes(row.status))throw Error("runtime_cleanup_scope_invalid");
+    if(row.source!=="dona_schedule"||workspaceFromJob(row).kind!=="scratch"||!(["completed","failed","cancelled"].includes(row.status)||(row.status==="needs_review"&&row.last_error_code==="workspace_cleanup_failed")))throw Error("runtime_cleanup_scope_invalid");
     const expected=path.join(this.config.jobsWorkspaceRoot,"scratch",workspaceJobId(row));
     const canonicalExpected=path.join(await fs.realpath(this.config.jobsWorkspaceRoot),"scratch",workspaceJobId(row));
     if(row.workspace_path!==expected||await fs.realpath(path.dirname(expected))!==path.dirname(canonicalExpected))throw Error("runtime_cleanup_path_invalid");
@@ -162,6 +165,6 @@ export class AppServerJobRuntime implements JobAgentRuntime {
         reason:"app_server_observed",observed_at:new Date().toISOString(),...tree};
     } catch{return unknown("runtime_query_failed");}
   }
-  async retireWorker(row:JobRow):Promise<void>{let agent:AgentRecord|null;try{agent=await this.client.status(row.agent_name);}catch{throw new WorkerStopNotSentError("runtime_stop_not_sent");}if(!agent||!this.matchesSession(row,agent)||agent.name!==row.herdr_pane_id)throw Error("runtime_identity_changed");await this.client.stop(agent.name,agent.generation);}
+  async retireWorker(row:JobRow):Promise<void>{let agent:AgentRecord|null;try{agent=await this.client.status(row.agent_name);}catch{throw new WorkerStopNotSentError("runtime_stop_not_sent");}if(!agent||!this.matchesSession(row,agent)||(agent.name!==row.herdr_pane_id&&JSON.parse(agent.config_json).legacyPaneId!==row.herdr_pane_id))throw Error("runtime_identity_changed");if(agent.state!=="stopped")await this.client.stop(agent.name,agent.generation);}
   async workerRetired(row:JobRow):Promise<boolean>{const agent=await this.client.status(row.agent_name);return !!agent&&this.matchesSession(row,agent)&&(agent.name===row.herdr_pane_id||JSON.parse(agent.config_json).legacyPaneId===row.herdr_pane_id)&&agent.state==="stopped";}
 }

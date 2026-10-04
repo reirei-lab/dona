@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {test} from "node:test";
+import {RuntimeResponseError} from "../src/app-server/client.js";
 import {PreparedWorkspaceCleanupError} from "../src/job-runtime.js";
 import {AppServerJobRuntime,AppServerAgentClient} from "../src/app-server/adapters.js";
 import type {AgentRecord} from "../src/app-server/store.js";
@@ -37,13 +38,13 @@ test("scratch continuationの作業ディレクトリ消失・symlinkを拒否�
 });
 
 for(const phase of ["accepted","no_thread","status_lost","not_sent"] as const)test(`worker start応答喪失の${phase}を分類し再送しない`,async()=>{
- const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath),runtime=new AppServerJobRuntime(config);
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath),runtime=new AppServerJobRuntime(config,true,undefined,()=>phase==="accepted");
  try{
   config.jobCommandTimeoutMs=5000;config.codexPath=path.join(root,"codex-stub");await fs.writeFile(config.codexPath,"#!/bin/sh\ncat >/dev/null\necho '[]'\n",{mode:0o700});
   const event=db.enqueue(eventEnvelope(phase)).row;
   const job=db.createJob({source_event_id:event.event_id,objective:"test",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
   let starts=0,agent:AgentRecord|null=null;
-  runtime.client.start=async input=>{assert.equal(input.threadConfig.approvalsReviewer,"user");starts++;agent={name:input.name,role:"worker",cwd:input.cwd,generation:"accepted",thread_id:phase==="no_thread"?null:"thread",config_json:JSON.stringify(input)} as AgentRecord;throw Object.assign(Error("lost"),phase==="not_sent"?{code:"ECONNREFUSED"}:{});};
+  runtime.client.start=async input=>{assert.equal(input.threadConfig.approvalsReviewer,"user");assert.equal(input.threadConfig.approvalPolicy,phase==="accepted"?undefined:"never");starts++;agent={name:input.name,role:"worker",cwd:input.cwd,generation:"accepted",thread_id:phase==="no_thread"?null:"thread",config_json:JSON.stringify(input)} as AgentRecord;throw Object.assign(Error("lost"),phase==="not_sent"?{code:"ECONNREFUSED"}:{});};
   runtime.client.status=async()=>{if(phase==="status_lost")throw Error("lost");return agent;};
   await assert.rejects(runtime.prepare(job),error=>{
    if(phase==="not_sent"){assert.match(String(error),/runtime_start_not_sent/);assert.equal(error instanceof PreparedWorkspaceCleanupError,false);}
@@ -94,5 +95,29 @@ test("interruptedをidle成功に変換せず、PIDなし停止receiptを停止�
   assert.equal((await client.get()).ok,false);assert.equal((await client.get()).errorCode,"runtime_turn_interrupted");
   const observation=await runtime.observeWorker({job_id:"job",agent_name:"worker",herdr_workspace_id:"worker",herdr_pane_id:"worker"} as JobRow);
   assert.equal(observation.state,"stopped");assert.deepEqual(observation.process_ids,[]);
+ }finally{await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("hostの確定未送信と受付不明・応答喪失を分離する",async()=>{
+ const client=new AppServerAgentClient("unused","main",100);
+ for(const [error,expected] of [
+  [new RuntimeResponseError("runtime_not_ready",409),"agent_not_running"],
+  [Object.assign(Error("refused"),{code:"ECONNREFUSED"}),"agent_not_running"],
+  [new RuntimeResponseError("runtime_acceptance_unknown",409),"steer_acceptance_unknown"],
+  [Object.assign(Error("lost"),{code:"ECONNRESET"}),"steer_acceptance_unknown"]
+ ] as const){client.client.prompt=async()=>{throw error;};assert.equal((await client.submit("作業","key")).errorCode,expected);}
+});
+
+for(const hasSession of [true,false])test(`移行済みscheduleの${hasSession?"保存session":"session不明の停止receipt"}を使いcleanup失敗から回復する`,async()=>{
+ const {root,config}=await tempConfig(),runtime=new AppServerJobRuntime(config,true,()=>hasSession?"old-thread":undefined);
+ const jobId="job_"+"0".repeat(26),workspace=path.join(config.jobsWorkspaceRoot,"scratch",jobId);
+ const row={job_id:jobId,source:"dona_schedule",status:"needs_review",last_error_code:"workspace_cleanup_failed",agent_name:"worker",herdr_workspace_id:"old-workspace",herdr_pane_id:"old-pane",workspace_path:workspace,workspace_json:JSON.stringify({kind:"scratch"})} as JobRow;
+ const agent={name:"worker",generation:"migrated",thread_id:hasSession?"old-thread":null,state:"stopped",request_hash:"legacy-stopped",config_json:JSON.stringify({legacyWorkspaceId:"old-workspace",legacyPaneId:"old-pane"})} as AgentRecord;
+ runtime.client.status=async()=>agent;runtime.client.stop=async()=>{throw Error("stopped generation must not receive stop again");};
+ try{
+  await fs.mkdir(workspace,{recursive:true});await fs.writeFile(path.join(workspace,"input"),"test");
+  await assert.rejects(runtime.cleanup({...row,last_error_code:"invalid_result"}),/scope_invalid/);
+  await assert.rejects(runtime.cleanup({...row,herdr_pane_id:"wrong"}),/identity_changed/);assert.equal(await fs.readFile(path.join(workspace,"input"),"utf8"),"test");
+  assert.equal((await runtime.cleanup(row)).ok,true);await assert.rejects(fs.stat(workspace),{code:"ENOENT"});
  }finally{await fs.rm(root,{recursive:true,force:true});}
 });
