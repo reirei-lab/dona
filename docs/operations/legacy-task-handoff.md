@@ -6,7 +6,7 @@
 
 停止・移行を依頼されたoperatorだけが実行する。Dona親やworkerにrecord作成を委任しない。
 
-1. 外部CLI `offline_update.py prepare --fresh-generation`で準備・実行した切替runの`succeeded`、停止したprocess identity、再生成抑止、新世代の起動と旧4DB backupを確認する。外部daemon・リモート処理の未確定な副作用は別に棚卸しする。記録は全外部処理の停止証明ではない。
+1. 外部CLI `offline_update.py prepare --fresh-generation`で準備・実行した切替runの`succeeded`、停止したprocess identity、再生成抑止、新世代の起動と旧構成に対応する4/5 DBのbackupを確認する。外部daemon・リモート処理の未確定な副作用は別に棚卸しする。記録は全外部処理の停止証明ではない。
 2. GitHubからProject/item、Issue node ID、旧Job IDを取得し、旧worktree・既存PR・履歴を照合する。repo移転前のdirectory名だけでrepositoryを決めない。
 3. `Dona Task ID` TEXT fieldと必要なStatus optionsを確認し、設定変更が許可された依頼なら欠落fieldを作成・read-backする。旧Job IDやStatusを一括clearしない。
 4. 照合済みの値を使い記録する。入力例のplaceholderは実値へ置き換える。
@@ -41,6 +41,8 @@ operator記録は同じdirectoryのprivate一時ファイルをfsyncしてから
 準備と実行の間に別のoffline更新が完了した場合、古いrunはowner照合で拒否され、現在の履歴を変更しない。最新状態から別runを準備する。同じrunの中断再開はそのまま利用できる。
 
 既存の引継ぎ記録は、記録したfresh cutoverを起点にする。以後のpreserve更新と正規の復旧は追跡するが、別のfresh cutoverをまたぐ自動再利用はしない。Taskの担当履歴が再び空になるため、途中で進んだTask・PR・新しいworktreeとProjectのTask IDも外部operatorが棚卸しする。必要な記録は旧記録を監査用に別途保全してから、新しい切替と最新成果へ照合し直す。旧世代の最初のworktreeだけを最新成果とみなさない。
+
+App Server導入後のfresh切替では、runtimeを含む4サービスの停止記録と、更新元の構成に対応する4/5 DBのbackupを照合する。現設定はLaunchAgentの実引数からruntime設定を読み、DB/socketの保存先と稼働process identityも確認する。
 
 DB backupに加え、Result snapshotもdirectoryの存在状態と保存したtree hashで再検証する。preserve/復旧の正規履歴に固定回数の上限は設けず、同じcanonical runの再訪を循環として拒否する。
 
