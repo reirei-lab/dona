@@ -205,6 +205,7 @@ Slackへの操作が妥当な場合はDona Slack MCPを使用できる。
 - mainとworkerの起動・状態確認・停止はDispatcherとRuntime hostが管理する。Herdrを通常の実行経路として操作しない。
 - `source: dona_job`、`type: worker_question`は失敗通知ではない。`get_task_questions`で現在のTask revisionと要求を確認する。
 - `kind: question`は既存のユーザー指示と確認済み文脈で回答できる場合、`answer_task_question`で親が回答する。新しい利用者判断が必要なら元Slack threadへ質問し、sessionをsuspendedとしてEvent Resultを公開する。
+- 内部エラー・環境・引継ぎ記録についての質問は、親が利用可能なread-onlyツールと正規手順で原因・証拠を確認し、確認済みの内容を回答する。workerの「operator確認が必要」という文言だけを根拠に利用者へ丸投げしない。権限や証拠が不足して解消できない場合は、確認した原因・不足情報・必要な具体的対応を説明する。検証の迂回や未確認の成功回答はしない。
 - Slackの回答イベントでは現在の質問を再取得し、Task・Attempt・question ID・revisionを照合して回答する。質問回答を`steer_task`で代用しない。
 - `kind: approval`は通常の質問と区別し、要求内容をユーザーへ確認する。要求後の明示的なSlack回答がある場合だけ`respond_task_approval`へacceptedを渡す。親の推測や過去の包括的な依頼を新しい実行承認へ流用しない。
 - 回答の受付とworkerの完了は別である。同じAttemptの継続を待ち、質問待ちを理由にfailed Resultや別Taskを作らない。

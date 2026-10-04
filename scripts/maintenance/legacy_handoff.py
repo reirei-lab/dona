@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import plistlib
 from pathlib import Path
 import re
 import shlex
@@ -146,6 +147,20 @@ def database_identities(paths):
     return identities
 
 
+def runtime_database(plan, run):
+    # 当時の封印済み起動構成で判定する。現在のfile存在や配列長から世代を推測しない。
+    if 'plists_seal' not in plan:
+        return None  # runtime導入前の旧形式。
+    directory = run/'plists'
+    require(maintenance.tree_seal(directory) == plan['plists_seal'], 'offline_lineage_plists_changed')
+    file = directory/(offline.RUNTIME_LABEL+'.plist')
+    if not file.exists():
+        return None
+    value = plistlib.loads(maintenance.regular(file).read_bytes())
+    require(value.get('Label') == offline.RUNTIME_LABEL, 'runtime_plist_identity')
+    return str(Path(plan['generation'])/'control/runtime.sqlite3')
+
+
 def expected_storage(seed_run, owner_path=None, lineage=None):
     owner = read(owner_path or Path.home()/'.dona-maintenance/offline-active.json')
     chain, seen = [], set()
@@ -160,7 +175,7 @@ def expected_storage(seed_run, owner_path=None, lineage=None):
         require(journal['phase'] in ('succeeded', 'rolled_back', 'aborted') and
                 (not journal.get('source_recreation_detected') or
                  (journal['phase'] == 'rolled_back' and offline.recreation_reconciled(journal))), 'offline_lineage_not_terminal')
-        chain.append((plan, inventory, journal['phase']))
+        chain.append((plan, inventory, journal['phase'], run))
         if lineage is not None:
             lineage.append((plan, inventory))
         if run == Path(seed_run).resolve():
@@ -168,17 +183,27 @@ def expected_storage(seed_run, owner_path=None, lineage=None):
             generation = Path(plan['generation'])
             paths = [str(generation/name) for name in ('dona.sqlite3', 'update-notifications.sqlite3', 'job-progress.sqlite3', 'control/updater.sqlite3')]
             results = [str(generation/name) for name in ('results', 'job-results')]
-            roots = [generation] * 6
-            for descendant, source, phase in reversed(chain[:-1]):
+            database_roots = [generation] * 4
+            runtime = runtime_database(plan, run)
+            if runtime:
+                paths.append(runtime)
+                database_roots.append(generation)
+            for descendant, source, phase, descendant_run in reversed(chain[:-1]):
                 require(source['databases'] == paths and source['old_results'] == results, 'offline_lineage_storage_mismatch')
-                # 正規の復旧・中止は更新元の4DBを維持する。次回成功runからもたどれる。
+                # 正規の復旧・中止はruntimeを含め更新元のDBを維持する。次回成功runからもたどれる。
                 if phase == 'succeeded':
                     require(descendant.get('mode') != 'fresh_generation', 'new_fresh_cutover_requires_inventory')
                     require(descendant.get('mode') == 'preserve', 'offline_lineage_storage_mismatch')
                     next_root = Path(descendant['generation'])
                     paths = paths[:3] + [str(next_root/'control/updater.sqlite3')]
-                    roots[3] = next_root
-            return paths, results, roots
+                    database_roots = database_roots[:3] + [next_root]
+                    next_runtime = runtime_database(descendant, descendant_run)
+                    require(runtime is None or next_runtime is not None, 'offline_lineage_runtime_removed')
+                    runtime = next_runtime
+                    if runtime:
+                        paths.append(runtime)
+                        database_roots.append(next_root)
+            return paths, results, database_roots + [generation] * 2
         owner = plan.get('previous_offline_run')
         require(isinstance(owner, dict), 'offline_lineage_missing')
 
@@ -216,6 +241,7 @@ def verify_result_directories(current, old):
 def verify_no_recreation(run, workspace):
     old = read(run/'inventory.json')
     current = maintenance.inventory(require_running=True)
+    offline.include_runtime_inventory(current)
     require(current['old_pointer'] != old['old_pointer'], 'old_release_restored')
     lineage = []
     databases, results, roots = expected_storage(run, lineage=lineage)

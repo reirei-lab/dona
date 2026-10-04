@@ -361,14 +361,8 @@ def probe_main(run, plan):
     require({row['server'] for row in results if row.get('initialized')} == {'dispatcher','slack'}, 'mcp_probe_failed')
 
 
-def prepare(run, repository, fresh_generation=False):
-    require(not run.exists(), 'run_already_exists')
-    common.private_dir(run.parent)
-    run.mkdir(mode=0o700)
-    for name in ('offline_update.py', 'reset_upgrade.py', 'main_bridge.mjs', 'offline_state.mjs'):
-        atomic(run/name, Path(__file__).with_name(name).read_bytes())
-    progress('設定を確認しています（サービス停止中でも準備できます）。')
-    inv = common.inventory(require_running=False)
+def include_runtime_inventory(inv):
+    """現行runtimeの保存先を通常4DBのinventoryへ追加する（read-only）。"""
     runtime_plist = Path.home()/'Library/LaunchAgents'/(RUNTIME_LABEL+'.plist')
     if runtime_plist.exists():
         data = common.regular(runtime_plist).read_bytes()
@@ -379,6 +373,17 @@ def prepare(run, repository, fresh_generation=False):
         runtime_database = Path(inv['policy']['control_root'])/'runtime.sqlite3'
         require(runtime_database.exists(), 'runtime_database_missing')
         inv['databases'].append(str(runtime_database))
+
+
+def prepare(run, repository, fresh_generation=False):
+    require(not run.exists(), 'run_already_exists')
+    common.private_dir(run.parent)
+    run.mkdir(mode=0o700)
+    for name in ('offline_update.py', 'reset_upgrade.py', 'main_bridge.mjs', 'offline_state.mjs'):
+        atomic(run/name, Path(__file__).with_name(name).read_bytes())
+    progress('設定を確認しています（サービス停止中でも準備できます）。')
+    inv = common.inventory(require_running=False)
+    include_runtime_inventory(inv)
     atomic(run/'inventory.json', encode(inv))
     executables = inv['policy']['executables']
     git = executables['git']
