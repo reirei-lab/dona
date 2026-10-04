@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 
 export type RpcId = string | number;
 export interface RpcMessage { id?: RpcId; method?: string; params?: unknown; result?: unknown; error?: {code:number;message:string} }
+export class RpcSpawnFailure extends Error {}
 export class RpcFailure extends Error {
   constructor(message:string,readonly acceptance:"not_sent"|"rejected"|"unknown",readonly code?:number) {super(message);}
 }
@@ -10,6 +11,7 @@ export class RpcFailure extends Error {
 /** 一つのApp Serverへの持続接続。request IDは接続世代の外で再利用しない。 */
 export class AppServerRpc extends EventEmitter {
   readonly child: ChildProcessWithoutNullStreams;
+  private spawnResult:Promise<boolean>;
   private sequence=0;
   private buffer="";
   private ended=false;
@@ -17,7 +19,9 @@ export class AppServerRpc extends EventEmitter {
 
   constructor(executable:string,args:readonly string[],cwd:string,env:NodeJS.ProcessEnv=process.env) {
     super();
-    this.child=spawn(executable,[...args,"app-server","--stdio"],{cwd,env,stdio:["pipe","pipe","pipe"],detached:true});
+    try {this.child=spawn(executable,[...args,"app-server","--stdio"],{cwd,env,stdio:["pipe","pipe","pipe"],detached:true});}
+    catch {throw new RpcSpawnFailure("runtime_spawn_failed");}
+    this.spawnResult=new Promise(resolve=>{this.child.once("spawn",()=>resolve(true));this.child.once("error",()=>resolve(false));});
     this.child.stdout.setEncoding("utf8");
     this.child.stdout.on("data",(chunk:string)=>this.consume(chunk));
     // stderrは秘密情報を含み得る。詰まりを防ぐため消費するが通知本文へ転記しない。
@@ -27,6 +31,8 @@ export class AppServerRpc extends EventEmitter {
     this.child.once("close",()=>this.disconnected());
     this.child.stdin.on("error",()=>this.disconnected());
   }
+
+  async confirmSpawn():Promise<void>{if(!await this.spawnResult)throw new RpcSpawnFailure("runtime_spawn_failed");}
 
   async initialize():Promise<void> {
     await this.request("initialize",{clientInfo:{name:"dona-runtime",version:"1.0.0"},capabilities:{experimentalApi:true}},30_000);

@@ -420,3 +420,23 @@ test("start応答と直後のstatus喪失でも、後日のAttempt照合を永�
   assert.throws(()=>f.db.reconcileJobPreparationRuntime(job.job_id,"w","p","other"),/identity_changed/);
  }finally{await f.dispose();}
 });
+
+test("process未生成の停止receiptを確認してTaskを引継ぎ、空のunknown証拠は拒否する",async()=>{
+ const f=await fixture();try{
+  f.start();f.interrupt();const t=f.db.tasks.get(f.task.task_id)!;
+  assert.throws(()=>f.db.tasks.claimStop(t,{state:"unknown",reason:"none",observed_at:new Date().toISOString(),process_ids:[],process_groups:[]}),/evidence_missing/);
+  f.setObserved({state:"stopped",process_ids:[],process_groups:[]});f.setStopped(true);
+  await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,2);assert.equal(f.sends(),0);
+ }finally{await f.dispose();}
+});
+
+test("質問回答後の失敗turnをrunningへ戻さず利用上限の解除を待つ",async()=>{
+ const f=await fixture();try{
+  f.start();f.db.markJobNeedsReview(f.task.current_attempt_id,"runtime_question_pending","question");
+  f.runtime.questions=async()=>[];
+  f.runtime.get=async()=>({ok:false,stdout:"",stderr:"runtime_turn_interrupted",exitCode:1,timedOut:false,aborted:false,agentStatus:"idle",errorCode:"runtime_turn_interrupted"});
+  f.runtime.recoveryHint=async()=>({reason:"capacity_wait",retry_after:new Date(Date.now()+3600000).toISOString()});
+  await f.supervisor().reconcileTasks();const t=f.db.tasks.get(f.task.task_id)!;
+  assert.equal(t.state,"waiting");assert.equal(t.wait_reason,"capacity_wait");assert.equal(t.attempt_number,1);assert.equal(f.sends(),0);
+ }finally{await f.dispose();}
+});

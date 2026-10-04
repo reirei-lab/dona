@@ -1,7 +1,7 @@
 import { createHash,randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { AppServerRpc,type RpcMessage,RpcFailure } from "./rpc.js";
+import { AppServerRpc,type RpcMessage,RpcFailure,RpcSpawnFailure } from "./rpc.js";
 import {stableStringify} from "../validation.js";
 import { RuntimeStore,type AgentRecord,type QuestionRecord } from "./store.js";
 import { identity,processes,same,stopScope,type ProcessIdentity } from "./process.js";
@@ -17,6 +17,8 @@ export class AppServerManager {
   private queues=new Map<string,Promise<unknown>>();
   private recoveryAfter=new Map<string,number>();
   constructor(readonly store:RuntimeStore,private readonly factory:RpcFactory) {
+    store.db.exec("CREATE TABLE IF NOT EXISTS main_readiness(agent TEXT PRIMARY KEY,generation TEXT NOT NULL)");
+    store.db.exec("CREATE TABLE IF NOT EXISTS turn_outcomes(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,state TEXT NOT NULL)");
     store.db.exec("CREATE TABLE IF NOT EXISTS main_recoveries(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,input_json TEXT NOT NULL)");
     store.db.exec("CREATE TABLE IF NOT EXISTS recovery_hints(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,reason TEXT NOT NULL,retry_after TEXT)");
     store.db.exec("CREATE TABLE IF NOT EXISTS stops(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,processes_json TEXT NOT NULL,state TEXT NOT NULL)");
@@ -42,9 +44,20 @@ export class AppServerManager {
       const row:AgentRecord={name:input.name,generation:randomUUID(),role:input.role,cwd:input.cwd,release:input.release,
         thread_id:input.role==="worker"?(prior?.thread_id??null):null,turn_id:null,pid:null,process_start:null,state:"starting",request_hash:requestHash,config_json:JSON.stringify(input),sequence:0};
       this.store.put(row);
-      const rpc=this.factory(input.args,input.cwd);this.connections.set(input.name,rpc);
+      let rpc:AppServerRpc;
+      try {
+        rpc=this.factory(input.args,input.cwd);this.connections.set(input.name,rpc);
+        // PIDなしの非同期spawn errorだけを待つ。PIDがある場合はawait前にidentityを保存する。
+        if(!rpc.child.pid)await rpc.confirmSpawn();
+      }catch(error){
+        if(error instanceof RpcSpawnFailure)this.store.db.transaction(()=>{
+          this.store.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopped') ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,processes_json=excluded.processes_json,state='stopped'").run(row.name,row.generation,"[]");
+          this.store.change(row.name,row.generation,{state:"stopped",turn_id:null});this.connections.delete(row.name);
+        }).immediate();
+        throw error;
+      }
       // spawn直後のPIDを他のawaitより前に保存する。開始identityが取得できなければ準備は未確定。
-      const pid=rpc.child.pid;if(!pid)throw Error("runtime_spawn_failed");
+      const pid=rpc.child.pid;if(!pid)throw Error("runtime_spawn_identity_missing");
       const processIdentity=identity(pid);if(!processIdentity)throw Error("runtime_process_identity_missing");
       row.pid=pid;row.process_start=processIdentity.start;this.store.put(row);
       rpc.on("request",(message:RpcMessage)=>this.onRequest(row,message));
@@ -65,6 +78,7 @@ export class AppServerManager {
   }
   status(name:string):AgentRecord|undefined {
     const row=this.store.agent(name);if(!row)return;
+    if(row.role==="main")row.startup_ready=!!this.store.db.prepare("SELECT 1 FROM main_readiness WHERE agent=? AND generation=?").get(row.name,row.generation);
     const hint=this.store.db.prepare("SELECT reason,retry_after FROM recovery_hints WHERE agent=? AND generation=?").get(name,row.generation) as {reason:"capacity_wait"|"authorization_required"|"configuration_error";retry_after:string|null}|undefined;
     if(hint)row.recovery_hint={reason:hint.reason,...(hint.retry_after?{retry_after:hint.retry_after}:{})};
     if(row.state==="stopped") {
@@ -123,18 +137,24 @@ export class AppServerManager {
     }
     if(p.threadId!==row.thread_id)return;
     if(message.method==="turn/started") {
-      const turn=object(p.turn);if(typeof turn.id==="string")this.store.change(agent.name,agent.generation,{turn_id:turn.id,state:"working"});
+      const turn=object(p.turn);if(typeof turn.id==="string"){
+        this.store.db.prepare("DELETE FROM turn_outcomes WHERE agent=? AND generation=?").run(agent.name,agent.generation);
+        this.store.change(agent.name,agent.generation,{turn_id:turn.id,state:"working"});
+      }
     } else if(message.method==="turn/completed") {
       const turn=object(p.turn);if(turn.id!==row.turn_id)return;
+      if(row.role==="main"&&turn.status==="completed")this.store.db.prepare("INSERT INTO main_readiness VALUES(?,?) ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation").run(row.name,row.generation);
       const code=object(turn.error).codexErrorInfo;
       const reason=["usageLimitExceeded","rateLimitExceeded","flexUnavailable","serverOverloaded"].includes(String(code))?"capacity_wait":code==="unauthorized"?"authorization_required":["badRequest","sandboxError","cyberPolicy","misalignmentPolicyViolation","tooManyDenials"].includes(String(code))?"configuration_error":undefined;
       if(reason)this.store.db.prepare("INSERT INTO recovery_hints VALUES(?,?,?,?) ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,reason=excluded.reason,retry_after=excluded.retry_after").run(agent.name,agent.generation,reason,reason==="capacity_wait"?(this.resets.get(agent.name)??new Date(Date.now()+900_000).toISOString()):null);
+      this.store.db.prepare("INSERT INTO turn_outcomes VALUES(?,?,?) ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,state=excluded.state").run(agent.name,agent.generation,turn.status==="completed"?"idle":"interrupted");
       // 非同期質問はturnが完了しても未解決であり得る。serverRequest/resolvedを終端証拠にする。
       this.store.change(agent.name,agent.generation,{turn_id:null,state:this.store.questions(agent.name).length?"waiting":turn.status==="completed"?"idle":"interrupted"});
     } else if(message.method==="serverRequest/resolved") {
       this.store.db.prepare("UPDATE questions SET state=CASE WHEN state='answering' THEN 'resolved' ELSE 'expired' END WHERE agent=? AND generation=? AND rpc_id_json=? AND state IN ('pending','answering')")
         .run(agent.name,agent.generation,JSON.stringify(p.requestId));
-      if(this.store.questions(agent.name).length===0)this.store.change(agent.name,agent.generation,{state:row.turn_id?"working":"idle"});
+      const terminal=this.store.db.prepare("SELECT state FROM turn_outcomes WHERE agent=? AND generation=?").get(agent.name,agent.generation) as {state:"idle"|"interrupted"}|undefined;
+      if(this.store.questions(agent.name).length===0)this.store.change(agent.name,agent.generation,{state:row.turn_id?"working":terminal?.state??"idle"});
     }
   }
   async prompt(name:string,key:string,text:string):Promise<unknown> {

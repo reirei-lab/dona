@@ -4,7 +4,7 @@ import path from "node:path";
 import type {UpdatePolicy} from "./policy.js";
 import type {MainAgentObservation,MainAgentStartResult,MainAgentStopResult} from "./types.js";
 
-interface RuntimeAgent {name:string;generation:string;thread_id:string|null;state:string;cwd:string;release:string;}
+interface RuntimeAgent {name:string;generation:string;thread_id:string|null;state:string;cwd:string;release:string;startup_ready?:boolean;}
 const absent=(code:string):MainAgentObservation=>({exists:false,name:null,kind:null,pane_id:null,status:null,interactive_ready:false,working_directory:null,session_id:null,matches_release:false,error_code:code});
 const delay=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
 
@@ -23,7 +23,7 @@ export class AppServerMain {
    const agent=await this.call<RuntimeAgent|null>("status",{name:this.policy.main_agent.name});
    if(!agent||agent.state==="stopped")return absent("agent_not_running");
    if(!["idle","working","waiting"].includes(agent.state)||!agent.thread_id)return absent("runtime_observation_unknown");
-   return {exists:true,name:agent.name,kind:"codex",pane_id:agent.name,status:agent.state==="waiting"?"blocked":agent.state==="working"?"working":"idle",interactive_ready:true,
+   return {exists:true,name:agent.name,kind:"codex",pane_id:agent.name,status:agent.state==="waiting"?"blocked":agent.state==="working"?"working":"idle",interactive_ready:agent.startup_ready===true,
     working_directory:agent.cwd,session_id:agent.generation,matches_release:release===undefined||agent.release===release,error_code:null};
   }catch{return absent("runtime_observation_unknown");}
  }
@@ -43,23 +43,25 @@ export class AppServerMain {
   }catch{return {outcome:"accepted_unknown",pane_id:current.pane_id,error_code:"main_agent_stop_unknown"};}
  }
  async start(name:string,release:string,previous?:string):Promise<MainAgentStartResult> {
+  let sent=false;
   try {
    if(name!==this.policy.main_agent.name)throw Error();
    const [canonical,root,configStat]=await Promise.all([fs.realpath(release),fs.realpath(this.policy.release_root),fs.lstat(this.policy.config_root)]);
    if(canonical!==release||path.dirname(canonical)!==root||!/^[a-f0-9]{40}$/.test(path.basename(canonical))||configStat.isSymbolicLink()||configStat.uid!==process.getuid?.()||(configStat.mode&0o077))throw Error();
    for(const file of ["dispatcher.env","slack.env","mcp-dispatcher.mjs","mcp-slack.mjs"]){const stat=await fs.lstat(path.join(this.policy.config_root,file));if(!stat.isFile()||stat.isSymbolicLink()||stat.uid!==process.getuid?.()||(stat.mode&0o077))throw Error();}
-   const args=["-c","features.default_mode_request_user_input=false","-c",`projects = { ${JSON.stringify(release)} = { trust_level = "trusted" } }`,"-c",'model_reasoning_effort="low"'];
+   const args=["-c","check_for_update_on_startup=false","-c","features.default_mode_request_user_input=false","-c",`projects = { ${JSON.stringify(release)} = { trust_level = "trusted" } }`,"-c",'model_reasoning_effort="low"'];
    for(const [server,file] of [["dona_dispatcher","dispatcher"],["dona_slack","slack"]]) {
     for(const [key,value] of Object.entries({command:this.policy.executables.node,args:[path.join(this.policy.config_root,`mcp-${file}.mjs`)],cwd:this.policy.config_root,required:true,enabled:true}))args.push("-c",`mcp_servers.${server}.${key}=${JSON.stringify(value)}`);
    }
-   const agent=await this.call<RuntimeAgent>("start",{input:{name,role:"main",cwd:release,release,args,threadConfig:{model:"gpt-6.1-sol",approvalsReviewer:"auto_review",config:{"features.default_mode_request_user_input":false},developerInstructions:"あなたはDona mainです。ユーザーへの質問はSlack MCPで元threadへ投稿し、Event Resultを公開してください。回答は次のSlack eventとして届きます。native request_user_inputは使用しません。workerからの質問はget_task_questions/answer_task_questionで処理し、分かることは親として回答してください。"}}});
+   sent=true;
+   const agent=await this.call<RuntimeAgent>("start",{input:{name,role:"main",cwd:release,release,args,threadConfig:{model:"gpt-6.1-sol",approvalsReviewer:"user",config:{"features.default_mode_request_user_input":false},developerInstructions:"あなたはDona mainです。ユーザーへの質問はSlack MCPで元threadへ投稿し、Event Resultを公開してください。回答は次のSlack eventとして届きます。native request_user_inputは使用しません。workerからの質問はget_task_questions/answer_task_questionで処理し、分かることは親として回答してください。"}}});
    await this.call("prompt",{name,key:`startup:${agent.generation}`,text:"起動確認です。外部操作、ファイル変更、プロセス操作は行わず、READYとだけ返してください。"});
    const deadline=Date.now()+this.policy.timeouts.agent_start_ms;
    let observation=await this.status(release);
    while(observation.status==="working"&&Date.now()<deadline){await delay(100);observation=await this.status(release);}
    const finished=await this.call<RuntimeAgent>("status",{name});
-   if(finished.state!=="idle"||agent.generation===previous||!observation.exists||!observation.matches_release||observation.status!=="idle")throw Error();
+   if(finished.state!=="idle"||agent.generation===previous||!observation.exists||!observation.interactive_ready||!observation.matches_release||observation.status!=="idle")throw Error();
    return {outcome:"started",observation,error_code:null};
-  }catch{return {outcome:"accepted_unknown",observation:await this.status(release),error_code:"main_agent_start_unknown"};}
+  }catch{return sent?{outcome:"accepted_unknown",observation:await this.status(release),error_code:"main_agent_start_unknown"}:{outcome:"rejected",observation:absent("main_agent_start_validation_failed"),error_code:"main_agent_start_validation_failed"};}
  }
 }

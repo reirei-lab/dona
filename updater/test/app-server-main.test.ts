@@ -12,22 +12,29 @@ test("App Server mainを新generationで起動し、照合済みidleだけ停止
  await fs.mkdir(policy.control_root,{recursive:true,mode:0o700});await fs.mkdir(policy.config_root,{recursive:true,mode:0o700});
  for(const file of ["dispatcher.env","slack.env","mcp-dispatcher.mjs","mcp-slack.mjs"])await fs.writeFile(path.join(policy.config_root,file),"",{mode:0o600});
  const release=await fs.realpath(await installRelease(policy,targetSha));
- let agent={name:"dona-main",generation:"new",thread_id:"thread",state:"idle",cwd:release,release};
- let startupFails=false;let stopCount=0;const starts:Array<Record<string,unknown>>=[];
+ let agent={name:"dona-main",generation:"new",thread_id:"thread",state:"idle",startup_ready:false,cwd:release,release};
+ let startupFails=false,loseStart=false;let stopCount=0;const starts:Array<Record<string,unknown>>=[];
  const server=http.createServer(async(req,res)=>{
   let data="";for await(const part of req)data+=part;const p=JSON.parse(data);
-  if(p.action==="start"){starts.push(p.input);agent={...agent,state:"idle"};}
-  if(p.action==="prompt"&&startupFails)agent={...agent,state:"interrupted"};
+  if(p.action==="start"){starts.push(p.input);agent={...agent,state:"idle",startup_ready:false};if(loseStart){res.destroy();return;}}
+  if(p.action==="prompt")agent={...agent,state:startupFails?"interrupted":"idle",startup_ready:!startupFails};
   if(p.action==="stop"){assert.equal(p.generation,agent.generation);stopCount++;agent={...agent,state:"stopped"};}
   res.setHeader("content-type","application/json");res.end(JSON.stringify({result:p.action==="prompt"?{turnId:"startup"}:agent}));
  });
  await new Promise<void>(resolve=>server.listen(path.join(policy.control_root,"runtime.sock"),resolve));
  try{
   const main=new AppServerMain(policy),started=await main.start("dona-main",release,"old");assert.equal(started.outcome,"started");
-  const input=starts[0]!;assert.equal(input.role,"main");assert.equal((input.threadConfig as {model:string}).model,"gpt-6.1-sol");
+  const input=starts[0]!;assert.equal(input.role,"main");assert.ok((input.args as string[]).includes("check_for_update_on_startup=false"));assert.equal((input.threadConfig as {approvalsReviewer:string}).approvalsReviewer,"user");assert.equal((input.threadConfig as {model:string}).model,"gpt-6.1-sol");
   const observation=await main.status(release);
   assert.equal((await main.stop({...observation,session_id:"stale"})).outcome,"rejected");assert.equal(stopCount,0);
   assert.equal((await main.stop(observation)).outcome,"stopped");assert.equal(stopCount,1);
+  const count=starts.length;
+  await fs.rm(path.join(policy.config_root,"mcp-slack.mjs"));
+  assert.equal((await main.start("dona-main",release,"old")).outcome,"rejected");assert.equal(starts.length,count);
+  await fs.writeFile(path.join(policy.config_root,"mcp-slack.mjs"),"",{mode:0o600});
+  assert.equal((await main.start("dona-main",release,"old")).outcome,"started");
+  loseStart=true;const lost=await main.start("dona-main",release,"old");assert.equal(lost.outcome,"accepted_unknown");assert.equal(lost.observation.interactive_ready,false);
+  assert.equal((await main.status(release)).interactive_ready,false);loseStart=false;
   startupFails=true;const failed=await main.start("dona-main",release,"old");assert.equal(failed.outcome,"accepted_unknown");
   assert.equal(failed.observation.interactive_ready,false);assert.notEqual(failed.observation.status,"idle");
   const reconciled=await main.status(release);assert.equal(reconciled.interactive_ready,false);assert.notEqual(reconciled.status,"idle");

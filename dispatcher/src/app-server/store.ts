@@ -7,6 +7,7 @@ export interface AgentRecord {
   thread_id:string|null; turn_id:string|null; pid:number|null; process_start:string|null;
   state:"starting"|"idle"|"working"|"waiting"|"interrupted"|"unknown"|"stopped";
   request_hash:string; config_json:string; sequence:number;
+  startup_ready?:boolean;
   recovery_hint?:{reason:"capacity_wait"|"authorization_required"|"configuration_error";retry_after?:string};
 }
 export interface QuestionRecord {

@@ -54,9 +54,18 @@ test("移行前にcrashしたrootはprocess groupも不在なら移行し、子�
  store.put({name:"crashed",generation:"g",role:"worker",cwd:root,release:root,thread_id:"t",turn_id:null,pid:live.group,process_start:"gone",state:"unknown",request_hash:"h",config_json:"{}",sequence:0});store.close();
  const receipt={processes:[{...live,start:"old"}],launch_agents:["dev.dona.dispatcher","dev.dona.updater","dev.dona.slack-adapter"],herdr_session:"dona",verified_at:new Date().toISOString()};
  try{
-  assert.throws(()=>migrateStoppedRuntime(file,runtime,receipt,root),/agent_stop_missing/);
+  assert.throws(()=>migrateStoppedRuntime(file,runtime,{...receipt,processes:[]},root),/agent_stop_missing/);
   const before=new RuntimeStore(runtime);const agent=before.agent("crashed")!;before.put({...agent,pid:2147483647});before.close();
-  migrateStoppedRuntime(file,runtime,receipt,root);
+  migrateStoppedRuntime(file,runtime,{...receipt,processes:[]},root);
   const after=new RuntimeStore(runtime);try{assert.equal(after.agent("crashed")?.state,"stopped");}finally{after.close();}
+ }finally{await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("全processが停止済みなら空のreceiptで旧worker履歴を保持して移行できる",async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-empty-migration-")),file=path.join(root,"dona.db"),runtime=path.join(root,"runtime.db");
+ const db=new Database(file);db.exec("CREATE TABLE jobs(job_id TEXT,agent_name TEXT,workspace_path TEXT,herdr_workspace_id TEXT,herdr_pane_id TEXT);CREATE TABLE job_live_session_identities(job_id TEXT,herdr_agent_session_id TEXT)");db.prepare("INSERT INTO jobs VALUES(?,?,?,?,?)").run("job","worker",root,"old","pane");db.close();
+ try{
+  migrateStoppedRuntime(file,runtime,{processes:[],launch_agents:["dev.dona.dispatcher","dev.dona.updater","dev.dona.slack-adapter"],herdr_session:"dona",verified_at:new Date().toISOString()},root);
+  const store=new RuntimeStore(runtime);try{const row=store.agent("worker")!;assert.equal(row.state,"stopped");assert.equal(row.pid,null);assert.equal((store.db.prepare("SELECT processes_json FROM stops").get() as {processes_json:string}).processes_json,"[]");}finally{store.close();}
  }finally{await fs.rm(root,{recursive:true,force:true});}
 });

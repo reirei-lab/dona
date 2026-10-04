@@ -151,12 +151,52 @@ for(const stopped of [false,true])test(`mainの復旧intentを${stopped?"停止�
  let manager=new AppServerManager(store,factory);
  try{
   const input={name:"dona-main",role:"main" as const,cwd:root,release:root,args:[],threadConfig:{}};
-  const old=await manager.start(input);
+  const old=await manager.start(input);assert.equal(manager.status(old.name)?.startup_ready,false);
   if(stopped){store.db.prepare("INSERT INTO main_recoveries VALUES(?,?,?)").run(old.name,old.generation,JSON.stringify(input));await manager.stop(old.name,old.generation);}
   manager=new AppServerManager(store,factory);await manager.recover();
-  const fresh=manager.status(old.name)!;assert.equal(fresh.state,"idle");assert.notEqual(fresh.generation,old.generation);
+  const fresh=manager.status(old.name)!;assert.equal(fresh.state,"idle");assert.notEqual(fresh.generation,old.generation);assert.equal(fresh.startup_ready,false);
   const {identity}=await import("../src/app-server/process.js");assert.ok(!identity(old.pid!)||identity(old.pid!)!.state.includes("Z"));
   await manager.stop(fresh.name,fresh.generation);
   manager=new AppServerManager(store,()=>{throw Error("intentional stop must not restart");});await manager.recover();assert.equal(manager.status(old.name)?.state,"stopped");
  }finally{const agent=store.agent("dona-main");if(agent&&agent.state!=="stopped")await manager.stop(agent.name,agent.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+for(const role of ["main","worker"] as const)for(const synchronous of [false,true])test(`${role}の${synchronous?"同期":"非同期"}spawn失敗を停止済みとして記録し同名で再起動できる`,async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-spawn-failure-")),script=path.join(root,"fake.mjs");await fs.writeFile(script,fake);
+ const store=new RuntimeStore(path.join(root,"runtime.db"));let fail=true;
+ const manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(fail?(synchronous?"":path.join(root,"missing-codex")):process.execPath,[script],cwd));
+ const input={name:"test",role,cwd:root,release:root,args:[],threadConfig:{}};
+ try{
+  await assert.rejects(manager.start(input),/runtime_spawn_failed/);
+  const failed=manager.status(input.name)!;assert.equal(failed.state,"stopped");assert.equal(failed.pid,null);
+  assert.equal((await manager.stop(failed.name,failed.generation)).state,"stopped");
+  fail=false;const active=await manager.start(input);assert.notEqual(active.generation,failed.generation);assert.equal(active.state,"idle");
+  await manager.stop(active.name,active.generation);
+ }finally{const row=store.agent(input.name);if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("非同期質問の背後で失敗したturnは、回答後もinterruptedと利用上限hintを保持する",async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-question-capacity-")),script=path.join(root,"fake.mjs");
+ await fs.writeFile(script,fake.replace("if(r.id==='question-1'&&r.result)","if(r.method==='turn/start')send({method:'turn/completed',params:{threadId:'thread-test',turn:{id:'turn-test',status:'failed',error:{codexErrorInfo:'usageLimitExceeded'}}}});\nif(r.id==='question-1'&&r.result)"));
+ const store=new RuntimeStore(path.join(root,"runtime.db")),manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));
+ try{
+  const agent=await manager.start({name:"worker",role:"worker",cwd:root,release:root,args:[],threadConfig:{}});
+  await manager.prompt(agent.name,"capacity-question","質問");await until(()=>store.questions(agent.name).length===1&&store.agent(agent.name)?.turn_id===null);
+  const q=store.questions(agent.name)[0]!;assert.equal(manager.status(agent.name)?.state,"waiting");
+  await manager.answer(agent.name,q.question_id,{choice:{answers:["A"]}});await until(()=>store.question(q.question_id)?.state==="resolved");
+  assert.equal(manager.status(agent.name)?.state,"interrupted");assert.equal(manager.status(agent.name)?.recovery_hint?.reason,"capacity_wait");
+  await manager.stop(agent.name,agent.generation);
+ }finally{const row=store.agent("worker");if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("mainのready証拠はそのgenerationの応答完了後だけ成立する",async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-main-ready-")),script=path.join(root,"fake.mjs");await fs.writeFile(script,fake.replace("if(r.id==='question-1'&&r.result)","if(r.id==='question-1'&&(r.result||r.error))"));
+ const store=new RuntimeStore(path.join(root,"runtime.db")),manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));
+ const input={name:"main",role:"main" as const,cwd:root,release:root,args:[],threadConfig:{}};
+ try{
+  const agent=await manager.start(input);assert.equal(manager.status(agent.name)?.startup_ready,false);
+  await manager.prompt(agent.name,"startup","READY");await until(()=>manager.status(agent.name)?.startup_ready===true);
+  await manager.stop(agent.name,agent.generation);const fresh=await manager.start(input);assert.notEqual(fresh.generation,agent.generation);assert.equal(manager.status(fresh.name)?.startup_ready,false);
+  await manager.stop(fresh.name,fresh.generation);
+ }finally{const row=store.agent(input.name);if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
 });

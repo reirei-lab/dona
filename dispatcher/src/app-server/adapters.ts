@@ -15,6 +15,7 @@ import {scheduledExecutablePaths,verifyScheduledSandbox} from "../scheduled-sand
 
 export function runtimeSocket(config:DispatcherConfig):string{return process.env.DONA_APP_SERVER_SOCKET??path.join(path.dirname(config.updaterSocketPath),"runtime.sock");}
 function result(row:AgentRecord|null,error?:string):HerdrCommandResult {
+  if(row?.state==="interrupted")error="runtime_turn_interrupted";
   const ok=!!row&&["idle","working","waiting","interrupted"].includes(row.state);
   if(row&&!["stopped","idle","working","waiting","interrupted"].includes(row.state))error="runtime_observation_unknown";
   const state=row?.state==="working"?"working":row?.state==="waiting"?"blocked":["idle","interrupted"].includes(row?.state??"")?"idle":"unknown";
@@ -106,7 +107,7 @@ export class AppServerJobRuntime implements JobAgentRuntime {
     serverArgs.push("-c",`features.default_mode_request_user_input=${interactive}`);
     let agent:AgentRecord;
     try {agent=await this.client.start({attemptId:row.job_id,name:row.agent_name,role:"worker",cwd:row.workspace_path,release:path.resolve(import.meta.dirname,"../../.."),args:serverArgs,
-      threadConfig:{model:"gpt-6.1-sol",approvalsReviewer:"auto_review",...(row.source==="dona_schedule"?{approvalPolicy:"never"}:{}),config:{"sandbox_workspace_write.writable_roots":writeRoots,"features.default_mode_request_user_input":interactive},developerInstructions:!interactive?"このjobには対話回答の経路がありません。native request_user_inputは使わず、承認済みscopeで進められない場合は不足情報をblocked Resultへ記録してください。":"あなたはDonaのworkerです。必要な質問はrequest_user_inputで親Donaへ送れます。hostが質問を親に届けるため、ユーザーへの直接連絡やSlack操作は行わないでください。回答を待つ間も独立した作業は進められます。質問待ちは失敗ではなく、質問のためにfailed Resultを公開しないでください。"}});
+      threadConfig:{model:"gpt-6.1-sol",approvalsReviewer:"user",...(row.source==="dona_schedule"?{approvalPolicy:"never"}:{}),config:{"sandbox_workspace_write.writable_roots":writeRoots,"features.default_mode_request_user_input":interactive},developerInstructions:!interactive?"このjobには対話回答の経路がありません。native request_user_inputは使わず、承認済みscopeで進められない場合は不足情報をblocked Resultへ記録してください。":"あなたはDonaのworkerです。必要な質問はrequest_user_inputで親Donaへ送れます。hostが質問を親に届けるため、ユーザーへの直接連絡やSlack操作は行わないでください。回答を待つ間も独立した作業は進められます。質問待ちは失敗ではなく、質問のためにfailed Resultを公開しないでください。"}});
     } catch(error) {
       // 接続前の失敗だけが未送信。応答喪失ではstartを再送せず、永続Attempt bindingを照合する。
       if(["ECONNREFUSED","ENOENT"].includes((error as NodeJS.ErrnoException).code??""))throw Error("runtime_start_not_sent");
@@ -149,7 +150,10 @@ export class AppServerJobRuntime implements JobAgentRuntime {
       if(!agent||!this.matchesSession(row,agent))return unknown("runtime_identity_missing");
       const legacy=JSON.parse(agent.config_json) as {legacyWorkspaceId?:string;legacyPaneId?:string;processGroups?:number[]};
       if(row.herdr_workspace_id!==(legacy.legacyWorkspaceId??agent.name)||row.herdr_pane_id!==(legacy.legacyPaneId??agent.name))return unknown("runtime_identity_missing");
-      if(!agent.pid)return unknown("runtime_observation_unknown");
+      if(!agent.pid){
+        if(agent.state==="stopped")return {state:"stopped",reason:"app_server_verified_empty_scope",observed_at:new Date().toISOString(),process_ids:[],process_groups:[]};
+        return unknown("runtime_observation_unknown");
+      }
       const sample=processes(),root=sample.find(p=>p.pid===agent.pid);
       if(agent.state!=="stopped"&&root&&root.start!==agent.process_start)return unknown("runtime_process_changed");
       const tree=agent.state==="stopped"?{process_ids:[agent.pid],process_groups:legacy.processGroups??[agent.pid]}:
