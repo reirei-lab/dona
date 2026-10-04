@@ -229,3 +229,13 @@ test("対話経路のないworkerの承認要求をpendingへ取り残さない"
   await manager.stop(agent.name,agent.generation);
  }finally{const row=store.agent("worker");if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+for(const method of ["item/commandExecution/requestApproval","item/fileChange/requestApproval","item/permissions/requestApproval"])test(`mainの${method}はDona MCP許可と分離して拒否する`,async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-main-denied-")),script=path.join(root,"fake.mjs");
+ await fs.writeFile(script,fake.replace("method:'item/tool/requestUserInput'",`method:'${method}'`).replace("if(r.id==='question-1'&&r.result){","if(r.id==='question-1'&&r.result)process.exit(9);\nif(r.id==='question-1'&&r.error){"));
+ const store=new RuntimeStore(path.join(root,"runtime.db")),manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));
+ try{
+  const agent=await manager.start({name:"main",role:"main",cwd:root,release:root,args:[],threadConfig:{approvalsReviewer:"user"}});
+  await manager.prompt(agent.name,"denied","OS承認");await until(()=>store.agent(agent.name)?.state==="idle");assert.equal(store.questions(agent.name).length,0);
+ }finally{const row=store.agent("main");if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
+});

@@ -26,6 +26,8 @@ test("App Server mainを新generationで起動し、照合済みidleだけ停止
  try{
   const main=new AppServerMain(policy),started=await main.start("dona-main",release,"old");assert.equal(started.outcome,"started");
   const input=starts[0]!;assert.equal(input.role,"main");assert.ok((input.args as string[]).includes("check_for_update_on_startup=false"));assert.equal((input.threadConfig as {approvalsReviewer:string}).approvalsReviewer,"user");assert.equal((input.threadConfig as {model:string}).model,"gpt-6.1-sol");
+  for(const server of ["dona_slack","dona_dispatcher"])assert.ok((input.args as string[]).includes(`mcp_servers.${server}.default_tools_approval_mode="approve"`));
+  assert.equal((input.args as string[]).filter(value=>value.includes("default_tools_approval_mode")).length,2);
   const observation=await main.status(release);
   assert.equal((await main.stop({...observation,session_id:"stale"})).outcome,"rejected");assert.equal(stopCount,0);
   assert.equal((await main.stop(observation)).outcome,"stopped");assert.equal(stopCount,1);

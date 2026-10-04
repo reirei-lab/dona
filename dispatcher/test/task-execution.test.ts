@@ -465,3 +465,12 @@ test("承認は通知後に取り込んだ所有者の返信だけを許可し�
   await supervisor.approveTaskRequest(f.task.task_id,after.event_id,revision,request.question_id,true);assert.equal(sent,1);
  }finally{await f.dispose();}
 });
+
+test("質問照合cursorは既通知pendingの次へ進み終端後に先頭へ戻る",async()=>{
+ const f=await fixture();try{
+  const received:Array<string|undefined>=[];const ids=["first","last"];let n=0;
+  f.runtime.pendingQuestions=async after=>{received.push(after);const id=ids[n++];return id?[{question_id:id,agent:"missing"} as import("../src/app-server/store.js").QuestionRecord]:[];};
+  const supervisor=f.supervisor();for(let i=0;i<4;i++)await supervisor.reconcileQuestions();
+  assert.deepEqual(received,[undefined,"first","last",undefined]);
+ }finally{await f.dispose();}
+});

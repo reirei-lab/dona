@@ -22,7 +22,7 @@ for(const signal of ["SIGINT","SIGTERM"] as const)process.once(signal,()=>{void 
 try {
  const args=["-c","check_for_update_on_startup=false","-c",`projects = { ${JSON.stringify(root)} = { trust_level = "trusted" } }`,"-c","features.default_mode_request_user_input=false","-c",'model_reasoning_effort="low"'];
  for(const [name,directory] of [["dona_dispatcher","dispatcher"],["dona_slack","sources/slack"]]) {
-  for(const [key,value] of Object.entries({command:process.execPath,args:[path.join(root,directory!,"dist/mcp/index.js")],cwd:path.join(root,directory!),enabled:true,required:true}))args.push("-c",`mcp_servers.${name}.${key}=${JSON.stringify(value)}`);
+  for(const [key,value] of Object.entries({command:process.execPath,args:[path.join(root,directory!,"dist/mcp/index.js")],cwd:path.join(root,directory!),enabled:true,required:true,default_tools_approval_mode:"approve"}))args.push("-c",`mcp_servers.${name}.${key}=${JSON.stringify(value)}`);
  }
  await client.start({name:config.agentName,role:"main",cwd:root,release:root,args,threadConfig:{model:"gpt-6.1-sol",approvalsReviewer:"user",developerInstructions:"Dona mainとしてAGENTS.mdに従う。ユーザーへの質問はSlack MCPを使い、native request_user_inputは使わない。"}});
  console.log("[runtime] App Serverとdona-mainがreadyになりました");

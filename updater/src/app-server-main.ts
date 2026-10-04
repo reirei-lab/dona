@@ -60,7 +60,7 @@ export class AppServerMain {
    for(const file of ["dispatcher.env","slack.env","mcp-dispatcher.mjs","mcp-slack.mjs"]){const stat=await fs.lstat(path.join(this.policy.config_root,file));if(!stat.isFile()||stat.isSymbolicLink()||stat.uid!==process.getuid?.()||(stat.mode&0o077))throw Error();}
    const args=["-c","check_for_update_on_startup=false","-c","features.default_mode_request_user_input=false","-c",`projects = { ${JSON.stringify(release)} = { trust_level = "trusted" } }`,"-c",'model_reasoning_effort="low"'];
    for(const [server,file] of [["dona_dispatcher","dispatcher"],["dona_slack","slack"]]) {
-    for(const [key,value] of Object.entries({command:this.policy.executables.node,args:[path.join(this.policy.config_root,`mcp-${file}.mjs`)],cwd:this.policy.config_root,required:true,enabled:true}))args.push("-c",`mcp_servers.${server}.${key}=${JSON.stringify(value)}`);
+    for(const [key,value] of Object.entries({command:this.policy.executables.node,args:[path.join(this.policy.config_root,`mcp-${file}.mjs`)],cwd:this.policy.config_root,required:true,enabled:true,default_tools_approval_mode:"approve"}))args.push("-c",`mcp_servers.${server}.${key}=${JSON.stringify(value)}`);
    }
    sent=true;
    const agent=await this.call<RuntimeAgent>("start",{input:{name,role:"main",cwd:release,release,args,threadConfig:{model:"gpt-6.1-sol",approvalsReviewer:"user",config:{"features.default_mode_request_user_input":false},developerInstructions:"あなたはDona mainです。ユーザーへの質問はSlack MCPで元threadへ投稿し、Event Resultを公開してください。回答は次のSlack eventとして届きます。native request_user_inputは使用しません。workerからの質問はget_task_questions/answer_task_questionで処理し、分かることは親として回答してください。"}}});

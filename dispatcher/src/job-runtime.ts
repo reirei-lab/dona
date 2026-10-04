@@ -26,7 +26,7 @@ export class PreparedWorkspaceCleanupError extends Error {
 export interface JobAgentRuntime {
   reconcilePreparation?(row:JobRow):Promise<PreparedJobRuntime|undefined>;
   recoveryHint?(row:JobRow):Promise<import("./app-server/store.js").AgentRecord["recovery_hint"]>;
-  pendingQuestions?(): Promise<import("./app-server/store.js").QuestionRecord[]>;
+  pendingQuestions?(after?:string): Promise<import("./app-server/store.js").QuestionRecord[]>;
   questions?(name:string,includeResolved?:boolean): Promise<import("./app-server/store.js").QuestionRecord[]>;
   approveRequest?(name:string,id:string,accepted:boolean):Promise<import("./app-server/store.js").QuestionRecord>;
   answerQuestion?(name:string,id:string,answers:Record<string,{answers:string[]}>): Promise<import("./app-server/store.js").QuestionRecord>;

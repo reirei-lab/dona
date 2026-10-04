@@ -79,7 +79,7 @@ export class AppServerJobRuntime implements JobAgentRuntime {
     return {herdrWorkspaceId:agent.name,herdrPaneId:agent.name,herdrAgentSessionId:JSON.stringify([agent.generation,agent.thread_id])};
   }
   async recoveryHint(row:JobRow){const agent=await this.client.status(row.agent_name);return agent&&this.matchesSession(row,agent)?agent.recovery_hint:undefined;}
-  pendingQuestions(){return this.client.call<import("./store.js").QuestionRecord[]>("pendingQuestions");}
+  pendingQuestions(after?:string){return this.client.call<import("./store.js").QuestionRecord[]>("pendingQuestions",{after});}
   questions(name:string,includeResolved=false){return this.client.questions(name,includeResolved);}
   approveRequest(name:string,id:string,accepted:boolean){return this.client.call<import("./store.js").QuestionRecord>("approve",{name,id,accepted});}
   answerQuestion(name:string,id:string,answers:Record<string,{answers:string[]}>){return this.client.answer(name,id,answers);}

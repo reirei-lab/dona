@@ -51,7 +51,9 @@ export async function serveRuntime(config:HostConfig):Promise<http.Server> {
         }
         case "prompt":if(typeof p.key!=="string"||typeof p.text!=="string"||p.key.length>256)throw Error("runtime_prompt_invalid");result=await manager.prompt(name,p.key,p.text);break;
         case "questions":result=p.includeResolved===true?store.db.prepare("SELECT q.* FROM questions q JOIN agents a ON a.name=q.agent AND a.generation=q.generation WHERE q.agent=? AND (q.state IN ('pending','answering') OR q.question_id IN (SELECT question_id FROM questions WHERE agent=q.agent AND generation=q.generation AND state NOT IN ('pending','answering') ORDER BY created_at DESC,question_id LIMIT 100)) ORDER BY q.created_at DESC,q.question_id").all(name):store.questions(name);break;
-        case "pendingQuestions":result=store.db.prepare("SELECT q.* FROM questions q JOIN agents a ON a.name=q.agent AND a.generation=q.generation WHERE q.state='pending' AND a.role='worker' ORDER BY q.created_at LIMIT 100").all();break;
+        case "pendingQuestions":
+          if(p.after!==undefined&&(typeof p.after!=="string"||p.after.length>128))throw Error("runtime_question_cursor_invalid");
+          result=store.db.prepare("SELECT q.* FROM questions q JOIN agents a ON a.name=q.agent AND a.generation=q.generation WHERE q.state='pending' AND a.role='worker' AND q.question_id>? ORDER BY q.question_id LIMIT 20").all(p.after??"");break;
         case "answer":if(typeof p.id!=="string"||!p.answers||typeof p.answers!=="object"||Array.isArray(p.answers))throw Error("runtime_answer_invalid");result=await manager.answer(name,p.id,p.answers as Record<string,{answers:string[]}>);break;
         case "approve":if(typeof p.id!=="string"||typeof p.accepted!=="boolean")throw Error("runtime_approval_invalid");result=await manager.approve(name,p.id,p.accepted);break;
         case "stop":if(typeof p.generation!=="string")throw Error("runtime_generation_required");result=await manager.stop(name,p.generation);break;

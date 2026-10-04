@@ -209,13 +209,16 @@ export class JobSupervisor {
   }
 
 
+  private questionCursor:string|undefined;
   async reconcileQuestions():Promise<void> {
     if(!this.runtime.pendingQuestions)return;
     try {
-      for(const question of await this.runtime.pendingQuestions()) {
+      const page=await this.runtime.pendingQuestions(this.questionCursor);
+      for(const question of page) {
         const job=this.database.getJobByAgent(question.agent);
         if(job)this.database.enqueueWorkerQuestion(job.job_id,question);
       }
+      this.questionCursor=page.at(-1)?.question_id; // 終端で先頭へ戻り、走査中に追加された小さいIDも次巡回で拾う。
     } catch {this.logger.warn("Worker question reconciliation deferred",{error_code:"runtime_questions_unavailable"});}
   }
   async taskQuestions(id:string,eventId:string):Promise<unknown> {
@@ -997,9 +1000,10 @@ export class JobSupervisor {
         });
       })
       .finally(async () => {
-        const finalStatus=this.database.getJob(row.job_id)?.status;
+        const finalJob=this.database.getJob(row.job_id),finalStatus=finalJob?.status;
+        const questionPending=finalStatus==="blocked"&&finalJob?.last_error_code==="runtime_question_pending";
         if(this.progress&&finalStatus==="needs_review")this.trackCancelledWorkerCleanup(row);
-        else if (!this.progress || (finalStatus!==undefined&&["blocked","completed","failed","cancelled"].includes(finalStatus))) await fs.rm(path.dirname(jobProgressPath(row)), { recursive:true, force:true }).catch(() => {
+        else if (!questionPending&&(!this.progress || (finalStatus!==undefined&&["blocked","completed","failed","cancelled"].includes(finalStatus)))) await fs.rm(path.dirname(jobProgressPath(row)), { recursive:true, force:true }).catch(() => {
           this.logger.warn("Disabled job progress terminal cleanup failed", { job_id:row.job_id, error_code:"job_progress_disabled_terminal_cleanup_failed" });
         });
         this.active.delete(row.job_id);
