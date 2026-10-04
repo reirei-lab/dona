@@ -1,3 +1,4 @@
+import {assertLinkedWorktreeRegistration} from "./job-worktree-identity.js";
 import { workspaceJobId, processGroups, type WorkerObservation } from "./job-handoff.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
@@ -857,7 +858,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     if (!origin.ok || normalizedRepository(origin.stdout) !== repository.toLowerCase()) throw new Error("handoff_repository_mismatch");
     const head = await runProcess(this.config.gitPath, ["-C", row.workspace_path, "rev-parse", "--verify", "HEAD^{commit}"], this.config.jobCommandTimeoutMs, signal);
     if (!head.ok) throw new Error("handoff_head_unavailable");
-    await this.verifyWorktreeIdentity({ ...row, job_id: originId }, repositoryPath, head.stdout.trim(), signal);
+    // 継続先の所有権はpathとrepositoryで照合する。workerが選んだbranch/HEADは保持する。
+    await this.verifyWorktreeIdentity({ ...row, job_id: originId }, repositoryPath, head.stdout.trim(), signal, "continuation");
   }
 
   private async verifyExistingGitHubWorktree(
@@ -989,6 +991,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     repositoryPath: string,
     expectedSha: string,
     signal?: AbortSignal,
+    mode: "initial" | "continuation" = "initial",
   ): Promise<void> {
     const head = await runProcess(
       this.config.gitPath,
@@ -1000,15 +1003,17 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     if (!head.ok || actualSha !== expectedSha) {
       throw new Error(`Git worktree HEAD mismatch for dona/${row.job_id}: expected ${expectedSha}, got ${actualSha || "unresolved"}`);
     }
-    const branch = await runProcess(
-      this.config.gitPath,
-      ["-C", row.workspace_path, "symbolic-ref", "--quiet", "HEAD"],
-      this.config.jobCommandTimeoutMs,
-      signal,
-    );
-    const expectedBranch = `refs/heads/dona/${row.job_id}`;
-    if (!branch.ok || branch.stdout.trim() !== expectedBranch) {
-      throw new Error(`Git worktree branch mismatch for dona/${row.job_id}`);
+    if (mode === "initial") {
+      const branch = await runProcess(
+        this.config.gitPath,
+        ["-C", row.workspace_path, "symbolic-ref", "--quiet", "HEAD"],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      const expectedBranch = `refs/heads/dona/${row.job_id}`;
+      if (!branch.ok || branch.stdout.trim() !== expectedBranch) {
+        throw new Error(`Git worktree branch mismatch for dona/${row.job_id}`);
+      }
     }
     const commonDir = await runProcess(
       this.config.gitPath,
@@ -1020,6 +1025,12 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     const expectedCommonDir = await fs.realpath(path.join(repositoryPath, ".git")).catch(() => "");
     if (!actualCommonDir || actualCommonDir !== expectedCommonDir) {
       throw new Error(`Git worktree repository mismatch for dona/${row.job_id}`);
+    }
+    if (mode === "continuation") {
+      const gitDirectory = await runProcess(this.config.gitPath,
+        ["-C", row.workspace_path, "rev-parse", "--path-format=absolute", "--git-dir"], this.config.jobCommandTimeoutMs, signal);
+      if (!gitDirectory.ok) throw new Error("handoff_worktree_registration_unavailable");
+      await assertLinkedWorktreeRegistration(row.workspace_path, gitDirectory.stdout.trim(), expectedCommonDir, row.job_id);
     }
   }
 }

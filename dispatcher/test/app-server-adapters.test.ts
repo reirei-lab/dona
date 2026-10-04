@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import {execFileSync} from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {test} from "node:test";
@@ -152,4 +153,26 @@ test("mainの失敗turnはwaitで中断を返し、次eventは上限解除後に
  agent={...agent,recovery_hint:{reason:"capacity_wait",retry_after:new Date(0).toISOString()}};
  assert.equal((await client.get()).ok,true);assert.equal((await client.get()).agentStatus,"idle");assert.equal((await client.wait()).errorCode,"runtime_turn_interrupted");
  for(const reason of ["authorization_required","configuration_error"] as const){agent={...agent,recovery_hint:{reason}};assert.equal((await client.get()).ok,true);}
+});
+
+for(const detached of [false,true])test(`GitHub継続は${detached?"detached HEAD":"作業用branch"}を保持してApp Serverの起動まで進む`,async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath),runtime=new AppServerJobRuntime(config);
+ try{
+  config.jobCommandTimeoutMs=5000;config.codexPath=path.join(root,"codex-stub");await fs.writeFile(config.codexPath,"#!/bin/sh\ncat >/dev/null\necho '[]'\n",{mode:0o700});
+  const source=db.enqueue(eventEnvelope(`continuation-${detached}`)).row;
+  const old=db.createJob({source_event_id:source.event_id,objective:"実装",workspace:{kind:"github",repository:"owner/repo"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+  const repo=path.join(config.jobsWorkspaceRoot,"github","owner","repo","repository");await fs.mkdir(repo,{recursive:true});
+  const git=(cwd:string,...args:string[])=>execFileSync(config.gitPath,["-C",cwd,...args],{encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
+  git(repo,"init");git(repo,"-c","user.name=Test","-c","user.email=test@example.invalid","commit","--allow-empty","-m","base");git(repo,"remote","add","origin","https://github.com/owner/repo.git");git(repo,"worktree","add","-b","approval-operations",old.workspace_path);
+  if(detached)git(old.workspace_path,"checkout","--detach");
+  await fs.writeFile(path.join(old.workspace_path,"keep"),"unfinished work");
+  const before=git(old.workspace_path,"status","--porcelain"),head=git(old.workspace_path,"rev-parse","HEAD"),branch=git(old.workspace_path,"rev-parse","--abbrev-ref","HEAD");
+  const follow=db.enqueue(eventEnvelope(`continuation-follow-${detached}`)).row;
+  const raw=db.createJob({source_event_id:follow.event_id,job_key:"continuation",objective:"続行",workspace:{kind:"github",repository:"owner/repo"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+  const next={...raw,workspace_path:old.workspace_path,workspace_json:JSON.stringify({...JSON.parse(raw.workspace_json),_dona_handoff:{predecessor_job_id:old.job_id,workspace_job_id:old.job_id}})};
+  let starts=0;
+  runtime.client.start=async input=>{starts++;assert.equal(input.cwd,old.workspace_path);assert.equal(input.attemptId,next.job_id);return {name:input.name,generation:"next",thread_id:"thread",config_json:JSON.stringify(input)} as AgentRecord;};
+  const prepared=await runtime.prepare(next);assert.equal(starts,1);assert.equal(prepared.herdrAgentSessionId,JSON.stringify(["next","thread"]));
+  assert.equal(git(old.workspace_path,"status","--porcelain"),before);assert.equal(git(old.workspace_path,"rev-parse","HEAD"),head);assert.equal(git(old.workspace_path,"rev-parse","--abbrev-ref","HEAD"),branch);assert.equal(await fs.readFile(path.join(old.workspace_path,"keep"),"utf8"),"unfinished work");
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });

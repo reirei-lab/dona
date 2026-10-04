@@ -622,3 +622,57 @@ test("前Attemptだけのcheckpointは現在Attemptのfile欠落として拒否�
     assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,3);assert.ok(f.db.tasks.attemptCheckpoint(previous.job_id));
   }finally{await f.dispose();}
 });
+
+for(const code of ["job_preparation_failed","command_failed","command_timeout","EACCES"])for(const action of ["resume","cancel"] as const)test(`worker未作成の${code}をpause後${action}し、同じAttemptと準備回数を保持する`,async()=>{
+ const f=await fixture();try{
+  f.db.beginJobPreparation(f.task.current_attempt_id);
+  f.db.recordJobPreparationFailure(f.task.current_attempt_id,code,"preparation failed",5);
+  const job=f.db.getJob(f.task.current_attempt_id)!;
+  f.runtime.observeWorker=async()=>{throw Error("worker was never created");};
+  const pause=f.db.enqueue(eventEnvelope("pause-preparation")).row;
+  const before=f.db.tasks.get(f.task.task_id)!;
+  f.db.tasks.control(before.task_id,pause.event_id,before.revision,"pause");
+  await f.supervisor().reconcileTasks();
+  const paused=f.db.tasks.get(before.task_id)!;assert.equal(paused.wait_reason,"paused");assert.equal(f.db.getJob(job.job_id)!.status,"blocked");assert.equal(f.db.tasks.canRun(f.db.getJob(job.job_id)!),false);
+  const follow=f.db.enqueue(eventEnvelope(action+"-preparation")).row;
+  const result=f.db.tasks.control(paused.task_id,follow.event_id,paused.revision,action);
+  assert.equal(result.state,action==="resume"?"active":"cancelled");assert.equal(result.current_attempt_id,job.job_id);assert.equal(result.attempt_number,1);assert.equal(f.db.getJob(job.job_id)!.attempt_count,job.attempt_count);assert.equal(f.sends(),0);
+  if(action==="resume")assert.equal(f.db.tasks.canRun(f.db.getJob(job.job_id)!),true);
+ }finally{await f.dispose();}
+});
+
+for(const boundary of ["stale_preparing","runtime_identity","dispatch_intent"] as const)test(`準備失敗の${boundary}はworker未作成と断定して再開しない`,async()=>{
+ const f=await fixture();try{
+  f.db.beginJobPreparation(f.task.current_attempt_id);
+  if(boundary==="runtime_identity")f.db.setJobRuntime(f.task.current_attempt_id,"w","p");
+  f.db.recordJobPreparationFailure(f.task.current_attempt_id,boundary==="stale_preparing"?"stale_preparing":"job_preparation_failed","failure",5);
+  if(boundary==="dispatch_intent"){const Database=(await import("better-sqlite3")).default,sql=new Database(f.config.databasePath);sql.prepare("UPDATE jobs SET dispatch_started_at=? WHERE job_id=?").run(new Date().toISOString(),f.task.current_attempt_id);sql.close();}
+  const before=f.db.tasks.get(f.task.task_id)!;
+  const pause=f.db.enqueue(eventEnvelope("pause-ambiguous-preparation")).row;f.db.tasks.control(before.task_id,pause.event_id,before.revision,"pause");
+  const paused=f.db.tasks.get(before.task_id)!;assert.equal(paused.wait_reason,"pause_requested");assert.equal(f.db.getJob(before.current_attempt_id)!.status,"retryable_failed");
+  const follow=f.db.enqueue(eventEnvelope("resume-ambiguous-preparation")).row;
+  const result=f.db.tasks.control(paused.task_id,follow.event_id,paused.revision,"resume");assert.equal(result.state,"waiting");assert.equal(f.db.tasks.canRun(f.db.getJob(result.current_attempt_id)!),false);
+ }finally{await f.dispose();}
+});
+
+ test("旧版で準備失敗をpauseしたTaskも未起動の同じAttemptへ復帰する",async()=>{
+ const f=await fixture();try{
+  f.db.beginJobPreparation(f.task.current_attempt_id);f.db.recordJobPreparationFailure(f.task.current_attempt_id,"job_preparation_failed","branch mismatch",5);
+  const Database=(await import("better-sqlite3")).default,sql=new Database(f.config.databasePath);
+  sql.prepare("UPDATE tasks SET state='paused',desired_state='paused',wait_reason='worker_unknown',observation_failures=3 WHERE task_id=?").run(f.task.task_id);sql.close();
+  const task=f.db.tasks.get(f.task.task_id)!,event=f.db.enqueue(eventEnvelope("resume-old-paused")).row;
+  const result=f.db.tasks.control(task.task_id,event.event_id,task.revision,"resume");assert.equal(result.state,"active");assert.equal(result.current_attempt_id,task.current_attempt_id);assert.equal(f.db.getJob(task.current_attempt_id)!.status,"queued");assert.equal(f.db.getJob(task.current_attempt_id)!.attempt_count,1);assert.equal(result.observation_failures,0);f.db.tasks.wait(result,"observation_unknown");assert.equal(f.db.tasks.get(task.task_id)!.wait_reason,"observation_unknown");
+ }finally{await f.dispose();}
+});
+
+for(const code of ["command_failed","command_timeout"])test(`未起動Attemptの${code}後の取消通知に古いerrorを残さない`,async()=>{
+ const f=await fixture();try{
+  f.db.beginJobPreparation(f.task.current_attempt_id);f.db.recordJobPreparationFailure(f.task.current_attempt_id,code,"old preparation error",5,new Date("2026-01-01T00:00:00Z"));
+  const Database=(await import("better-sqlite3")).default,sql=new Database(f.config.databasePath);sql.prepare("UPDATE jobs SET updated_at='2026-01-01T00:00:00Z' WHERE job_id=?").run(f.task.current_attempt_id);sql.close();
+  const before=f.db.getJob(f.task.current_attempt_id)!,task=f.db.tasks.get(f.task.task_id)!,event=f.db.enqueue(eventEnvelope("cancel-preparation-error")).row;
+  f.db.tasks.control(task.task_id,event.event_id,task.revision,"cancel");
+  const after=f.db.getJob(before.job_id)!;assert.equal(after.status,"cancelled");assert.equal(after.last_error_code,null);assert.equal(after.last_error_message,null);assert.equal(after.updated_at,after.completed_at);assert.notEqual(after.updated_at,before.updated_at);
+  f.db.sealJobGroup(f.event.event_id);const notice=f.db.enqueueJobNotification(after.job_id).row,payload=JSON.parse(notice.payload_json);
+  assert.equal(payload.job_status,"cancelled");assert.equal(payload.error,undefined);
+ }finally{await f.dispose();}
+});

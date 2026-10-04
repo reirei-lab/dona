@@ -246,11 +246,15 @@ export class TaskRepository {
       this.sql.prepare("UPDATE tasks SET state=?,desired_state=?,wait_reason=?,next_check_at=?,revision=revision+1,updated_at=? WHERE task_id=?")
         .run(state,action==="pause"?"paused":action==="cancel"?"cancelled":"running",reason,new Date().toISOString(),new Date().toISOString(),id);
       const job=this.dispatcher.getJob(task.current_attempt_id)!;
-      if(!job.dispatch_started_at&&!job.herdr_pane_id&&["queued","blocked"].includes(job.status)) {
-        if(action==="cancel")this.sql.prepare("UPDATE jobs SET status='cancelled',completed_at=? WHERE job_id=?").run(new Date().toISOString(),job.job_id);
+      // preparation失敗が確定し、runtime identityもdispatch intentもないAttemptは停止対象を作っていない。
+      // stale_preparing等の受理不明はこの経路に含めない。再開しても同じAttemptと準備予算を使う。
+      const preparationNotStarted=job.status==="retryable_failed"&&job.last_error_code!=="stale_preparing"&&!job.herdr_workspace_id&&task.stop_state==="none";
+      if(!job.dispatch_started_at&&!job.herdr_pane_id&&(["queued","blocked"].includes(job.status)||preparationNotStarted)) {
+        const controlledAt=new Date().toISOString();
+        if(action==="cancel")this.sql.prepare("UPDATE jobs SET status='cancelled',completed_at=?,updated_at=?,last_error_code=NULL,last_error_message=NULL WHERE job_id=?").run(controlledAt,controlledAt,job.job_id);
         else {
-          this.sql.prepare("UPDATE jobs SET status=?,last_error_code=? WHERE job_id=?").run(action==="pause"?"blocked":"queued",action==="pause"?"task_paused":null,job.job_id);
-          this.sql.prepare("UPDATE tasks SET state=?,wait_reason=?,next_check_at=NULL WHERE task_id=?").run(action==="pause"?"paused":"active",action==="pause"?"paused":null,id);
+          this.sql.prepare("UPDATE jobs SET status=?,last_error_code=?,last_error_message=NULL,updated_at=? WHERE job_id=?").run(action==="pause"?"blocked":"queued",action==="pause"?"task_paused":null,controlledAt,job.job_id);
+          this.sql.prepare("UPDATE tasks SET state=?,wait_reason=?,next_check_at=NULL,observation_failures=? WHERE task_id=?").run(action==="pause"?"paused":"active",action==="pause"?"paused":null,action==="resume"?0:task.observation_failures,id);
         }
       }
       this.sql.prepare("INSERT INTO task_controls(task_id,source_event_id,request_sha256) VALUES(?,?,?)").run(id,eventId,digest);

@@ -939,13 +939,14 @@ process.exit(2);
   });
 });
 
-test("引継ぎworkerは元branchの追加commit・index・未trackedファイルを保持して新しいResultだけを使う",async()=>{
+test("引継ぎworkerは変更したbranchの追加commit・index・未trackedファイルを保持して新しいResultだけを使う",async()=>{
   const f=await githubFixture();
   try {
     const event=f.database.enqueue(eventEnvelope("handoff-github")).row;
     const old=f.database.createJob({source_event_id:event.event_id,objective:"実装",workspace:{kind:"github",repository:"owner/repo"}},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).row;
     const runtime=new HerdrJobAgentRuntime(f.config);
     await runtime.prepare(old);
+    await git(old.workspace_path,"switch","-c",`dona/${old.job_id}-approval-operations`);
     await git(old.workspace_path,"config","user.email","test@example.com");
     await git(old.workspace_path,"config","user.name","Test");
     await fs.writeFile(path.join(old.workspace_path,"committed.txt"),"commit");
@@ -963,5 +964,11 @@ test("引継ぎworkerは元branchの追加commit・index・未trackedファイ�
     assert.equal(calls.filter(args=>args[2]==="worktree"&&args[3]==="create").length,1);
     const start=calls.filter(args=>args[2]==="agent"&&args[3]==="start").at(-1)!;
     assert.equal(start[4],next.job_id);assert.ok(start.includes(path.dirname(next.result_path)));assert.ok(!start.includes(path.dirname(old.result_path)));
+    const repository=path.join(f.config.jobsWorkspaceRoot,"github","owner","repo","repository"),other=path.join(f.root,"other-worktree");
+    await git(repository,"worktree","add","--detach",other,"HEAD");await fs.copyFile(path.join(other,".git"),path.join(old.workspace_path,".git"));
+    await assert.rejects(runtime.prepare(next),/handoff_worktree_registration_mismatch/);
+    const afterCalls=(await fs.readFile(f.logPath,"utf8")).trim().split("\n").map(line=>JSON.parse(line) as string[]);
+    assert.equal(afterCalls.filter(args=>args[2]==="agent"&&args[3]==="start").length,calls.filter(args=>args[2]==="agent"&&args[3]==="start").length);
+
   } finally {f.database.close();}
 });
