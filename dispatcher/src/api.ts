@@ -796,7 +796,7 @@ export class DispatcherApi {
     const managedTask=this.database.tasks.forAttempt(jobId);
     if(managedTask&&request.method==="POST")throw new ApiRequestError(409,"task_control_required","Use the Task ID and revision for control");
     if(managedTask&&request.method==="GET"&&url.searchParams.has("source_event_id")) {
-      try{this.database.tasks.assertOwner(managedTask.task_id,url.searchParams.get("source_event_id")!);}
+      try{this.database.tasks.assertOwner(managedTask.task_id,url.searchParams.get("source_event_id")!,true);}
       catch{throw new ApiRequestError(403,"task_owner_mismatch","Task does not belong to this event owner");}
     }
     const liveReceiptId=match[3];

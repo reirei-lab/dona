@@ -213,7 +213,7 @@ describe("DispatcherApi", () => {
     otherEnvelope.reply_target!.thread_ts="1756722031.000001";
     otherEnvelope.subject.thread_ts="1756722031.000001";
     const other=await request(config.socketPath,"POST","/v1/events",otherEnvelope);
-    assert.equal((await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}?source_event_id=${other.body.event_id}`)).status,200);
+    assert.equal((await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}?source_event_id=${other.body.event_id}`)).status,403);
     const otherChannelEnvelope=eventEnvelope("Ev-job-api-other-channel");
     otherChannelEnvelope.subject.channel_id="C_OTHER";otherChannelEnvelope.reply_target!.channel_id="C_OTHER";
     const otherChannel=await request(config.socketPath,"POST","/v1/events",otherChannelEnvelope);
@@ -688,6 +688,8 @@ test("Issue lookupから別threadのTaskを取得し制御、外部ownerを拒�
  const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger);await api.start();try{
   const route=`/v1/tasks/issue?repository=org%2Frepo&issue_number=24&source_event_id=${event.event_id}`;
   const found=await request(config.socketPath,"GET",route);assert.equal(found.status,200);assert.equal((found.body.task as {task_id:string}).task_id,task.task_id);
+  assert.equal((await request(config.socketPath,"GET",`/v1/jobs/${task.current_attempt_id}?source_event_id=${event.event_id}`)).status,403);
+  assert.equal((await request(config.socketPath,"GET",`/v1/jobs/${task.current_attempt_id}?source_event_id=${source.event_id}`)).status,200);
   const paused=await request(config.socketPath,"POST",`/v1/tasks/${task.task_id}/pause`,{source_event_id:event.event_id,revision:task.revision});assert.equal(paused.status,200);
   const foreign=eventEnvelope("issue-other");foreign.subject.actor_id="U_OTHER";const other=database.enqueue(foreign).row;
   assert.equal((await request(config.socketPath,"GET",route.replace(event.event_id,other.event_id))).status,403);
