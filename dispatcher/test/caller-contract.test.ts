@@ -261,3 +261,23 @@ test("実DBからMCPまで99件・100件・101件の候補を正確に区別す�
     }
   } finally { await f.close(); }
 });
+
+
+test("Issue Task照会をmainの許可設定からMCP・UDSへ通す",async()=>{
+ const f=await fixture();try{
+  const text=await fs.readFile(new URL("../../.codex/config.toml",import.meta.url),"utf8");
+  const section=text.split("[mcp_servers.dona_dispatcher]")[1]!;
+  const enabled=JSON.parse(section.match(/enabled_tools = (\[[^\n]+\])/)![1]!) as string[];
+  const advertised=(await f.client.listTools()).tools.map(t=>t.name);
+  for(const name of ["find_issue_task","get_task","list_tasks","resume_task","get_task_questions","answer_task_question","respond_task_approval"]) {
+   assert.ok(enabled.includes(name),`mainで${name}を許可する`);assert.ok(advertised.includes(name),`${name}をMCPで公開する`);
+  }
+  const gh=f.config.databasePath+".fake-gh";
+  await fs.writeFile(gh,`#!/bin/sh\nprintf '%s' '{"data":{"repository":{"nameWithOwner":"org/repo","issue":{"id":"I_contract","number":24}}}}'\n`,{mode:0o700});f.config.ghPath=gh;
+  const task=f.database.tasks.create({source_event_id:f.source,task_key:"issue",objective:"残作業",workspace:{kind:"github",repository:"org/repo"},issue_number:24,policy:{max_attempts:3,retry_delay_ms:1000}},f.config.jobsWorkspaceRoot,f.config.jobResultsDir,{node_id:"I_contract",repository:"org/repo",number:24}).task;
+  const e=eventEnvelope("issue-follow");e.subject.thread_ts="1756722030.999999";e.reply_target!.thread_ts=e.subject.thread_ts;
+  const follow=f.database.enqueue(e).row;
+  const found=await f.call("find_issue_task",{source_event_id:follow.event_id,repository:"org/repo",issue_number:24});
+  assert.equal(found.error,undefined);assert.equal(found.data.task.task_id,task.task_id);assert.equal(f.database.listEventJobs(follow.event_id).length,0);
+ }finally{await f.close();}
+});
