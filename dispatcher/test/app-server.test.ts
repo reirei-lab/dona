@@ -125,3 +125,38 @@ test("対話経路のないjobではnative質問を拒否してpending要求を�
   assert.equal(store.questions(agent.name).length,0);await manager.stop(agent.name,agent.generation);
  }finally{const row=store.agent("worker-test");if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+for(const disappeared of [false,true])test(`停止途中のhost再起動は${disappeared?"root消失後の子":"凍結済みrootと子"}を照合して終了する`,async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-stop-recovery-")),script=path.join(root,"fake.mjs");
+ await fs.writeFile(script,`import {spawn} from 'node:child_process';import fs from 'node:fs';const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});fs.writeFileSync('child.pid',String(child.pid));\n`+fake);
+ const store=new RuntimeStore(path.join(root,"runtime.db"));let manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));
+ try{
+  const agent=await manager.start({name:"worker-test",role:"worker",cwd:root,release:root,args:[],threadConfig:{}});
+  const child=Number(await fs.readFile(path.join(root,"child.pid"),"utf8"));
+  const {identity}=await import("../src/app-server/process.js"),captured=identity(agent.pid!)!;
+  store.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopping')").run(agent.name,agent.generation,JSON.stringify([captured]));
+  process.kill(agent.pid!,disappeared?"SIGKILL":"SIGSTOP");
+  if(disappeared)await until(()=>!identity(agent.pid!));
+  manager=new AppServerManager(store,()=>{throw Error("worker must not restart");});
+  await manager.recover();assert.equal(manager.status(agent.name)?.state,"stopped");assert.ok(!identity(child)||identity(child)!.state.includes("Z"));
+  // 旧実装でreceiptだけ確定したcrash状態も、agentの終端まで完遂する。
+  store.change(agent.name,agent.generation,{state:"unknown"});
+  manager=new AppServerManager(store,()=>{throw Error("worker must not restart");});await manager.recover();assert.equal(manager.status(agent.name)?.state,"stopped");
+ }finally{const agent=store.agent("worker-test");if(agent&&agent.state!=="stopped")await manager.stop(agent.name,agent.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+for(const stopped of [false,true])test(`mainの復旧intentを${stopped?"停止完了後":"host再起動後"}から再開する`,async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-main-recovery-")),script=path.join(root,"fake.mjs");await fs.writeFile(script,fake);
+ const store=new RuntimeStore(path.join(root,"runtime.db")),factory=(_args:string[],cwd:string)=>new AppServerRpc(process.execPath,[script],cwd);
+ let manager=new AppServerManager(store,factory);
+ try{
+  const input={name:"dona-main",role:"main" as const,cwd:root,release:root,args:[],threadConfig:{}};
+  const old=await manager.start(input);
+  if(stopped){store.db.prepare("INSERT INTO main_recoveries VALUES(?,?,?)").run(old.name,old.generation,JSON.stringify(input));await manager.stop(old.name,old.generation);}
+  manager=new AppServerManager(store,factory);await manager.recover();
+  const fresh=manager.status(old.name)!;assert.equal(fresh.state,"idle");assert.notEqual(fresh.generation,old.generation);
+  const {identity}=await import("../src/app-server/process.js");assert.ok(!identity(old.pid!)||identity(old.pid!)!.state.includes("Z"));
+  await manager.stop(fresh.name,fresh.generation);
+  manager=new AppServerManager(store,()=>{throw Error("intentional stop must not restart");});await manager.recover();assert.equal(manager.status(old.name)?.state,"stopped");
+ }finally{const agent=store.agent("dona-main");if(agent&&agent.state!=="stopped")await manager.stop(agent.name,agent.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
+});

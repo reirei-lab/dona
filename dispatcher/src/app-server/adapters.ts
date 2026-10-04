@@ -2,7 +2,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import type {DispatcherConfig} from "../config.js";
 import type {HerdrClient,HerdrCommandResult} from "../herdr.js";
-import {PreparedWorkspaceCleanupError,codexAgentArguments,parseScheduledMcpInventory,runProcess,type JobAgentRuntime,type PreparedJobRuntime} from "../job-runtime.js";
+import {WorkerStopNotSentError,PreparedWorkspaceCleanupError,codexAgentArguments,parseScheduledMcpInventory,runProcess,type JobAgentRuntime,type PreparedJobRuntime} from "../job-runtime.js";
 import {JobWorkspace} from "../job-workspace.js";
 import {workspaceJobId,processGroups,type WorkerObservation} from "../job-handoff.js";
 import {jobProgressPath,workspaceFromJob} from "../job-prompt.js";
@@ -68,7 +68,11 @@ export class AppServerJobRuntime implements JobAgentRuntime {
       path.join(this.config.jobsWorkspaceRoot,"github",...workspace.repository.split("/"),"worktrees",workspaceJobId(row));
     if(row.workspace_path!==expected)throw Error("runtime_workspace_mismatch");
     // 通常Taskは既存Mac環境を利用する。scheduleのread-only制約を通常Taskへ流用しない。
-    if(workspace.kind==="scratch")await fs.mkdir(expected,{recursive:true,mode:0o700});
+    if(workspace.kind==="scratch") {
+      if(workspaceJobId(row)!==row.job_id) {
+        const prior=await fs.lstat(expected);if(prior.isSymbolicLink()||!prior.isDirectory())throw Error("runtime_continuation_workspace_missing");
+      }else await fs.mkdir(expected,{recursive:true,mode:0o700});
+    }
     else if(workspaceJobId(row)!==row.job_id)await provisioner.verifyContinuationWorktree(row,workspace.repository,signal);
     else {const created=await provisioner.createGitHubWorktree(row,workspace.repository,workspace.base_ref,signal);if(!created.ok)throw Error("runtime_workspace_preparation_failed");}
     if((await fs.lstat(expected)).isSymbolicLink())throw Error("runtime_workspace_symlink");
@@ -103,7 +107,13 @@ export class AppServerJobRuntime implements JobAgentRuntime {
   async prompt(name:string,text:string,_signal?:AbortSignal,_timeout?:number,_submissionOnly?:boolean,key?:string):Promise<HerdrCommandResult>{return new AppServerAgentClient(runtimeSocket(this.config),name,this.config.agentWaitTimeoutMs).submit(text,key);}
   async wait(name:string,signal?:AbortSignal):Promise<HerdrCommandResult>{return new AppServerAgentClient(runtimeSocket(this.config),name,this.config.agentWaitTimeoutMs).wait(signal);}
   async listAgents():Promise<HerdrCommandResult>{const rows=await this.client.list();return {ok:true,stdout:JSON.stringify({result:{type:"agent_list",agents:rows.filter(r=>r.state!=="stopped").map(r=>({name:r.name,pane_id:r.name}))}}),stderr:"",exitCode:0,timedOut:false,aborted:false};}
-  async cancel(name:string):Promise<HerdrCommandResult>{const row=await this.client.status(name);if(!row)return result(null,"agent_not_found");await this.client.stop(name,row.generation);return {ok:true,stdout:"{}",stderr:"",exitCode:0,timedOut:false,aborted:false};}
+  async cancel(name:string):Promise<HerdrCommandResult>{
+    let row:AgentRecord|null;
+    try{row=await this.client.status(name);}catch{return result(null,"cancel_not_sent");}
+    if(!row)return result(null,"agent_not_found");
+    try{await this.client.stop(name,row.generation);return {ok:true,stdout:"{}",stderr:"",exitCode:0,timedOut:false,aborted:false};}
+    catch{return result(null,"cancel_acceptance_unknown");}
+  }
   async closeAgent(name:string):Promise<HerdrCommandResult>{return this.cancel(name);}
   async cleanup(row:JobRow):Promise<HerdrCommandResult>{return this.cancel(row.agent_name);}
   async observeWorker(row:JobRow):Promise<WorkerObservation>{
@@ -115,13 +125,13 @@ export class AppServerJobRuntime implements JobAgentRuntime {
       if(row.herdr_workspace_id!==(legacy.legacyWorkspaceId??agent.name)||row.herdr_pane_id!==(legacy.legacyPaneId??agent.name))return unknown("runtime_identity_missing");
       if(!agent.pid)return unknown("runtime_observation_unknown");
       const sample=processes(),root=sample.find(p=>p.pid===agent.pid);
-      if(agent.state!=="stopped"&&root?.start!==agent.process_start)return unknown("runtime_process_changed");
+      if(agent.state!=="stopped"&&root&&root.start!==agent.process_start)return unknown("runtime_process_changed");
       const tree=agent.state==="stopped"?{process_ids:[agent.pid],process_groups:legacy.processGroups??[agent.pid]}:
-        processGroups(sample.map(p=>`${p.pid} ${p.parent} ${p.group}`).join("\n"),agent.pid);
+        root?processGroups(sample.map(p=>`${p.pid} ${p.parent} ${p.group}`).join("\n"),agent.pid):{process_ids:[agent.pid,...sample.filter(p=>p.group===agent.pid).map(p=>p.pid)],process_groups:[agent.pid]};
       return {state:agent.state==="stopped"?"stopped":agent.state==="working"?"working":agent.state==="waiting"?"waiting":["idle","interrupted"].includes(agent.state)?"inactive":agent.state==="unknown"?"unreachable":"unknown",
         reason:"app_server_observed",observed_at:new Date().toISOString(),...tree};
     } catch{return unknown("runtime_query_failed");}
   }
-  async retireWorker(row:JobRow):Promise<void>{const agent=await this.client.status(row.agent_name);if(!agent||!this.matchesSession(row,agent)||agent.name!==row.herdr_pane_id)throw Error("runtime_identity_changed");await this.client.stop(agent.name,agent.generation);}
+  async retireWorker(row:JobRow):Promise<void>{let agent:AgentRecord|null;try{agent=await this.client.status(row.agent_name);}catch{throw new WorkerStopNotSentError("runtime_stop_not_sent");}if(!agent||!this.matchesSession(row,agent)||agent.name!==row.herdr_pane_id)throw Error("runtime_identity_changed");await this.client.stop(agent.name,agent.generation);}
   async workerRetired(row:JobRow):Promise<boolean>{const agent=await this.client.status(row.agent_name);return !!agent&&this.matchesSession(row,agent)&&(agent.name===row.herdr_pane_id||JSON.parse(agent.config_json).legacyPaneId===row.herdr_pane_id)&&agent.state==="stopped";}
 }

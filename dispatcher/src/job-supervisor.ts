@@ -10,7 +10,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { DispatcherConfig } from "./config.js";
 import type { DispatcherDatabase } from "./database.js";
 import type { HerdrCommandResult } from "./herdr.js";
-import { PreparedWorkspaceCleanupError, type JobAgentRuntime } from "./job-runtime.js";
+import { WorkerStopNotSentError, PreparedWorkspaceCleanupError, type JobAgentRuntime } from "./job-runtime.js";
 import { buildJobPrompt, jobProgressPath } from "./job-prompt.js";
 import { JobResultNotFoundError, readJobResultEnvelope } from "./job-result.js";
 import type { Logger } from "./logger.js";
@@ -322,7 +322,14 @@ export class JobSupervisor {
       if(task.stop_state==="none")task=this.database.tasks.claimStop(task,this.database.getWorkerObservation(job)??observed);
       // Last observation before the only control write; current desired state is checked by CAS.
       if(observed.state!=="stopped"&&this.database.tasks.beginStop(task)) {
-        try {await this.runtime.retireWorker(job,this.abortController.signal);}catch{/* reconcile without resending */}
+        try {await this.runtime.retireWorker(job,this.abortController.signal);}catch(error){
+          if(error instanceof WorkerStopNotSentError){
+            const fresh=this.database.tasks.get(task.task_id)!;
+            if(fresh.current_attempt_id===job.job_id){this.database.tasks.stopNotSent(fresh);this.database.tasks.wait(fresh,"worker_stop_pending",3000);}
+            return;
+          }
+          // stop送信後の不明応答では永続intentと実processを照合する。
+        }
       }
     }
     const evidence=JSON.parse(task.stop_evidence_json!) as WorkerObservation;
@@ -618,7 +625,7 @@ export class JobSupervisor {
       if (!cancelled.ok) {
         this.database.markJobNeedsReview(
           jobId,
-          "cancel_acceptance_unknown",
+          cancelled.errorCode==="cancel_not_sent"?"cancel_not_sent":"cancel_acceptance_unknown",
           commandMessage(cancelled),
         );
         this.wake();

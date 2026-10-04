@@ -17,6 +17,8 @@ export interface PreparedJobRuntime {
   herdrAgentSessionId?: string;
 }
 
+export class WorkerStopNotSentError extends Error {}
+
 export class PreparedWorkspaceCleanupError extends Error {
   constructor(message:string,readonly herdrWorkspaceId:string,readonly herdrPaneId:string) { super(message);this.name="PreparedWorkspaceCleanupError"; }
 }

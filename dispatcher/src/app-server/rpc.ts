@@ -23,6 +23,7 @@ export class AppServerRpc extends EventEmitter {
     // stderrは秘密情報を含み得る。詰まりを防ぐため消費するが通知本文へ転記しない。
     this.child.stderr.on("data",()=>{});
     this.child.once("error",()=>this.disconnected());
+    this.child.once("exit",()=>this.disconnected());
     this.child.once("close",()=>this.disconnected());
     this.child.stdin.on("error",()=>this.disconnected());
   }

@@ -65,6 +65,9 @@ export async function serveRuntime(config:HostConfig):Promise<http.Server> {
     }
   });
   await new Promise<void>((resolve,reject)=>{server.once("error",reject);server.listen(config.socket,()=>{fs.chmodSync(config.socket,0o600);resolve();});});
-  server.on("close",()=>{try{fs.unlinkSync(config.socket);}catch{}store.db.prepare("DELETE FROM host_owner WHERE identity_json=?").run(JSON.stringify(owner));store.close();});
+  let recovering=false;
+  const recover=()=>{if(recovering)return;recovering=true;void manager.recover().finally(()=>{recovering=false;}).catch(()=>{});};
+  const recoveryTimer=setInterval(recover,1000);recoveryTimer.unref();recover();
+  server.on("close",()=>{clearInterval(recoveryTimer);try{fs.unlinkSync(config.socket);}catch{}store.db.prepare("DELETE FROM host_owner WHERE identity_json=?").run(JSON.stringify(owner));store.close();});
   return server;
 }

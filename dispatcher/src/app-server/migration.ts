@@ -19,6 +19,7 @@ export function migrateStoppedRuntime(dispatcherFile:string,runtimeFile:string,r
     if(owner){const old=JSON.parse(owner.identity_json) as ProcessIdentity;if(!receipt.processes.some(p=>same(p,old))&&sample.some(p=>same(p,old)&&!p.state.includes("Z")))throw Error("runtime_migration_host_stop_missing");}
     store.db.prepare("DELETE FROM host_owner").run();
    }
+   if(store.db.prepare("SELECT 1 FROM sqlite_master WHERE name='main_recoveries'").get())store.db.prepare("DELETE FROM main_recoveries").run();
    // 古いApp Server要求は旧stdio接続に束縛されている。新接続へ回答を移植しない。
    store.db.prepare("UPDATE questions SET state='expired' WHERE state IN ('pending','answering')").run();
    for(const agent of store.agents()) {

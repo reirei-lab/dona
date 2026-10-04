@@ -679,7 +679,7 @@ export class DispatcherApi {
       const id=taskIdSchema.parse(match[1]),action=match[2];
       if(request.method==="GET"&&action==="questions"){if(!this.jobs.taskQuestions)throw Error("task_questions_unavailable");sendJson(response,200,await this.jobs.taskQuestions(id,source));return;}
       if(request.method==="GET"&&!action){sendJson(response,200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.assertOwner(id,source),true)});return;}
-      if(request.method==="POST"&&action) {
+      if(request.method==="POST"&&action&&action!=="questions") {
         const input=await this.readJson(request) as Record<string,unknown>;
         if(typeof input.source_event_id!=="string"||!Number.isSafeInteger(input.revision))throw new Error("task_control_invalid");
         if(action==="approve") {

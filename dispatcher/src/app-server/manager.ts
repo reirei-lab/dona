@@ -4,7 +4,7 @@ import path from "node:path";
 import { AppServerRpc,type RpcMessage,RpcFailure } from "./rpc.js";
 import {stableStringify} from "../validation.js";
 import { RuntimeStore,type AgentRecord,type QuestionRecord } from "./store.js";
-import { identity,processes,same,stopTree,type ProcessIdentity } from "./process.js";
+import { identity,processes,same,stopScope,type ProcessIdentity } from "./process.js";
 
 export const hash=(value:unknown)=>createHash("sha256").update(stableStringify(value)).digest("hex");
 export interface StartAgent {name:string;role:"main"|"worker";cwd:string;release:string;args:string[];threadConfig:Record<string,unknown>}
@@ -15,7 +15,9 @@ export class AppServerManager {
   private connections=new Map<string,AppServerRpc>();
   private resets=new Map<string,string>();
   private queues=new Map<string,Promise<unknown>>();
+  private recoveryAfter=new Map<string,number>();
   constructor(readonly store:RuntimeStore,private readonly factory:RpcFactory) {
+    store.db.exec("CREATE TABLE IF NOT EXISTS main_recoveries(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,input_json TEXT NOT NULL)");
     store.db.exec("CREATE TABLE IF NOT EXISTS recovery_hints(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,reason TEXT NOT NULL,retry_after TEXT)");
     store.db.exec("CREATE TABLE IF NOT EXISTS stops(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,processes_json TEXT NOT NULL,state TEXT NOT NULL)");
     // 再接続していないprocessをidleとみなさない。永続receiptは残す。
@@ -27,7 +29,9 @@ export class AppServerManager {
     this.queues.set(name,next);void next.finally(()=>{if(this.queues.get(name)===next)this.queues.delete(name);}).catch(()=>{});return next;
   }
   async start(input:StartAgent):Promise<AgentRecord> {
-    return this.serialized(input.name,async()=>{
+    return this.serialized(input.name,()=>this.startAgent(input));
+  }
+  private async startAgent(input:StartAgent):Promise<AgentRecord> {
       if(!/^[a-zA-Z0-9_-]{1,128}$/.test(input.name)||!path.isAbsolute(input.cwd)||!path.isAbsolute(input.release)||!fs.statSync(input.cwd).isDirectory())throw Error("runtime_start_scope");
       const requestHash=hash(input),prior=this.store.agent(input.name);
       if(prior&&prior.state!=="stopped") {
@@ -58,7 +62,6 @@ export class AppServerManager {
         this.store.change(row.name,row.generation,{thread_id:thread.id,state:"idle"});
         return this.store.agent(row.name)!;
       } catch(error){this.store.change(row.name,row.generation,{state:"unknown"});throw error;}
-    });
   }
   status(name:string):AgentRecord|undefined {
     const row=this.store.agent(name);if(!row)return;
@@ -189,21 +192,54 @@ export class AppServerManager {
     });
   }
   async stop(name:string,generation:string):Promise<AgentRecord> {
-    return this.serialized(name,async()=>{
-      const row=this.store.agent(name);if(!row||row.generation!==generation)throw Error("runtime_stop_identity_changed");
-      if(row.state==="stopped")return row;
-      const saved=this.store.db.prepare("SELECT * FROM stops WHERE agent=? AND generation=?").get(name,generation) as {processes_json:string}|undefined;
-      if(saved) {
-        const recorded=JSON.parse(saved.processes_json) as ProcessIdentity[],sample=processes();
-        if(recorded.some(p=>{const live=sample.find(x=>x.pid===p.pid);return same(p,live)&&!live!.state.includes("Z");}))throw Error("runtime_stop_reconciliation_required");
-      } else {
-        const live=row.pid?identity(row.pid):undefined;
-        if(!live||live.start!==row.process_start)throw Error("runtime_process_stop_evidence_missing");
-        await stopTree(live,rows=>this.store.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopping') ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,processes_json=excluded.processes_json,state='stopping'").run(name,generation,JSON.stringify(rows)));
-      }
+    // queue待機中のhost crashでもintentを失わない。generationに束縛して保存する。
+    const row=this.store.agent(name);
+    if(!row||row.generation!==generation)throw Error("runtime_stop_identity_changed");
+    if(row.state!=="stopped") {
+      if(!row.pid||!row.process_start)throw Error("runtime_process_stop_evidence_missing");
+      const root:ProcessIdentity={pid:row.pid,parent:0,group:row.pid,uid:process.getuid!(),start:row.process_start,state:"unknown"};
+      this.store.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopping') ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,processes_json=excluded.processes_json,state='stopping' WHERE stops.generation<>excluded.generation").run(name,generation,JSON.stringify([root]));
+    }
+    return this.serialized(name,()=>this.stopAgent(name,generation));
+  }
+  private async stopAgent(name:string,generation:string):Promise<AgentRecord> {
+    const row=this.store.agent(name);if(!row||row.generation!==generation)throw Error("runtime_stop_identity_changed");
+    if(row.state==="stopped")return row;
+    if(!row.pid||!row.process_start)throw Error("runtime_process_stop_evidence_missing");
+    const saved=this.store.db.prepare("SELECT processes_json FROM stops WHERE agent=? AND generation=?").get(name,generation) as {processes_json:string}|undefined;
+    const root:ProcessIdentity={pid:row.pid,parent:0,group:row.pid,uid:process.getuid!(),start:row.process_start,state:"unknown"};
+    await stopScope(root,saved?JSON.parse(saved.processes_json):[],rows=>this.store.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopping') ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,processes_json=excluded.processes_json,state='stopping'").run(name,generation,JSON.stringify(rows)));
+    this.store.db.transaction(()=>{
       this.store.db.prepare("UPDATE stops SET state='stopped' WHERE agent=? AND generation=?").run(name,generation);
       this.store.db.prepare("UPDATE questions SET state='expired' WHERE agent=? AND generation=? AND state IN ('pending','answering')").run(name,generation);
-      this.connections.delete(name);this.store.change(name,generation,{state:"stopped",turn_id:null});return this.store.agent(name)!;
-    });
+      this.store.change(name,generation,{state:"stopped",turn_id:null});
+    }).immediate();
+    this.connections.delete(name);return this.store.agent(name)!;
+  }
+  /** workerは停止intentだけ再開する。mainのみ、停止証明の後に新threadで再生成する。 */
+  async recover():Promise<void> {
+    for(const candidate of this.store.agents()) {
+      if((this.recoveryAfter.get(candidate.name)??0)>Date.now())continue;
+      const intent=this.store.db.prepare("SELECT 1 FROM main_recoveries WHERE agent=? AND generation=?").get(candidate.name,candidate.generation);
+      const pending=this.store.db.prepare("SELECT 1 FROM stops WHERE agent=? AND generation=?").get(candidate.name,candidate.generation);
+      if(!intent&&!pending&&(candidate.role!=="main"||this.status(candidate.name)?.state!=="unknown"))continue;
+      this.recoveryAfter.set(candidate.name,Date.now()+30_000);
+      await this.serialized(candidate.name,async()=>{
+        const current=this.store.agent(candidate.name);
+        if(!current||current.generation!==candidate.generation)return;
+        let recovery=this.store.db.prepare("SELECT input_json FROM main_recoveries WHERE agent=? AND generation=?").get(current.name,current.generation) as {input_json:string}|undefined;
+        if(!recovery) {
+          if(current.state==="stopped")return;
+          const interrupted=this.store.db.prepare("SELECT 1 FROM stops WHERE agent=? AND generation=?").get(current.name,current.generation);
+          if(interrupted){await this.stopAgent(current.name,current.generation);return;}
+          if(current.role!=="main"||this.status(current.name)?.state!=="unknown")return;
+          recovery={input_json:current.config_json};
+          this.store.db.prepare("INSERT INTO main_recoveries VALUES(?,?,?) ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,input_json=excluded.input_json").run(current.name,current.generation,recovery.input_json);
+        }
+        if(current.state!=="stopped")await this.stopAgent(current.name,current.generation);
+        await this.startAgent(JSON.parse(recovery.input_json) as StartAgent);
+        this.store.db.prepare("DELETE FROM main_recoveries WHERE agent=? AND generation=?").run(current.name,current.generation);
+      }).catch(()=>{});
+    }
   }
 }

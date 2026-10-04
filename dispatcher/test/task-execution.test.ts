@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { DispatcherDatabase } from "../src/database.js";
 import { taskRequestSchema } from "../src/task-execution.js";
 import { JobSupervisor } from "../src/job-supervisor.js";
-import type { JobAgentRuntime } from "../src/job-runtime.js";
+import { WorkerStopNotSentError,type JobAgentRuntime } from "../src/job-runtime.js";
 import type { WorkerObservation } from "../src/job-handoff.js";
 import { DispatcherApi } from "../src/api.js";
 import { DispatcherApiClient } from "../src/client.js";
@@ -384,5 +384,26 @@ test("質問回答直後のResultがrunning復帰より先に届いても同じA
   await fs.writeFile(job.result_path,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"回答後に完了",completed_at:new Date().toISOString()}));
   f.due();await f.supervisor().reconcileTasks();
   assert.equal(f.db.tasks.get(f.task.task_id)!.state,"completed");assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,1);
+ }finally{await f.dispose();}
+});
+
+test("POST questionsはTaskを変更せずroute errorにする",async()=>{
+ const f=await fixture(),api=new DispatcherApi(f.db,{isRunning:()=>true,wake(){}},f.supervisor(),f.config,logger);
+ try{
+  const pause=f.db.enqueue(eventEnvelope("pause-route")).row;f.db.tasks.control(f.task.task_id,pause.event_id,f.task.revision,"pause");
+  const before=f.db.tasks.get(f.task.task_id)!;await api.start();const client=new DispatcherApiClient(f.config.socketPath);
+  await assert.rejects(client.controlTask(f.task.task_id,"questions" as "pause",{source_event_id:f.event.event_id,revision:before.revision}),/task_route_not_found/);
+  assert.deepEqual(f.db.tasks.get(f.task.task_id),before);
+  assert.throws(()=>f.db.tasks.control(f.task.task_id,f.event.event_id,before.revision,"questions" as "pause"),/task_control_invalid/);
+ }finally{await api.stop();await f.dispose();}
+});
+
+
+test("Task停止の事前照会だけ失敗した場合は未送信として再照合できる",async()=>{
+ const f=await fixture();try{
+  f.start();f.interrupt();const stop=f.runtime.retireWorker!;
+  f.runtime.retireWorker=async()=>{throw new WorkerStopNotSentError("read unavailable");};
+  await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)?.stop_state,"not_sent");assert.equal(f.sends(),0);
+  f.runtime.retireWorker=stop;f.due();await f.supervisor().reconcileTasks();assert.equal(f.sends(),1);assert.equal(f.db.tasks.get(f.task.task_id)?.attempt_number,2);
  }finally{await f.dispose();}
 });

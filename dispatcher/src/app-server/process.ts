@@ -36,3 +36,27 @@ export async function stopTree(root:ProcessIdentity,save:(rows:ProcessIdentity[]
   }
   throw Error("runtime_process_stop_unconfirmed");
 }
+
+/** 保存済み停止intentを再照合して完遂する。root消失時も元groupを調べる。 */
+export async function stopScope(root:ProcessIdentity,recorded:ProcessIdentity[],save:(rows:ProcessIdentity[])=>void):Promise<void> {
+  if(root.uid!==process.getuid?.()||root.pid===process.pid)throw Error("runtime_process_scope");
+  const captured=new Map(recorded.map(row=>[row.pid,row]));
+  captured.set(root.pid,root);
+  const persist=(rows:ProcessIdentity[])=>{for(const row of rows)captured.set(row.pid,row);save([...captured.values()]);};
+  persist([]);
+  for(let pass=0;pass<10;pass++) {
+    const sample=processes(),leader=sample.find(p=>p.pid===root.pid);
+    if(leader&&!same(root,leader))throw Error("runtime_process_identity_changed");
+    const live=sample.filter(p=>!p.state.includes("Z")&&(p.group===root.group||same(captured.get(p.pid)??root,p)));
+    if(!live.length)return;
+    for(const row of live) {
+      if(row.uid!==root.uid)throw Error("runtime_child_owner_changed");
+      const current=identity(row.pid);if(!same(row,current)||current!.state.includes("Z"))continue;
+      try{await stopTree(row,persist);}catch(error){
+        if(!(error instanceof Error)||error.message!=="runtime_process_stop_evidence_missing")throw error;
+        // 採取とfreezeの間に終了した場合も、次のsampleで子/groupを照合する。
+      }
+    }
+  }
+  throw Error("runtime_process_stop_unconfirmed");
+}

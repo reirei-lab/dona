@@ -205,6 +205,7 @@ export class TaskRepository {
   }
   control(id:string,eventId:string,revision:number,action:"pause"|"resume"|"cancel"):TaskRow {
     return this.sql.transaction(()=>{
+      if(!["pause","resume","cancel"].includes(action))throw new Error("task_control_invalid");
       const task=this.assertOwner(id,eventId);if(this.dispatcher.get(eventId)?.source!=="slack")throw new Error("task_control_requires_slack");
       const digest=hash({revision,action});
       const old=this.sql.prepare("SELECT request_sha256 FROM task_controls WHERE task_id=? AND source_event_id=?").get(id,eventId) as {request_sha256:string}|undefined;
@@ -321,6 +322,9 @@ export class TaskRepository {
   beginStop(task:TaskRow):boolean {
     return this.sql.prepare("UPDATE tasks SET stop_state='attempting' WHERE task_id=? AND current_attempt_id=? AND revision=? AND stop_state='not_sent'")
       .run(task.task_id,task.current_attempt_id,task.revision).changes===1;
+  }
+  stopNotSent(task:TaskRow):void {
+    this.sql.prepare("UPDATE tasks SET stop_state='not_sent' WHERE task_id=? AND current_attempt_id=? AND revision=? AND stop_state='attempting'").run(task.task_id,task.current_attempt_id,task.revision);
   }
   stopped(task:TaskRow,evidence:WorkerObservation):void {
     this.sql.transaction(()=>{
