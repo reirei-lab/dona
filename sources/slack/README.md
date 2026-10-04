@@ -122,7 +122,7 @@ cd ../..
 codex mcp list
 ```
 
-設定では読み取りツールをそのまま使え、`set_agent_session_status`、`post_message`、`add_reaction`は実行前に承認対象となる`default_tools_approval_mode = "writes"`を指定しています。既に起動している`dona-main`へ反映するには、そのCodexエージェントを再起動してください。Codexのproject-scoped `.codex/config.toml` とstdio MCP設定については[OpenAI公式ドキュメント](https://developers.openai.com/codex/mcp)も参照できます。
+設定では読み取りツールをそのまま使え、`set_agent_session_status`、`post_message`、`add_reaction`は実行前に承認対象となる`default_tools_approval_mode = "writes"`を指定しています。App Serverの管理下で起動するmainでは、launcherが固定したDona Slack/Dispatcher MCPだけを`approve`へ上書きし、ツール側のevent/owner認可を通して実行します。OS操作や他のMCPの承認はこの例外に含みません。既に起動している`dona-main`へ反映するには、そのCodexエージェントを再起動してください。Codexのproject-scoped `.codex/config.toml` とstdio MCP設定については[OpenAI公式ドキュメント](https://developers.openai.com/codex/mcp)も参照できます。
 
 MCPだけを手動で起動するデバッグ用コマンドもありますが、通常はCodexに起動させます。
 

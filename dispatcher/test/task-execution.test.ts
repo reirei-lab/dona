@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { DispatcherDatabase } from "../src/database.js";
 import { taskRequestSchema } from "../src/task-execution.js";
 import { JobSupervisor } from "../src/job-supervisor.js";
-import type { JobAgentRuntime } from "../src/job-runtime.js";
+import { WorkerStopNotSentError,type JobAgentRuntime } from "../src/job-runtime.js";
 import type { WorkerObservation } from "../src/job-handoff.js";
 import { DispatcherApi } from "../src/api.js";
 import { DispatcherApiClient } from "../src/client.js";
@@ -352,4 +352,125 @@ test("steer受理直後の再起動はexact eventのreceiptだけで復旧する
     f.db.tasks.prepareSteer(task.task_id,second.event_id,current.revision,"二つ目");
     await f.supervisor().reconcileTasks();assert.notEqual(f.db.tasks.get(task.task_id)!.state,"active");
   }finally{await f.dispose();}
+});
+
+for(const crashed of [false,true])test(`worker質問を${crashed?"prompt送信直後のDispatcher再起動後も":""}親eventへ一度だけ届け、回答後に同じAttemptへ戻る`,async()=>{
+ const f=await fixture();try{
+  const job=f.db.getJob(f.task.current_attempt_id)!;f.db.beginJobPreparation(job.job_id,new Date(job.available_at));f.db.setJobRuntime(job.job_id,"w","p",JSON.stringify(["generation","thread-question"]));f.db.beginJobDispatch(job.job_id);if(crashed){f.db.recoverStaleJobs();assert.equal(f.db.getJob(job.job_id)?.status,"needs_review");}else f.db.markJobRunning(job.job_id);
+  const question:import("../src/app-server/store.js").QuestionRecord={question_id:"550e8400-e29b-41d4-a716-446655440000",agent:job.agent_name,generation:"generation",thread_id:"thread-question",turn_id:"turn",rpc_id_json:'"request"',kind:"question",payload_json:JSON.stringify({questions:[{id:"choice",question:"どちら？"}]}),state:"pending",answer_hash:null,created_at:new Date().toISOString()};
+  let pending=true,answers=0;
+  f.runtime.pendingQuestions=async()=>pending?[question]:[];f.runtime.questions=async()=>pending?[question]:[];
+  f.runtime.get=async()=>({ok:true,stdout:"{}",stderr:"",exitCode:0,timedOut:false,aborted:false,agentStatus:pending?"blocked":"working"});
+  f.runtime.answerQuestion=async(name,id)=>{assert.equal(name,job.agent_name);assert.equal(id,question.question_id);answers++;pending=false;return {...question,state:"resolved"};};
+  const supervisor=f.supervisor();await supervisor.reconcileQuestions();await supervisor.reconcileQuestions();
+  const events=f.db.list().filter(e=>e.event_type==="worker_question");assert.equal(events.length,1);
+  assert.equal(f.db.tasks.mayNotify(f.db.getJob(job.job_id)!),false);
+  const listed=await supervisor.taskQuestions(f.task.task_id,events[0]!.event_id) as {revision:number;questions:unknown[]};assert.equal(listed.questions.length,1);
+  await supervisor.answerTaskQuestion(f.task.task_id,events[0]!.event_id,listed.revision,question.question_id,{choice:{answers:["A"]}});
+  f.due();await supervisor.reconcileTasks();
+  assert.equal(answers,1);assert.equal(f.db.tasks.get(f.task.task_id)!.current_attempt_id,job.job_id);assert.equal(f.db.tasks.get(f.task.task_id)!.state,"active");
+  const foreign=f.db.enqueue({...eventEnvelope("foreign-answer"),subject:{...eventEnvelope("foreign-answer").subject,actor_id:"OTHER"}}).row;
+  await assert.rejects(supervisor.answerTaskQuestion(f.task.task_id,foreign.event_id,listed.revision,question.question_id,{choice:{answers:["B"]}}),/owner_mismatch/);
+ }finally{await f.dispose();}
+});
+
+
+test("質問回答直後のResultがrunning復帰より先に届いても同じAttemptを完了する",async()=>{
+ const f=await fixture();try {
+  const job=f.db.getJob(f.task.current_attempt_id)!;
+  f.db.beginJobPreparation(job.job_id,new Date(job.available_at));f.db.setJobRuntime(job.job_id,"w","p",JSON.stringify(["generation","thread"]));f.db.beginJobDispatch(job.job_id);f.db.markJobRunning(job.job_id);
+  f.db.enqueueWorkerQuestion(job.job_id,{question_id:"question-fast",agent:job.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",rpc_id_json:"1",kind:"question",payload_json:"{}",state:"pending",answer_hash:null,created_at:new Date().toISOString()});
+  await fs.mkdir(path.dirname(job.result_path),{recursive:true});
+  await fs.writeFile(job.result_path,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"回答後に完了",completed_at:new Date().toISOString()}));
+  f.due();await f.supervisor().reconcileTasks();
+  assert.equal(f.db.tasks.get(f.task.task_id)!.state,"completed");assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,1);
+ }finally{await f.dispose();}
+});
+
+test("POST questionsはTaskを変更せずroute errorにする",async()=>{
+ const f=await fixture(),api=new DispatcherApi(f.db,{isRunning:()=>true,wake(){}},f.supervisor(),f.config,logger);
+ try{
+  const pause=f.db.enqueue(eventEnvelope("pause-route")).row;f.db.tasks.control(f.task.task_id,pause.event_id,f.task.revision,"pause");
+  const before=f.db.tasks.get(f.task.task_id)!;await api.start();const client=new DispatcherApiClient(f.config.socketPath);
+  await assert.rejects(client.controlTask(f.task.task_id,"questions" as "pause",{source_event_id:f.event.event_id,revision:before.revision}),/task_route_not_found/);
+  assert.deepEqual(f.db.tasks.get(f.task.task_id),before);
+  assert.throws(()=>f.db.tasks.control(f.task.task_id,f.event.event_id,before.revision,"questions" as "pause"),/task_control_invalid/);
+ }finally{await api.stop();await f.dispose();}
+});
+
+
+test("Task停止の事前照会だけ失敗した場合は未送信として再照合できる",async()=>{
+ const f=await fixture();try{
+  f.start();f.interrupt();const stop=f.runtime.retireWorker!;
+  f.runtime.retireWorker=async()=>{throw new WorkerStopNotSentError("read unavailable");};
+  await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)?.stop_state,"not_sent");assert.equal(f.sends(),0);
+  f.runtime.retireWorker=stop;f.due();await f.supervisor().reconcileTasks();assert.equal(f.sends(),1);assert.equal(f.db.tasks.get(f.task.task_id)?.attempt_number,2);
+ }finally{await f.dispose();}
+});
+
+test("start応答と直後のstatus喪失でも、後日のAttempt照合を永続化して停止・引継ぐ",async()=>{
+ const f=await fixture();try{
+  const job=f.db.getJob(f.task.current_attempt_id)!;f.db.beginJobPreparation(job.job_id);f.db.setJobRuntime(job.job_id,"w","p");
+  f.db.markJobNeedsReview(job.job_id,"runtime_preparation_unknown","response lost");
+  f.runtime.reconcilePreparation=async()=>{throw Error("socket offline");};
+  await f.supervisor().reconcileTasks();assert.equal(f.sends(),0);assert.equal(f.db.getJobLiveSessionIdentity(job.job_id),undefined);
+  f.due();f.runtime.reconcilePreparation=async()=>({herdrWorkspaceId:"w",herdrPaneId:"p",herdrAgentSessionId:JSON.stringify(["generation",null])});
+  f.runtime.retireWorker=async()=>{assert.equal(f.db.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id,JSON.stringify(["generation",null]));f.setStopped(true);};
+  await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,2);
+  assert.throws(()=>f.db.reconcileJobPreparationRuntime(job.job_id,"w","p","other"),/identity_changed/);
+ }finally{await f.dispose();}
+});
+
+test("process未生成の停止receiptを確認してTaskを引継ぎ、空のunknown証拠は拒否する",async()=>{
+ const f=await fixture();try{
+  f.start();f.interrupt();const t=f.db.tasks.get(f.task.task_id)!;
+  assert.throws(()=>f.db.tasks.claimStop(t,{state:"unknown",reason:"none",observed_at:new Date().toISOString(),process_ids:[],process_groups:[]}),/evidence_missing/);
+  f.setObserved({state:"stopped",process_ids:[],process_groups:[]});f.setStopped(true);
+  await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,2);assert.equal(f.sends(),0);
+ }finally{await f.dispose();}
+});
+
+test("質問回答後の失敗turnをrunningへ戻さず利用上限の解除を待つ",async()=>{
+ const f=await fixture();try{
+  f.start();f.db.markJobNeedsReview(f.task.current_attempt_id,"runtime_question_pending","question");
+  f.runtime.questions=async()=>[];
+  f.runtime.get=async()=>({ok:false,stdout:"",stderr:"runtime_turn_interrupted",exitCode:1,timedOut:false,aborted:false,agentStatus:"idle",errorCode:"runtime_turn_interrupted"});
+  f.runtime.recoveryHint=async()=>({reason:"capacity_wait",retry_after:new Date(Date.now()+3600000).toISOString()});
+  await f.supervisor().reconcileTasks();const t=f.db.tasks.get(f.task.task_id)!;
+  assert.equal(t.state,"waiting");assert.equal(t.wait_reason,"capacity_wait");assert.equal(t.attempt_number,1);assert.equal(f.sends(),0);
+ }finally{await f.dispose();}
+});
+
+for(const reason of ["invalid_result","cancel_acceptance_unknown","ambiguous_steer_acceptance"])test(`${reason}は質問通知で解除しない`,async()=>{
+ const f=await fixture();try{
+  const job=f.db.getJob(f.task.current_attempt_id)!;f.db.beginJobPreparation(job.job_id);f.db.setJobRuntime(job.job_id,"w","p",JSON.stringify(["g","t"]));f.db.beginJobDispatch(job.job_id);f.db.markJobRunning(job.job_id);f.db.markJobNeedsReview(job.job_id,reason,"unresolved");
+  f.db.enqueueWorkerQuestion(job.job_id,{question_id:"q",agent:job.agent_name,generation:"g",thread_id:"t",turn_id:"turn",rpc_id_json:"1",kind:"question",payload_json:"{}",state:"pending",answer_hash:null,created_at:new Date().toISOString()});
+  assert.equal(f.db.getJob(job.job_id)?.last_error_code,reason);assert.equal(f.db.list().filter(e=>e.event_type==="worker_question").length,0);
+ }finally{await f.dispose();}
+});
+
+test("承認は通知後に取り込んだ所有者の返信だけを許可し時計差を使わない",async()=>{
+ const f=await fixture();try{
+  const job=f.db.getJob(f.task.current_attempt_id)!;
+  f.db.beginJobPreparation(job.job_id,new Date(job.available_at));f.db.setJobRuntime(job.job_id,"w","p",JSON.stringify(["g","t"]));f.db.beginJobDispatch(job.job_id);f.db.markJobRunning(job.job_id);
+  const before=f.db.enqueue({...eventEnvelope("before-approval"),occurred_at:"2099-01-01T00:00:00.000Z"}).row;
+  const request={question_id:"approval",agent:job.agent_name,generation:"g",thread_id:"t",turn_id:"turn",rpc_id_json:"1",kind:"approval" as const,payload_json:"{}",state:"pending" as const,answer_hash:null,created_at:"2000-01-01T00:00:00.000Z"};
+  let sent=0;f.runtime.questions=async()=>[request];f.runtime.approveRequest=async()=>{sent++;return {...request,state:"resolved"};};
+  const supervisor=f.supervisor();
+  await assert.rejects(supervisor.approveTaskRequest(f.task.task_id,before.event_id,f.db.tasks.get(f.task.task_id)!.revision,request.question_id,true),/requires_user_reply/);
+  f.db.enqueueWorkerQuestion(job.job_id,request);
+  const revision=f.db.tasks.get(f.task.task_id)!.revision;
+  for(const event of [f.event,before])await assert.rejects(supervisor.approveTaskRequest(f.task.task_id,event.event_id,revision,request.question_id,true),/requires_user_reply/);
+  const after=f.db.enqueue({...eventEnvelope("after-approval"),occurred_at:"1999-01-01T00:00:00.000Z"}).row;
+  await supervisor.approveTaskRequest(f.task.task_id,after.event_id,revision,request.question_id,true);assert.equal(sent,1);
+ }finally{await f.dispose();}
+});
+
+test("質問照合cursorは既通知pendingの次へ進み終端後に先頭へ戻る",async()=>{
+ const f=await fixture();try{
+  const received:Array<string|undefined>=[];const ids=["first","last"];let n=0;
+  f.runtime.pendingQuestions=async after=>{received.push(after);const id=ids[n++];return id?[{question_id:id,agent:"missing"} as import("../src/app-server/store.js").QuestionRecord]:[];};
+  const supervisor=f.supervisor();for(let i=0;i<4;i++)await supervisor.reconcileQuestions();
+  assert.deepEqual(received,[undefined,"first","last",undefined]);
+ }finally{await f.dispose();}
 });

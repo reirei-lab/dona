@@ -192,6 +192,8 @@ async function main() {
   process.once("SIGINT", () => receiveSignal("SIGINT"));
   process.once("SIGTERM", () => receiveSignal("SIGTERM"));
 
+  const runtime = startTsx("Runtime", dispatcherDir, ["src/app-server/dev.ts"], dispatcherEnvironment);
+  const runtimeExit = childExit(runtime, "Runtime");
   const dispatcher = startTsx(
     "Dispatcher",
     dispatcherDir,
@@ -216,6 +218,7 @@ async function main() {
       slackExit = childExit(slack, "Slack Adapter");
 
       const outcome = await Promise.race([
+        runtimeExit.then((result) => ({ kind: "exit", result })),
         dispatcherExit.then((result) => ({ kind: "exit", result })),
         slackExit.then((result) => ({ kind: "exit", result })),
         signalReceived,
@@ -236,6 +239,9 @@ async function main() {
     const children = slack ? [slack, dispatcher] : [dispatcher];
     const exits = slackExit ? [slackExit, dispatcherExit] : [dispatcherExit];
     await stopAll(children, exits);
+    // Dispatcherを先に止め、新しいworkerの作成がなくなってからruntimeを停止する。
+    stopChild(runtime, "SIGTERM");
+    await runtimeExit;
   }
 
   if (requestedSignal === "SIGINT") process.exitCode = 130;

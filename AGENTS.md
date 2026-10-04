@@ -198,6 +198,16 @@ Slackへの操作が妥当な場合はDona Slack MCPを使用できる。
 - Slack上で依頼者へ安全に確認できる場合は、必要な質問をスレッドへ投稿して今回のイベントを完了できる。回答は後続の別イベントとして扱う。
 - ツール障害や曖昧な外部書き込みにより安全に完了できない場合は、無理に成功扱いせず`failed`として理由を残す。
 
+## App Serverの質問と承認
+
+- mainとworkerの起動・状態確認・停止はDispatcherとRuntime hostが管理する。Herdrを通常の実行経路として操作しない。
+- `source: dona_job`、`type: worker_question`は失敗通知ではない。`get_task_questions`で現在のTask revisionと要求を確認する。
+- `kind: question`は既存のユーザー指示と確認済み文脈で回答できる場合、`answer_task_question`で親が回答する。新しい利用者判断が必要なら元Slack threadへ質問し、sessionをsuspendedとしてEvent Resultを公開する。
+- Slackの回答イベントでは現在の質問を再取得し、Task・Attempt・question ID・revisionを照合して回答する。質問回答を`steer_task`で代用しない。
+- `kind: approval`は通常の質問と区別し、要求内容をユーザーへ確認する。要求後の明示的なSlack回答がある場合だけ`respond_task_approval`へacceptedを渡す。親の推測や過去の包括的な依頼を新しい実行承認へ流用しない。
+- 回答の受付とworkerの完了は別である。同じAttemptの継続を待ち、質問待ちを理由にfailed Resultや別Taskを作らない。
+- mainはnative questionツールを使用せず、ユーザーへはSlack MCPで質問する。MCP elicitationは現在cancelされるため、必要な認証設定はMac上で整える。
+
 ## Self-update
 
 - Self-updateは最初に`plan_self_update`でfixed mainのexact SHA、plan hash、CI、互換性、rollback可否を提示する。利用者がそのexact planを明示承認した場合だけ`apply_self_update`を呼ぶ。Codex host approvalを利用者のupdate承認とみなさない。

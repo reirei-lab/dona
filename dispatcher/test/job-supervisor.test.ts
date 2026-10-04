@@ -2212,3 +2212,17 @@ for (const valid of [true, false]) test(`legacy timestamp producer to DB: ${vali
     // fakeRuntime throws on prepare/prompt/wait: ingestion cannot replay worker side effects.
   } finally { await supervisor.stop(); database.close(); }
 });
+
+test("native質問待ちの同じAttemptではprogress directoryを保持する",async()=>{
+ const {root,config}=await tempConfig();roots.push(root);const database=new DispatcherDatabase(config.databasePath);
+ const job=createScratchJob(database,config,"question-progress");markRunning(database,job.job_id);
+ const directory=path.dirname(jobProgressPath(job));await fs.mkdir(directory,{recursive:true});
+ const runtime=fakeRuntime({async wait(){return {...ok("blocked"),errorCode:"runtime_question_pending"};}});
+ const supervisor=new JobSupervisor(database,runtime,config,logger,()=>{});supervisor.start();
+ try{
+  await waitFor(()=>database.getJob(job.job_id)?.status==="blocked");
+  await new Promise(resolve=>setTimeout(resolve,30));
+  await fs.writeFile(path.join(directory,"progress.json.tmp"),"after answer");await fs.rename(path.join(directory,"progress.json.tmp"),path.join(directory,"progress.json"));
+  assert.equal(await fs.readFile(path.join(directory,"progress.json"),"utf8"),"after answer");
+ }finally{await supervisor.stop();database.close();}
+});

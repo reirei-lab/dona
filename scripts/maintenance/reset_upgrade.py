@@ -171,12 +171,13 @@ class LaunchdRejected(RuntimeError):
 
 
 class Launchd:
-    def __init__(self, maintenance_label=None):
+    def __init__(self, maintenance_label=None, service_labels=LABELS):
         self.maintenance_label = maintenance_label
+        self.service_labels = frozenset(service_labels)
         self.domain = 'gui/' + str(os.getuid())
 
     def observe(self, label):
-        require(label in LABELS or label == self.maintenance_label, 'label_scope')
+        require(label in self.service_labels or label == self.maintenance_label, 'label_scope')
         r = subprocess.run(['/bin/launchctl', 'print', self.domain + '/' + label], capture_output=True, timeout=5)
         if r.returncode != 0:
             # 他のエラー（権限やdomain不在）を未登録と取り違えない。

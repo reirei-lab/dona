@@ -22,6 +22,7 @@ export interface UpdatePolicy {
     session: "dona";
     name: "dona-main";
     minimum_herdr_version: string;
+    runtime?: "app_server";
   };
   launchd: {
     dispatcher_label: string;
@@ -119,7 +120,8 @@ export function parsePolicy(input: unknown): UpdatePolicy {
     throw new ValidationError("policy_version is invalid");
   }
   const mainAgent = record(value.main_agent, "main_agent");
-  exact(mainAgent, ["session", "name", "minimum_herdr_version"], "main_agent");
+  exact(mainAgent, ["session", "name", "minimum_herdr_version",...(Object.hasOwn(mainAgent,"runtime")?["runtime"]:[])], "main_agent");
+  if(mainAgent.runtime!==undefined&&mainAgent.runtime!=="app_server")throw new ValidationError("main_agent runtime is invalid");
   if (mainAgent.session !== "dona" || mainAgent.name !== "dona-main" ||
     typeof mainAgent.minimum_herdr_version !== "string" || !/^\d+\.\d+\.\d+$/.test(mainAgent.minimum_herdr_version)) {
     throw new ValidationError("main_agent configuration is not allowed");
@@ -220,6 +222,7 @@ export function parsePolicy(input: unknown): UpdatePolicy {
       session: "dona",
       name: "dona-main",
       minimum_herdr_version: mainAgent.minimum_herdr_version,
+      ...(mainAgent.runtime==="app_server"?{runtime:"app_server" as const}:{}),
     },
     launchd: {
       dispatcher_label: typeof launchd.dispatcher_label === "string" ? launchd.dispatcher_label : "",

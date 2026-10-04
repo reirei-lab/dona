@@ -43,6 +43,11 @@ export function assertFreshDatabase(db) {
 }
 
 export async function migrate(request) {
+  if(request.runtime_only) {
+    const {migrateStoppedRuntime}=await import(pathToFileURL(path.join(request.release,'dispatcher/dist/app-server/migration.js')));
+    migrateStoppedRuntime(request.databases[0],request.runtime_migration.database,request.runtime_migration.stop_receipt,request.release);
+    return;
+  }
   if (request.fresh_generation) {
     const {default:Database} = await import(pathToFileURL(path.join(request.release,'updater/node_modules/better-sqlite3/lib/index.js')));
     // 準備中の再開でも、既存の仕事を削除・移行して空DB扱いしない。
@@ -71,6 +76,10 @@ export async function migrate(request) {
     for (let index=0; index<constructors.length; index++) new constructors[index](request.databases[index]).close();
   }
   const {default:Database} = await import(pathToFileURL(path.join(request.release,'updater/node_modules/better-sqlite3/lib/index.js')));
+  if(request.runtime_migration&&!request.retire_only) {
+    const {migrateStoppedRuntime}=await import(pathToFileURL(path.join(request.release,'dispatcher/dist/app-server/migration.js')));
+    migrateStoppedRuntime(request.databases[0],request.runtime_migration.database,request.runtime_migration.stop_receipt,request.release);
+  }
   const db = new Database(request.databases[3]);
   try { retireUpdates(db,request.run_id,request.target_sha); } finally { db.close(); }
 }

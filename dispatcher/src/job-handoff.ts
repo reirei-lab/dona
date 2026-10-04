@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { JobRow } from "./types.js";
 
-export type WorkerActivity = "working" | "waiting" | "inactive" | "stopped" | "unknown";
+export type WorkerActivity = "working" | "waiting" | "inactive" | "stopped" | "unreachable" | "unknown";
 export interface WorkerObservation {
   state: WorkerActivity;
   reason: string;

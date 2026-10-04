@@ -18,7 +18,8 @@ import time
 
 import reset_upgrade as common
 
-LABELS = common.LABELS
+RUNTIME_LABEL = 'dev.dona.runtime'
+LABELS = (*common.LABELS, RUNTIME_LABEL)
 require = common.require
 atomic = common.atomic
 encode = common.encode
@@ -53,14 +54,14 @@ def progress(message):
 
 
 def process_table():
-    body = command(['/bin/ps', '-axo', 'pid=,ppid=,uid=,lstart=,stat='])
+    body = command(['/bin/ps', '-axo', 'pid=,ppid=,uid=,pgid=,lstart=,stat='])
     table = {}
     for line in body.splitlines():
         fields = line.split()
-        require(len(fields) == 9, 'process_table_format')
+        require(len(fields) == 10, 'process_table_format')
         pid, parent, uid = map(int, fields[:3])
         table[pid] = {'pid': pid, 'parent': parent, 'uid': uid,
-                      'start': ' '.join(fields[3:8]), 'state': fields[8]}
+                      'group':int(fields[3]), 'start': ' '.join(fields[4:9]), 'state': fields[9]}
     return table
 
 
@@ -209,6 +210,7 @@ def render(run, plan, inv):
         protected = [Path(p).resolve() for p in inv['databases'] + inv['old_results']]
         for target in [Path(p) for p in fresh_databases(g)] + [g/'results', g/'job-results', g/'run']:
             require(not any(target.resolve() == old or old in target.resolve().parents or target.resolve() in old.parents for old in protected), 'fresh_paths_overlap_source')
+        render_runtime(run, plan)
         return
     for name in ('config', 'control', 'logs', 'run'):
         common.private_dir(g/name)
@@ -226,7 +228,7 @@ def render(run, plan, inv):
     atomic(g/'control/policy.json', encode(policy))
     os.symlink(release, g/'runtime/current')
     common.private_dir(run/'plists')
-    for label in LABELS:
+    for label in common.LABELS:
         plist = copy.deepcopy(inv['plists'][label])
         env = plist['EnvironmentVariables']
         if label == 'dev.dona.updater':
@@ -241,6 +243,7 @@ def render(run, plan, inv):
             values.update(DONA_RELEASE_MANIFEST_PATH=str(Path(policy['current_pointer'])/'release-manifest.json'),
                           DONA_CODEX_PATH=policy['executables']['codex'],
                           DONA_UPDATER_SOCKET_PATH=str(g/'control/updater.sock'),
+                          DONA_APP_SERVER_SOCKET=str(g/'control/runtime.sock'),
                           DONA_UPDATE_INTERNAL_TOKEN_PATH=policy['dispatcher_internal_token_file'])
             file = g/'config'/(key+'.env')
             atomic(file, common.dotenv(values).encode())
@@ -267,6 +270,26 @@ await import({json.dumps((Path(policy['current_pointer'])/component/'dist/mcp/in
         old = inv['configs'][component]['config']
         keys = ('databasePath', 'resultsDir', 'jobResultsDir', 'jobProgressDatabasePath', 'updateNotificationDatabasePath', 'socketPath') if component == 'dispatcher' else ('healthSocketPath', 'dispatcherSocketPath')
         require(all(config[k] == old[k] for k in keys) and config['buildSha'] == plan['target_sha'], 'rendered_paths_mismatch')
+    render_runtime(run, plan)
+
+
+def render_runtime(run, plan):
+    """runtime hostはUpdaterと同じstable controlに置き、受付再起動から独立させる。"""
+    g, release = Path(plan['generation']), Path(plan['release'])
+    policy_file = g/'control/policy.json'
+    policy = read_json(policy_file)
+    policy['main_agent']['runtime'] = 'app_server'
+    atomic(policy_file, encode(policy))
+    shutil.copytree(release/'dispatcher', g/'control/runtime', symlinks=True)
+    config = {'socket':str(g/'control/runtime.sock'), 'database':str(g/'control/runtime.sqlite3'),
+              'codex':policy['executables']['codex'], 'buildSha':plan['target_sha']}
+    atomic(g/'control/runtime-config.json', encode(config))
+    plist = {'Label':RUNTIME_LABEL, 'ProgramArguments':[plan['node'], str(g/'control/runtime/dist/app-server/cli.js'),
+             str(g/'control/runtime-config.json')], 'WorkingDirectory':str(g/'control/runtime'),
+             'RunAtLoad':True, 'KeepAlive':True, 'ThrottleInterval':10,
+             'EnvironmentVariables':{'HOME':str(Path.home()), 'PATH':os.environ.get('PATH','/usr/bin:/bin')},
+             'StandardOutPath':str(g/'logs/runtime.log'), 'StandardErrorPath':str(g/'logs/runtime.error.log')}
+    atomic(run/'plists'/(RUNTIME_LABEL+'.plist'), plistlib.dumps(plist))
 
 
 
@@ -298,7 +321,8 @@ await import({json.dumps((release/component/'dist/mcp/index.js').as_uri())});
 
 def asset_seal(g):
     return common.digest(encode({name: common.tree_seal(g/name) if (g/name).is_dir() else common.file_digest(g/name)
-        for name in ('config', 'control/updater', 'control/policy.json', 'control/dispatcher.token', 'runtime')}))
+        for name in ('config', 'control/updater', 'control/policy.json', 'control/dispatcher.token', 'runtime',
+                     *(['control/runtime', 'control/runtime-config.json'] if (g/'control/runtime-config.json').exists() else []))}))
 
 
 
@@ -345,6 +369,16 @@ def prepare(run, repository, fresh_generation=False):
         atomic(run/name, Path(__file__).with_name(name).read_bytes())
     progress('設定を確認しています（サービス停止中でも準備できます）。')
     inv = common.inventory(require_running=False)
+    runtime_plist = Path.home()/'Library/LaunchAgents'/(RUNTIME_LABEL+'.plist')
+    if runtime_plist.exists():
+        data = common.regular(runtime_plist).read_bytes()
+        plist = plistlib.loads(data)
+        require(plist.get('Label') == RUNTIME_LABEL, 'runtime_plist_identity')
+        inv['plists'][RUNTIME_LABEL] = plist
+        inv['files'][str(runtime_plist)] = common.digest(data)
+        runtime_database = Path(inv['policy']['control_root'])/'runtime.sqlite3'
+        require(runtime_database.exists(), 'runtime_database_missing')
+        inv['databases'].append(str(runtime_database))
     atomic(run/'inventory.json', encode(inv))
     executables = inv['policy']['executables']
     git = executables['git']
@@ -393,6 +427,7 @@ def prepare(run, repository, fresh_generation=False):
     prepare_rollback(run, inv, plan)
     common.make_immutable(release)
     common.make_immutable(g/'control/updater')
+    common.make_immutable(g/'control/runtime')
     plan['rollback_seal'] = common.tree_seal(run/'rollback')
     plan['seal'] = asset_seal(g)
     plan['plists_seal'] = common.tree_seal(run/'plists')
@@ -414,7 +449,7 @@ class Runner:
         for name, expected in self.plan['bundle'].items():
             require(common.file_digest(run/name) == expected, 'runner_changed')
         require(Path(__file__).resolve() == (run/'offline_update.py').resolve(), 'use_prepared_runner')
-        self.live = common.Launchd()
+        self.live = common.Launchd(service_labels=LABELS)
         self.g = Path(self.plan['generation'])
         self.node = self.plan['node']
         self.policy = read_json(self.g/'control/policy.json')
@@ -539,6 +574,22 @@ class Runner:
         roots = list(herdr_root(self.policy['executables']['herdr']))
         roots.extend(herdr_starting(self.policy['executables']['herdr']))
         table = process_table()
+        # hostが先にcrashして孤児化したApp Serverも保存済み開始identityで拾う。
+        for root in {self.policy.get('control_root'),self.inv.get('policy',{}).get('control_root')} - {None}:
+            database = Path(root)/'runtime.sqlite3'
+            if not database.exists(): continue
+            reader = common.NodeDatabase(self.node, Path(self.plan['release'])/'dispatcher/node_modules/better-sqlite3/lib/index.js')
+            for pid, started in reader.read(database,"SELECT pid,process_start FROM agents WHERE state<>'stopped' AND pid IS NOT NULL"):
+                observed = table.get(pid)
+                if observed and observed['start'] == started:
+                    require(observed['uid']==os.getuid(), 'runtime_process_owner')
+                    roots.append(observed)
+                elif observed is None:
+                    # rootのcrash後も元のprocess groupに残る子を停止対象へ含める。
+                    for child in table.values():
+                        if child['group'] == pid:
+                            require(child['uid']==os.getuid(), 'runtime_process_owner')
+                            roots.append(child)
         ancestor = os.getpid()
         while ancestor in table:
             require(all(ancestor != p['pid'] for p in roots), 'run_from_terminal_outside_dona')
@@ -580,7 +631,7 @@ class Runner:
                    'herdr_config_sha256': self.plan['bundle']['herdr-config.toml'] if check_source else None}
         for label in LABELS:
             require(self.live.observe(label) is None, 'service_still_registered')
-        self.record(processes=[], server_start_intent=False, server_pid=None,
+        self.record(processes=[], server_start_intent=False, server_pid=None,last_stop_receipt=receipt,
                     **({'source_stop_receipt': receipt} if check_source else {}))
 
     def backup(self):
@@ -642,11 +693,20 @@ class Runner:
                 shutil.copytree(diagnostics, target, symlinks=True, dirs_exist_ok=True)
         request = {'release': self.plan['release'], 'databases': databases,
                    'run_id': self.run.name, 'target_sha': self.plan['target_sha'], 'retire_only': retire_only}
+        if not retire_only and self.policy.get('main_agent',{}).get('runtime') == 'app_server':
+            target = self.g/'control/runtime.sqlite3'
+            for suffix in ('','-wal','-shm'): Path(str(target)+suffix).unlink(missing_ok=True)
+            if len(self.inv['databases'])>4:
+                atomic(target,(self.run/'backup/db-4').read_bytes())
+            request['runtime_migration']={'database':str(target),'stop_receipt':self.journal['source_stop_receipt']}
         env = dict(os.environ, DONA_RELEASE_MANIFEST_PATH=str(Path(self.plan['release'])/'release-manifest.json'))
         command([self.node, str(self.run/'offline_state.mjs')], env=env, input=encode(request), timeout=120)
 
     def install(self, old=False):
         for label in LABELS:
+            if old and label not in self.inv['plists']:
+                (Path.home()/'Library/LaunchAgents'/(label+'.plist')).unlink(missing_ok=True)
+                continue
             data = plistlib.dumps(self.inv['plists'][label]) if old else (self.run/'plists'/(label+'.plist')).read_bytes()
             atomic(Path.home()/'Library/LaunchAgents'/(label+'.plist'), data)
 
@@ -671,6 +731,9 @@ class Runner:
             time.sleep(.2)
 
     def start_main(self, old=False):
+        policy = self.inv['policy'] if old else self.policy
+        if policy['main_agent'].get('runtime') == 'app_server':
+            return self.start_app_server_main(old)
         self.ensure_herdr()
         release = self.inv['old_pointer'] if old else self.plan['release']
         # 専用serverの起動はHerdr自身の--session起動経路を使う。
@@ -717,6 +780,40 @@ class Runner:
         require(result['outcome'] == 'started', 'main_start_not_confirmed')
         state['session_id'] = result['observation']['session_id']
         self.record(**{key: state})
+
+    def start_app_server_main(self, old=False):
+        policy = self.inv['policy'] if old else self.policy
+        runtime_database = Path(policy['control_root'])/'runtime.sqlite3'
+        if runtime_database.exists() and self.journal.get('last_stop_receipt') and self.live.observe(RUNTIME_LABEL) is None:
+            dispatcher_database = fresh_databases(self.g)[0] if fresh(self.plan) and not old else self.inv['databases'][0]
+            request = {'runtime_only':True,'release':self.plan['release'],'databases':[dispatcher_database],
+                       'runtime_migration':{'database':str(runtime_database),'stop_receipt':self.journal['last_stop_receipt']}}
+            command([self.node,str(self.run/'offline_state.mjs')],input=encode(request),timeout=120)
+        self.start_service(RUNTIME_LABEL)
+        socket_path = str(Path(policy['control_root'])/'runtime.sock')
+        deadline = time.monotonic()+30
+        while True:
+            try:
+                health = common.http_unix(socket_path, '/health/version')
+                expected = read_json(Path(policy['control_root'])/'runtime-config.json')['buildSha']
+                if health.get('service') == 'runtime' and health.get('status') == 'ready' and health.get('build_sha') == expected: break
+            except (OSError, RuntimeError): pass
+            require(time.monotonic()<deadline, 'runtime_start_not_confirmed')
+            time.sleep(.2)
+        key = 'old_main' if old else 'main'
+        release = self.inv['old_pointer'] if old else self.plan['release']
+        control = self.run/'rollback/control' if old else self.g/'control'
+        def bridge(request):
+            return json.loads(command([self.node,str(self.run/'main_bridge.mjs'),str(control)],input=encode(request),timeout=180))
+        observed = bridge({'action':'status','release':release})
+        if not observed.get('exists'):
+            require(not self.journal.get(key,{}).get('start_intent'), 'main_start_unknown')
+            self.record(**{key:{'pane':'dona-main','start_intent':True}})
+            result = bridge({'action':'start','pane':'dona-main','release':release})
+            require(result['outcome']=='started', 'main_start_not_confirmed')
+            observed = result['observation']
+        require(observed.get('matches_release') and observed.get('interactive_ready') and observed.get('status')=='idle', 'main_not_ready')
+        self.record(**{key:{'pane':'dona-main','session_id':observed['session_id']}})
 
     def start_service(self, label):
         command(['/bin/launchctl', 'enable', self.live.domain+'/'+label])
@@ -843,7 +940,7 @@ class Runner:
                     # 停止intent直後のcrashでも、別更新後のサービスを先に止めない。
                     self.source_preflight()
                     self.probe()
-                progress('Donaの3サービスと専用Herdrプロセスを停止しています。')
+                progress('Donaのサービスと管理対象agentプロセスを停止しています。')
                 self.stop(check_source=True)
                 self.record('stopped')
             if self.journal['phase'] == 'stopped':

@@ -1239,6 +1239,36 @@ export class DispatcherDatabase {
     return changed === 1;
   }
 
+  getJobByAgent(name:string):JobRow|undefined {
+    return this.db.prepare("SELECT * FROM jobs WHERE agent_name=? ORDER BY created_at DESC LIMIT 1").get(name) as JobRow|undefined;
+  }
+  enqueueWorkerQuestion(jobId:string,question:import("./app-server/store.js").QuestionRecord):void {
+    this.db.transaction(()=>{
+      const job=this.getJob(jobId),task=this.tasks.forAttempt(jobId);
+      if(!job||!task||task.current_attempt_id!==jobId||task.desired_state!=="running"||task.stop_state!=="none"||
+        !(["running","blocked"].includes(job.status)||(job.status==="needs_review"&&taskMayAcceptLateResult(job)))||question.state!=="pending"||question.agent!==job.agent_name||JSON.stringify([question.generation,question.thread_id])!==this.getJobLiveSessionIdentity(jobId)?.herdr_agent_session_id)return;
+      const source=this.getRequired(job.source_event_id),binding=readEventJobBinding(this.db,job.source_event_id);
+      if(!binding||binding.owner.kind!=="slack_thread")return;
+      const envelope:EventEnvelope={schema_version:1,source:"dona_job",type:"worker_question",external_event_id:`question:${question.question_id}`,
+        occurred_at:question.created_at,subject:{job_id:jobId,source_event_id:job.source_event_id,workspace_id:job.workspace_id!,channel_id:job.channel_id!,thread_ts:job.thread_ts!,actor_id:job.actor_id!},
+        payload:{task_id:task.task_id,question_id:question.question_id,request_kind:question.kind},
+        reply_target:JSON.parse(source.reply_target_json!),trace:{job_id:jobId,source_event_id:job.source_event_id}};
+      const result=this.enqueue(envelope,new Date(question.created_at));
+      if(result.payloadMismatch)throw Error("task_question_notification_conflict");
+      insertEventJobBinding(this.db,result.row.event_id,binding);
+      this.db.prepare("UPDATE jobs SET status='blocked',last_error_code='runtime_question_pending',last_error_message='Worker requested input through Dona' WHERE job_id=?").run(jobId);
+      this.tasks.wait(task,"human_input");
+    }).immediate();
+  }
+
+  hasWorkerApprovalReply(jobId:string,questionId:string,eventId:string):boolean {
+    // Dispatcherの永続sequenceを使い、Slack/host間の時計差を認可に用いない。
+    return this.db.prepare(`SELECT 1 FROM events notification JOIN events reply ON reply.sequence>notification.sequence
+      WHERE notification.source='dona_job' AND notification.event_type='worker_question'
+      AND notification.external_event_id=? AND json_extract(notification.subject_json,'$.job_id')=?
+      AND json_extract(notification.payload_json,'$.request_kind')='approval' AND reply.event_id=? AND reply.source='slack'`).get(`question:${questionId}`,jobId,eventId)!==undefined;
+  }
+
   getJob(jobId: string): JobRow | undefined {
     return this.db.prepare("SELECT * FROM jobs WHERE job_id = ?").get(jobId) as JobRow | undefined;
   }
@@ -1618,6 +1648,15 @@ export class DispatcherDatabase {
         job_id,identity_version,herdr_agent_session_id,herdr_workspace_id,herdr_pane_id,agent_name,recorded_at,generation_nonce)
         SELECT job_id,1,?,?,?,?,?,? FROM jobs WHERE job_id=?`)
         .run(agentSessionId,herdrWorkspaceId,herdrPaneId,agentName,at.toISOString(),randomUUID(),jobId);
+    }).immediate();
+  }
+
+  reconcileJobPreparationRuntime(jobId:string,workspaceId:string,paneId:string,sessionId:string):void {
+    this.db.transaction(()=>{
+      const row=this.getJob(jobId);
+      if(!row||row.status!=="needs_review"||row.last_error_code!=="runtime_preparation_unknown"||this.getJobLiveSessionIdentity(jobId)||workspaceId!==row.herdr_workspace_id||paneId!==row.herdr_pane_id||sessionId.length>512)throw Error("runtime_preparation_identity_changed");
+      this.db.prepare(`INSERT INTO job_live_session_identities(job_id,identity_version,herdr_agent_session_id,herdr_workspace_id,herdr_pane_id,agent_name,recorded_at,generation_nonce) VALUES(?,1,?,?,?,?,?,?)`)
+        .run(jobId,sessionId,workspaceId,paneId,row.agent_name,new Date().toISOString(),randomUUID());
     }).immediate();
   }
 
@@ -2301,9 +2340,9 @@ export class DispatcherDatabase {
     });
   }
 
-  markJobBlocked(jobId: string, message: string, from: JobStatus[] = ["running"]): void {
+  markJobBlocked(jobId: string, message: string, from: JobStatus[] = ["running"], code="agent_blocked"): void {
     this.updateJob(jobId, from, "blocked", {
-      last_error_code: "agent_blocked",
+      last_error_code: code,
       last_error_message: message,
     });
   }
@@ -2401,7 +2440,7 @@ export class DispatcherDatabase {
           this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE job_id=?").run(jobId);
         }
         if(recoverAmbiguous&&binding?.owner.kind==="schedule") this.scheduler.recoverWorkRunForResult(binding.owner.run_id,jobId,job.source_event_id,new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
-        this.updateJob(jobId, recoverAmbiguous?["needs_review"]:["running","cancelling"], status, {
+        this.updateJob(jobId, recoverAmbiguous?["needs_review"]:managedAttempt&&job.status==="blocked"&&job.last_error_code==="runtime_question_pending"?["blocked"]:["running","cancelling"], status, {
           result_json: stableStringify(result), result_path: resultPath, completed_at: completedAt.toISOString(),
           last_error_code: job.status === "cancelling" && job.last_error_code !== "cancel_worker_stopped"
             ? "cancel_worker_unverified" : job.steer_state === "dispatching" || job.steer_state === "accepted"

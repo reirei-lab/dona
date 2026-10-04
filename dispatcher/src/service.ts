@@ -2,8 +2,8 @@ import { assertTaskGenerationFile } from "./task-execution.js";
 import type { DispatcherConfig } from "./config.js";
 import { DispatcherApi } from "./api.js";
 import { DispatcherDatabase } from "./database.js";
-import { HerdrProcessClient } from "./herdr.js";
-import { HerdrJobAgentRuntime } from "./job-runtime.js";
+import { AppServerAgentClient,AppServerJobRuntime,runtimeSocket } from "./app-server/adapters.js";
+
 import { JobSupervisor } from "./job-supervisor.js";
 import { SlackAdapterJobNotificationVerifier } from "./job-notification-verifier.js";
 import { createLogger } from "./logger.js";
@@ -38,12 +38,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       error_message: error instanceof Error ? error.message : String(error),
     });
   }
-  const herdr = new HerdrProcessClient({
-    executable: config.herdrPath,
-    session: config.herdrSession,
-    agentName: config.agentName,
-    waitTimeoutMs: config.agentWaitTimeoutMs,
-  });
+  const herdr = new AppServerAgentClient(runtimeSocket(config),config.agentName,config.agentWaitTimeoutMs);
   let jobSupervisor!: JobSupervisor;
   let jobProgress = jobProgressStore
     ? new JobProgressCoordinator(database, jobProgressStore, config, createLogger("dispatcher_job_progress"))
@@ -60,7 +55,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     new SystemClock(), createLogger("dispatcher_slack_reminders"), Math.min(config.queuePollMs, 60_000));
   jobSupervisor = new JobSupervisor(
     database,
-    new HerdrJobAgentRuntime(config, jobProgress !== undefined),
+    new AppServerJobRuntime(config, jobProgress !== undefined,id=>database.getJobLiveSessionIdentity(id)?.herdr_agent_session_id??undefined,id=>!!database.tasks.forAttempt(id)),
     config,
     createLogger("dispatcher_jobs"),
     () => worker.wake(),
