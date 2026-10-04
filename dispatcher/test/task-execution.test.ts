@@ -523,7 +523,7 @@ test("明示照合は停止済み旧Attemptの失敗Resultを保持し、同一T
     const input=await f.input(),before=await fs.readFile(f.job.result_path,"utf8");
     await f.supervisor().reconcileTaskResult(f.task.task_id,input);
     const task=f.db.tasks.get(f.task.task_id)!;assert.equal(task.attempt_number,2);assert.equal(task.state,"active");assert.equal(task.steer_pending_event_id,null);assert.equal(f.sends(),0);
-    const next=f.db.getJob(task.current_attempt_id)!;assert.equal(next.workspace_path,f.job.workspace_path);assert.notEqual(next.result_path,f.job.result_path);assert.match(next.objective,/未受理失敗Result/);
+    const next=f.db.getJob(task.current_attempt_id)!;assert.equal(next.workspace_path,f.job.workspace_path);assert.notEqual(next.result_path,f.job.result_path);assert.match(next.objective,/未受理失敗Result/);assert.ok(next.objective.includes(input.reason));assert.ok(next.objective.includes(input.steer_resolution));assert.ok(next.objective.includes(input.evidence[0]!.reference));assert.ok(next.objective.includes(input.evidence[0]!.finding));
     assert.equal(await fs.readFile(f.job.result_path,"utf8"),before);assert.equal(await fs.readFile(path.join(next.workspace_path,"unfinished"),"utf8"),"残作業");
     assert.equal(f.db.getJob(f.job.job_id)!.result_json,null);assert.equal(f.db.tasks.mayNotify(f.db.getJob(f.job.job_id)!),false);
     const Database=(await import("better-sqlite3")).default,sql=new Database(f.config.databasePath,{readonly:true});
@@ -588,8 +588,23 @@ test("main用の照合MCPからUDSを通し、理由と証拠を保存して継�
   await api.start();const server=createDispatcherMcpServer(new DispatcherApiClient(f.config.socketPath),logger),client=new Client({name:"recovery-contract",version:"1"});const [a,b]=InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(b),client.connect(a)]);
   try{
-    const input=await f.input();const inspected=await client.callTool({name:"inspect_task_recovery",arguments:{task_id:f.task.task_id,source_event_id:input.source_event_id}});assert.equal(inspected.isError,undefined);assert.equal(inspected.structuredContent!.result_sha256,input.result_sha256);
+    const input=await f.input();const inspected=await client.callTool({name:"inspect_task_recovery",arguments:{task_id:f.task.task_id,source_event_id:input.source_event_id}});assert.equal(inspected.isError,undefined);assert.equal((inspected.structuredContent as {result_sha256:string}).result_sha256,input.result_sha256);
     const call={name:"reconcile_task_result",arguments:{task_id:f.task.task_id,...input}};const result=await client.callTool(call);assert.equal(result.isError,undefined);assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,2);
     assert.equal((await client.callTool(call)).isError,undefined);assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,2);
   }finally{await client.close();await server.close();await api.stop();await f.dispose();}
+});
+
+test("checkpoint file欠落時に永続checkpointの未解決操作を忘れない",async()=>{
+  const f=await failedSteerFixture();try{
+    const {checkpointSchema}=await import("../src/task-checkpoint.js");
+    f.db.tasks.checkpoint(f.job,checkpointSchema.parse({...f.checkpoint,unresolved_operations:["unknown external write"],waiting:"external_effect_unknown"}));
+    await fs.unlink(f.checkpointPath);const input=await f.input();assert.equal(input.checkpoint_sha256,"missing");
+    await assert.rejects(f.supervisor().reconcileTaskResult(f.task.task_id,input),/checkpoint_missing/);assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,1);
+  }finally{await f.dispose();}
+});
+test("回復検査は観測・checkpointをDBへ書き込まない",async()=>{
+  const f=await failedSteerFixture();try{
+    assert.equal(f.db.getWorkerObservation(f.job),undefined);assert.equal(f.db.tasks.latestCheckpoint(f.task.task_id),undefined);
+    await f.input();assert.equal(f.db.getWorkerObservation(f.job),undefined);assert.equal(f.db.tasks.latestCheckpoint(f.task.task_id),undefined);
+  }finally{await f.dispose();}
 });

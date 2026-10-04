@@ -262,13 +262,13 @@ export class JobSupervisor {
 
   async inspectTaskRecovery(id:string,eventId:string):Promise<Record<string,unknown>> {
     const task=this.database.tasks.assertOwner(id,eventId),job=this.database.getJob(task.current_attempt_id)!;
-    const observed=await this.observeWorker(job);
+    const observed=this.runtime.observeWorker?await this.runtime.observeWorker(job,this.abortController.signal):{state:"unknown"};
     const fresh=this.database.tasks.assertOwner(id,eventId);
     if(fresh.revision!==task.revision||fresh.current_attempt_id!==job.job_id)throw Error("task_revision_conflict");
     const result=this.database.readTaskRecoveryResult(job.job_id),checkpoint=checkpointSnapshot(job,id);
     return {task_id:id,revision:task.revision,attempt_id:job.job_id,worker_state:observed.state,
       cause:job.last_error_code,result_sha256:result.sha256,unaccepted_result:result.result,
-      checkpoint_sha256:checkpoint.sha256,checkpoint:checkpoint.checkpoint??null,
+      checkpoint_sha256:checkpoint.sha256,checkpoint:checkpoint.checkpoint??null,persisted_checkpoint:this.database.tasks.latestCheckpoint(id)??null,
       reconciliation:this.database.tasks.resultRecovery(job.job_id)??null};
   }
   async reconcileTaskResult(id:string,value:unknown):Promise<Record<string,unknown>> {

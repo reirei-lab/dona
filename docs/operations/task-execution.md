@@ -63,7 +63,7 @@ Mac上の任意CLIが起動する外部daemonやSimulatorまでprocess groupで�
 
 照合できた場合だけ`reconcile_task_result`へ、exact Task revision・Attempt ID・Result/checkpoint hash、`reason`、`steer_resolution`、証拠の参照と確認内容を渡す。停止証拠だけで外部操作の成否を推測しない。ユーザーの継続依頼やResultの自己申告だけを副作用の照合証拠にせず、既存PR・commit・providerのdurable receipt等を読み直す。確認不能なら保留する。
 
-Dispatcherは旧workerの停止を照合した後、Resultとcheckpointをtransaction内で再読する。未解決外部操作、worker稼働・停止不明、成功・不正・隔離Result、revision/hash不一致では拒否する。旧checkpointの`design`成果物は参照情報として読み取る。旧Result fileを削除・受理せず、内容・hash・照合event・理由・証拠・停止記録を`task_attempt_result_recoveries`へ保存し、同じTask・Issue claim・worktreeで次のAttemptへ進む。後継workerも既存成果・外部操作を照合し、成否不明の操作を再送しない。
+Dispatcherは旧workerの停止を照合した後、Resultとcheckpointをtransaction内で再読する。未解決外部操作、worker稼働・停止不明、成功・不正・隔離Result、revision/hash不一致では拒否する。checkpoint fileが欠落しても保存済みcheckpointを無視せず、両者が一致しない場合は保留する。検査ツール自体は観測・checkpointをDBへ保存しない。旧checkpointの`design`成果物は参照情報として読み取る。旧Result fileを削除・受理せず、内容・hash・照合event・理由・証拠・停止記録を`task_attempt_result_recoveries`へ保存し、同じTask・Issue claim・worktreeで次のAttemptへ進む。照合結論・理由・証拠参照は未検証の引継ぎ情報として後継promptにも渡す。後継workerも既存成果・外部操作を照合し、成否不明の操作を再送しない。
 
 上限到達なら停止証拠と照合記録を保持した`retry_exhausted`になる。追加実行が承認されれば`retry_task`で予算を増やせる。後継作成前にResult/checkpoint hashと停止状態を再照合する。競合したpause/cancelは優先し、停止確認後に一時停止/取消を確定する。一時停止だけではResult照合を済ませたことにならない。
 
