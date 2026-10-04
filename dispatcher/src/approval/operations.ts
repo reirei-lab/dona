@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import type { VerifiedAuditState } from "../audit/codec.js";
 import { ApprovalRequestLifecycle } from "./request-lifecycle.js";
 import { z } from "zod";
-import { assertSynchronousResult } from "../audit/synchronous.js";
+import { assertSynchronousResult, assertSynchronousCallback, type SynchronousCallback } from "../audit/synchronous.js";
 import { AuditRepository } from "../audit/repository.js";
 import { ApprovalRecordRepository } from "./record-repository.js";
 import { ApprovalClockHistory } from "./clock-history.js";
@@ -10,11 +10,23 @@ import type { SupervisorBindingGuard } from "./supervisor-binding.js";
 import { advanceClockMark, parseClockMark, type ClockMark } from "./clock.js";
 import type { ApprovalRecordScope } from "./record-codec.js";
 import type { ApprovalTransactionProviders } from "./transaction.js";
+import type { OperationsPolicyRepository, OperationsAction } from "./operations-policy.js";
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const scopeSchema = z.strictObject({ instance_id: id, workspace_id: id });
 const pageSchema = z.strictObject({ limit: z.number().int().min(1).max(100), after: id.nullable() });
 const requestStates = ["requested", "delivery_pending", "delivery_unknown", "sent", "approved", "needs_review"] as const;
+const filterSchema = z.strictObject({ state: z.enum(["all", "requested", "delivery_pending", "delivery_unknown", "sent", "approved",
+  "rejected", "cancelled", "expired", "delivery_failed", "consumed", "execution_cancelled", "consume_expired", "needs_review"]), due_only: z.boolean() });
+const cursorSchema = z.strictObject({ codec_version: z.literal(1), scope: scopeSchema, principal_id: id,
+  policy_revision: z.number().int().positive(), filter: filterSchema, after: id });
+const listSchema = z.strictObject({ limit: z.number().int().min(1).max(100), cursor: z.string().max(2048).nullable(), filter: filterSchema });
+export type OperationsListInput = z.infer<typeof listSchema>;
+export interface OperationsListPage {
+  readonly requests: readonly { readonly handle: string; readonly revision: number; readonly state: string; readonly due: boolean }[];
+  readonly cursor: string | null;
+  readonly has_more: boolean;
+}
 
 export class ApprovalOperationsError extends Error {
   constructor() { super("approval_operations_unverified"); this.name = "ApprovalOperationsError"; }
@@ -28,7 +40,7 @@ export interface ApprovalHealth {
   readonly live: true;
   readonly ready: false;
   readonly degraded: readonly string[];
-  readonly counts: Readonly<Record<"expiry_lag" | "stale_claim" | "unknown_attempt" | "unknown_delivery" | "needs_review", number> & { retention_overdue: null }> | null;
+  readonly counts: Readonly<Record<"expiry_lag" | "stale_claim" | "unknown_attempt" | "unknown_delivery" | "needs_review", number> & { retention_overdue: number | null }> | null;
 }
 
 /** Internal, read-only operations view. SQL supplies bounded candidate IDs only;
@@ -41,7 +53,8 @@ export class ApprovalOperations {
   private readonly history: ApprovalClockHistory;
   private readonly lifecycle: ApprovalRequestLifecycle;
   constructor(private readonly db: Database.Database, private readonly providers: ApprovalTransactionProviders, scope: ApprovalRecordScope,
-    private readonly bindingGuard?: SupervisorBindingGuard) {
+    private readonly bindingGuard?: SupervisorBindingGuard,
+    private readonly retentionObservation?: (state: VerifiedAuditState, mark: Readonly<ClockMark>) => number) {
     try {
       assertSynchronousResult(scope);
       this.scope = Object.freeze(scopeSchema.parse(scope));
@@ -49,6 +62,55 @@ export class ApprovalOperations {
       this.records = new ApprovalRecordRepository(db, providers.auditAnchors, providers.auditKeys, this.scope);
       this.history = new ApprovalClockHistory(db, this.scope);
       this.lifecycle = new ApprovalRequestLifecycle(db, providers, this.scope);
+      if (retentionObservation !== undefined) assertSynchronousCallback(retentionObservation);
+    } catch { throw new ApprovalOperationsError(); }
+  }
+  /** operator専用projection。cursorは開示権限を与えず、毎pageで認可する。
+   * filterで空pageでも走査cursorを進め、候補数を成功件数と解釈しない。 */
+  listRequests(policies: OperationsPolicyRepository, input: OperationsListInput): OperationsListPage {
+    try {
+      assertSynchronousResult(input); const parsed = listSchema.parse(input);
+      if (!policies.matchesContext(this.db, this.scope)) throw Error();
+      return this.audit.readVerifiedState(state => {
+        const mark = this.observation(state), grant = policies.authorize(state, mark, "read");
+        let after: string | null = null;
+        if (parsed.cursor !== null) {
+          const raw = Buffer.from(parsed.cursor, "base64url");
+          if (raw.toString("base64url") !== parsed.cursor || raw.length > 1536) throw Error();
+          const cursor = cursorSchema.parse(JSON.parse(raw.toString("utf8")));
+          if (cursor.scope.instance_id !== this.scope.instance_id || cursor.scope.workspace_id !== this.scope.workspace_id
+            || cursor.principal_id !== grant.principal_id || cursor.policy_revision !== grant.policy_revision
+            || JSON.stringify(cursor.filter) !== JSON.stringify(parsed.filter)) throw Error();
+          after = cursor.after;
+        }
+        const page = this.records.readListPageInState(state, { record_kind: "request", membership: "all" }, after, parsed.limit);
+        const requests: OperationsListPage["requests"][number][] = [];
+        for (const request of page.records) {
+          if (request.kind !== "request") throw Error();
+          this.lifecycle.verifyClock(request, mark, state);
+          const due = request.row.state === "approved" ? request.row.consume_expires_at !== null && request.row.consume_expires_at <= mark.effective_utc
+            : requestStates.slice(0, 4).includes(request.row.state as never) && request.row.expires_at <= mark.effective_utc;
+          if ((parsed.filter.state === "all" || parsed.filter.state === request.row.state) && (!parsed.filter.due_only || due))
+            requests.push(Object.freeze({ handle: request.row.request_id, revision: request.row.revision, state: request.row.state, due }));
+        }
+        const cursor = page.has_more && page.next_after !== null ? Buffer.from(JSON.stringify({ codec_version: 1,
+          scope: this.scope, principal_id: grant.principal_id, policy_revision: grant.policy_revision, filter: parsed.filter, after: page.next_after })).toString("base64url") : null;
+        return Object.freeze({ requests: Object.freeze(requests), cursor, has_more: page.has_more });
+      }) as OperationsListPage;
+    } catch { throw new ApprovalOperationsError(); }
+  }
+  /** 認可と保護clock観測を同じ監査snapshotで行う内部接続点。 */
+  authorizedObservation<F extends (state: VerifiedAuditState, mark: Readonly<ClockMark>, principal: { principal_id: string; policy_revision: number; binding_revision: number }) => unknown>
+    (policies: OperationsPolicyRepository, action: OperationsAction, inspect: SynchronousCallback<F>): ReturnType<F>;
+  authorizedObservation(policies: OperationsPolicyRepository, action: OperationsAction,
+    inspect: (state: VerifiedAuditState, mark: Readonly<ClockMark>, principal: { principal_id: string; policy_revision: number; binding_revision: number }) => unknown): unknown {
+    try {
+      assertSynchronousCallback(inspect);
+      if (!policies.matchesContext(this.db, this.scope)) throw Error();
+      return this.audit.readVerifiedState(state => {
+        const mark = this.observation(state), principal = policies.authorize(state, mark, action);
+        return inspect(state, mark, principal);
+      });
     } catch { throw new ApprovalOperationsError(); }
   }
   /** A request list is a hint for an authenticated internal expiry worker. The
@@ -76,8 +138,8 @@ export class ApprovalOperations {
   }
   /** Health is derived from a protected clock observation and root-verified rows.
    * A clock/anchor/DB mismatch returns a degraded result, never safe readiness. */
-  metrics(): string {
-    const health = this.health();
+  metrics(policies?: OperationsPolicyRepository): string {
+    const health = this.health(policies);
     const lines = ["dona_approval_live 1", "dona_approval_safe_ready 0",
       "dona_approval_observation_verified " + Number(health.counts !== null)];
     if (health.counts !== null) {
@@ -99,12 +161,14 @@ export class ApprovalOperations {
     if (saved === null || (createdAt !== undefined && saved.effective_utc !== createdAt)
       || saved.boot_id !== current.boot_id || saved.continuous_ms > current.continuous_ms || saved.effective_utc > current.effective_utc) throw Error();
   }
-  health(): ApprovalHealth {
-    const counts = { expiry_lag: 0, stale_claim: 0, unknown_attempt: 0, unknown_delivery: 0, retention_overdue: null, needs_review: 0 };
+  health(policies?: OperationsPolicyRepository): ApprovalHealth {
+    const counts = { expiry_lag: 0, stale_claim: 0, unknown_attempt: 0, unknown_delivery: 0, retention_overdue: null as number | null, needs_review: 0 };
     try {
       return this.audit.readVerifiedState(state => {
         const mark = this.observation(state), effective = mark.effective_utc;
+        if (policies !== undefined) { if (!policies.matchesContext(this.db, this.scope)) throw Error(); policies.authorize(state, mark, "read"); }
         if (this.bindingGuard && !this.bindingGuard.matchesScope(this.scope)) throw Error();
+        if (this.retentionObservation !== undefined) counts.retention_overdue = z.number().int().nonnegative().max(200).parse(this.retentionObservation(state, mark));
         const requestRows = this.db.prepare("SELECT request_id FROM main.approval_requests WHERE instance_id=? AND workspace_id=? ORDER BY request_id LIMIT 101")
           .all(this.scope.instance_id, this.scope.workspace_id) as { request_id: string }[];
         if (requestRows.length > 100 || this.records.readListHeadInState(state, { record_kind: "request", membership: "all" }, 1).count !== requestRows.length) throw Error();
@@ -150,7 +214,8 @@ export class ApprovalOperations {
           if (presentation.row.state === "needs_review") counts.needs_review++;
         }
         // 内部recordの健全性だけではoperator認可やruntimeの安全性を証明できない。
-        const degraded = ["runtime_readiness_unverified", "retention_unverified", ...Object.entries(counts).filter(([, count]) => count !== null && count > 0).map(([name]) => name)];
+        const degraded = ["runtime_readiness_unverified", ...(counts.retention_overdue === null ? ["retention_unverified"] : []),
+          ...Object.entries(counts).filter(([, count]) => count !== null && count > 0).map(([name]) => name)];
         return Object.freeze({ live: true as const, ready: false as const, degraded: Object.freeze(degraded), counts: Object.freeze(counts) });
       }) as ApprovalHealth;
     } catch {

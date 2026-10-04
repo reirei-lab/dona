@@ -59,6 +59,11 @@ jobs:
         run: npm ci
         working-directory: ${{ matrix.component }}
 
+      - name: Install provider contract test dependencies
+        if: matrix.component == 'dispatcher'
+        run: npm ci --ignore-scripts
+        working-directory: sources/slack
+
       - name: Run tests
         run: npm test
         working-directory: ${{ matrix.component }}

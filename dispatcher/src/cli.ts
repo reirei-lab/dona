@@ -5,10 +5,12 @@ import { loadConfig } from "./config.js";
 import { DispatcherDatabase } from "./database.js";
 import { eventStatuses, jobStatuses, type EventStatus, type JobStatus } from "./types.js";
 import { runService } from "./service.js";
+import { runOperationsFrontend } from "./approval/operations-frontend.js";
 
 function usage(): never {
   console.error(`Usage:
   dona-dispatcher serve
+  dona-dispatcher approval-operations <list|health|metrics|expire|retention|reconcile|backup|restore-check|sweep> --config <private_config> [options]
   dona-dispatcher event list [--status STATUS]
   dona-dispatcher event show <event_id>
   dona-dispatcher event retry <event_id> [--force]
@@ -26,8 +28,12 @@ function eventIdAt(args: string[], index: number): string {
 }
 
 async function main(): Promise<void> {
-  const config = loadConfig();
   const args = process.argv.slice(2);
+  if (args[0] === "approval-operations") {
+    const result = await runOperationsFrontend(args.slice(1));
+    console.log(typeof result === "string" ? result : JSON.stringify(result)); return;
+  }
+  const config = loadConfig();
   if (args.length === 0 || args[0] === "serve") {
     await runService(config);
     return;

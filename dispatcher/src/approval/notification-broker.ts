@@ -125,7 +125,8 @@ export class ApprovalNotificationBroker {
         assertSynchronousResult(raw); const grant = notificationReceiptGrantSchema.parse(raw);
         if (grant.status === "denied") return this.denied(base, grant.reason);
         if (!this.matches(grant, notification)) return this.denied(base, "scope_mismatch");
-        const event = this.event(request, notification, grant.consumer_id);
+        const event = { ...this.event(request, notification, grant.consumer_id),
+          session_ref: grant.operator_context_ref ?? null, authz_revision: grant.operator_revision ?? 0 };
         if (command.expected_fence !== notification.row.fence || grant.delivery_fence !== notification.row.fence) return this.denied(event, "revision_mismatch");
         this.lifecycle.verifyClock(request, mark, state);
         if (terminal(notification.row.state)) return this.unchanged(event, request, notification);

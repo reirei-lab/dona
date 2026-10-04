@@ -148,14 +148,15 @@ export class ApprovalExecutionBroker {
         assertSynchronousResult(raw); const grant = executionReceiptGrantSchema.parse(raw);
         if (grant.status === "denied") return this.denied(base, grant.reason);
         if (!this.matches(grant, attempt)) return this.denied(base, "scope_mismatch");
-        const event = this.event(request, attempt, grant.consumer_id);
+        const event = { ...this.event(request, attempt, grant.consumer_id),
+          session_ref: grant.operator_context_ref ?? null, authz_revision: grant.operator_revision ?? 0 };
         if (command.expected_fence !== attempt.row.fence || grant.execution_fence !== attempt.row.fence) return this.denied(event, "revision_mismatch");
         this.clock(request, attempt, mark, state);
         if (terminal(attempt.row.state)) return this.unchanged(event, attempt);
         const expired = approvalExpired(attempt.row.payload_expires_at, mark);
         const payload = this.payloads.inspectInState(state, "attempt", attempt.row.attempt_id);
         const missing = payload?.metadata.state !== "active" || payload.secret.status !== "present";
-        if (expired || missing) return this.change(mark, state, attempt,
+        if (grant.proof_kind !== "reconcile" && (expired || missing)) return this.change(mark, state, attempt,
           attempt.row.state === "executing" ? "acceptance_unknown" : "needs_review", expired ? "expired" : "integrity_failure", null, event, true);
         this.marker(state, attempt, mark);
         if (grant.proof_kind === "callback" ? attempt.row.state !== "executing" || marker.marker.execution_fence !== grant.execution_fence

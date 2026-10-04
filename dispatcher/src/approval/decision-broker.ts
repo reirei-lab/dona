@@ -14,7 +14,9 @@ import { ApprovalPayloadRepository } from "./payload-repository.js";
 import { openApprovalPayload, type ApprovalPayloadKey } from "./payload-protection.js";
 import { verifyApprovalNotificationMarker, type ApprovalNotificationKey } from "./notification-marker.js";
 import { recordDecision, terminateApproved, type RequestState } from "./domain.js";
-import { approvalSupervisorBindingRequired } from "./schema.js";
+import { approvalSupervisorBindingRequired, approvalOperationsRequired } from "./schema.js";
+import type { OperationsPolicyRepository } from "./operations-policy.js";
+import { OperationsAccessDenied } from "./operations-policy.js";
 import type { SupervisorBindingGuard } from "./supervisor-binding.js";
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
@@ -65,11 +67,13 @@ export class ApprovalDecisionBroker {
     private readonly contentKey: (version: number) => ApprovalPayloadKey,
     private readonly wrappingKey: (version: number) => ApprovalPayloadKey,
     private readonly notificationKey: (version: number) => ApprovalNotificationKey,
-    private readonly bindingGuard?: SupervisorBindingGuard) {
+    private readonly bindingGuard?: SupervisorBindingGuard,
+    private readonly expiryPolicy?: OperationsPolicyRepository) {
     try {
       assertSynchronousResult(scope); this.scope = Object.freeze(scopeSchema.parse(scope));
       for (const callback of [authorize, contentKey, wrappingKey, notificationKey]) assertSynchronousCallback(callback);
-      if (approvalSupervisorBindingRequired(db) && (bindingGuard === undefined || !bindingGuard.matchesScope(this.scope))) throw Error();
+      if (expiryPolicy !== undefined && !expiryPolicy.matchesContext(db, this.scope)) throw Error();
+      if (approvalSupervisorBindingRequired(db) && (bindingGuard === undefined || !bindingGuard.matchesScope(this.scope)) && expiryPolicy === undefined) throw Error();
       this.transaction = new ApprovalHistoryTransaction(db, providers, this.scope);
       this.history = new ApprovalClockHistory(db, this.scope);
       this.records = new ApprovalRecordRepository(db, providers.auditAnchors, providers.auditKeys, this.scope);
@@ -162,19 +166,39 @@ export class ApprovalDecisionBroker {
     } catch { throw new ApprovalDecisionError(); }
   }
   /** trusted内部expiry worker専用。transport commandとして公開しない。 */
-  expire(transactionId: string, requestHandle: string): ApprovalDecisionResult {
+  expire(transactionId: string, requestHandle: string, expectedRevision?: number, expectedPolicyRevision?: number): ApprovalDecisionResult {
     try {
       id.parse(requestHandle);
+      if (approvalOperationsRequired(this.db) && this.expiryPolicy === undefined) throw Error();
+      if (this.expiryPolicy !== undefined) { positive.parse(expectedRevision); positive.parse(expectedPolicyRevision); }
       return this.transaction.runPrepared<() => ApprovalDecisionResult>(transactionId, (mark, state) => {
+        let operator: ReturnType<OperationsPolicyRepository["authorize"]> | undefined;
+        try { operator = this.expiryPolicy?.authorize(state, mark, "expire"); }
+        catch (error) {
+          if (!(error instanceof OperationsAccessDenied)) throw error;
+          return { event: { ...this.event("cancel"), reason: "unauthorized" as const }, resource_digest: null,
+            mutation: () => ({ status: "denied" as const, reason: "unauthorized" as const }) };
+        }
         const request = this.records.readInState(state, "request", requestHandle);
         if (request === null) throw Error();
+        if (expectedRevision !== undefined && request.row.revision !== expectedRevision
+          || operator !== undefined && operator.policy_revision !== expectedPolicyRevision) return {
+          event: { ...this.event("cancel"), resource_id: requestHandle, reason: "revision_mismatch" as const }, resource_digest: null,
+          mutation: () => ({ status: "denied" as const, reason: "revision_mismatch" as const }) };
         this.lifecycle.verifyClock(request, mark, state);
-        if (undecided.has(request.row.state) && approvalExpired(request.row.expires_at, mark)) return this.expireRequest(mark, state, request);
+        const actor = operator === undefined ? { kind: "system" as const, id: "approval_expiry" }
+          : { kind: "operator" as const, id: operator.principal_id };
+        if (undecided.has(request.row.state) && approvalExpired(request.row.expires_at, mark)) {
+          const plan = this.expireRequest(mark, state, request);
+          return { ...plan, event: { ...plan.event, actor, authz_revision: operator?.policy_revision ?? 0 } };
+        }
         const event = { ...this.event("cancel"), actor: { kind: "system" as const, id: "approval_expiry" }, operation: "slack.post_thread_reply.v1" as const, resource_id: request.row.request_id,
-          policy_revision: request.row.policy_revision, binding_revision: request.row.binding_revision, outcome: "succeeded" as const, reason: "none" as const };
+          policy_revision: request.row.policy_revision, binding_revision: request.row.binding_revision, outcome: "succeeded" as const, reason: "none" as const,
+          authz_revision: operator?.policy_revision ?? 0 };
+        const authorizedEvent = { ...event, actor };
         if (request.row.state === "approved" && approvalExpired(request.row.consume_expires_at!, mark))
-          return this.lifecycle.change(mark, state, request, "consume_expired", null, { ...event, reason: "consume_expired" });
-        return { event, resource_digest: null, mutation: () => ({ status: "unchanged" as const, request_state: request.row.state }) };
+          return this.lifecycle.change(mark, state, request, "consume_expired", null, { ...authorizedEvent, reason: "consume_expired" });
+        return { event: authorizedEvent, resource_digest: null, mutation: () => ({ status: "unchanged" as const, request_state: request.row.state }) };
       });
     } catch { throw new ApprovalDecisionError(); }
   }

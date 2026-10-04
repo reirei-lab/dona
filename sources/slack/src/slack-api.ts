@@ -32,6 +32,11 @@ export interface SlackThread {
   hasMore: boolean;
   nextCursor?: string;
 }
+export interface SlackApprovalEvidencePage {
+  messages: { ts: string; threadTs?: string; userId?: string; botId?: string; metadata?: unknown }[];
+  hasMore: boolean;
+  nextCursor?: string;
+}
 
 export interface SlackPostResult {
   channelId: string;
@@ -133,6 +138,7 @@ export interface SlackApiClient {
   getUser(userId: string): Promise<SlackUser>;
   getChannelMembers?(channelId: string, limit: number, cursor?: string): Promise<{ members: string[]; nextCursor?: string }>;
   getThread(channelId: string, threadTs: string, limit: number, cursor?: string): Promise<SlackThread>;
+  getApprovalEvidencePage?(channelId: string, threadTs: string, upperTs: string, cursor?: string): Promise<SlackApprovalEvidencePage>;
   getReactions(channelId: string, messageTs: string): Promise<SlackReactionSnapshot>;
   getFile(fileId: string): Promise<SlackFileInfo>;
   postMessage(input: {
@@ -422,6 +428,21 @@ export class SlackWebApiClient implements SlackApiClient {
     return userFromResponse(response.user);
   }
 
+  /** 内部provider専用。通常MCP thread projectionへmetadataを追加しない。 */
+  async getApprovalEvidencePage(channelId: string, threadTs: string, upperTs: string, cursor?: string): Promise<SlackApprovalEvidencePage> {
+    const response = await callSlack(() => this.client.conversations.replies({
+      channel: channelId, ts: threadTs, latest: upperTs, inclusive: true, include_all_metadata: true, limit: 100,
+      ...(cursor === undefined ? {} : { cursor }),
+    }));
+    if (!Array.isArray(response.messages) || typeof response.has_more !== "boolean") throw new SlackApiError("invalid_slack_response", "Approval evidence response incomplete");
+    const nextCursor = optionalCursor(response.response_metadata?.next_cursor);
+    return { messages: response.messages.map(message => {
+      if (!message.ts) throw new SlackApiError("invalid_slack_response", "Approval evidence timestamp missing");
+      return { ts: message.ts, ...(message.thread_ts ? { threadTs: message.thread_ts } : {}),
+        ...(message.user ? { userId: message.user } : {}), ...(message.bot_id ? { botId: message.bot_id } : {}),
+        ...(message.metadata === undefined ? {} : { metadata: message.metadata }) };
+    }), hasMore: response.has_more, ...(nextCursor ? { nextCursor } : {}) };
+  }
   async getThread(channelId: string, threadTs: string, limit: number, cursor?: string): Promise<SlackThread> {
     const response = await callSlack(() =>
       this.client.conversations.replies({

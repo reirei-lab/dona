@@ -23,7 +23,7 @@ export const notificationReceiptSchema=z.discriminatedUnion("outcome",[
  z.strictObject({outcome:z.literal("rejected"),reason:z.enum(["unauthorized","resource_not_visible","invalid_input","scope_denied"])}),
  z.strictObject({outcome:z.literal("unknown")}),z.strictObject({outcome:z.literal("ambiguous")})]);
 export const notificationReceiptGrantSchema=z.discriminatedUnion("status",[denied,z.strictObject({status:z.literal("verified"),scope,notification_id:id,consumer_id:id,
- delivery_fence:positive,proof_kind:z.enum(["callback","reconcile"]),receipt:notificationReceiptSchema})]);
+ delivery_fence:positive,proof_kind:z.enum(["callback","reconcile"]),operator_context_ref:id.optional(),operator_revision:positive.optional(),receipt:notificationReceiptSchema})]);
 /** authenticated transportのexact message/author/target/保存markerへ結合した
  * receiptだけを返す。callback/reconcile fenceは別に確認。text類似・近接時刻・
  * user入力のresultを証拠にしない。0件はunknownで、再送を許可しない。 */

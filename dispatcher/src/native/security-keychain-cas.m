@@ -43,7 +43,7 @@ static NSDictionary *scope(id value) {
     if (!keysEqual(value, @[@"access_group", @"instance_id", @"purpose"])) return nil;
     if (!matches(value[@"access_group"], @"^[A-Z0-9]{10}\\.[A-Za-z0-9.-]+$", 256) ||
         !matches(value[@"instance_id"], @"^[A-Za-z0-9_-]{1,128}$", 128) ||
-        ![@[@"audit_anchor", @"clock_mark", @"binding_generation", @"policy_generation"] containsObject:value[@"purpose"]]) return nil;
+        ![@[@"audit_anchor", @"clock_mark", @"binding_generation", @"policy_generation", @"approval_key"] containsObject:value[@"purpose"]]) return nil;
     return value;
 }
 
