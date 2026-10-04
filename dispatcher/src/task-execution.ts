@@ -330,10 +330,7 @@ export class TaskRepository {
       try{fs.lstatSync(old.result_path);throw Error("task_result_requires_reconciliation");}
       catch(error){if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error;}
       // Never race a pending/in-flight/ambiguous failure notification. Keep its history.
-      const group=this.dispatcher.getJobGroup(old.source_event_id);
-      for(const event of new Set([old.completion_event_id,group?.attention_event_id,group?.all_terminal_event_id])) {
-        if(event&&this.dispatcher.get(event)?.status!=="completed")throw Error("task_prior_notification_requires_reconciliation");
-      }
+      this.dispatcher.assertTaskRetryNotificationsSettled(old.job_id);
       const next=`job_${ulid().toLowerCase()}`,number=task.attempt_number+1,now=new Date().toISOString();
       const workspace={...JSON.parse(old.workspace_json),_dona_task:{task_id:id,attempt_id:next,attempt_number:number},
         _dona_handoff:{predecessor_job_id:old.job_id,workspace_job_id:workspaceJobId(old)}};
