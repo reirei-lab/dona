@@ -1899,6 +1899,10 @@ export class DispatcherDatabase {
       Array.isArray(result.actions)&&result.actions.length===0;
   }
 
+  readTaskRecoveryResult(jobId:string):{result:JobResultEnvelope;sha256:string} {
+    return this.lateResultFile(this.getJobRequired(jobId));
+  }
+
   inspectLateJobResult(jobId:string):{job_id:string;status:JobStatus;updated_at:string;cause:string|null;result_sha256:string;notification_evidence_sha256:string} {
     const job=this.getJobRequired(jobId);
     const file=this.lateResultFile(job);

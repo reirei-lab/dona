@@ -1,7 +1,7 @@
 import {stableStringify} from "./validation.js";
-import { readCheckpoint } from "./task-checkpoint.js";
+import { checkpointSnapshot,readCheckpoint } from "./task-checkpoint.js";
 import { TaskProjector, githubQuery } from "./task-github.js";
-import { taskRecoveryReason, type TaskRow } from "./task-execution.js";
+import { taskResultReconcileSchema,taskRecoveryReason, type TaskRow } from "./task-execution.js";
 import { jobSnapshot, publicObservation, type WorkerObservation } from "./job-handoff.js";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -260,6 +260,34 @@ export class JobSupervisor {
     });
   }
 
+  async inspectTaskRecovery(id:string,eventId:string):Promise<Record<string,unknown>> {
+    const task=this.database.tasks.assertOwner(id,eventId),job=this.database.getJob(task.current_attempt_id)!;
+    const observed=this.runtime.observeWorker?await this.runtime.observeWorker(job,this.abortController.signal):{state:"unknown"};
+    const fresh=this.database.tasks.assertOwner(id,eventId);
+    if(fresh.revision!==task.revision||fresh.current_attempt_id!==job.job_id)throw Error("task_revision_conflict");
+    const result=this.database.readTaskRecoveryResult(job.job_id),checkpoint=checkpointSnapshot(job,id);
+    return {task_id:id,revision:task.revision,attempt_id:job.job_id,worker_state:observed.state,
+      cause:job.last_error_code,result_sha256:result.sha256,unaccepted_result:result.result,
+      checkpoint_sha256:checkpoint.sha256,checkpoint:checkpoint.checkpoint??null,persisted_checkpoint:this.database.tasks.attemptCheckpoint(job.job_id)??null,
+      reconciliation:this.database.tasks.resultRecovery(job.job_id)??null};
+  }
+  async reconcileTaskResult(id:string,value:unknown):Promise<Record<string,unknown>> {
+    const input=taskResultReconcileSchema.parse(value),initial=this.database.tasks.assertOwner(id,input.source_event_id);
+    return this.serialized(input.attempt_id,async()=>{
+      const replay=this.database.tasks.replayResultRecovery(id,input);
+      if(replay)return {task:this.database.tasks.projection(replay)};
+      const task=this.database.tasks.assertOwner(id,input.source_event_id);
+      if(task.revision!==input.revision||task.current_attempt_id!==input.attempt_id||initial.current_attempt_id!==input.attempt_id)throw Error("task_revision_conflict");
+      const job=this.database.getJob(input.attempt_id)!;
+      if(!this.runtime.observeWorker||!this.runtime.workerRetired)throw Error("task_worker_stop_unproven");
+      const observed=await this.observeWorker(job);
+      if(observed.state!=="stopped"||!await this.runtime.workerRetired(job,observed,this.abortController.signal))throw Error("task_worker_stop_unproven");
+      // checkpointを含む全fileは停止照合後、writer transaction内で再読する。
+      const updated=this.database.tasks.reconcileFailedResult(id,input,job.updated_at,observed,this.config.jobResultsDir);
+      this.wake();return {task:this.database.tasks.projection(updated)};
+    });
+  }
+
   async reconcileTasks(): Promise<void> {
     for (const task of this.database.tasks.candidates().slice(0,1)) {
       if(this.stopping) return;
@@ -285,6 +313,22 @@ export class JobSupervisor {
     // A result is evidence belonging to this attempt, never to its successor.
     try {
       const result=await readJobResultEnvelope(job.result_path,job.job_id);
+      if(result.status==="failed"&&job.last_error_code==="steer_acceptance_unknown") {
+        const prior=this.database.tasks.resultRecovery(job.job_id);
+        if(prior&&task.wait_reason==="retry_exhausted")return;
+        if(task.desired_state!=="running"||(prior&&task.wait_reason==="resume_requested")) {
+          const file=this.database.readTaskRecoveryResult(job.job_id);
+          if(!this.runtime.observeWorker||!this.runtime.workerRetired)return;
+          const observed=await this.observeWorker(job);
+          if(observed.state!=="stopped"||!await this.runtime.workerRetired(job,observed,this.abortController.signal))return;
+          try {
+            if(task.desired_state!=="running")this.database.tasks.settleFailedResultControl(task,file.sha256,observed);
+            else this.database.tasks.continueReconciledResult(task,observed,this.config.jobResultsDir);
+            this.wake();
+          }catch {if(task.desired_state==="running")this.database.tasks.wait(task,"result_reconciliation_required");}
+          return;
+        }
+      }
       try { this.database.saveJobResult(job.job_id,result,job.result_path); }
       catch { this.database.tasks.wait(task,"result_reconciliation_required"); }
       return;

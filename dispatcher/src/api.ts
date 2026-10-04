@@ -99,6 +99,8 @@ export interface ApiWorkerState {
 }
 
 export interface ApiJobController {
+  inspectTaskRecovery?(id:string,eventId:string):Promise<unknown>;
+  reconcileTaskResult?(id:string,input:unknown):Promise<unknown>;
   approveTaskRequest?(id:string,eventId:string,revision:number,questionId:string,accepted:boolean):Promise<unknown>;
   taskQuestions?(id:string,eventId:string):Promise<unknown>;
   answerTaskQuestion?(id:string,eventId:string,revision:number,questionId:string,answers:Record<string,{answers:string[]}>):Promise<unknown>;
@@ -681,14 +683,16 @@ export class DispatcherApi {
         if(!issue)throw new Error("task_issue_identity_unverified");
         sendJson(response,200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.findIssue(source,issue),true)});return;
       }
-      const match=/^\/v1\/tasks\/([^/]+)(?:\/(pause|resume|cancel|steer|retry|questions|answer|approve))?$/.exec(url.pathname);
+      const match=/^\/v1\/tasks\/([^/]+)(?:\/(pause|resume|cancel|steer|retry|questions|answer|approve|recovery|reconcile))?$/.exec(url.pathname);
       if(!match)throw new Error("task_route_not_found");
       const id=taskIdSchema.parse(match[1]),action=match[2];
+      if(request.method==="GET"&&action==="recovery"){if(!this.jobs.inspectTaskRecovery)throw Error("task_recovery_unavailable");sendJson(response,200,await this.jobs.inspectTaskRecovery(id,source));return;}
       if(request.method==="GET"&&action==="questions"){if(!this.jobs.taskQuestions)throw Error("task_questions_unavailable");sendJson(response,200,await this.jobs.taskQuestions(id,source));return;}
       if(request.method==="GET"&&!action){sendJson(response,200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.assertOwner(id,source),true)});return;}
       if(request.method==="POST"&&action&&action!=="questions") {
         const input=await this.readJson(request) as Record<string,unknown>;
         if(typeof input.source_event_id!=="string"||!Number.isSafeInteger(input.revision))throw new Error("task_control_invalid");
+        if(action==="reconcile"){if(!this.jobs.reconcileTaskResult)throw Error("task_recovery_unavailable");sendJson(response,200,await this.jobs.reconcileTaskResult(id,input));return;}
         if(action==="approve") {
           if(!this.jobs.approveTaskRequest||typeof input.question_id!=="string"||typeof input.accepted!=="boolean")throw Error("task_approval_invalid");
           sendJson(response,200,await this.jobs.approveTaskRequest(id,input.source_event_id,input.revision as number,input.question_id,input.accepted));this.jobs.wake();return;

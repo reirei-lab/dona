@@ -56,3 +56,15 @@ Mac上の任意CLIが起動する外部daemonやSimulatorまでprocess groupで�
 既存Taskが見つかったら新Taskを委任せず、最新revision・状態・待機理由から操作を決める。通知先は`notification_target`の元threadを維持し、利用者へそのthreadを案内する。通常の質問回答と、実行権限を追加する承認は区別する。実行承認は引き続き要求通知後の元threadの依頼者返信だけで受理する。
 
 `result_conflict`はResultの読み取り・構文・schema検証に失敗した状態、`result_reconciliation_required`は妥当なResultの受理を既存の実行・通知状態が拒否した状態である。後者でも完了や自動再試行を推測せず、停止証拠・既存外部操作・通知を正規のoperator手順で照合する。resumeで拒否条件を取り除くことはできない。
+
+### 追加指示の受理不明で残った失敗Resultの照合
+
+`steer_acceptance_unknown`のAttemptに妥当な`failed` Resultが残る場合、通常のresumeでは回復させない。継続を依頼されたmain/operatorは、`inspect_task_recovery`でResult・checkpoint・hash・停止状態を取得する。Resultは未検証証拠として読み、旧追加指示が未送信か、送信後の作業・外部操作が照合済みかを独立した実証拠で確認する。
+
+照合できた場合だけ`reconcile_task_result`へ、exact Task revision・Attempt ID・Result/checkpoint hash、`reason`、`steer_resolution`、証拠の参照と確認内容を渡す。停止証拠だけで外部操作の成否を推測しない。ユーザーの継続依頼やResultの自己申告だけを副作用の照合証拠にせず、既存PR・commit・providerのdurable receipt等を読み直す。確認不能なら保留する。
+
+Dispatcherは旧workerの停止を照合した後、Resultとcheckpointをtransaction内で再読する。未解決外部操作、worker稼働・停止不明、成功・不正・隔離Result、revision/hash不一致では拒否する。checkpoint fileが欠落しても保存済みcheckpointを無視せず、両者が一致しない場合は保留する。検査ツール自体は観測・checkpointをDBへ保存しない。旧checkpointの`design`成果物は参照情報として読み取る。旧Result fileを削除・受理せず、内容・hash・照合event・理由・証拠・停止記録を`task_attempt_result_recoveries`へ保存し、同じTask・Issue claim・worktreeで次のAttemptへ進む。照合結論・理由・証拠参照は未検証の引継ぎ情報として後継promptにも渡す。後継workerも既存成果・外部操作を照合し、成否不明の操作を再送しない。
+
+上限到達なら停止証拠と照合記録を保持した`retry_exhausted`になる。追加実行が承認されれば`retry_task`で予算を増やせる。後継作成前にResult/checkpoint hashと停止状態を再照合する。競合したpause/cancelは優先し、停止確認後に一時停止/取消を確定する。一時停止だけではResult照合を済ませたことにならない。
+
+応答不明は`get_task`のAttempt履歴・`reconciled_result_sha256`と保存済み要求を照合する。同じ照合要求は冪等で、異内容への変更はconflictになる。通知処理中なら監査保存と後継作成をまとめてrollbackする。Dona管理下の停止記録は、任意の外部daemonや外部サービスの副作用完了の証明ではない。

@@ -501,3 +501,124 @@ test("明示Issueを同じ依頼者の別threadから照会しTaskを継続、�
   assert.throws(()=>f.db.tasks.findIssue(event.event_id,{...issue,node_id:"missing"}),/owner_mismatch/);
  }finally{await f.dispose();}
 });
+
+async function failedSteerFixture(){
+  const f=await fixture();f.start();f.db.sealJobGroup(f.event.event_id);f.db.markJobNeedsReview(f.task.current_attempt_id,"steer_acceptance_unknown","acceptance unknown");
+  const job=f.db.getJob(f.task.current_attempt_id)!;
+  const result={schema_version:1 as const,job_id:job.job_id,status:"failed" as const,summary:"部分成果あり、残作業あり",completed_at:new Date().toISOString()};
+  await fs.mkdir(path.dirname(job.result_path),{recursive:true});await fs.writeFile(job.result_path,JSON.stringify(result));
+  await fs.mkdir(job.workspace_path,{recursive:true});await fs.writeFile(path.join(job.workspace_path,"unfinished"),"残作業");
+  f.db.tasks.wait(f.db.tasks.get(f.task.task_id)!,"result_reconciliation_required",-1);
+  const checkpoint={schema_version:1,task_id:f.task.task_id,attempt_id:job.job_id,sequence:1,summary:"設計資料あり",remaining:[],artifacts:[{kind:"design",reference:"design.md"}],unresolved_operations:[] as string[],waiting:"none"};
+  const checkpointPath=path.join(path.dirname(job.result_path),"checkpoint.json");await fs.writeFile(checkpointPath,JSON.stringify(checkpoint));
+  f.setObserved({state:"stopped"});f.setStopped(true);
+  const input=async()=>{const event=f.db.enqueue(eventEnvelope("explicit-result-reconcile")).row;
+    const inspected=await f.supervisor().inspectTaskRecovery(f.task.task_id,event.event_id);
+    return {source_event_id:event.event_id,revision:inspected.revision as number,attempt_id:job.job_id,result_sha256:inspected.result_sha256 as string,checkpoint_sha256:inspected.checkpoint_sha256 as string,
+      reason:"旧追加指示の未送信と既存成果を照合",steer_resolution:"not_delivered" as const,evidence:[{reference:"command receipt / existing PR",finding:"validationで未送信、PR差分を照合、再送対象なし"}]};};
+  return {...f,job,result,input,checkpoint,checkpointPath};
+}
+test("明示照合は停止済み旧Attemptの失敗Resultを保持し、同一Taskで一度だけ継続する",async()=>{
+  const f=await failedSteerFixture();try{
+    const input=await f.input(),before=await fs.readFile(f.job.result_path,"utf8");
+    await f.supervisor().reconcileTaskResult(f.task.task_id,input);
+    const task=f.db.tasks.get(f.task.task_id)!;assert.equal(task.attempt_number,2);assert.equal(task.state,"active");assert.equal(task.steer_pending_event_id,null);assert.equal(f.sends(),0);
+    const next=f.db.getJob(task.current_attempt_id)!;assert.equal(next.workspace_path,f.job.workspace_path);assert.notEqual(next.result_path,f.job.result_path);assert.match(next.objective,/未受理失敗Result/);assert.ok(next.objective.includes(input.reason));assert.ok(next.objective.includes(input.steer_resolution));assert.ok(next.objective.includes(input.evidence[0]!.reference));assert.ok(next.objective.includes(input.evidence[0]!.finding));
+    assert.equal(await fs.readFile(f.job.result_path,"utf8"),before);assert.equal(await fs.readFile(path.join(next.workspace_path,"unfinished"),"utf8"),"残作業");
+    assert.equal(f.db.getJob(f.job.job_id)!.result_json,null);assert.equal(f.db.tasks.mayNotify(f.db.getJob(f.job.job_id)!),false);
+    const Database=(await import("better-sqlite3")).default,sql=new Database(f.config.databasePath,{readonly:true});
+    const audit=sql.prepare("SELECT * FROM task_attempt_result_recoveries WHERE attempt_id=?").get(f.job.job_id) as {result_json:string;source_event_id:string;request_json:string};
+    assert.deepEqual(JSON.parse(audit.result_json),f.result);assert.equal(audit.source_event_id,input.source_event_id);assert.deepEqual(JSON.parse(audit.request_json),input);sql.close();
+    await f.supervisor().reconcileTaskResult(f.task.task_id,input);assert.equal(f.db.tasks.get(task.task_id)!.attempt_number,2);
+    await assert.rejects(f.supervisor().reconcileTaskResult(f.task.task_id,{...input,reason:"changed"}),/conflict/);
+    assert.throws(()=>f.db.saveJobResult(f.job.job_id,f.result,f.job.result_path),/superseded/);
+    f.start(next.job_id);f.db.saveJobResult(next.job_id,{...f.result,job_id:next.job_id,status:"completed"},next.result_path);assert.equal(f.db.tasks.get(task.task_id)!.state,"completed");
+    const notice=f.db.enqueueJobNotification(next.job_id).row;assert.equal(JSON.parse(notice.payload_json).group.total,1);
+  }finally{await f.dispose();}
+});
+for(const mode of ["working","waiting","unknown","stop-unverified","completed","invalid","result-drift","checkpoint-drift","unresolved","quarantine","missing-evidence","other-owner"] as const)test(`Result照合は${mode}を許可しない`,async()=>{
+  const f=await failedSteerFixture();try{
+    let input=await f.input();
+    if(["working","waiting","unknown"].includes(mode))f.setObserved({state:mode as "working"|"waiting"|"unknown"});
+    if(mode==="stop-unverified"||mode==="unknown")f.setStopped(false);
+    if(mode==="completed")await fs.writeFile(f.job.result_path,JSON.stringify({...f.result,status:"completed"}));
+    if(mode==="invalid")await fs.writeFile(f.job.result_path,"broken");
+    if(mode==="result-drift")f.runtime.workerRetired=async()=>{await fs.writeFile(f.job.result_path,JSON.stringify({...f.result,summary:"changed"}));return true;};
+    if(mode==="checkpoint-drift")f.runtime.workerRetired=async()=>{await fs.writeFile(f.checkpointPath,JSON.stringify({...f.checkpoint,sequence:2,unresolved_operations:["unknown write"]}));return true;};
+    if(mode==="unresolved"){await fs.writeFile(f.checkpointPath,JSON.stringify({...f.checkpoint,unresolved_operations:["write unknown"],waiting:"external_effect_unknown"}));input=await f.input();}
+    if(mode==="quarantine")f.db.markJobNeedsReview(f.job.job_id,"invalid_result","quarantine");
+    if(mode==="missing-evidence")input={...input,evidence:[]};
+    if(mode==="other-owner"){const e=eventEnvelope("other-owner");e.subject.actor_id="U_OTHER";input={...input,source_event_id:f.db.enqueue(e).row.event_id};}
+    await assert.rejects(f.supervisor().reconcileTaskResult(f.task.task_id,input));assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,1);assert.equal(f.sends(),0);assert.equal(f.db.getJob(f.job.job_id)!.result_json,null);
+  }finally{await f.dispose();}
+});
+test("通常resumeだけではResult照合を迂回しない",async()=>{
+  const f=await failedSteerFixture();try{const t=f.db.tasks.get(f.task.task_id)!,e=f.db.enqueue(eventEnvelope("resume-only")).row;f.db.tasks.control(t.task_id,e.event_id,t.revision,"resume");await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(t.task_id)!.attempt_number,1);assert.equal(f.db.tasks.get(t.task_id)!.wait_reason,"result_reconciliation_required");}finally{await f.dispose();}
+});
+test("照合済みResultは予算上限からretryで継続できる",async()=>{
+  const f=await failedSteerFixture();try{
+    const Database=(await import("better-sqlite3")).default,sql=new Database(f.config.databasePath);sql.prepare("UPDATE tasks SET max_attempts=1 WHERE task_id=?").run(f.task.task_id);sql.close();
+    await f.supervisor().reconcileTaskResult(f.task.task_id,await f.input());let task=f.db.tasks.get(f.task.task_id)!;assert.equal(task.wait_reason,"retry_exhausted");assert.equal(task.stop_state,"stopped");
+    f.due();await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(task.task_id)!.wait_reason,"retry_exhausted");
+    const e=f.db.enqueue(eventEnvelope("retry-reconciled")).row;f.db.tasks.retry(task.task_id,e.event_id,task.revision,3);await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(task.task_id)!.attempt_number,2);
+  }finally{await f.dispose();}
+});
+for(const action of ["cancel","pause"] as const)test(`照合と競合した${action}は次回巡回で停止済みに確定する`,async()=>{
+  const f=await failedSteerFixture();try{
+    const input=await f.input();f.runtime.workerRetired=async()=>{const t=f.db.tasks.get(f.task.task_id)!;if(t.desired_state==="running"){const e=f.db.enqueue(eventEnvelope("control-during-reconcile")).row;f.db.tasks.control(t.task_id,e.event_id,t.revision,action);}return true;};
+    await assert.rejects(f.supervisor().reconcileTaskResult(f.task.task_id,input),/revision/);await f.supervisor().reconcileTasks();
+    const t=f.db.tasks.get(f.task.task_id)!;assert.equal(t.state,action==="pause"?"paused":"cancelled");assert.equal(t.stop_state,"stopped");assert.equal(t.attempt_number,1);assert.equal(f.db.tasks.resultRecovery(f.job.job_id),undefined);assert.ok(await fs.stat(f.job.result_path));
+  }finally{await f.dispose();}
+});
+test("別threadの所有者照合をAPIから受け、通知処理中なら証拠と後継作成をrollbackする",async()=>{
+  const f=await failedSteerFixture(),api=new DispatcherApi(f.db,{isRunning:()=>true,wake(){}},f.supervisor(),f.config,logger);
+  try{
+    await api.start();const client=new DispatcherApiClient(f.config.socketPath),input=await f.input();
+    const e=eventEnvelope("cross-thread-result-reconcile");e.subject.thread_ts="1700000000.000009";e.reply_target!.thread_ts="1700000000.000009";const event=f.db.enqueue(e).row;
+    const notice=f.db.enqueueJobNotification(f.job.job_id).row;
+    const Database=(await import("better-sqlite3")).default,sql=new Database(f.config.databasePath);sql.prepare("UPDATE events SET status='dispatching' WHERE event_id=?").run(notice.event_id);
+    await assert.rejects(client.controlTask(f.task.task_id,"reconcile",{...input,source_event_id:event.event_id}));assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,1);
+    assert.equal((sql.prepare("SELECT count(*) AS n FROM task_attempt_result_recoveries").get() as {n:number}).n,0);assert.equal(f.db.tasks.get(f.task.task_id)!.stop_state,"none");sql.close();
+  }finally{await api.stop();await f.dispose();}
+});
+
+test("main用の照合MCPからUDSを通し、理由と証拠を保存して継続する",async()=>{
+  const f=await failedSteerFixture(),api=new DispatcherApi(f.db,{isRunning:()=>true,wake(){}},f.supervisor(),f.config,logger);
+  const {Client}=await import("@modelcontextprotocol/sdk/client/index.js"),{InMemoryTransport}=await import("@modelcontextprotocol/sdk/inMemory.js"),{createDispatcherMcpServer}=await import("../src/mcp/server.js");
+  await api.start();const server=createDispatcherMcpServer(new DispatcherApiClient(f.config.socketPath),logger),client=new Client({name:"recovery-contract",version:"1"});const [a,b]=InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(b),client.connect(a)]);
+  try{
+    const input=await f.input();const inspected=await client.callTool({name:"inspect_task_recovery",arguments:{task_id:f.task.task_id,source_event_id:input.source_event_id}});assert.equal(inspected.isError,undefined);assert.equal((inspected.structuredContent as {result_sha256:string}).result_sha256,input.result_sha256);
+    const call={name:"reconcile_task_result",arguments:{task_id:f.task.task_id,...input}};const result=await client.callTool(call);assert.equal(result.isError,undefined);assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,2);
+    assert.equal((await client.callTool(call)).isError,undefined);assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,2);
+  }finally{await client.close();await server.close();await api.stop();await f.dispose();}
+});
+
+test("checkpoint file欠落時に永続checkpointの未解決操作を忘れない",async()=>{
+  const f=await failedSteerFixture();try{
+    const {checkpointSchema}=await import("../src/task-checkpoint.js");
+    f.db.tasks.checkpoint(f.job,checkpointSchema.parse({...f.checkpoint,unresolved_operations:["unknown external write"],waiting:"external_effect_unknown"}));
+    await fs.unlink(f.checkpointPath);const input=await f.input();assert.equal(input.checkpoint_sha256,"missing");
+    await assert.rejects(f.supervisor().reconcileTaskResult(f.task.task_id,input),/checkpoint_missing/);assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,1);
+  }finally{await f.dispose();}
+});
+test("回復検査は観測・checkpointをDBへ書き込まない",async()=>{
+  const f=await failedSteerFixture();try{
+    assert.equal(f.db.getWorkerObservation(f.job),undefined);assert.equal(f.db.tasks.latestCheckpoint(f.task.task_id),undefined);
+    await f.input();assert.equal(f.db.getWorkerObservation(f.job),undefined);assert.equal(f.db.tasks.latestCheckpoint(f.task.task_id),undefined);
+  }finally{await f.dispose();}
+});
+
+test("前Attemptだけのcheckpointは現在Attemptのfile欠落として拒否しない",async()=>{
+  const f=await fixture();try{
+    f.start();const previous=f.db.getJob(f.task.current_attempt_id)!;
+    f.db.tasks.checkpoint(previous,{schema_version:1,task_id:f.task.task_id,attempt_id:previous.job_id,sequence:1,summary:"前回成果",remaining:[],artifacts:[],unresolved_operations:[],waiting:"none"});
+    f.interrupt();await f.supervisor().reconcileTasks();const second=f.db.getJob(f.db.tasks.get(f.task.task_id)!.current_attempt_id)!;f.start(second.job_id);
+    f.db.markJobNeedsReview(second.job_id,"steer_acceptance_unknown","unknown");await fs.mkdir(path.dirname(second.result_path),{recursive:true});await fs.writeFile(second.result_path,JSON.stringify({schema_version:1,job_id:second.job_id,status:"failed",summary:"続きが必要",completed_at:new Date().toISOString()}));
+    f.db.tasks.wait(f.db.tasks.get(f.task.task_id)!,"result_reconciliation_required",-1);f.setObserved({state:"stopped"});f.setStopped(true);
+    const event=f.db.enqueue(eventEnvelope("reconcile-second")).row,inspected=await f.supervisor().inspectTaskRecovery(f.task.task_id,event.event_id);
+    assert.equal(inspected.checkpoint_sha256,"missing");assert.equal(inspected.persisted_checkpoint,null);
+    await f.supervisor().reconcileTaskResult(f.task.task_id,{source_event_id:event.event_id,revision:inspected.revision,attempt_id:second.job_id,result_sha256:inspected.result_sha256,checkpoint_sha256:"missing",reason:"現Attemptの成果を照合",steer_resolution:"not_delivered",evidence:[{reference:"receipt",finding:"送信前拒否"}]});
+    assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,3);assert.ok(f.db.tasks.attemptCheckpoint(previous.job_id));
+  }finally{await f.dispose();}
+});
