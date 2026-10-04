@@ -56,3 +56,13 @@ Mac上の任意CLIが起動する外部daemonやSimulatorまでprocess groupで�
 既存Taskが見つかったら新Taskを委任せず、最新revision・状態・待機理由から操作を決める。通知先は`notification_target`の元threadを維持し、利用者へそのthreadを案内する。通常の質問回答と、実行権限を追加する承認は区別する。実行承認は引き続き要求通知後の元threadの依頼者返信だけで受理する。
 
 `result_conflict`はResultの読み取り・構文・schema検証に失敗した状態、`result_reconciliation_required`は妥当なResultの受理を既存の実行・通知状態が拒否した状態である。後者でも完了や自動再試行を推測せず、停止証拠・既存外部操作・通知を正規のoperator手順で照合する。resumeで拒否条件を取り除くことはできない。
+
+### 追加指示の受理不明で残った失敗Resultからの継続
+
+`steer_acceptance_unknown`のAttemptに妥当な`failed` Resultが残り、通常のResult受理が拒否された場合は、所有者による明示的な`resume_task`を使う。同じTask・Issue claim・作業ディレクトリを保持して次のAttemptへ進む。自動観測だけではこの継続を開始しない。
+
+DispatcherはApp Server adapterで旧workerの`stopped`と停止記録を照合し、Task revision・current Attempt・Result SHA-256・再試行予算をtransaction内で再確認する。未解決外部操作を持つcheckpoint、稼働中・質問待ち・停止不明、成功Result、不正Result、隔離済みResult、取消との競合では後継Attemptを作らない。
+
+旧checkpointの`design`成果物も参照情報として読み取る。旧Result fileと既存成果は削除しない。未受理Resultの内容・hash、明示resume event、旧エラー、停止証拠を`task_attempt_result_recoveries`へ保存し、旧Attemptを中断済みとして一度だけ引き継ぐ。旧ResultをTaskの完了として受理したり、曖昧だった追加指示を受理済みに書き換えたりはしない。後継workerは最新のTask objectiveと旧証拠を読み、既存PR・差分・外部操作を照合して残作業を行う。
+
+停止済み記録はDona管理下の実行世代についての証拠であり、任意の外部daemonや外部サービスの処理結果の証明ではない。後継workerも成否不明の操作を再送しない。停止や通知の照合に失敗した場合は保留を維持し、DB直接書換え・Result削除で回避しない。

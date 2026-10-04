@@ -501,3 +501,64 @@ test("明示Issueを同じ依頼者の別threadから照会しTaskを継続、�
   assert.throws(()=>f.db.tasks.findIssue(event.event_id,{...issue,node_id:"missing"}),/owner_mismatch/);
  }finally{await f.dispose();}
 });
+
+async function failedSteerFixture(){
+  const f=await fixture();f.start();f.db.sealJobGroup(f.event.event_id);f.db.markJobNeedsReview(f.task.current_attempt_id,"steer_acceptance_unknown","acceptance unknown");
+  const job=f.db.getJob(f.task.current_attempt_id)!;
+  const result={schema_version:1 as const,job_id:job.job_id,status:"failed" as const,summary:"部分成果あり、残作業あり",completed_at:new Date().toISOString()};
+  await fs.mkdir(path.dirname(job.result_path),{recursive:true});await fs.writeFile(job.result_path,JSON.stringify(result));
+  await fs.mkdir(job.workspace_path,{recursive:true});await fs.writeFile(path.join(job.workspace_path,"unfinished"),"残作業");
+  f.db.tasks.wait(f.db.tasks.get(f.task.task_id)!,"result_reconciliation_required",-1);
+  const resume=()=>{const t=f.db.tasks.get(f.task.task_id)!;const e=f.db.enqueue(eventEnvelope("explicit-result-resume")).row;f.db.tasks.control(t.task_id,e.event_id,t.revision,"resume");return e;};
+  await fs.writeFile(path.join(path.dirname(job.result_path),"checkpoint.json"),JSON.stringify({schema_version:1,task_id:f.task.task_id,attempt_id:job.job_id,sequence:1,summary:"設計資料あり",remaining:[],artifacts:[{kind:"design",reference:"design.md"}],unresolved_operations:[],waiting:"none"}));
+  f.setObserved({state:"stopped"});f.setStopped(true);return {...f,job,result,resume};
+}
+test("明示resumeは停止済み旧Attemptの失敗Resultを保持し、同一Taskで一度だけ継続する",async()=>{
+  const f=await failedSteerFixture();try{
+    const revision=f.db.tasks.get(f.task.task_id)!.revision,event=f.resume(),before=await fs.readFile(f.job.result_path,"utf8");
+    await f.supervisor().reconcileTasks();
+    const task=f.db.tasks.get(f.task.task_id)!;assert.equal(task.attempt_number,2);assert.equal(task.state,"active");assert.equal(task.steer_pending_event_id,null);assert.equal(f.sends(),0);
+    const next=f.db.getJob(task.current_attempt_id)!;assert.equal(next.workspace_path,f.job.workspace_path);assert.notEqual(next.result_path,f.job.result_path);assert.match(next.objective,/未受理失敗Result/);
+    assert.equal(await fs.readFile(f.job.result_path,"utf8"),before);assert.equal(await fs.readFile(path.join(next.workspace_path,"unfinished"),"utf8"),"残作業");
+    assert.equal(f.db.getJob(f.job.job_id)!.result_json,null);assert.equal(f.db.tasks.mayNotify(f.db.getJob(f.job.job_id)!),false);
+    const Database=(await import("better-sqlite3")).default,sql=new Database(f.config.databasePath,{readonly:true});
+    const audit=sql.prepare("SELECT * FROM task_attempt_result_recoveries WHERE attempt_id=?").get(f.job.job_id) as {result_json:string;resume_event_id:string;result_sha256:string};
+    assert.deepEqual(JSON.parse(audit.result_json),f.result);assert.equal(audit.resume_event_id,event.event_id);assert.match(audit.result_sha256,/^[a-f0-9]{64}$/);sql.close();
+    f.db.tasks.control(task.task_id,event.event_id,revision,"resume");await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(task.task_id)!.attempt_number,2);
+    assert.throws(()=>f.db.saveJobResult(f.job.job_id,f.result,f.job.result_path),/superseded/);
+    f.start(next.job_id);f.db.saveJobResult(next.job_id,{...f.result,job_id:next.job_id,status:"completed"},next.result_path);assert.equal(f.db.tasks.get(task.task_id)!.state,"completed");
+    const notice=f.db.enqueueJobNotification(next.job_id).row;assert.equal(JSON.parse(notice.payload_json).group.total,1);
+  }finally{await f.dispose();}
+});
+for(const mode of ["no-request","working","waiting","unknown","stop-unverified","completed","invalid","result-drift","cancel","unresolved","budget","quarantine"] as const)test(`失敗Result継続は${mode}を許可しない`,async()=>{
+  const f=await failedSteerFixture();try{
+    if(mode!=="no-request")f.resume();
+    if(["working","waiting","unknown"].includes(mode))f.setObserved({state:mode as "working"|"waiting"|"unknown"});
+    if(mode==="stop-unverified")f.setStopped(false);
+    if(mode==="completed")await fs.writeFile(f.job.result_path,JSON.stringify({...f.result,status:"completed"}));
+    if(mode==="invalid")await fs.writeFile(f.job.result_path,"broken");
+    if(mode==="result-drift")f.runtime.workerRetired=async()=>{await fs.writeFile(f.job.result_path,JSON.stringify({...f.result,summary:"changed"}));return true;};
+    if(mode==="cancel")f.runtime.workerRetired=async()=>{const t=f.db.tasks.get(f.task.task_id)!;const e=f.db.enqueue(eventEnvelope("cancel-during-result-recovery")).row;f.db.tasks.control(t.task_id,e.event_id,t.revision,"cancel");return true;};
+    if(mode==="unresolved")await fs.writeFile(path.join(path.dirname(f.job.result_path),"checkpoint.json"),JSON.stringify({schema_version:1,task_id:f.task.task_id,attempt_id:f.job.job_id,sequence:1,summary:"送信結果不明",remaining:[],artifacts:[],unresolved_operations:["write unknown"],waiting:"external_effect_unknown"}));
+    if(mode==="budget"){const Database=(await import("better-sqlite3")).default,sql=new Database(f.config.databasePath);sql.prepare("UPDATE tasks SET max_attempts=1 WHERE task_id=?").run(f.task.task_id);sql.close();}
+    if(mode==="quarantine")f.db.markJobNeedsReview(f.job.job_id,"invalid_result","quarantine");
+    await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,1);assert.equal(f.sends(),0);assert.equal(f.db.getJob(f.job.job_id)!.result_json,null);assert.ok(await fs.stat(f.job.result_path));
+  }finally{await f.dispose();}
+});
+
+test("別threadの所有者resumeをAPIから受け、通知処理中なら証拠と後継作成をrollbackする",async()=>{
+  const f=await failedSteerFixture(),api=new DispatcherApi(f.db,{isRunning:()=>true,wake(){}},f.supervisor(),f.config,logger);
+  try{
+    await api.start();const client=new DispatcherApiClient(f.config.socketPath);
+    const e=eventEnvelope("cross-thread-result-resume");e.subject.thread_ts="1700000000.000009";e.reply_target!.thread_ts="1700000000.000009";const event=f.db.enqueue(e).row;
+    const revision=f.db.tasks.get(f.task.task_id)!.revision;
+    await client.controlTask(f.task.task_id,"resume",{source_event_id:event.event_id,revision});
+    // Resultの回復と、旧attention通知の整合を同じtransactionで検査する。
+    const notice=f.db.enqueueJobNotification(f.job.job_id).row;
+    const Database=(await import("better-sqlite3")).default,sql=new Database(f.config.databasePath);
+    sql.prepare("UPDATE events SET status='dispatching' WHERE event_id=?").run(notice.event_id);
+    await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,1);
+    assert.equal((sql.prepare("SELECT count(*) AS n FROM task_attempt_result_recoveries").get() as {n:number}).n,0);assert.equal(f.db.tasks.get(f.task.task_id)!.stop_state,"none");
+    sql.close();
+  }finally{await api.stop();await f.dispose();}
+});

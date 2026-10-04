@@ -285,6 +285,20 @@ export class JobSupervisor {
     // A result is evidence belonging to this attempt, never to its successor.
     try {
       const result=await readJobResultEnvelope(job.result_path,job.job_id);
+      if(task.wait_reason==="resume_requested"&&result.status==="failed"&&job.last_error_code==="steer_acceptance_unknown") {
+        const file=this.database.readTaskRecoveryResult(job.job_id);
+        const checkpoint=await readCheckpoint(job,task.task_id);
+        if(checkpoint)this.database.tasks.checkpoint(job,checkpoint);
+        if(!this.runtime.observeWorker||!this.runtime.workerRetired) {this.database.tasks.wait(task,"worker_unknown");return;}
+        const observed=await this.observeWorker(job);
+        if(observed.state!=="stopped"||!await this.runtime.workerRetired(job,observed,this.abortController.signal)) {
+          this.database.tasks.wait(task,"worker_unknown");return;
+        }
+        // 停止確認後にrevision・Attempt・Resultを再照合し、現在の明示resumeだけを消費する。
+        try {this.database.tasks.resumeFailedResult(task,job.updated_at,file.sha256,observed,this.config.jobResultsDir);this.wake();}
+        catch {this.database.tasks.wait(task,"result_reconciliation_required");}
+        return;
+      }
       try { this.database.saveJobResult(job.job_id,result,job.result_path); }
       catch { this.database.tasks.wait(task,"result_reconciliation_required"); }
       return;
