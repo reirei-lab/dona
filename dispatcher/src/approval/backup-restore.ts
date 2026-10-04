@@ -18,6 +18,10 @@ import { ApprovalClockHistory } from "./clock-history.js";
 import { ApprovalExecutionMarkerStore } from "./execution-marker-store.js";
 import type { ApprovalRecordScope, ApprovalRecordKind } from "./record-codec.js";
 import type { ApprovalTransactionProviders } from "./transaction.js";
+import { parseClockMark, type ClockMark } from "./clock.js";
+import { emptyMetadataRoot } from "./metadata-tree.js";
+import { ApprovalMetadataNodes } from "./metadata-store.js";
+import { ApprovalIndexBlobs } from "./index-store.js";
 import { requestPayloadRequired } from "./domain.js";
 
 export class ApprovalBackupError extends Error { constructor() { super("approval_backup_unverified"); this.name = "ApprovalBackupError"; } }
@@ -76,6 +80,60 @@ export class ApprovalBackupRestore {
     if (db.prepare("SELECT 1 FROM security_audit_records WHERE json_extract(record_json,'$.event.scope.instance_id') IS NOT ? OR json_extract(record_json,'$.event.scope.tenant_id') IS NOT ? LIMIT 1")
       .get(this.scope.instance_id, this.scope.workspace_id)) throw Error();
   }
+  /** SQLだけに挿入されたrowを、認証済みmanifestの走査で見落とさない。 */
+  private verifySqlMembership(db: Database.Database, state: VerifiedAuditState, records: ApprovalRecordRepository,
+    payloads: ApprovalPayloadRepository, history: ApprovalClockHistory, markers: ApprovalExecutionMarkerStore, mark: Readonly<ClockMark>,
+    nodes: ApprovalMetadataNodes, indexes: ApprovalIndexBlobs) {
+    const scan = (table: string, primary: string, inspect: (row: Record<string, string>) => void) => {
+      let after: string | null = null;
+      for (let page = 0; page < 1000; page++) {
+        const rows = db.prepare(`SELECT * FROM "${table}" WHERE (? IS NULL OR "${primary}" > ?) ORDER BY "${primary}" LIMIT 100`)
+          .all(after, after) as Record<string, string>[];
+        for (const row of rows) inspect(row);
+        if (rows.length < 100) return;
+        const next = rows.at(-1)![primary]!; if (next === after) throw Error(); after = next;
+      }
+      throw Error();
+    };
+    for (const [kind, table, primary] of [
+      ["request", "approval_requests", "request_id"], ["decision", "approval_decisions", "request_id"],
+      ["consume", "approval_consumes", "request_id"], ["execution", "approval_execution_attempts", "attempt_id"],
+      ["notification", "approval_notifications", "notification_attempt_id"], ["event", "approval_event_outbox", "event_id"],
+      ["presentation", "approval_presentation_updates", "update_id"],
+    ] as const) scan(table, primary, row => { if (records.readInState(state, kind, row[primary]!) === null) throw Error(); });
+    scan("approval_payload_metadata", "payload_ref", row => {
+      const payload = payloads.inspectInState(state, row.owner_kind as "request" | "attempt", row.owner_id!);
+      if (payload === null || payload.metadata.binding.payload_ref !== row.payload_ref) throw Error();
+    });
+    if (db.prepare("SELECT 1 FROM approval_payload_secrets LIMIT 1").get()) throw Error();
+    if (db.prepare("SELECT 1 FROM security_audit_records WHERE sequence <= (SELECT json_extract(checkpoint_json,'$.sequence') FROM security_audit_checkpoint WHERE singleton=1) LIMIT 1").get()) throw Error();
+    scan("approval_execution_markers", "attempt_id", row => { if (markers.readInState(state, row.attempt_id!) === null) throw Error(); });
+    scan("approval_clock_reservations", "transaction_id", row => {
+      const saved = parseClockMark(JSON.parse(row.mark_json!));
+      if (saved.transaction_id !== row.transaction_id || saved.boot_id !== mark.boot_id
+        || saved.continuous_ms > mark.continuous_ms || saved.effective_utc > mark.effective_utc) throw Error();
+      const audit = db.prepare("SELECT record_json FROM security_audit_records WHERE transaction_id=?").get(row.transaction_id) as { record_json: string } | undefined;
+      if (audit === undefined) {
+        // Retained audit checkpoints still authenticate the current history root.
+        // An old reservation is admissible only if its full leaf remains verified.
+        if (history.readInState(state, row.transaction_id!) === null) throw Error();
+        return;
+      }
+      const proof = JSON.parse(audit.record_json);
+      if (proof.event.occurred_at !== saved.effective_utc) throw Error();
+      const root = proof.resource_commitments?.find((item: { resource_id: string }) => item.resource_id === "approval_clock_marks");
+      // Legacy schema/root admission predates authenticated history leaves.
+      // Only verified chain transactions without a new history leaf are exempt.
+      if (root !== undefined && root.resource_digest !== emptyMetadataRoot({ ...this.scope, collection: "approval_clock_marks_v1" })) {
+        if (history.readInState(state, row.transaction_id!) === null) throw Error();
+      }
+    });
+    // Immutable historical blobs are content-addressed; their full bytes must
+    // verify even when a newer root no longer points to their old version.
+    nodes.read(reader => scan("approval_metadata_nodes", "digest", row => { if (reader(row.digest!) === undefined) throw Error(); }));
+    indexes.read(reader => scan("approval_index_blobs", "digest", row => { if (reader(row.digest!) === undefined) throw Error(); }));
+
+  }
   verifyRestore(candidate: string): { status: "continuity_verified" | "needs_review"; safe_ready: false } {
     let restored: Database.Database | undefined;
     try {
@@ -96,8 +154,10 @@ export class ApprovalBackupRestore {
       const payloads = new ApprovalPayloadRepository(db, this.providers.auditAnchors, this.providers.auditKeys, this.scope);
       const lifecycle = new ApprovalRequestLifecycle(db, this.providers, this.scope), history = new ApprovalClockHistory(db, this.scope);
       const markers = new ApprovalExecutionMarkerStore(db, this.providers, this.scope);
+      const nodes = new ApprovalMetadataNodes(db), indexes = new ApprovalIndexBlobs(db, this.scope);
       operations.authorizedObservation(policies, "restore", (state, mark) => {
         this.assertSingleScope(state, db);
+        this.verifySqlMembership(db, state, records, payloads, history, markers, mark, nodes, indexes);
         for (const kind of ["request", "decision", "consume", "execution", "notification", "event", "presentation"] as ApprovalRecordKind[]) {
           let after: string | null = null, complete = false;
           for (let page = 0; page < 1000; page++) {

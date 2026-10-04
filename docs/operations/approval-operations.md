@@ -59,6 +59,8 @@ probeは実team/bot identity、messageの物理author/target、markerを署名�
 
 ## sweep、retention、health
 
+SDKの`has_more`は省略可能であり、空・null・欠落した`next_cursor`を最終pageとする。非空cursorの全pageを取得し、上限・cursor循環・不完全応答ではcompleteとしない。[Slack cursor pagination](https://docs.slack.dev/apis/web-api/pagination/)の契約へ従う。reconcile proofにはoperator context referenceとcurrent authorization revisionを必須とし、callback proofへの混入を禁止する。
+
 foreground sweepはtickごとにcurrent policyと保護clockを確認し、各collectionの設定page数まで処理する。SIGINT/SIGTERMで終了し、例外・clock fault・認可変更・応答不明で停止する。単件brokerのdeniedも直ちに停止し、同じtickの後続候補へ進まない。restartはcursorを捨て、監査付きstateを再走査する。重複tickは既存decision/fenceを作り直さない。常駐service登録は別の配備作業である。
 
 retentionはowner・semantic hash・clock履歴を照合し、payloadの期限到達時にterminalな本文envelopeだけを削除する。active、needs_review、nonterminal execution、unknown/dispatch中のnotificationを保護する。metadata tombstone、request/attempt/index、consume fence、marker、共有audit/historyは保持し、削除によって再実行可能にしない。通常terminal処理で既に本文を削除した場合もtombstoneを維持する。
@@ -67,12 +69,14 @@ healthは`live`と`ready`を分離する。expiry lag、stale claim、execution/
 
 ## backupとrestore continuity
 
-backupは単一instance/workspaceの専用DBだけを対象とし、別scopeのroot・row・監査eventや無関係なtableがある場合は拒否する。同じ認可済み監査snapshotからSQLite Online Backupを使用する。sourceをmemory SQLiteへ写し、memory内でsecret tableを空にしてVACUUMした後、metadataのみをprivate destinationへ写す。ciphertext envelopeもbackupのdiskへ一時保存しない。digestは固定サイズのchunkで計算する。元DBを変更せず、同directoryの一時fileをfsync後、上書き不可のlinkで公開する。[SQLite Online Backup](https://www.sqlite.org/backup.html)のsnapshot契約を使用する。
+backupは単一instance/workspaceの専用DBだけを対象とし、別scopeのroot・row・監査eventや無関係なtableがある場合は拒否する。同じ認可済み監査snapshotからsecret tableの値を読まず、metadataをrow単位でprivate一時DBへ構築し、そのmetadata imageだけをSQLite Online Backupで128pageずつdestinationへ写す。schemaを先に構築し、全metadataの後にimmutable trigger/indexを再現する。各destination connectionのpager cacheは2MiB、valueは2MiBまでに制限し、source全体のmemory copyやVACUUMを行わない。ciphertext envelopeもbackupのdiskへ一時保存しない。一時metadata imageは所有inodeを確認して通常終了時に削除する。crash時に残るprivate metadata imageは復元・有効化せず、operatorが照合して回収する。digestは固定サイズのchunkで計算する。元DBを変更せず、同directoryの一時fileをfsync後、上書き不可のlinkで公開する。[SQLite Online Backup](https://www.sqlite.org/backup.html)のsnapshot契約を使用する。
 
 backupはcredential・Keychain head・used-node storeを含まず、runtimeを自動復旧するbundleではない。active本文は復元できない。`restore-check`はcurrent operator認可の後、standalone DELETE-journal形式の候補DBをread-onlyで開き、schema/FK/quick_check、同じinstance/workspace、current binding/policy generation、保護clock/boot、外部audit anchor、全record/linkとmarker continuityを有界走査する。WAL/SHM/hot journalを伴う候補は回復せずneeds_reviewへ送る。decision/consumeの保存時刻、request/attemptのpayload binding、notification/executionのMACと保持鍵も照合する。start前に拒否されたfence 2のneeds_reviewは送信markerを必須とせず、markerが存在する場合と送信済み状態では検証を省略しない。検査は候補fileやsidecarを変更せず、DB置換・anchor巻戻し・repair・再送・enablementをしない。
 
 古いbackup、binding/boot不一致、欠落したactive本文、unknownな履歴、検証上限到達は`needs_review`と`safe_ready: false`にする。完全一致したmetadataだけでも`continuity_verified`はsafe readinessや復元完了を意味しない。復元後のunknown acceptanceと永久fenceを保持し、再配送を開始しない。安全な復元手順とlive証明は#25のruntime gateで判断する。
 
 ## 障害時の確認
+
+restoreではSQL側も列挙してmanifest・payload root・marker rootへ照合し、clock reservationは検証済みaudit transactionと履歴へ結合する。履歴leaf以前のlegacy admissionにも署名済みtransaction/timeを要求する。content-addressedな旧node/blobも全bytesのdigestを検証する。
 
 writeのtimeout・切断・CAS/DB commit不一致・backup公開結果不明では同じwriteを再送しない。current監査root、clock、generation、対象revision/fence、custody receiptまたはbackup fileを読み取りで照合する。accepted/unknownを取り違えず、整合性が不明ならsafe-off/needs_reviewを保持する。外部監視SaaS、Project metadata変更、自動retryは本機能に含めない。

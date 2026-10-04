@@ -145,50 +145,108 @@ static void file_identity_ok(sqlite3_context *context, int argc, sqlite3_value *
   sqlite3_result_int(context, moved == 0);
 }
 
-static int copy_database(sqlite3 *destination, sqlite3 *source) {
-  sqlite3_backup *backup = sqlite3_backup_init(destination, "main", source, "main");
-  if (!backup) return SQLITE_ERROR;
-  int step = sqlite3_backup_step(backup, -1);
-  int finish = sqlite3_backup_finish(backup);
-  return step == SQLITE_DONE && finish == SQLITE_OK ? SQLITE_OK : SQLITE_ERROR;
+/* Copy one validated metadata row at a time. No source secret value, free page,
+ * or full database image is loaded into memory or written to the destination.
+ * Pager caches and per-value size are bounded independently of source DB size. */
+static int copy_metadata_table(sqlite3 *source, sqlite3 *output, const char *name) {
+  sqlite3_stmt *read = NULL, *write = NULL; char *query = NULL; sqlite3_str *builder = NULL;
+  int ok = 0, status, columns;
+  query = sqlite3_mprintf("SELECT * FROM main.\"%w\"", name);
+  if (!query || sqlite3_prepare_v2(source, query, -1, &read, NULL) != SQLITE_OK) goto cleanup;
+  sqlite3_free(query); query = NULL; columns = sqlite3_column_count(read);
+  if (columns < 1 || columns > 64) goto cleanup;
+  builder = sqlite3_str_new(output); if (!builder) goto cleanup;
+  sqlite3_str_appendf(builder, "INSERT INTO main.\"%w\" VALUES(", name);
+  for (int index = 0; index < columns; index++) sqlite3_str_appendall(builder, index == 0 ? "?" : ",?");
+  sqlite3_str_appendall(builder, ")"); query = sqlite3_str_finish(builder); builder = NULL;
+  if (!query || sqlite3_prepare_v2(output, query, -1, &write, NULL) != SQLITE_OK) goto cleanup;
+  while ((status = sqlite3_step(read)) == SQLITE_ROW) {
+    for (int index = 0; index < columns; index++) {
+      if (sqlite3_column_bytes(read, index) > 2 * 1024 * 1024
+        || sqlite3_bind_value(write, index + 1, sqlite3_column_value(read, index)) != SQLITE_OK) goto cleanup;
+    }
+    if (sqlite3_step(write) != SQLITE_DONE || sqlite3_reset(write) != SQLITE_OK
+      || sqlite3_clear_bindings(write) != SQLITE_OK) goto cleanup;
+  }
+  ok = status == SQLITE_DONE;
+cleanup:
+  if (read) sqlite3_finalize(read);
+  if (write) sqlite3_finalize(write);
+  if (builder) sqlite3_free(sqlite3_str_finish(builder));
+  sqlite3_free(query);
+  return ok ? SQLITE_OK : SQLITE_ERROR;
 }
 
-/* The first Online Backup is memory-only. Secret pages are securely removed and
- * vacuumed there before the second Online Backup writes any byte to disk.
- * Authenticated metadata/tombstones remain unchanged; a restore with omitted
- * active payload must fail closed. Never persist a full payload-store backup. */
+static int copy_metadata_image(sqlite3 *destination, sqlite3 *projection) {
+  sqlite3_backup *backup = sqlite3_backup_init(destination, "main", projection, "main");
+  if (!backup) return SQLITE_ERROR;
+  int status;
+  do { status = sqlite3_backup_step(backup, 128); } while (status == SQLITE_OK);
+  int finish = sqlite3_backup_finish(backup);
+  return status == SQLITE_DONE && finish == SQLITE_OK ? SQLITE_OK : SQLITE_ERROR;
+}
+
 static void approval_metadata_backup(sqlite3_context *context, int argc, sqlite3_value **argv) {
-  sqlite3 *source = sqlite3_context_db_handle(context), *memory = NULL, *output = NULL;
-  sqlite3_stmt *statement = NULL; sqlite3_str *builder = NULL; char *ddl = NULL;
-  struct stat before, after; int moved = -1, ok = 0;
+  sqlite3 *source = sqlite3_context_db_handle(context), *output = NULL, *image = NULL;
+  char *projection_path = NULL; struct stat projection_before = {0}, projection_after = {0}; int projection_created = 0;
+  sqlite3_stmt *statement = NULL; struct stat before, after; int moved = -1, ok = 0, status = -1;
   const char *filename = argc == 1 && sqlite3_value_type(argv[0]) == SQLITE_TEXT ? (const char *)sqlite3_value_text(argv[0]) : NULL;
   if (!filename || filename[0] != '/' || strlen(filename) > 4096 || getuid() != geteuid()
     || lstat(filename, &before) != 0 || !S_ISREG(before.st_mode) || before.st_uid != getuid()
     || before.st_nlink != 1 || (before.st_mode & 077) != 0 || before.st_size != 0
     || sqlite3_file_control(source, "main", SQLITE_FCNTL_HAS_MOVED, &moved) != SQLITE_OK || moved != 0) goto cleanup;
-  if (sqlite3_open_v2(":memory:", &memory, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_MEMORY, NULL) != SQLITE_OK) goto cleanup;
-  if (copy_database(memory, source) != SQLITE_OK || sqlite3_exec(memory, "PRAGMA temp_store=MEMORY; PRAGMA secure_delete=ON; PRAGMA journal_mode=MEMORY", NULL, NULL, NULL) != SQLITE_OK) goto cleanup;
-  if (sqlite3_prepare_v2(memory, "SELECT sql FROM sqlite_master WHERE (type='table' AND name='approval_payload_secrets') OR (type='trigger' AND tbl_name='approval_payload_secrets') ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END,name", -1, &statement, NULL) != SQLITE_OK) goto cleanup;
-  builder = sqlite3_str_new(memory); if (!builder) goto cleanup;
-  int count = 0, status;
+  projection_path = sqlite3_mprintf("%s.metadata", filename); if (!projection_path) goto cleanup;
+  int descriptor = open(projection_path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  if (descriptor < 0) goto cleanup;
+  projection_created = 1; int identity_ok = fstat(descriptor, &projection_before) == 0;
+  close(descriptor); if (!identity_ok) goto cleanup;
+  if (sqlite3_open_v2(projection_path, &output, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) goto cleanup;
+  sqlite3_limit(output, SQLITE_LIMIT_LENGTH, 2 * 1024 * 1024);
+  if (sqlite3_exec(output, "PRAGMA foreign_keys=OFF; PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; BEGIN", NULL, NULL, NULL) != SQLITE_OK) goto cleanup;
+  /* Exact schema has been verified by the caller. Defer indexes and immutable
+   * triggers until after data import; do not weaken or remove source guards. */
+  if (sqlite3_prepare_v2(source, "SELECT name,sql FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name", -1, &statement, NULL) != SQLITE_OK) goto cleanup;
   while ((status = sqlite3_step(statement)) == SQLITE_ROW) {
-    const char *sql = (const char *)sqlite3_column_text(statement, 0);
-    if (!sql || strlen(sql) > 8192 || ++count > 4) goto cleanup;
-    sqlite3_str_appendall(builder, sql); sqlite3_str_appendchar(builder, 1, ';');
+    const char *name = (const char *)sqlite3_column_text(statement, 0), *ddl = (const char *)sqlite3_column_text(statement, 1);
+    if (!name || !ddl || strlen(name) > 128 || strlen(ddl) > 65536
+      || (strncmp(name, "approval_", 9) != 0 && strcmp(name, "security_audit_schema") != 0
+        && strcmp(name, "security_audit_records") != 0 && strcmp(name, "security_audit_checkpoint") != 0)
+      || sqlite3_exec(output, ddl, NULL, NULL, NULL) != SQLITE_OK) goto cleanup;
+
   }
-  if (status != SQLITE_DONE || count != 4) goto cleanup;
+  if (status != SQLITE_DONE) goto cleanup;
   sqlite3_finalize(statement); statement = NULL;
-  ddl = sqlite3_str_finish(builder); builder = NULL; if (!ddl) goto cleanup;
-  if (sqlite3_exec(memory, "DROP TABLE approval_payload_secrets", NULL, NULL, NULL) != SQLITE_OK
-    || sqlite3_exec(memory, ddl, NULL, NULL, NULL) != SQLITE_OK
-    || sqlite3_exec(memory, "VACUUM", NULL, NULL, NULL) != SQLITE_OK) goto cleanup;
-  if (lstat(filename, &after) != 0 || after.st_dev != before.st_dev || after.st_ino != before.st_ino || after.st_size != 0) goto cleanup;
-  if (sqlite3_open_v2(filename, &output, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK
-    || copy_database(output, memory) != SQLITE_OK
-    || sqlite3_exec(output, "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL", NULL, NULL, NULL) != SQLITE_OK
+  if (sqlite3_prepare_v2(source, "SELECT name FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='approval_payload_secrets' ORDER BY name", -1, &statement, NULL) != SQLITE_OK) goto cleanup;
+  while ((status = sqlite3_step(statement)) == SQLITE_ROW) {
+    const char *name = (const char *)sqlite3_column_text(statement, 0);
+    if (!name || copy_metadata_table(source, output, name) != SQLITE_OK) goto cleanup;
+  }
+  if (status != SQLITE_DONE) goto cleanup;
+  sqlite3_finalize(statement); statement = NULL;
+  if (sqlite3_prepare_v2(source, "SELECT sql FROM main.sqlite_master WHERE type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name", -1, &statement, NULL) != SQLITE_OK) goto cleanup;
+  while ((status = sqlite3_step(statement)) == SQLITE_ROW) {
+    const char *ddl = (const char *)sqlite3_column_text(statement, 0);
+    if (!ddl || strlen(ddl) > 65536 || sqlite3_exec(output, ddl, NULL, NULL, NULL) != SQLITE_OK) goto cleanup;
+  }
+  if (status != SQLITE_DONE) goto cleanup;
+  sqlite3_finalize(statement); statement = NULL;
+  if (sqlite3_prepare_v2(source, "PRAGMA main.application_id", -1, &statement, NULL) != SQLITE_OK
+    || sqlite3_step(statement) != SQLITE_ROW || sqlite3_column_int(statement, 0) != 0x444f4e50) goto cleanup;
+  sqlite3_finalize(statement); statement = NULL;
+  if (sqlite3_exec(output, "PRAGMA application_id=1146048080; COMMIT", NULL, NULL, NULL) != SQLITE_OK
     || sqlite3_db_cacheflush(output) != SQLITE_OK) goto cleanup;
   moved = -1;
-  if (sqlite3_file_control(output, "main", SQLITE_FCNTL_HAS_MOVED, &moved) != SQLITE_OK || moved != 0) goto cleanup;
+  if (sqlite3_file_control(output, "main", SQLITE_FCNTL_HAS_MOVED, &moved) != SQLITE_OK || moved != 0
+    || lstat(projection_path, &projection_after) != 0 || projection_after.st_dev != projection_before.st_dev
+    || projection_after.st_ino != projection_before.st_ino || projection_after.st_uid != getuid()
+    || (projection_after.st_mode & 077) != 0) goto cleanup;
+  if (sqlite3_open_v2(filename, &image, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK
+    || sqlite3_exec(image, "PRAGMA cache_size=-2048; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL", NULL, NULL, NULL) != SQLITE_OK
+    || copy_metadata_image(image, output) != SQLITE_OK || sqlite3_db_cacheflush(image) != SQLITE_OK) goto cleanup;
+  moved = -1;
+  if (sqlite3_file_control(image, "main", SQLITE_FCNTL_HAS_MOVED, &moved) != SQLITE_OK || moved != 0) goto cleanup;
+  if (sqlite3_close(image) != SQLITE_OK) goto cleanup;
+  image = NULL;
   if (sqlite3_close(output) != SQLITE_OK) goto cleanup;
   output = NULL;
   if (lstat(filename, &after) != 0 || after.st_dev != before.st_dev || after.st_ino != before.st_ino
@@ -196,10 +254,11 @@ static void approval_metadata_backup(sqlite3_context *context, int argc, sqlite3
   ok = 1;
 cleanup:
   if (statement) sqlite3_finalize(statement);
-  if (builder) sqlite3_free(sqlite3_str_finish(builder));
-  sqlite3_free(ddl);
+  if (image) sqlite3_close(image);
   if (output) sqlite3_close(output);
-  if (memory) sqlite3_close(memory);
+  if (projection_created && lstat(projection_path, &projection_after) == 0
+    && projection_after.st_dev == projection_before.st_dev && projection_after.st_ino == projection_before.st_ino) unlink(projection_path);
+  sqlite3_free(projection_path);
   if (!ok) sqlite3_result_error(context, "approval_metadata_backup_unverified", -1);
   else sqlite3_result_int(context, 1);
 }

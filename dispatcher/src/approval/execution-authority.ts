@@ -32,9 +32,11 @@ export const executionReceiptSchema = z.discriminatedUnion("outcome", [
   z.strictObject({ outcome: z.literal("unknown") }),
   z.strictObject({ outcome: z.literal("ambiguous") }),
 ]);
-export const executionReceiptGrantSchema = z.discriminatedUnion("status", [denied,
-  z.strictObject({ status: z.literal("verified"), scope, attempt_id: id, consumer_id: id, execution_fence: positive, proof_kind: z.enum(["callback", "reconcile"]),
-    operator_context_ref: id.optional(), operator_revision: positive.optional(), receipt: executionReceiptSchema })]);
+const executionReceiptBase = { status: z.literal("verified"), scope, attempt_id: id, consumer_id: id, execution_fence: positive, receipt: executionReceiptSchema };
+export const executionReceiptGrantSchema = z.union([denied, z.discriminatedUnion("proof_kind", [
+  z.strictObject({ ...executionReceiptBase, proof_kind: z.literal("callback") }),
+  z.strictObject({ ...executionReceiptBase, proof_kind: z.literal("reconcile"), operator_context_ref: id, operator_revision: positive }),
+])]);
 /** current callback/reconcile fenceへ結合した認証済みreceiptを解決する。
  * 送信応答またはexact app author/target/保存marker/全page/pagination fenceを
  * 検証する。reconcileの0件はunknown、複数/不完全はambiguous。text類似や

@@ -4,7 +4,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { operationsPolicyFixture } from "./fixtures/operations.js";
 import type Database from "better-sqlite3";
-import { openSecurityReadOnlyDatabase, withSecurityTransactionLock } from "../../src/audit/coordination.js";
+import { openSecurityDatabase, openSecurityReadOnlyDatabase, withSecurityTransactionLock } from "../../src/audit/coordination.js";
 import { ApprovalRecordSql } from "../../src/approval/record-sql.js";
 import { ApprovalRecordRepository } from "../../src/approval/record-repository.js";
 import { ApprovalPayloadRepository } from "../../src/approval/payload-repository.js";
@@ -404,4 +404,26 @@ test("期限前applyはpreview直後に期限へ達してもexpiryを実行し�
   }) as typeof f.operations.authorizedObservation;
   assert.deepEqual(executeOperationsCommand(f.connection, { ...command, apply: true, confirm: before.confirmation }), { status: "not_due" });
   assert.equal(f.records.read("request", command.handle)?.row.state, "delivery_pending");
+});
+
+test("restoreは監査manifestにないrequestとclock reservationのSQL追加を拒否する", t => {
+  for (const kind of ["request", "clock"] as const) {
+    const f = frontendFixture(t, 1), candidate = path.join(path.dirname(f.filename), "extra-" + kind + ".sqlite");
+    f.recovery.backup(candidate, 1);
+    const db = openSecurityDatabase(candidate);
+    try {
+      if (kind === "clock") {
+        const row = db.prepare("SELECT mark_json FROM approval_clock_reservations LIMIT 1").get() as { mark_json: string };
+        const mark = { ...JSON.parse(row.mark_json), transaction_id: "unaudited_clock" };
+        db.prepare("INSERT INTO approval_clock_reservations VALUES(?,?)").run(mark.transaction_id, JSON.stringify(mark));
+      } else {
+        const row = db.prepare("SELECT * FROM approval_requests LIMIT 1").get() as Record<string, unknown>;
+        row.request_id = "unaudited_request"; row.creation_key = "f".repeat(64);
+        const keys = Object.keys(row);
+        db.prepare(`INSERT INTO approval_requests(${keys.join(",")}) VALUES(${keys.map(() => "?").join(",")})`).run(...keys.map(key => row[key]));
+      }
+      assert.equal(db.prepare("PRAGMA quick_check").pluck().get(), "ok");
+    } finally { db.close(); }
+    assert.equal(f.recovery.verifyRestore(candidate).status, "needs_review");
+  }
 });

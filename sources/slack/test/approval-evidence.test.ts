@@ -20,5 +20,15 @@ test("provider SDK経路はmetadata/full cursor契約を要求し本文とprivat
   assert.equal(result.hasMore, true); assert.equal(result.nextCursor, "next");
   assert.equal(JSON.stringify(result).includes("private_body"), false); assert.equal(JSON.stringify(result).includes("private_url"), false);
   internal.conversations.replies = async () => ({ messages: [] });
+  assert.equal((await client.getApprovalEvidencePage("C123", "1234567890.123456", "1234567900.000000")).hasMore, false);
+  for (const next_cursor of ["", null]) {
+    internal.conversations.replies = async () => ({ messages: [], response_metadata: { next_cursor } });
+    assert.equal((await client.getApprovalEvidencePage("C123", "1234567890.123456", "1234567900.000000")).hasMore, false);
+  }
+  internal.conversations.replies = async () => ({ messages: [], response_metadata: { next_cursor: "next" } });
+  assert.equal((await client.getApprovalEvidencePage("C123", "1234567890.123456", "1234567900.000000")).hasMore, true);
+  internal.conversations.replies = async () => ({});
+  await assert.rejects(client.getApprovalEvidencePage("C123", "1234567890.123456", "1234567900.000000"));
+  internal.conversations.replies = async () => ({ messages: [], has_more: true });
   await assert.rejects(client.getApprovalEvidencePage("C123", "1234567890.123456", "1234567900.000000"));
 });

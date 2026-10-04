@@ -128,7 +128,8 @@ export class ApprovalNotificationBroker {
         const event = { ...this.event(request, notification, grant.consumer_id),
           actor: grant.proof_kind !== "reconcile" ? this.event(request, notification, grant.consumer_id).actor
             : { kind: "operator" as const, id: grant.consumer_id },
-          session_ref: grant.operator_context_ref ?? null, authz_revision: grant.operator_revision ?? 0 };
+          session_ref: grant.proof_kind === "reconcile" ? grant.operator_context_ref : null,
+          authz_revision: grant.proof_kind === "reconcile" ? grant.operator_revision : 0 };
         if (command.expected_fence !== notification.row.fence || grant.delivery_fence !== notification.row.fence) return this.denied(event, "revision_mismatch");
         this.lifecycle.verifyClock(request, mark, state);
         if (terminal(notification.row.state)) return this.unchanged(event, request, notification);

@@ -434,14 +434,15 @@ export class SlackWebApiClient implements SlackApiClient {
       channel: channelId, ts: threadTs, latest: upperTs, inclusive: true, include_all_metadata: true, limit: 100,
       ...(cursor === undefined ? {} : { cursor }),
     }));
-    if (!Array.isArray(response.messages) || typeof response.has_more !== "boolean") throw new SlackApiError("invalid_slack_response", "Approval evidence response incomplete");
+    if (!Array.isArray(response.messages) || response.has_more !== undefined && typeof response.has_more !== "boolean") throw new SlackApiError("invalid_slack_response", "Approval evidence response incomplete");
     const nextCursor = optionalCursor(response.response_metadata?.next_cursor);
+    if (response.has_more === true && nextCursor === undefined) throw new SlackApiError("invalid_slack_response", "Approval evidence cursor missing");
     return { messages: response.messages.map(message => {
       if (!message.ts) throw new SlackApiError("invalid_slack_response", "Approval evidence timestamp missing");
       return { ts: message.ts, ...(message.thread_ts ? { threadTs: message.thread_ts } : {}),
         ...(message.user ? { userId: message.user } : {}), ...(message.bot_id ? { botId: message.bot_id } : {}),
         ...(message.metadata === undefined ? {} : { metadata: message.metadata }) };
-    }), hasMore: response.has_more, ...(nextCursor ? { nextCursor } : {}) };
+    }), hasMore: nextCursor !== undefined, ...(nextCursor ? { nextCursor } : {}) };
   }
   async getThread(channelId: string, threadTs: string, limit: number, cursor?: string): Promise<SlackThread> {
     const response = await callSlack(() =>

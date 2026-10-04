@@ -103,7 +103,7 @@ test("再openしたdispatchingを再送せずunknownへ進めexact receiptだけ
  try{db.pragma("journal_mode=WAL");db.pragma("synchronous=FULL");db.pragma("foreign_keys=ON");installApprovalSchema(db);
   const broker=new ApprovalNotificationBroker(db,f.providers,scope,()=>({status:"denied",reason:"unauthorized"}),
     (_command,_request,notification)=>({status:"verified",scope,notification_id:notification.row.notification_attempt_id,consumer_id:"fixture_reopened"}),
-    (command,_request,notification)=>({status:"verified",scope,notification_id:notification.row.notification_attempt_id,consumer_id:"fixture_reopened",delivery_fence:command.expected_fence,proof_kind:"reconcile",receipt:{outcome:"sent",presentation_ref:"message_approval_card"}}),
+    (command,_request,notification)=>({status:"verified",scope,notification_id:notification.row.notification_attempt_id,consumer_id:"fixture_reopened",delivery_fence:command.expected_fence,proof_kind:"reconcile",operator_context_ref:"fixture_operator_context",operator_revision:1,receipt:{outcome:"sent",presentation_ref:"message_approval_card"}}),
     ()=>content,()=>wrapping,()=>markerKey);
   broker.recover("reopen_recover",command);const records=new ApprovalRecordRepository(db,f.providers.auditAnchors,f.providers.auditKeys,scope);
   assert.equal(records.read("request",f.requestId)!.row.state,"delivery_unknown");
