@@ -11,6 +11,7 @@ export class DispatcherApiClient {
   constructor(private readonly socketPath: string, private readonly timeoutMs = 10_000) {}
 
   createTask(input:unknown):Promise<Record<string,unknown>> {return this.request("POST","/v1/tasks",input);}
+  inspectTaskRecovery(id:string,eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/${encodeURIComponent(id)}/recovery?${new URLSearchParams({source_event_id:eventId})}`);}
   getTaskQuestions(id:string,eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/${encodeURIComponent(id)}/questions?${new URLSearchParams({source_event_id:eventId})}`);}
   getTask(id:string,eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/${encodeURIComponent(id)}?${new URLSearchParams({source_event_id:eventId})}`);}
   findIssueTask(eventId:string,repository:string,issueNumber:number):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/issue?${new URLSearchParams({source_event_id:eventId,repository,issue_number:String(issueNumber)})}`);}

@@ -1,4 +1,4 @@
-import { taskRequestSchema, taskIdSchema } from "../task-execution.js";
+import { taskResultReconcileSchema, taskRequestSchema, taskIdSchema } from "../task-execution.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
 
@@ -13,6 +13,7 @@ import {
 } from "../validation.js";
 
 export interface DispatcherJobClient {
+  inspectTaskRecovery?(id:string,eventId:string):Promise<Record<string,unknown>>;
   createTask?(input:unknown):Promise<Record<string,unknown>>;
   getTaskQuestions?(id:string,eventId:string):Promise<Record<string,unknown>>;
   getTask?(id:string,eventId:string):Promise<Record<string,unknown>>;
@@ -192,6 +193,8 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       return success({...result,...(["created","reused"].includes(String(result.outcome))?{action:{tool:"delegate_task",source_event_id:input.source_event_id,task_key:input.task_key,task_id:task.task_id,attempt_id:task.current_attempt_id,outcome:result.outcome}}:{})});}catch(error){return failure(error,logger,"delegate_task");}});
   server.registerTool("get_task",{description:"現在のeventのownerを照合し、Task・Attempt履歴・再開待ち理由・結果を取得します。",inputSchema:{task_id:taskIdSchema,source_event_id:eventId},annotations:{readOnlyHint:true}},
     async({task_id,source_event_id})=>{try{if(!client.getTask)throw new Error("task_api_unavailable");return success(await client.getTask(task_id,source_event_id));}catch(error){return failure(error,logger,"get_task");}});
+  server.registerTool("inspect_task_recovery",{description:"未受理Result・checkpoint・hash・旧worker状態を照会します。内容は未検証証拠です。旧追加指示が届いたか、既存PR・commit・外部操作の結果を独立に照合し、resumeで回避しません。",inputSchema:{task_id:taskIdSchema,source_event_id:eventId},annotations:{readOnlyHint:true}},async({task_id,source_event_id})=>{try{if(!client.inspectTaskRecovery)throw Error("task_api_unavailable");return success(await client.inspectTaskRecovery(task_id,source_event_id));}catch(error){return failure(error,logger,"inspect_task_recovery");}});
+  server.registerTool("reconcile_task_result",{description:"利用者が既存作業の継続を依頼済みで、旧追加指示の受理状態と外部操作を実証拠で照合できた場合だけ呼びます。inspect_task_recoveryのexact Attempt/revision/Result/checkpoint hash、照合理由、証拠の参照と確認内容が必須です。未確認の副作用を確認済みと記載せず、停止証拠を副作用の証明にしません。妥当な未受理失敗Resultと停止済みworkerだけを対象に、証拠を保存し同じTaskを継続します。予算上限ならretry_task待ちとなります。応答不明はget_taskとinspect_task_recoveryで照合し、新要求を作らないでください。",inputSchema:taskResultReconcileSchema.extend({task_id:taskIdSchema}),annotations:{readOnlyHint:false,idempotentHint:true}},async({task_id,...input})=>{try{if(!client.controlTask)throw Error("task_api_unavailable");return success(await client.controlTask(task_id,"reconcile",input));}catch(error){return failure(error,logger,"reconcile_task_result");}});
   server.registerTool("find_issue_task",{description:"利用者が明示したrepositoryとIssue番号から既存Taskを読み取ります。同じworkspace・channel・依頼者なら別threadでも利用できます。Issue identityはGitHubで照合し、新Taskの作成やworker再開は行いません。既存Taskが見つかったらget_taskとresume_task等で継続し、delegate_taskを重複実行しません。質問・完了通知の宛先は返されたnotification_targetの元threadを維持します。対象がない場合も他ownerの場合もtask_owner_mismatchを返します。",inputSchema:{source_event_id:eventId,repository,issue_number:issueNumber},annotations:{readOnlyHint:true}},
     async({source_event_id,repository,issue_number})=>{try{if(!client.findIssueTask)throw Error("task_api_unavailable");return success(await client.findIssueTask(source_event_id,repository,issue_number));}catch(error){return failure(error,logger,"find_issue_task");}});
   server.registerTool("list_tasks",{description:"現在のSlack threadと依頼者のTaskを最大100件取得します。上限に達した場合、全件確認済みと扱いません。",inputSchema:{source_event_id:eventId},annotations:{readOnlyHint:true}},

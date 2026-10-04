@@ -27,7 +27,7 @@
 Task世代では、この節と現行Issue lifecycle手順を、後段に残る旧job transport・手動引継ぎの説明より優先する。旧手順は旧世代の保守照合用であり、新Taskの作成や再開には使わない。
 
 - 通常の長時間作業は`delegate_task`へ委任する。初回write前に安定した`task_key`を決め、対象Issueは`issue_number`へ構造化指定する。scope、権限、依頼を超える自動再開を許可しない。
-- 同じ依頼者が同じworkspace/channelの別threadでrepositoryとIssue番号を明示して継続を求めた場合は、`find_issue_task`で対象を照合する。取得できた既存Taskを`get_task`とTask操作で継続し、重複委任しない。通知先は返された`notification_target`の元threadを維持して利用者へ案内する。実行承認は元threadで要求通知後の依頼者の返信を得る。`result_reconciliation_required`は妥当Resultの受理に状態照合が必要であり、resumeや再委任で迂回しない。
+- 同じ依頼者が同じworkspace/channelの別threadでrepositoryとIssue番号を明示して継続を求めた場合は、`find_issue_task`で対象を照合する。取得できた既存Taskを`get_task`とTask操作で継続し、重複委任しない。通知先は返された`notification_target`の元threadを維持して利用者へ案内する。実行承認は元threadで要求通知後の依頼者の返信を得る。`result_reconciliation_required`は妥当Resultの受理に状態照合が必要であり、resumeや再委任で迂回しない。継続依頼がある場合は`inspect_task_recovery`で未受理Result・checkpointを読み、追加指示の受理状態・既存成果・外部操作を独立した証拠で照合する。照合できた内容だけを理由と証拠参照に記録して`reconcile_task_result`を使う。停止証拠だけで外部操作の成否を推測せず、不明なら実行しない。
 - Task IDは仕事のidentity、Attempt ID（内部のjob ID）は一回の実行identity。`get_task` / `list_tasks`で照合し、Taskごとの現在Attempt・待機理由・残予算を見る。自動回復中に別Taskや旧`resume_job`で重複実行しない。
 - `pause_task` / `resume_task` / `cancel_task` / `steer_task`には直前のTask revisionと現在のSlack event IDを渡す。`retry_task`は停止確認済みの再試行上限待ちで、利用者が追加実行を明示した場合だけ総Attempt上限を増やす。旧Attempt数は消さない。
 - `job_json.task`があるworkerはProjectの`Dona Job ID`、`Dona Task ID`、`Status`を書かない。DispatcherがIssue node IDで排他し、明示されたProjectへ`Dona Task ID`と進捗を同期する。Project同期失敗は実行所有権の喪失ではない。

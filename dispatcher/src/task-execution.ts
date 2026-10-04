@@ -1,4 +1,4 @@
-import type { TaskCheckpoint } from "./task-checkpoint.js";
+import {checkpointSnapshot,type TaskCheckpoint} from "./task-checkpoint.js";
 import Database from "better-sqlite3";
 import { ulid } from "ulid";
 import { createHash } from "node:crypto";
@@ -38,6 +38,15 @@ export const taskRequestSchema = z.object({
 }).strict().refine(v=>v.issue_number===undefined||v.workspace.kind==="github", "Issue requires a GitHub workspace")
   .refine(v=>v.project===undefined||v.issue_number!==undefined,"Project requires an Issue");
 export type TaskRequest = z.infer<typeof taskRequestSchema>;
+export const taskResultReconcileSchema=z.object({
+  source_event_id:z.string().regex(/^evt_[0-9a-hjkmnp-tv-z]{26}$/i),revision:z.number().int().positive(),
+  attempt_id:z.string().regex(/^job_[0-9a-hjkmnp-tv-z]{26}$/),result_sha256:z.string().regex(/^[0-9a-f]{64}$/),
+  checkpoint_sha256:z.union([z.literal("missing"),z.string().regex(/^[0-9a-f]{64}$/)]),
+  reason:z.string().trim().min(1).max(4000),
+  steer_resolution:z.enum(["not_delivered","delivered_effects_reconciled"]),
+  evidence:z.array(z.object({reference:z.string().trim().min(1).max(2000),finding:z.string().trim().min(1).max(4000)}).strict()).min(1).max(16),
+}).strict();
+export type TaskResultReconcile=z.infer<typeof taskResultReconcileSchema>;
 export type TaskState = "active"|"waiting"|"paused"|"completed"|"failed"|"cancelled";
 export interface TaskRow {
   task_id:string;source_event_id:string;task_key:string;request_sha256:string;
@@ -84,8 +93,9 @@ export class TaskRepository {
         request_sha256 TEXT NOT NULL,checkpoint_sequence INTEGER,PRIMARY KEY(task_id,source_event_id));
       CREATE TABLE IF NOT EXISTS task_attempt_result_recoveries(
         attempt_id TEXT PRIMARY KEY REFERENCES task_attempts(attempt_id),task_id TEXT NOT NULL REFERENCES tasks(task_id),
-        resume_event_id TEXT NOT NULL REFERENCES events(event_id),revision INTEGER NOT NULL,
+        source_event_id TEXT NOT NULL REFERENCES events(event_id),revision INTEGER NOT NULL,
         previous_error TEXT NOT NULL,result_sha256 TEXT NOT NULL,result_json TEXT NOT NULL,
+        checkpoint_sha256 TEXT NOT NULL,request_sha256 TEXT NOT NULL,request_json TEXT NOT NULL,
         stop_evidence_json TEXT NOT NULL,created_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS tasks_recovery ON tasks(state,next_check_at);
       CREATE TRIGGER IF NOT EXISTS task_attempt_completion AFTER UPDATE OF status ON jobs
@@ -206,7 +216,7 @@ export class TaskRepository {
       attempt_number:task.attempt_number,max_attempts:task.max_attempts,worker_state:current.status,steer_event_id:current.steer_event_id,steer_state:current.steer_state,
       notification_target:JSON.parse(this.dispatcher.get(task.source_event_id)!.reply_target_json!),
       project_state:task.project_json?task.project_state:"not_configured",
-      attempts:this.sql.prepare("SELECT attempt_id,number,outcome,created_at,ended_at FROM task_attempts WHERE task_id=? ORDER BY number").all(task.task_id),
+      attempts:this.sql.prepare("SELECT a.attempt_id,a.number,a.outcome,a.created_at,a.ended_at,r.result_sha256 AS reconciled_result_sha256 FROM task_attempts a LEFT JOIN task_attempt_result_recoveries r ON r.attempt_id=a.attempt_id WHERE a.task_id=? ORDER BY a.number").all(task.task_id),
       ...(includeResult&&current.result_json?{result:JSON.parse(current.result_json)}:{})};
   }
   list(eventId:string):TaskRow[] {
@@ -346,31 +356,54 @@ export class TaskRepository {
       this.sql.prepare("UPDATE task_attempts SET stop_receipt_json=? WHERE attempt_id=?").run(JSON.stringify({...evidence,verified_at:new Date().toISOString()}),task.current_attempt_id);
     }).immediate();
   }
-  resumeFailedResult(snapshot:TaskRow,jobUpdatedAt:string,digest:string,evidence:WorkerObservation,resultDir:string):JobRow|undefined {
+  resultRecovery(attemptId:string):{task_id:string;request_sha256:string;result_sha256:string;checkpoint_sha256:string}|undefined {
+    return this.sql.prepare("SELECT task_id,request_sha256,result_sha256,checkpoint_sha256 FROM task_attempt_result_recoveries WHERE attempt_id=?").get(attemptId) as ReturnType<TaskRepository["resultRecovery"]>;
+  }
+  replayResultRecovery(id:string,input:TaskResultReconcile):TaskRow|undefined {
+    const task=this.assertOwner(id,input.source_event_id),prior=this.resultRecovery(input.attempt_id);
+    if(prior){if(prior.task_id!==id||prior.request_sha256!==hash(input))throw Error("task_reconciliation_conflict");return task;}
+  }
+  reconcileFailedResult(id:string,input:TaskResultReconcile,jobUpdatedAt:string,evidence:WorkerObservation,resultDir:string):TaskRow {
     return this.sql.transaction(()=>{
-      const task=this.get(snapshot.task_id)!;
-      if(task.revision!==snapshot.revision||task.current_attempt_id!==snapshot.current_attempt_id||
-        task.state!=="waiting"||task.wait_reason!=="resume_requested"||task.desired_state!=="running"||
-        !["none","stopped"].includes(task.stop_state))throw new Error("task_revision_conflict");
-      const control=this.sql.prepare("SELECT source_event_id FROM task_controls WHERE task_id=? AND request_sha256=?")
-        .get(task.task_id,hash({revision:task.revision-1,action:"resume"})) as {source_event_id:string}|undefined;
-      if(!control)throw new Error("task_explicit_resume_required");
-      this.assertOwner(task.task_id,control.source_event_id);
+      const replay=this.replayResultRecovery(id,input);if(replay)return replay;
+      const task=this.assertOwner(id,input.source_event_id);
+      if(this.dispatcher.get(input.source_event_id)?.source!=="slack"||task.revision!==input.revision||task.current_attempt_id!==input.attempt_id||
+        task.state!=="waiting"||task.desired_state!=="running"||!["none","stopped"].includes(task.stop_state))throw Error("task_revision_conflict");
       const job=this.dispatcher.getJob(task.current_attempt_id)!;
       if(job.updated_at!==jobUpdatedAt||job.status!=="needs_review"||job.last_error_code!=="steer_acceptance_unknown"||
-        !job.dispatch_started_at||job.result_json!==null||evidence.state!=="stopped")throw new Error("task_result_recovery_unavailable");
-      const file=this.dispatcher.readTaskRecoveryResult(job.job_id);
-      if(file.sha256!==digest||file.result.status!=="failed")throw new Error("task_result_recovery_drift");
-      if(task.attempt_number>=task.max_attempts)throw new Error("task_result_recovery_budget_exhausted");
-      const checkpoint=this.latestCheckpoint(task.task_id);
-      if(checkpoint?.waiting==="external_effect_unknown"||checkpoint?.unresolved_operations.length)throw new Error("task_external_effect_reconciliation_required");
-      // Resultは受理・上書きせず、旧Attemptの証拠として停止記録と同一transactionで保持する。
-      this.sql.prepare("INSERT INTO task_attempt_result_recoveries VALUES(?,?,?,?,?,?,?,?,?)")
-        .run(job.job_id,task.task_id,control.source_event_id,task.revision,job.last_error_code,digest,
-          stableStringify(file.result),JSON.stringify(evidence),new Date().toISOString());
+        !job.dispatch_started_at||job.result_json!==null||evidence.state!=="stopped")throw Error("task_result_recovery_unavailable");
+      const file=this.dispatcher.readTaskRecoveryResult(job.job_id),snapshot=checkpointSnapshot(job,id);
+      if(file.sha256!==input.result_sha256||file.result.status!=="failed"||snapshot.sha256!==input.checkpoint_sha256)throw Error("task_result_recovery_drift");
+      if(snapshot.checkpoint?.waiting==="external_effect_unknown"||snapshot.checkpoint?.unresolved_operations.length)throw Error("task_external_effect_reconciliation_required");
+      if(snapshot.checkpoint)this.checkpoint(job,snapshot.checkpoint);
+      this.sql.prepare("INSERT INTO task_attempt_result_recoveries VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+        .run(job.job_id,id,input.source_event_id,task.revision,job.last_error_code,file.sha256,stableStringify(file.result),
+          snapshot.sha256,hash(input),stableStringify(input),JSON.stringify(evidence),new Date().toISOString());
+      this.sql.prepare("UPDATE tasks SET stop_state='stopped',stop_evidence_json=?,wait_reason='resume_requested',revision=revision+1 WHERE task_id=?").run(JSON.stringify(evidence),id);
+      this.sql.prepare("UPDATE task_attempts SET stop_receipt_json=? WHERE attempt_id=?").run(JSON.stringify(evidence),job.job_id);
+      this.replaceStopped(id,resultDir,file.sha256);
+      return this.get(id)!;
+    }).immediate();
+  }
+  continueReconciledResult(snapshot:TaskRow,evidence:WorkerObservation,resultDir:string):void {
+    this.sql.transaction(()=>{
+      const task=this.get(snapshot.task_id)!;
+      if(task.revision!==snapshot.revision||task.current_attempt_id!==snapshot.current_attempt_id||task.wait_reason!=="resume_requested"||task.desired_state!=="running"||evidence.state!=="stopped")throw Error("task_revision_conflict");
+      const prior=this.resultRecovery(task.current_attempt_id),job=this.dispatcher.getJob(task.current_attempt_id)!;
+      if(!prior||checkpointSnapshot(job,task.task_id).sha256!==prior.checkpoint_sha256)throw Error("task_result_recovery_drift");
+      this.replaceStopped(task.task_id,resultDir,prior.result_sha256);
+    }).immediate();
+  }
+  settleFailedResultControl(snapshot:TaskRow,digest:string,evidence:WorkerObservation):void {
+    this.sql.transaction(()=>{
+      const task=this.get(snapshot.task_id)!;
+      if(task.revision!==snapshot.revision||task.current_attempt_id!==snapshot.current_attempt_id||task.desired_state==="running"||evidence.state!=="stopped")throw Error("task_revision_conflict");
+      const job=this.dispatcher.getJob(task.current_attempt_id)!,file=this.dispatcher.readTaskRecoveryResult(task.current_attempt_id);
+      if(job.last_error_code!=="steer_acceptance_unknown"||file.result.status!=="failed"||file.sha256!==digest)throw Error("task_result_recovery_drift");
       this.sql.prepare("UPDATE tasks SET stop_state='stopped',stop_evidence_json=? WHERE task_id=?").run(JSON.stringify(evidence),task.task_id);
       this.sql.prepare("UPDATE task_attempts SET stop_receipt_json=? WHERE attempt_id=?").run(JSON.stringify(evidence),job.job_id);
-      return this.replaceStopped(task.task_id,resultDir,digest);
+      if(task.desired_state==="paused")this.sql.prepare("UPDATE tasks SET state='paused',wait_reason='paused',next_check_at=NULL WHERE task_id=?").run(task.task_id);
+      else {this.dispatcher.beginJobCancellation(job.job_id,job.source_event_id);this.dispatcher.markJobCancelled(job.job_id,"Task cancelled after verified stop; unaccepted failed Result retained");this.dispatcher.markTerminalWorkerStopProof(job.job_id);}
     }).immediate();
   }
   private recoveryResultMatches(job:JobRow,digest:string):boolean {

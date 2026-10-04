@@ -1,3 +1,5 @@
+import syncFs,{constants} from "node:fs";
+import {createHash} from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
@@ -21,4 +23,20 @@ export async function readCheckpoint(job:JobRow,taskId:string):Promise<TaskCheck
     if(value.task_id!==taskId||value.attempt_id!==job.job_id)throw new Error("task_checkpoint_identity_mismatch");
     return value;
   }finally{await file.close();}
+}
+
+/** 停止照合後・DB transaction内で使うbounded snapshot。欠落もhashへ束縛する。 */
+export function checkpointSnapshot(job:JobRow,taskId:string):{sha256:string;checkpoint?:TaskCheckpoint} {
+  let fd:number;
+  try{fd=syncFs.openSync(checkpointPath(job),constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);}
+  catch(error){if((error as NodeJS.ErrnoException).code==="ENOENT")return {sha256:"missing"};throw error;}
+  try{
+    const stat=syncFs.fstatSync(fd);if(!stat.isFile()||stat.size>128_000)throw Error("task_checkpoint_invalid");
+    const buffer=Buffer.alloc(128_001);let size=0;
+    while(size<buffer.length){const n=syncFs.readSync(fd,buffer,size,buffer.length-size,null);if(!n)break;size+=n;}
+    if(size>128_000)throw Error("task_checkpoint_invalid");
+    const bytes=buffer.subarray(0,size),checkpoint=checkpointSchema.parse(JSON.parse(bytes.toString("utf8")));
+    if(checkpoint.task_id!==taskId||checkpoint.attempt_id!==job.job_id)throw Error("task_checkpoint_identity_mismatch");
+    return {sha256:createHash("sha256").update(bytes).digest("hex"),checkpoint};
+  }finally{syncFs.closeSync(fd);}
 }

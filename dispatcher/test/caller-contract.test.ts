@@ -269,7 +269,7 @@ test("Issue Task照会をmainの許可設定からMCP・UDSへ通す",async()=>{
   const section=text.split("[mcp_servers.dona_dispatcher]")[1]!;
   const enabled=JSON.parse(section.match(/enabled_tools = (\[[^\n]+\])/)![1]!) as string[];
   const advertised=(await f.client.listTools()).tools.map(t=>t.name);
-  for(const name of ["find_issue_task","get_task","list_tasks","resume_task","get_task_questions","answer_task_question","respond_task_approval"]) {
+  for(const name of ["find_issue_task","inspect_task_recovery","reconcile_task_result","get_task","list_tasks","resume_task","get_task_questions","answer_task_question","respond_task_approval"]) {
    assert.ok(enabled.includes(name),`mainで${name}を許可する`);assert.ok(advertised.includes(name),`${name}をMCPで公開する`);
   }
   const gh=f.config.databasePath+".fake-gh";

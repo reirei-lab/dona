@@ -57,12 +57,14 @@ Mac上の任意CLIが起動する外部daemonやSimulatorまでprocess groupで�
 
 `result_conflict`はResultの読み取り・構文・schema検証に失敗した状態、`result_reconciliation_required`は妥当なResultの受理を既存の実行・通知状態が拒否した状態である。後者でも完了や自動再試行を推測せず、停止証拠・既存外部操作・通知を正規のoperator手順で照合する。resumeで拒否条件を取り除くことはできない。
 
-### 追加指示の受理不明で残った失敗Resultからの継続
+### 追加指示の受理不明で残った失敗Resultの照合
 
-`steer_acceptance_unknown`のAttemptに妥当な`failed` Resultが残り、通常のResult受理が拒否された場合は、所有者による明示的な`resume_task`を使う。同じTask・Issue claim・作業ディレクトリを保持して次のAttemptへ進む。自動観測だけではこの継続を開始しない。
+`steer_acceptance_unknown`のAttemptに妥当な`failed` Resultが残る場合、通常のresumeでは回復させない。継続を依頼されたmain/operatorは、`inspect_task_recovery`でResult・checkpoint・hash・停止状態を取得する。Resultは未検証証拠として読み、旧追加指示が未送信か、送信後の作業・外部操作が照合済みかを独立した実証拠で確認する。
 
-DispatcherはApp Server adapterで旧workerの`stopped`と停止記録を照合し、Task revision・current Attempt・Result SHA-256・再試行予算をtransaction内で再確認する。未解決外部操作を持つcheckpoint、稼働中・質問待ち・停止不明、成功Result、不正Result、隔離済みResult、取消との競合では後継Attemptを作らない。
+照合できた場合だけ`reconcile_task_result`へ、exact Task revision・Attempt ID・Result/checkpoint hash、`reason`、`steer_resolution`、証拠の参照と確認内容を渡す。停止証拠だけで外部操作の成否を推測しない。ユーザーの継続依頼やResultの自己申告だけを副作用の照合証拠にせず、既存PR・commit・providerのdurable receipt等を読み直す。確認不能なら保留する。
 
-旧checkpointの`design`成果物も参照情報として読み取る。旧Result fileと既存成果は削除しない。未受理Resultの内容・hash、明示resume event、旧エラー、停止証拠を`task_attempt_result_recoveries`へ保存し、旧Attemptを中断済みとして一度だけ引き継ぐ。旧ResultをTaskの完了として受理したり、曖昧だった追加指示を受理済みに書き換えたりはしない。後継workerは最新のTask objectiveと旧証拠を読み、既存PR・差分・外部操作を照合して残作業を行う。
+Dispatcherは旧workerの停止を照合した後、Resultとcheckpointをtransaction内で再読する。未解決外部操作、worker稼働・停止不明、成功・不正・隔離Result、revision/hash不一致では拒否する。旧checkpointの`design`成果物は参照情報として読み取る。旧Result fileを削除・受理せず、内容・hash・照合event・理由・証拠・停止記録を`task_attempt_result_recoveries`へ保存し、同じTask・Issue claim・worktreeで次のAttemptへ進む。後継workerも既存成果・外部操作を照合し、成否不明の操作を再送しない。
 
-停止済み記録はDona管理下の実行世代についての証拠であり、任意の外部daemonや外部サービスの処理結果の証明ではない。後継workerも成否不明の操作を再送しない。停止や通知の照合に失敗した場合は保留を維持し、DB直接書換え・Result削除で回避しない。
+上限到達なら停止証拠と照合記録を保持した`retry_exhausted`になる。追加実行が承認されれば`retry_task`で予算を増やせる。後継作成前にResult/checkpoint hashと停止状態を再照合する。競合したpause/cancelは優先し、停止確認後に一時停止/取消を確定する。一時停止だけではResult照合を済ませたことにならない。
+
+応答不明は`get_task`のAttempt履歴・`reconciled_result_sha256`と保存済み要求を照合する。同じ照合要求は冪等で、異内容への変更はconflictになる。通知処理中なら監査保存と後継作成をまとめてrollbackする。Dona管理下の停止記録は、任意の外部daemonや外部サービスの副作用完了の証明ではない。
