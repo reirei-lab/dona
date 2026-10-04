@@ -321,7 +321,8 @@ export class JobWorkspace {
     if (!origin.ok || normalizedRepository(origin.stdout) !== repository.toLowerCase()) throw new Error("handoff_repository_mismatch");
     const head = await runProcess(this.config.gitPath, ["-C", row.workspace_path, "rev-parse", "--verify", "HEAD^{commit}"], this.config.jobCommandTimeoutMs, signal);
     if (!head.ok) throw new Error("handoff_head_unavailable");
-    await this.verifyWorktreeIdentity({ ...row, job_id: originId }, repositoryPath, head.stdout.trim(), signal);
+    // 継続先の所有権はpathとrepositoryで照合する。workerが選んだbranch/HEADは保持する。
+    await this.verifyWorktreeIdentity({ ...row, job_id: originId }, repositoryPath, head.stdout.trim(), signal, "continuation");
   }
 
   private async verifyExistingGitHubWorktree(
@@ -453,6 +454,7 @@ export class JobWorkspace {
     repositoryPath: string,
     expectedSha: string,
     signal?: AbortSignal,
+    mode: "initial" | "continuation" = "initial",
   ): Promise<void> {
     const head = await runProcess(
       this.config.gitPath,
@@ -464,15 +466,17 @@ export class JobWorkspace {
     if (!head.ok || actualSha !== expectedSha) {
       throw new Error(`Git worktree HEAD mismatch for dona/${row.job_id}: expected ${expectedSha}, got ${actualSha || "unresolved"}`);
     }
-    const branch = await runProcess(
-      this.config.gitPath,
-      ["-C", row.workspace_path, "symbolic-ref", "--quiet", "HEAD"],
-      this.config.jobCommandTimeoutMs,
-      signal,
-    );
-    const expectedBranch = `refs/heads/dona/${row.job_id}`;
-    if (!branch.ok || branch.stdout.trim() !== expectedBranch) {
-      throw new Error(`Git worktree branch mismatch for dona/${row.job_id}`);
+    if (mode === "initial") {
+      const branch = await runProcess(
+        this.config.gitPath,
+        ["-C", row.workspace_path, "symbolic-ref", "--quiet", "HEAD"],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      const expectedBranch = `refs/heads/dona/${row.job_id}`;
+      if (!branch.ok || branch.stdout.trim() !== expectedBranch) {
+        throw new Error(`Git worktree branch mismatch for dona/${row.job_id}`);
+      }
     }
     const commonDir = await runProcess(
       this.config.gitPath,

@@ -939,13 +939,14 @@ process.exit(2);
   });
 });
 
-test("引継ぎworkerは元branchの追加commit・index・未trackedファイルを保持して新しいResultだけを使う",async()=>{
+test("引継ぎworkerは変更したbranchの追加commit・index・未trackedファイルを保持して新しいResultだけを使う",async()=>{
   const f=await githubFixture();
   try {
     const event=f.database.enqueue(eventEnvelope("handoff-github")).row;
     const old=f.database.createJob({source_event_id:event.event_id,objective:"実装",workspace:{kind:"github",repository:"owner/repo"}},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).row;
     const runtime=new HerdrJobAgentRuntime(f.config);
     await runtime.prepare(old);
+    await git(old.workspace_path,"switch","-c",`dona/${old.job_id}-approval-operations`);
     await git(old.workspace_path,"config","user.email","test@example.com");
     await git(old.workspace_path,"config","user.name","Test");
     await fs.writeFile(path.join(old.workspace_path,"committed.txt"),"commit");

@@ -246,7 +246,10 @@ export class TaskRepository {
       this.sql.prepare("UPDATE tasks SET state=?,desired_state=?,wait_reason=?,next_check_at=?,revision=revision+1,updated_at=? WHERE task_id=?")
         .run(state,action==="pause"?"paused":action==="cancel"?"cancelled":"running",reason,new Date().toISOString(),new Date().toISOString(),id);
       const job=this.dispatcher.getJob(task.current_attempt_id)!;
-      if(!job.dispatch_started_at&&!job.herdr_pane_id&&["queued","blocked"].includes(job.status)) {
+      // preparation失敗が確定し、runtime identityもdispatch intentもないAttemptは停止対象を作っていない。
+      // stale_preparing等の受理不明はこの経路に含めない。再開しても同じAttemptと準備予算を使う。
+      const preparationNotStarted=job.status==="retryable_failed"&&job.last_error_code==="job_preparation_failed"&&!job.herdr_workspace_id&&task.stop_state==="none";
+      if(!job.dispatch_started_at&&!job.herdr_pane_id&&(["queued","blocked"].includes(job.status)||preparationNotStarted)) {
         if(action==="cancel")this.sql.prepare("UPDATE jobs SET status='cancelled',completed_at=? WHERE job_id=?").run(new Date().toISOString(),job.job_id);
         else {
           this.sql.prepare("UPDATE jobs SET status=?,last_error_code=? WHERE job_id=?").run(action==="pause"?"blocked":"queued",action==="pause"?"task_paused":null,job.job_id);
