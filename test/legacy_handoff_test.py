@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import plistlib
 from pathlib import Path
 import subprocess
 import tempfile
@@ -118,6 +119,41 @@ class HandoffTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'cutover_evidence_changed'):h.verify_cutover(run,seals)
         with self.assertRaisesRegex(RuntimeError,'fresh_cutover_not_succeeded'):h.verify_cutover(run)
 
+    def test_fresh_cutover_after_runtime_introduction_verifies_all_stop_and_backup_evidence(self):
+        def save(path,value):
+            path.write_text(json.dumps(value));path.chmod(0o600)
+            return h.digest(path.read_bytes())
+        for source_runtime in (False,True):
+            with self.subTest(source_runtime=source_runtime):
+                run=self.root/('cutover-'+str(source_runtime));run.mkdir();(run/'backup').mkdir();(run/'plists').mkdir()
+                (run/'plists'/(h.offline.RUNTIME_LABEL+'.plist')).write_bytes(plistlib.dumps({'Label':h.offline.RUNTIME_LABEL}))
+                sources=['/old/db-'+str(i) for i in range(4)]+(['/old/control/runtime.sqlite3'] if source_runtime else [])
+                inv={'databases':sources,'old_results':['/old/results','/old/job-results'],'policy':{'control_root':'/old/control'},
+                     'plists':{h.offline.RUNTIME_LABEL:{'Label':h.offline.RUNTIME_LABEL}} if source_runtime else {}}
+                entries=[]
+                for i,source in enumerate(sources):
+                    file=run/'backup'/str(i);file.write_bytes(b'database')
+                    entries.append({'source':source,'exists':True,'backup':str(file),'hash':h.digest(file.read_bytes())})
+                for source in inv['old_results']:
+                    entries.append({'directory':True,'source':source,'exists':False,'backup':str(run/'backup'/Path(source).name),'hash':None})
+                plan={'mode':'fresh_generation','generation':str(run/'g'),'inventory_hash':save(run/'inventory.json',inv),
+                      'plists_seal':h.maintenance.tree_seal(run/'plists'),'bundle':{'herdr-config.toml':'sealed'}}
+                receipt={'processes':[],'verified_at':'2026-10-04T00:00:00Z','herdr_session':'dona','herdr_config_sha256':'sealed','launch_agents':list(h.offline.LABELS)}
+                journal={'phase':'succeeded','plan_hash':save(run/'plan.json',plan),'backup_index_hash':save(run/'backup/index.json',entries),
+                         'source_stop_receipt':receipt,'source_stop_guard':{'phase':'committed'}}
+                save(run/'journal.json',journal)
+                with patch.object(subprocess,'check_output',return_value=''):
+                    h.verify_cutover(run)
+                    receipt['launch_agents'].remove(h.offline.RUNTIME_LABEL);save(run/'journal.json',journal)
+                    with self.assertRaisesRegex(RuntimeError,'cutover_stop_evidence_missing'):h.verify_cutover(run)
+                    receipt['launch_agents'].append(h.offline.RUNTIME_LABEL);save(run/'journal.json',journal)
+                    original=entries.copy();entries.pop(len(sources)-1)
+                    journal['backup_index_hash']=save(run/'backup/index.json',entries);save(run/'journal.json',journal)
+                    with self.assertRaisesRegex(RuntimeError,'old_database_backup_incomplete'):h.verify_cutover(run)
+                    journal['backup_index_hash']=save(run/'backup/index.json',original);save(run/'journal.json',journal)
+                    (run/'backup'/str(len(sources)-1)).write_bytes(b'tampered')
+                    with self.assertRaisesRegex(RuntimeError,'old_database_backup_changed'):h.verify_cutover(run)
+
     def test_untracked_executable_bit_drift(self):
         file=self.workspace/'new.sh';file.write_text('echo example\n');file.chmod(0o644)
         before=h.fingerprint(self.workspace);file.chmod(0o755)
@@ -224,6 +260,64 @@ class HandoffTest(unittest.TestCase):
         save(owner,seal(successor,plan,{'databases':expected}))
         save(successor/'journal.json',{'phase':'prepared','plan_hash':h.digest((successor/'plan.json').read_bytes())})
         with self.assertRaisesRegex(RuntimeError,'offline_lineage_not_terminal'):h.expected_databases(seed,owner)
+
+    def test_runtime_lineage_upgrade_preserve_rollback_and_storage_tampering(self):
+        def save(path, value):
+            path.write_text(json.dumps(value));path.chmod(0o600)
+            return h.digest(path.read_bytes())
+        def seal(name, previous, databases, runtime=False, phase='succeeded'):
+            run=self.root/name;run.mkdir(exist_ok=True)
+            plists=run/'plists';plists.mkdir(exist_ok=True)
+            if runtime:
+                (plists/(h.offline.RUNTIME_LABEL+'.plist')).write_bytes(plistlib.dumps({'Label':h.offline.RUNTIME_LABEL}))
+            inventory={'databases':databases,'old_results':[str(self.root/'seed/g'/part) for part in ('results','job-results')]}
+            plan={'mode':'preserve' if previous else 'fresh_generation', 'generation':str(run/'g'),
+                  'previous_offline_run':previous,'inventory_hash':save(run/'inventory.json',inventory),
+                  'plists_seal':h.maintenance.tree_seal(plists)}
+            hashed=save(run/'plan.json',plan)
+            save(run/'journal.json',{'phase':phase,'plan_hash':hashed})
+            result={'run':str(run),'plan_hash':hashed};save(owner,result)
+            return result
+        owner=self.root/'owner.json'
+        seed=seal('seed',None,[])
+        before=h.expected_databases(seed['run'],owner)
+        upgraded=seal('app-server',seed,before,True)
+        expected=before[:3]+[str(self.root/'app-server/g/control'/part) for part in ('updater.sqlite3','runtime.sqlite3')]
+        self.assertEqual(h.expected_databases(seed['run'],owner),expected)
+        successor=seal('next',upgraded,expected,True)
+        moved=before[:3]+[str(self.root/'next/g/control'/part) for part in ('updater.sqlite3','runtime.sqlite3')]
+        paths,results,roots=h.expected_storage(seed['run'],owner)
+        self.assertEqual(paths,moved)
+        self.assertEqual(roots,[self.root/'seed/g']*3+[self.root/'next/g']*2+[self.root/'seed/g']*2)
+        for phase in ('rolled_back','aborted'):
+            successor=seal(phase,successor,moved,True,phase)
+            self.assertEqual(h.expected_databases(seed['run'],owner),moved)
+        after=seal('after-recovery',successor,moved,True)
+        self.assertEqual(h.expected_databases(seed['run'],owner)[-1],str(self.root/'after-recovery/g/control/runtime.sqlite3'))
+        fresh=seal('fresh-runtime',None,[],True)
+        self.assertEqual(len(h.expected_databases(fresh['run'],owner)),5)
+        for index in range(5):
+            replaced=expected.copy();replaced[index]='/unrelated/db'
+            seal('bad-'+str(index),upgraded,replaced,True)
+            with self.assertRaisesRegex(RuntimeError,'offline_lineage_storage_mismatch'):h.expected_databases(seed['run'],owner)
+        for name,databases in [('missing',expected[:4]),('extra',expected+['/extra/db'])]:
+            seal(name,upgraded,databases,True)
+            with self.assertRaisesRegex(RuntimeError,'offline_lineage_storage_mismatch'):h.expected_databases(seed['run'],owner)
+        seal('downgrade',upgraded,expected,False)
+        with self.assertRaisesRegex(RuntimeError,'offline_lineage_runtime_removed'):h.expected_databases(seed['run'],owner)
+        save(owner,after)
+        (Path(after['run'])/'plists'/ (h.offline.RUNTIME_LABEL+'.plist')).write_bytes(b'changed')
+        with self.assertRaisesRegex(RuntimeError,'offline_lineage_plists_changed'):h.expected_databases(seed['run'],owner)
+
+    def test_current_runtime_inventory_is_used_for_handoff(self):
+        inv={'databases':['/new/db'+str(i) for i in range(4)],'old_pointer':'/new/release','old_results':[]}
+        with patch.object(h,'read',return_value={'old_pointer':'/old/release'}), \
+             patch.object(h.maintenance,'inventory',return_value=inv), \
+             patch.object(h.offline,'include_runtime_inventory',side_effect=lambda value,**kwargs:value['databases'].append('/new/runtime')) as include, \
+             patch.object(h,'expected_storage',return_value=(inv['databases']+['/new/runtime'],[],[])), \
+             patch.object(h,'verify_storage_roots',side_effect=RuntimeError('reached_storage_check')):
+            with self.assertRaisesRegex(RuntimeError,'reached_storage_check'):h.verify_no_recreation(self.root,self.workspace)
+            include.assert_called_once_with(inv,require_running=True)
 
     def test_rollback_and_abort_lineage_remains_usable_after_next_update(self):
         def write(path,value):

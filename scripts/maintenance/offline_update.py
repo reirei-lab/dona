@@ -361,6 +361,46 @@ def probe_main(run, plan):
     require({row['server'] for row in results if row.get('initialized')} == {'dispatcher','slack'}, 'mcp_probe_failed')
 
 
+def include_runtime_inventory(inv, require_running=False):
+    """plistが指定するruntime設定と観測したprocessをread-onlyで照合する。"""
+    runtime_plist = Path.home()/'Library/LaunchAgents'/(RUNTIME_LABEL+'.plist')
+    if not runtime_plist.exists():
+        require(inv['policy'].get('main_agent', {}).get('runtime') != 'app_server', 'runtime_plist_missing')
+        return
+    data = common.regular(runtime_plist).read_bytes()
+    plist = plistlib.loads(data)
+    require(plist.get('Label') == RUNTIME_LABEL, 'runtime_plist_identity')
+    root = Path(inv['policy']['control_root'])
+    args = plist.get('ProgramArguments', [])
+    require(len(args) == 3 and args[1] == str(root/'runtime/dist/app-server/cli.js') and
+            args[2] == str(root/'runtime-config.json'), 'runtime_plist_arguments')
+    config_file = common.regular(args[2])
+    require(not config_file.stat().st_mode & 0o022, 'runtime_config_unsafe')
+    config_bytes = config_file.read_bytes()
+    config = json.loads(config_bytes)
+    require(config.get('database') == str(root/'runtime.sqlite3') and
+            config.get('socket') == str(root/'runtime.sock'), 'runtime_storage_mismatch')
+    runtime_database = common.regular(config['database'])
+    live = common.Launchd(service_labels=LABELS)
+    observation = live.observe(RUNTIME_LABEL)
+    if require_running:
+        require(observation and observation.get('pid'), 'runtime_service_not_running')
+    if observation and observation.get('pid'):
+        process = live.process(observation['pid'])
+        require(process and process.split()[0] == str(os.getuid()) and
+                all(argument in process for argument in args), 'runtime_process_identity')
+        require(live.observe(RUNTIME_LABEL) == observation, 'runtime_process_changed')
+        inv['services'][RUNTIME_LABEL] = {**observation, 'identity_hash':common.digest(process.encode())}
+    else:
+        inv['services'][RUNTIME_LABEL] = observation
+    require(common.regular(runtime_plist).read_bytes() == data and
+            common.regular(config_file).read_bytes() == config_bytes, 'runtime_configuration_drift')
+    inv['plists'][RUNTIME_LABEL] = plist
+    inv['files'][str(runtime_plist)] = common.digest(data)
+    inv['files'][str(config_file)] = common.digest(config_bytes)
+    inv['databases'].append(str(runtime_database))
+
+
 def prepare(run, repository, fresh_generation=False):
     require(not run.exists(), 'run_already_exists')
     common.private_dir(run.parent)
@@ -369,16 +409,7 @@ def prepare(run, repository, fresh_generation=False):
         atomic(run/name, Path(__file__).with_name(name).read_bytes())
     progress('設定を確認しています（サービス停止中でも準備できます）。')
     inv = common.inventory(require_running=False)
-    runtime_plist = Path.home()/'Library/LaunchAgents'/(RUNTIME_LABEL+'.plist')
-    if runtime_plist.exists():
-        data = common.regular(runtime_plist).read_bytes()
-        plist = plistlib.loads(data)
-        require(plist.get('Label') == RUNTIME_LABEL, 'runtime_plist_identity')
-        inv['plists'][RUNTIME_LABEL] = plist
-        inv['files'][str(runtime_plist)] = common.digest(data)
-        runtime_database = Path(inv['policy']['control_root'])/'runtime.sqlite3'
-        require(runtime_database.exists(), 'runtime_database_missing')
-        inv['databases'].append(str(runtime_database))
+    include_runtime_inventory(inv)
     atomic(run/'inventory.json', encode(inv))
     executables = inv['policy']['executables']
     git = executables['git']

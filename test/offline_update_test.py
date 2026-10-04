@@ -1,5 +1,7 @@
 """停止更新の順序、crash再開、復旧境界を本番に触れず検証する。"""
 import copy
+import json
+import plistlib
 import os
 from pathlib import Path
 import signal
@@ -28,6 +30,37 @@ class RuntimeLaunchdScopeTests(unittest.TestCase):
                 live.observe('dev.unrelated.service')
             with self.assertRaisesRegex(RuntimeError,'label_scope'):
                 m.common.Launchd().observe(m.RUNTIME_LABEL)
+
+    def test_runtime_inventory_reads_actual_config_and_checks_live_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory);root=home/'control';root.mkdir()
+            plist_path=home/'Library/LaunchAgents'/(m.RUNTIME_LABEL+'.plist');plist_path.parent.mkdir(parents=True)
+            args=['/node',str(root/'runtime/dist/app-server/cli.js'),str(root/'runtime-config.json')]
+            plist={'Label':m.RUNTIME_LABEL,'ProgramArguments':args}
+            plist_path.write_bytes(plistlib.dumps(plist))
+            config={'database':str(root/'runtime.sqlite3'),'socket':str(root/'runtime.sock')}
+            config_path=Path(args[2]);config_path.write_text(json.dumps(config));config_path.chmod(0o600)
+            Path(config['database']).write_bytes(b'db')
+            def inventory():return {'policy':{'control_root':str(root),'main_agent':{'runtime':'app_server'}},'plists':{},'files':{},'services':{},'databases':['/db'+str(i) for i in range(4)]}
+            with patch.object(Path,'home',return_value=home),patch.object(m.common,'Launchd') as launch:
+                live=launch.return_value;live.observe.return_value={'pid':123}
+                live.process.return_value=str(os.getuid())+' Sun Oct 4 12:00:00 2026 '+' '.join(args)
+                inv=inventory();m.include_runtime_inventory(inv,require_running=True)
+                self.assertEqual(inv['databases'][-1],config['database'])
+                self.assertIn(str(config_path),inv['files'])
+                self.assertEqual(inv['services'][m.RUNTIME_LABEL]['pid'],123)
+                config_path.write_text(json.dumps({**config,'database':'/retired/runtime.sqlite3'}))
+                with self.assertRaisesRegex(RuntimeError,'runtime_storage_mismatch'):m.include_runtime_inventory(inventory(),True)
+                config_path.write_text(json.dumps(config))
+                live.process.return_value=str(os.getuid())+' /node /other/cli.js /other/config.json'
+                with self.assertRaisesRegex(RuntimeError,'runtime_process_identity'):m.include_runtime_inventory(inventory(),True)
+                live.observe.return_value=None
+                with self.assertRaisesRegex(RuntimeError,'runtime_service_not_running'):m.include_runtime_inventory(inventory(),True)
+                m.include_runtime_inventory(inventory(),False)  # 停止中の更新準備は可能。
+                plist_path.write_bytes(plistlib.dumps({**plist,'ProgramArguments':args[:2]+['/retired/runtime-config.json']}))
+                with self.assertRaisesRegex(RuntimeError,'runtime_plist_arguments'):m.include_runtime_inventory(inventory(),False)
+                plist_path.unlink()
+                with self.assertRaisesRegex(RuntimeError,'runtime_plist_missing'):m.include_runtime_inventory(inventory(),True)
 
 
 class ProcessTests(unittest.TestCase):
