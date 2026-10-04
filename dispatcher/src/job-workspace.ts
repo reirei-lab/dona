@@ -494,7 +494,7 @@ export class JobWorkspace {
       const gitDirectory = await runProcess(this.config.gitPath,
         ["-C", row.workspace_path, "rev-parse", "--path-format=absolute", "--git-dir"], this.config.jobCommandTimeoutMs, signal);
       if (!gitDirectory.ok) throw new Error("handoff_worktree_registration_unavailable");
-      await assertLinkedWorktreeRegistration(row.workspace_path, gitDirectory.stdout.trim(), expectedCommonDir);
+      await assertLinkedWorktreeRegistration(row.workspace_path, gitDirectory.stdout.trim(), expectedCommonDir, row.job_id);
     }
   }
 }
