@@ -79,6 +79,8 @@ export class AppServerJobRuntime implements JobAgentRuntime {
     const expected=workspace.kind==="scratch"?path.join(this.config.jobsWorkspaceRoot,"scratch",workspaceJobId(row)):
       path.join(this.config.jobsWorkspaceRoot,"github",...workspace.repository.split("/"),"worktrees",workspaceJobId(row));
     if(row.workspace_path!==expected)throw Error("runtime_workspace_mismatch");
+    await fs.mkdir(this.config.jobsWorkspaceRoot,{recursive:true,mode:0o700});
+    await fs.chmod(this.config.jobsWorkspaceRoot,0o700);
     // 通常Taskは既存Mac環境を利用する。scheduleのread-only制約を通常Taskへ流用しない。
     if(workspace.kind==="scratch") {
       if(workspaceJobId(row)!==row.job_id) {
@@ -88,8 +90,10 @@ export class AppServerJobRuntime implements JobAgentRuntime {
     else if(workspaceJobId(row)!==row.job_id)await provisioner.verifyContinuationWorktree(row,workspace.repository,signal);
     else {const created=await provisioner.createGitHubWorktree(row,workspace.repository,workspace.base_ref,signal);if(!created.ok)throw Error("runtime_workspace_preparation_failed");}
     if((await fs.lstat(expected)).isSymbolicLink())throw Error("runtime_workspace_symlink");
+    await fs.chmod(expected,0o700);
     await fs.mkdir(path.dirname(row.result_path),{recursive:true,mode:0o700});
-    if(this.progressEnabled)await fs.mkdir(path.dirname(jobProgressPath(row)),{recursive:true,mode:0o700});
+    await fs.chmod(path.dirname(row.result_path),0o700);
+    if(this.progressEnabled){await fs.mkdir(path.dirname(jobProgressPath(row)),{recursive:true,mode:0o700});await fs.chmod(path.dirname(jobProgressPath(row)),0o700);}
     let executablePaths:string[]=[],disabledMcpServers:string[]=[];
     if(row.source==="dona_schedule") {
       if(workspace.kind!=="scratch")throw Error("runtime_schedule_workspace_invalid");

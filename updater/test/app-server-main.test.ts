@@ -13,9 +13,10 @@ test("App Server mainを新generationで起動し、照合済みidleだけ停止
  for(const file of ["dispatcher.env","slack.env","mcp-dispatcher.mjs","mcp-slack.mjs"])await fs.writeFile(path.join(policy.config_root,file),"",{mode:0o600});
  const release=await fs.realpath(await installRelease(policy,targetSha));
  let agent={name:"dona-main",generation:"new",thread_id:"thread",state:"idle",startup_ready:false,cwd:release,release};
- let startupFails=false,loseStart=false;let stopCount=0;const starts:Array<Record<string,unknown>>=[];
+ let startupFails=false,loseStart=false;let rejectAction="",rejectCode="";let stopCount=0;const starts:Array<Record<string,unknown>>=[];
  const server=http.createServer(async(req,res)=>{
   let data="";for await(const part of req)data+=part;const p=JSON.parse(data);
+  if(p.action===rejectAction){res.statusCode=409;res.end(JSON.stringify({error:rejectCode}));return;}
   if(p.action==="start"){starts.push(p.input);agent={...agent,state:"idle",startup_ready:false};if(loseStart){res.destroy();return;}}
   if(p.action==="prompt")agent={...agent,state:startupFails?"interrupted":"idle",startup_ready:!startupFails};
   if(p.action==="stop"){assert.equal(p.generation,agent.generation);stopCount++;agent={...agent,state:"stopped"};}
@@ -33,6 +34,17 @@ test("App Server mainを新generationで起動し、照合済みidleだけ停止
   assert.equal((await main.start("dona-main",release,"old")).outcome,"rejected");assert.equal(starts.length,count);
   await fs.writeFile(path.join(policy.config_root,"mcp-slack.mjs"),"",{mode:0o600});
   assert.equal((await main.start("dona-main",release,"old")).outcome,"started");
+  for(const code of ["runtime_agent_conflict","runtime_agent_recovery_required"]){
+   rejectAction="start";rejectCode=code;const count=starts.length;
+   const refused=await main.start("dona-main",release,"old");assert.equal(refused.outcome,"rejected");assert.equal(refused.error_code,code);assert.equal(starts.length,count);
+  }
+  rejectCode="runtime_operation_failed";assert.equal((await main.start("dona-main",release,"old")).outcome,"accepted_unknown");
+  rejectAction="stop";rejectCode="runtime_stop_identity_changed";
+  const refusedStop=await main.stop(await main.status(release));assert.equal(refusedStop.outcome,"rejected");assert.equal(refusedStop.error_code,rejectCode);assert.equal(stopCount,1);
+  rejectCode="runtime_operation_failed";assert.equal((await main.stop(await main.status(release))).outcome,"accepted_unknown");
+  rejectAction="prompt";rejectCode="runtime_not_ready";
+  assert.equal((await main.start("dona-main",release,"old")).outcome,"accepted_unknown");
+  rejectAction="";
   loseStart=true;const lost=await main.start("dona-main",release,"old");assert.equal(lost.outcome,"accepted_unknown");assert.equal(lost.observation.interactive_ready,false);
   assert.equal((await main.status(release)).interactive_ready,false);loseStart=false;
   startupFails=true;const failed=await main.start("dona-main",release,"old");assert.equal(failed.outcome,"accepted_unknown");

@@ -5,6 +5,12 @@ import type {UpdatePolicy} from "./policy.js";
 import type {MainAgentObservation,MainAgentStartResult,MainAgentStopResult} from "./types.js";
 
 interface RuntimeAgent {name:string;generation:string;thread_id:string|null;state:string;cwd:string;release:string;startup_ready?:boolean;}
+class RuntimeControlError extends Error {
+ constructor(readonly code:string,readonly status:number){super(code);}
+}
+function definiteRejection(error:unknown,codes:string[]):error is RuntimeControlError {
+ return error instanceof RuntimeControlError&&error.status===409&&codes.includes(error.code);
+}
 const absent=(code:string):MainAgentObservation=>({exists:false,name:null,kind:null,pane_id:null,status:null,interactive_ready:false,working_directory:null,session_id:null,matches_release:false,error_code:code});
 const delay=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
 
@@ -14,7 +20,7 @@ export class AppServerMain {
  private call<T>(action:string,input:Record<string,unknown>={}):Promise<T> {
   return new Promise((resolve,reject)=>{
    const body=JSON.stringify({action,...input}),request=http.request({socketPath:path.join(this.policy.control_root,"runtime.sock"),path:"/control",method:"POST",headers:{"content-type":"application/json","content-length":Buffer.byteLength(body)}},response=>{
-    let data="";response.setEncoding("utf8");response.on("data",chunk=>{data+=chunk;if(data.length>1_048_576)response.destroy(Error("runtime_response_limit"));});response.on("error",reject);response.on("end",()=>{try{const value=JSON.parse(data);if(response.statusCode!==200)throw Error("runtime_control_failed");resolve(value.result);}catch(error){reject(error);}});
+    let data="";response.setEncoding("utf8");response.on("data",chunk=>{data+=chunk;if(data.length>1_048_576)response.destroy(Error("runtime_response_limit"));});response.on("error",reject);response.on("end",()=>{try{const value=JSON.parse(data);if(response.statusCode!==200)throw new RuntimeControlError(typeof value.error==="string"?value.error:"runtime_control_failed",response.statusCode??0);resolve(value.result);}catch(error){reject(error);}});
    });request.setTimeout(this.policy.timeouts.agent_start_ms+30_000,()=>request.destroy(Error("runtime_control_unknown")));request.on("error",reject);request.end(body);
   });
  }
@@ -40,10 +46,13 @@ export class AppServerMain {
    const stopped=await this.call<RuntimeAgent>("stop",{name:current.name,generation:current.session_id});
    if(stopped.state!=="stopped"||stopped.generation!==current.session_id)throw Error();
    return {outcome:"stopped",pane_id:current.pane_id,error_code:null};
-  }catch{return {outcome:"accepted_unknown",pane_id:current.pane_id,error_code:"main_agent_stop_unknown"};}
+  }catch(error){
+   if(definiteRejection(error,["runtime_stop_identity_changed","runtime_generation_required"]))return {outcome:"rejected",pane_id:current.pane_id,error_code:error.code};
+   return {outcome:"accepted_unknown",pane_id:current.pane_id,error_code:"main_agent_stop_unknown"};
+  }
  }
  async start(name:string,release:string,previous?:string):Promise<MainAgentStartResult> {
-  let sent=false;
+  let sent=false,started=false;
   try {
    if(name!==this.policy.main_agent.name)throw Error();
    const [canonical,root,configStat]=await Promise.all([fs.realpath(release),fs.realpath(this.policy.release_root),fs.lstat(this.policy.config_root)]);
@@ -55,6 +64,7 @@ export class AppServerMain {
    }
    sent=true;
    const agent=await this.call<RuntimeAgent>("start",{input:{name,role:"main",cwd:release,release,args,threadConfig:{model:"gpt-6.1-sol",approvalsReviewer:"user",config:{"features.default_mode_request_user_input":false},developerInstructions:"あなたはDona mainです。ユーザーへの質問はSlack MCPで元threadへ投稿し、Event Resultを公開してください。回答は次のSlack eventとして届きます。native request_user_inputは使用しません。workerからの質問はget_task_questions/answer_task_questionで処理し、分かることは親として回答してください。"}}});
+   started=true;
    await this.call("prompt",{name,key:`startup:${agent.generation}`,text:"起動確認です。外部操作、ファイル変更、プロセス操作は行わず、READYとだけ返してください。"});
    const deadline=Date.now()+this.policy.timeouts.agent_start_ms;
    let observation=await this.status(release);
@@ -62,6 +72,9 @@ export class AppServerMain {
    const finished=await this.call<RuntimeAgent>("status",{name});
    if(finished.state!=="idle"||agent.generation===previous||!observation.exists||!observation.interactive_ready||!observation.matches_release||observation.status!=="idle")throw Error();
    return {outcome:"started",observation,error_code:null};
-  }catch{return sent?{outcome:"accepted_unknown",observation:await this.status(release),error_code:"main_agent_start_unknown"}:{outcome:"rejected",observation:absent("main_agent_start_validation_failed"),error_code:"main_agent_start_validation_failed"};}
+  }catch(error){
+   // hostの409にはspawn後の失敗も含まれる。start前の確定拒否だけを分類する。
+   if(!started&&definiteRejection(error,["runtime_agent_conflict","runtime_agent_recovery_required","runtime_start_scope","runtime_start_invalid"]))return {outcome:"rejected",observation:await this.status(release),error_code:error.code};
+   return sent?{outcome:"accepted_unknown",observation:await this.status(release),error_code:"main_agent_start_unknown"}:{outcome:"rejected",observation:absent("main_agent_start_validation_failed"),error_code:"main_agent_start_validation_failed"};}
  }
 }

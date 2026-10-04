@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {test} from "node:test";
 import {RuntimeResponseError} from "../src/app-server/client.js";
+import {jobProgressPath} from "../src/job-prompt.js";
 import {PreparedWorkspaceCleanupError} from "../src/job-runtime.js";
 import {AppServerJobRuntime,AppServerAgentClient} from "../src/app-server/adapters.js";
 import type {AgentRecord} from "../src/app-server/store.js";
@@ -120,4 +121,25 @@ for(const hasSession of [true,false])test(`移行済みscheduleの${hasSession?"
   await assert.rejects(runtime.cleanup({...row,herdr_pane_id:"wrong"}),/identity_changed/);assert.equal(await fs.readFile(path.join(workspace,"input"),"utf8"),"test");
   assert.equal((await runtime.cleanup(row)).ok,true);await assert.rejects(fs.stat(workspace),{code:"ENOENT"});
  }finally{await fs.rm(root,{recursive:true,force:true});}
+});
+
+
+test("既存workspace・成果・進捗directoryの権限を再正規化して引継ぎ内容を保持する",async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath),runtime=new AppServerJobRuntime(config);
+ try{
+  config.jobCommandTimeoutMs=5000;config.codexPath=path.join(root,"codex-stub");await fs.writeFile(config.codexPath,"#!/bin/sh\ncat >/dev/null\necho '[]'\n",{mode:0o700});
+  const event=db.enqueue(eventEnvelope("private-continuation")).row;
+  const original=db.createJob({source_event_id:event.event_id,objective:"test",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+  const job={...original,job_id:"job_"+"1".repeat(26),workspace_json:JSON.stringify({kind:"scratch",_dona_handoff:{workspace_job_id:original.job_id}})};
+  job.result_path=path.join(config.jobResultsDir,job.job_id,"result.json");
+  const directories=[config.jobsWorkspaceRoot,job.workspace_path,path.dirname(job.result_path),path.dirname(jobProgressPath(job))];
+  for(const directory of directories){await fs.mkdir(directory,{recursive:true});await fs.chmod(directory,0o777);}
+  await fs.writeFile(path.join(job.workspace_path,"kept"),"uncommitted work");
+  runtime.client.start=async input=>{
+   for(const directory of directories)assert.equal((await fs.stat(directory)).mode&0o777,0o700);
+   return {name:input.name,generation:"g",thread_id:"t"} as AgentRecord;
+  };
+  await runtime.prepare(job);
+  assert.equal(await fs.readFile(path.join(job.workspace_path,"kept"),"utf8"),"uncommitted work");
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
