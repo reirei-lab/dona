@@ -136,7 +136,7 @@ export class TaskRepository {
   }
   get(id:string):TaskRow|undefined {return this.sql.prepare("SELECT * FROM tasks WHERE task_id=?").get(id) as TaskRow|undefined;}
   forAttempt(id:string):TaskRow|undefined {return this.sql.prepare("SELECT t.* FROM tasks t JOIN task_attempts a USING(task_id) WHERE a.attempt_id=?").get(id) as TaskRow|undefined;}
-  assertOwner(id:string,eventId:string):TaskRow {
+  assertOwner(id:string,eventId:string,sameThread=false):TaskRow {
     const task=this.get(id);if(!task)throw new Error("task_owner_mismatch");
     try{this.dispatcher.assertJobSourceMatchesThread(task.current_attempt_id,eventId);}catch{throw new Error("task_owner_mismatch");}
     const event=this.dispatcher.get(eventId);
@@ -144,10 +144,17 @@ export class TaskRepository {
     if(event.source==="dona_job"&&JSON.parse(event.subject_json).source_event_id!==task.source_event_id)throw new Error("task_owner_mismatch");
     const original=this.dispatcher.get(task.source_event_id)!;
     const target=original.reply_target_json?JSON.parse(original.reply_target_json):{},current=event.reply_target_json?JSON.parse(event.reply_target_json):{};
-    if(["workspace_id","channel_id","thread_ts"].some(key=>typeof target[key]!=="string"||target[key]!==current[key]))throw new Error("task_owner_mismatch");
+    if(["workspace_id","channel_id"].some(key=>typeof target[key]!=="string"||target[key]!==current[key]))throw new Error("task_owner_mismatch");
+    if(sameThread&&target.thread_ts!==current.thread_ts)throw new Error("task_owner_mismatch");
     const actor=JSON.parse(original.subject_json).actor_id;
     if(typeof actor!=="string"||JSON.parse(event.subject_json).actor_id!==actor)throw new Error("task_owner_mismatch");
     return task;
+  }
+  findIssue(eventId:string,issue:VerifiedTaskIssue):TaskRow {
+    const row=this.sql.prepare("SELECT task_id FROM tasks WHERE resource_id=?").get(`github:${issue.node_id}`) as {task_id:string}|undefined;
+    // Absence and another owner's claim have the same public response.
+    if(!row)throw new Error("task_owner_mismatch");
+    return this.assertOwner(row.task_id,eventId);
   }
   lookupRequest(input:TaskRequest):TaskRow|undefined {
     const event=this.dispatcher.get(input.source_event_id);
@@ -192,6 +199,7 @@ export class TaskRepository {
     return {task_id:task.task_id,task_key:task.task_key,source_event_id:task.source_event_id,revision:task.revision,progress:task.progress,state:task.state,
       wait_reason:task.wait_reason,next_check_at:task.next_check_at,current_attempt_id:task.current_attempt_id,
       attempt_number:task.attempt_number,max_attempts:task.max_attempts,worker_state:current.status,steer_event_id:current.steer_event_id,steer_state:current.steer_state,
+      notification_target:JSON.parse(this.dispatcher.get(task.source_event_id)!.reply_target_json!),
       project_state:task.project_json?task.project_state:"not_configured",
       attempts:this.sql.prepare("SELECT attempt_id,number,outcome,created_at,ended_at FROM task_attempts WHERE task_id=? ORDER BY number").all(task.task_id),
       ...(includeResult&&current.result_json?{result:JSON.parse(current.result_json)}:{})};
@@ -295,7 +303,7 @@ export class TaskRepository {
     const task=this.forAttempt(job.job_id);if(!task)return true;
     if(task.current_attempt_id!==job.job_id)return false;
     if(["completed","failed","cancelled"].includes(task.state))return true;
-    return ["human_input","retry_exhausted","result_conflict","external_effect_unknown","cancellation_unknown","worker_unknown","steer_acceptance_unknown"].includes(task.wait_reason??"");
+    return ["human_input","retry_exhausted","result_conflict","result_reconciliation_required","external_effect_unknown","cancellation_unknown","worker_unknown","steer_acceptance_unknown"].includes(task.wait_reason??"");
   }
   assertCurrent(job:JobRow):void {const task=this.forAttempt(job.job_id);if(task&&task.current_attempt_id!==job.job_id)throw new Error("task_attempt_superseded");}
   canRun(job:JobRow):boolean {const task=this.forAttempt(job.job_id);return !task||(task.current_attempt_id===job.job_id&&task.state==="active"&&task.desired_state==="running");}

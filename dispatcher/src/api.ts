@@ -674,6 +674,13 @@ export class DispatcherApi {
       if(request.method==="GET"&&url.pathname==="/v1/tasks") {
         sendJson(response,200,{schema_version:1,tasks:this.database.tasks.list(source).map(task=>this.database.tasks.projection(task)),limit:100});return;
       }
+      if(request.method==="GET"&&url.pathname==="/v1/tasks/issue") {
+        const input=taskRequestSchema.parse({source_event_id:source,task_key:"lookup",objective:"Issue lookup",
+          workspace:{kind:"github",repository:url.searchParams.get("repository")},issue_number:Number(url.searchParams.get("issue_number"))});
+        const issue=await verifyTaskIssue(input,githubQuery(this.config.ghPath));
+        if(!issue)throw new Error("task_issue_identity_unverified");
+        sendJson(response,200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.findIssue(source,issue),true)});return;
+      }
       const match=/^\/v1\/tasks\/([^/]+)(?:\/(pause|resume|cancel|steer|retry|questions|answer|approve))?$/.exec(url.pathname);
       if(!match)throw new Error("task_route_not_found");
       const id=taskIdSchema.parse(match[1]),action=match[2];
@@ -789,7 +796,7 @@ export class DispatcherApi {
     const managedTask=this.database.tasks.forAttempt(jobId);
     if(managedTask&&request.method==="POST")throw new ApiRequestError(409,"task_control_required","Use the Task ID and revision for control");
     if(managedTask&&request.method==="GET"&&url.searchParams.has("source_event_id")) {
-      try{this.database.tasks.assertOwner(managedTask.task_id,url.searchParams.get("source_event_id")!);}
+      try{this.database.tasks.assertOwner(managedTask.task_id,url.searchParams.get("source_event_id")!,true);}
       catch{throw new ApiRequestError(403,"task_owner_mismatch","Task does not belong to this event owner");}
     }
     const liveReceiptId=match[3];

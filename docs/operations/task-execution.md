@@ -20,7 +20,7 @@
 4. `cancel_task`は自動再開を禁止する。起動済みworkerでは停止確認が終わるまで取消完了にしない。
 5. `retry_exhausted`では、追加実行の明示依頼を得てから`retry_task`へ新しい総`max_attempts`を渡す。使用済みAttempt数は維持する。
 
-Taskの読み取り・制御は元のworkspace/channel/threadと依頼者へ束縛する。
+Taskの読み取り・通常制御は元のworkspace/channelと依頼者へ束縛する。明示Task IDまたはIssue照会で対象を確定した場合は別threadからも利用できる。実行承認と通知先は元threadへ束縛する。
 
 同じeventによる同じcontrolの再照合は既存状態を返し、異内容はconflictにする。古いrevisionを自動上書きしない。
 
@@ -47,3 +47,12 @@ Project同期は実行と独立する。write intentを先に保存し、成功r
 5. 隔離環境で委任、通常中断、停止確認、後継実行、Result、通知、Project read-backを確認してから受付を開く。
 
 Mac上の任意CLIが起動する外部daemonやSimulatorまでprocess groupで包含できるとは扱わない。管理外で継続する処理は別の外部操作としてinventoryへ残す。停止不明を許容した重複実行は行わない。
+
+
+## 別スレッドからの継続
+
+利用者がrepositoryとIssue番号を明示した場合、`find_issue_task`でGitHub上のIssue identityと既存Taskを照合する。同じworkspace・channel・依頼者のTaskに限り、別threadからも`get_task`とTask操作を使える。一覧は引き続き現在threadだけである。Taskが存在しない場合と他ownerの場合は同じ不透明な拒否を返すため、その拒否だけで新Taskを作成しない。
+
+既存Taskが見つかったら新Taskを委任せず、最新revision・状態・待機理由から操作を決める。通知先は`notification_target`の元threadを維持し、利用者へそのthreadを案内する。通常の質問回答と、実行権限を追加する承認は区別する。実行承認は引き続き要求通知後の元threadの依頼者返信だけで受理する。
+
+`result_conflict`はResultの読み取り・構文・schema検証に失敗した状態、`result_reconciliation_required`は妥当なResultの受理を既存の実行・通知状態が拒否した状態である。後者でも完了や自動再試行を推測せず、停止証拠・既存外部操作・通知を正規のoperator手順で照合する。resumeで拒否条件を取り除くことはできない。

@@ -13,6 +13,7 @@ export class DispatcherApiClient {
   createTask(input:unknown):Promise<Record<string,unknown>> {return this.request("POST","/v1/tasks",input);}
   getTaskQuestions(id:string,eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/${encodeURIComponent(id)}/questions?${new URLSearchParams({source_event_id:eventId})}`);}
   getTask(id:string,eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/${encodeURIComponent(id)}?${new URLSearchParams({source_event_id:eventId})}`);}
+  findIssueTask(eventId:string,repository:string,issueNumber:number):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/issue?${new URLSearchParams({source_event_id:eventId,repository,issue_number:String(issueNumber)})}`);}
   listTasks(eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks?${new URLSearchParams({source_event_id:eventId})}`);}
   controlTask(id:string,action:string,input:unknown):Promise<Record<string,unknown>> {return this.request("POST",`/v1/tasks/${encodeURIComponent(id)}/${encodeURIComponent(action)}`,input);}
 

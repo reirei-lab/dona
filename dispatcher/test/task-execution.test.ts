@@ -304,7 +304,7 @@ for(const reason of ["result_path_exists","invalid_result","invalid_result_agent
     if(reason!=="result_path_exists")f.start();else f.db.beginJobPreparation(f.task.current_attempt_id);
     f.db.markJobNeedsReview(f.task.current_attempt_id,reason,"quarantine");const job=f.db.getJob(f.task.current_attempt_id)!;
     await fs.mkdir(path.dirname(job.result_path),{recursive:true});await fs.writeFile(job.result_path,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"不正な置換",completed_at:new Date().toISOString()}));
-    await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)!.wait_reason,"result_conflict");assert.equal(f.db.getJob(job.job_id)!.result_json,null);
+    await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)!.wait_reason,"result_reconciliation_required");assert.equal(f.db.getJob(job.job_id)!.result_json,null);
   }finally{await f.dispose();}
 });
 
@@ -316,7 +316,7 @@ test("所有者の異なるIssue claim競合は存在を開示しない",async()
     assert.throws(()=>f.db.tasks.create({...input,source_event_id:event.event_id},f.config.jobsWorkspaceRoot,f.config.jobResultsDir,issue),/^Error: task_owner_mismatch$/);
     const otherThread=eventEnvelope("foreign-thread");otherThread.subject.thread_ts="1700000000.000002";otherThread.reply_target!.thread_ts="1700000000.000002";
     const threadEvent=f.db.enqueue(otherThread).row;
-    assert.throws(()=>f.db.tasks.create({...input,source_event_id:threadEvent.event_id},f.config.jobsWorkspaceRoot,f.config.jobResultsDir,issue),/^Error: task_owner_mismatch$/);
+    assert.throws(()=>f.db.tasks.create({...input,source_event_id:threadEvent.event_id},f.config.jobsWorkspaceRoot,f.config.jobResultsDir,issue),/^Error: task_resource_already_claimed$/);
   }finally{await f.dispose();}
 });
 
@@ -461,6 +461,9 @@ test("承認は通知後に取り込んだ所有者の返信だけを許可し�
   f.db.enqueueWorkerQuestion(job.job_id,request);
   const revision=f.db.tasks.get(f.task.task_id)!.revision;
   for(const event of [f.event,before])await assert.rejects(supervisor.approveTaskRequest(f.task.task_id,event.event_id,revision,request.question_id,true),/requires_user_reply/);
+  const elsewhere=eventEnvelope("approval-other-thread");elsewhere.subject.thread_ts="1700000000.000099";elsewhere.reply_target!.thread_ts=elsewhere.subject.thread_ts;
+  const cross=f.db.enqueue(elsewhere).row;
+  await assert.rejects(supervisor.approveTaskRequest(f.task.task_id,cross.event_id,revision,request.question_id,true),/owner_mismatch/);assert.equal(sent,0);
   const after=f.db.enqueue({...eventEnvelope("after-approval"),occurred_at:"1999-01-01T00:00:00.000Z"}).row;
   await supervisor.approveTaskRequest(f.task.task_id,after.event_id,revision,request.question_id,true);assert.equal(sent,1);
  }finally{await f.dispose();}
@@ -472,5 +475,29 @@ test("質問照合cursorは既通知pendingの次へ進み終端後に先頭へ�
   f.runtime.pendingQuestions=async after=>{received.push(after);const id=ids[n++];return id?[{question_id:id,agent:"missing"} as import("../src/app-server/store.js").QuestionRecord]:[];};
   const supervisor=f.supervisor();for(let i=0;i<4;i++)await supervisor.reconcileQuestions();
   assert.deepEqual(received,[undefined,"first","last",undefined]);
+ }finally{await f.dispose();}
+});
+
+
+test("明示Issueを同じ依頼者の別threadから照会しTaskを継続、通知先は保持",async()=>{
+ const f=await fixture();try{
+  const issue={node_id:"I_lookup",repository:"org/repo",number:24};
+  const input=taskRequestSchema.parse({...f.request,task_key:"lookup",workspace:{kind:"github",repository:"org/repo"},issue_number:24});
+  const task=f.db.tasks.create(input,f.config.jobsWorkspaceRoot,f.config.jobResultsDir,issue).task;
+  const e=eventEnvelope("cross-thread");e.subject.thread_ts="1700000000.000009";e.reply_target!.thread_ts=e.subject.thread_ts;
+  const event=f.db.enqueue(e).row;
+  assert.equal(f.db.tasks.list(event.event_id).length,0);
+  assert.equal(f.db.tasks.findIssue(event.event_id,issue).task_id,task.task_id);
+  const paused=f.db.tasks.control(task.task_id,event.event_id,task.revision,"pause");assert.equal(paused.state,"paused");
+  assert.deepEqual(f.db.tasks.projection(paused).notification_target,JSON.parse(f.event.reply_target_json!));
+  assert.throws(()=>f.db.tasks.assertOwner(task.task_id,event.event_id,true),/owner_mismatch/);
+  assert.equal(f.db.listEventJobs(event.event_id).length,0);
+  for(const key of ["actor_id","channel_id","workspace_id"] as const){
+   const foreign=eventEnvelope(`foreign-${key}`);foreign.subject[key]="other";if(key!=="actor_id")foreign.reply_target![key]="other";
+   const denied=f.db.enqueue(foreign).row;
+   assert.throws(()=>f.db.tasks.findIssue(denied.event_id,issue),/owner_mismatch/);
+   assert.throws(()=>f.db.tasks.control(task.task_id,denied.event_id,paused.revision,"resume"),/owner_mismatch/);
+  }
+  assert.throws(()=>f.db.tasks.findIssue(event.event_id,{...issue,node_id:"missing"}),/owner_mismatch/);
  }finally{await f.dispose();}
 });

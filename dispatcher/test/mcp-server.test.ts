@@ -15,6 +15,7 @@ describe("Dona Dispatcher MCP server", () => {
     const calls: Array<{ method: string; args: unknown[] }> = [];
     let planError: Error | undefined;
     const api: DispatcherJobClient = {
+      async findIssueTask(eventId,repository,issueNumber) {calls.push({method:"findIssueTask",args:[eventId,repository,issueNumber]});return {task:{task_id:"existing"}};},
       async inspectWorker(jobId,sourceEventId) { calls.push({method:"inspectWorker",args:[jobId,sourceEventId]}); return {worker:{state:"inactive"}}; },
       async resumeJob(jobId,input) { calls.push({method:"resumeJob",args:[jobId,input]}); return {outcome:"created",job_id:"job_01m1es03xy5cf8d9pm5cwx4srv"}; },
       async createJob(input) {
@@ -85,10 +86,13 @@ describe("Dona Dispatcher MCP server", () => {
       assert.equal(calls.pop()?.method,"inspectWorker");
       await client.callTool({name:"resume_job",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",source_event_id:"evt_01K00000000000000000000000",instruction:"残作業を引継ぐ"}});
       assert.deepEqual(calls.pop(),{method:"resumeJob",args:["job_01m1es03xy5cf8d9pm5cwx4srv",{source_event_id:"evt_01K00000000000000000000000",instruction:"残作業を引継ぐ"}]});
+      const found=await client.callTool({name:"find_issue_task",arguments:{source_event_id:"evt_01K00000000000000000000000",repository:"org/repo",issue_number:24}});
+      assert.notEqual(found.isError,true);
+      assert.deepEqual(calls.pop(),{method:"findIssueTask",args:["evt_01K00000000000000000000000","org/repo",24]});
       const listed = await client.listTools();
       assert.equal(listed.tools.find(tool=>tool.name==="authorize_job_notification")?.annotations?.idempotentHint,false);
       assert.deepEqual(listed.tools.map(({ name }) => name), [
-        "delegate_task", "get_task", "list_tasks", "get_task_questions", "answer_task_question", "respond_task_approval", "pause_task", "resume_task", "cancel_task", "steer_task", "retry_task",
+        "delegate_task", "get_task", "find_issue_task", "list_tasks", "get_task_questions", "answer_task_question", "respond_task_approval", "pause_task", "resume_task", "cancel_task", "steer_task", "retry_task",
         "delegate_job",
         "delegate_scheduled_work",
         "list_event_jobs",

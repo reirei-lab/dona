@@ -16,6 +16,7 @@ export interface DispatcherJobClient {
   createTask?(input:unknown):Promise<Record<string,unknown>>;
   getTaskQuestions?(id:string,eventId:string):Promise<Record<string,unknown>>;
   getTask?(id:string,eventId:string):Promise<Record<string,unknown>>;
+  findIssueTask?(eventId:string,repository:string,issueNumber:number):Promise<Record<string,unknown>>;
   listTasks?(eventId:string):Promise<Record<string,unknown>>;
   controlTask?(id:string,action:string,input:unknown):Promise<Record<string,unknown>>;
   inspectWorker?(jobId: string, sourceEventId: string): Promise<Record<string, unknown>>;
@@ -191,6 +192,8 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       return success({...result,...(["created","reused"].includes(String(result.outcome))?{action:{tool:"delegate_task",source_event_id:input.source_event_id,task_key:input.task_key,task_id:task.task_id,attempt_id:task.current_attempt_id,outcome:result.outcome}}:{})});}catch(error){return failure(error,logger,"delegate_task");}});
   server.registerTool("get_task",{description:"現在のeventのownerを照合し、Task・Attempt履歴・再開待ち理由・結果を取得します。",inputSchema:{task_id:taskIdSchema,source_event_id:eventId},annotations:{readOnlyHint:true}},
     async({task_id,source_event_id})=>{try{if(!client.getTask)throw new Error("task_api_unavailable");return success(await client.getTask(task_id,source_event_id));}catch(error){return failure(error,logger,"get_task");}});
+  server.registerTool("find_issue_task",{description:"利用者が明示したrepositoryとIssue番号から既存Taskを読み取ります。同じworkspace・channel・依頼者なら別threadでも利用できます。Issue identityはGitHubで照合し、新Taskの作成やworker再開は行いません。既存Taskが見つかったらget_taskとresume_task等で継続し、delegate_taskを重複実行しません。質問・完了通知の宛先は返されたnotification_targetの元threadを維持します。対象がない場合も他ownerの場合もtask_owner_mismatchを返します。",inputSchema:{source_event_id:eventId,repository,issue_number:issueNumber},annotations:{readOnlyHint:true}},
+    async({source_event_id,repository,issue_number})=>{try{if(!client.findIssueTask)throw Error("task_api_unavailable");return success(await client.findIssueTask(source_event_id,repository,issue_number));}catch(error){return failure(error,logger,"find_issue_task");}});
   server.registerTool("list_tasks",{description:"現在のSlack threadと依頼者のTaskを最大100件取得します。上限に達した場合、全件確認済みと扱いません。",inputSchema:{source_event_id:eventId},annotations:{readOnlyHint:true}},
     async({source_event_id})=>{try{if(!client.listTasks)throw new Error("task_api_unavailable");return success(await client.listTasks(source_event_id));}catch(error){return failure(error,logger,"list_tasks");}});
   server.registerTool("get_task_questions",{description:"Taskの現行workerからDona宛の質問と回答受付状態を取得します。ユーザーの質問への返答ではsteer_taskより先に確認してください。承認要求は通常の質問と別です。",inputSchema:{task_id:taskIdSchema,source_event_id:eventId},annotations:{readOnlyHint:true}},
