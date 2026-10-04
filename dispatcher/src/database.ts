@@ -1528,6 +1528,8 @@ export class DispatcherDatabase {
       JOIN job_owner_bindings b ON b.job_id=j.job_id
       LEFT JOIN job_groups g ON g.source_event_id=j.source_event_id
       WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review')
+        AND NOT EXISTS (SELECT 1 FROM task_attempts a JOIN tasks t ON t.task_id=a.task_id
+          WHERE a.attempt_id=j.job_id AND a.attempt_id<>t.current_attempt_id)
         AND NOT EXISTS (SELECT 1 FROM job_handoffs h WHERE h.job_id=j.job_id AND h.state='accepted') AND (
         (json_extract(b.owner_json,'$.kind')='schedule' AND j.completion_event_id IS NULL
           AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id AND c.job_status=j.status))
@@ -1542,8 +1544,12 @@ export class DispatcherDatabase {
               AND (g.attention_event_id IS NOT NULL OR EXISTS (SELECT 1 FROM jobs original JOIN job_handoffs h ON (h.job_id=original.job_id OR h.successor_job_id=original.job_id)
                 WHERE original.source_event_id=j.source_event_id AND h.state='accepted'))
               AND NOT EXISTS (SELECT 1 FROM jobs sibling WHERE sibling.source_event_id=j.source_event_id
+                AND NOT EXISTS (SELECT 1 FROM task_attempts a JOIN tasks t ON t.task_id=a.task_id
+                  WHERE a.attempt_id=sibling.job_id AND a.attempt_id<>t.current_attempt_id)
                 AND sibling.status NOT IN ('completed','failed','cancelled'))
               AND NOT EXISTS (SELECT 1 FROM jobs unresolved WHERE unresolved.source_event_id=j.source_event_id
+                AND NOT EXISTS (SELECT 1 FROM task_attempts a JOIN tasks t ON t.task_id=a.task_id
+                  WHERE a.attempt_id=unresolved.job_id AND a.attempt_id<>t.current_attempt_id)
                 AND unresolved.status='failed' AND NOT EXISTS (
                   SELECT 1 FROM job_attention_resolutions r WHERE r.job_id=unresolved.job_id
                     AND r.source_event_id=j.source_event_id AND r.status_at_resolution='failed')))
@@ -3835,9 +3841,13 @@ export class DispatcherDatabase {
     if(this.db.prepare("SELECT 1 FROM job_attention_delivery_claims WHERE attention_event_id=?")
       .get(attentionEventId)) return;
     const cause=this.getJob(causeJobId);
+    const task=this.tasks.forAttempt(causeJobId);
+    const superseded=task!==undefined&&task.current_attempt_id!==causeJobId;
     if(!cause || cause.source_event_id!==sourceEventId ||
-        !(cause.status==="completed" || cause.status==="cancelled" || this.jobAttentionResolved(cause))) return;
+        !(superseded || cause.status==="completed" || cause.status==="cancelled" || this.jobAttentionResolved(cause))) return;
     const unresolvedSibling = this.db.prepare(`SELECT 1 FROM jobs j WHERE j.source_event_id=? AND j.job_id<>?
+      AND NOT EXISTS (SELECT 1 FROM task_attempts a JOIN tasks t ON t.task_id=a.task_id
+        WHERE a.attempt_id=j.job_id AND a.attempt_id<>t.current_attempt_id)
       AND (j.status IN ('blocked','needs_review') OR (j.status='failed' AND NOT EXISTS (
         SELECT 1 FROM job_attention_resolutions r WHERE r.job_id=j.job_id
           AND r.source_event_id=j.source_event_id AND r.status_at_resolution='failed'

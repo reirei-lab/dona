@@ -746,3 +746,36 @@ for(const status of ["queued","dispatching","needs_review","completed","mcp_comp
   }
  }finally{await f.dispose();}
 });
+
+for(const status of ["failed","needs_review","blocked"] as const)test(`旧attention配送後の後継${status}を新しいattentionとして通知する`,async()=>{
+ const f=await failedPreparationFixture();try{
+  f.db.sealJobGroup(f.event.event_id);const notification=f.db.enqueueJobNotification(f.failed.current_attempt_id).row;
+  const resultPath=path.join(f.config.resultsDir,"attention.json"),target=JSON.parse(notification.reply_target_json!);
+  f.db.beginDispatch(notification.event_id,resultPath);f.db.markWaiting(notification.event_id);
+  f.db.saveCompleted(notification.event_id,{schema_version:1,event_id:notification.event_id,status:"completed",summary:"delivered",completed_at:new Date().toISOString(),actions:[
+    {tool:"dona_slack.post_message",...target,message_ts:"123.456"},
+    {tool:"dona_slack.set_agent_session_status",...target,status:"suspended"}
+  ]},resultPath);
+  const oldNotice=f.db.get(notification.event_id),oldJob=f.db.getJob(f.failed.current_attempt_id);
+  const task=f.retry();f.start(task.current_attempt_id);const job=f.db.getJob(task.current_attempt_id)!;
+  if(status==="failed")f.db.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"failed",summary:"failed again",completed_at:new Date().toISOString()},job.result_path);
+  else if(status==="needs_review")f.db.markJobNeedsReview(job.job_id,"invalid_result","review needed");
+  else f.db.markJobBlocked(job.job_id,"input needed");
+  assert.ok(f.db.listJobsNeedingNotification().some(row=>row.job_id===job.job_id));
+  const next=f.db.enqueueJobNotification(job.job_id).row,group=JSON.parse(next.payload_json).group;
+  assert.notEqual(next.event_id,notification.event_id);assert.equal(group.transition,"attention");assert.equal(group.total,1);assert.equal(group.jobs[0].job_id,job.job_id);
+  assert.equal(f.db.getJobGroup(f.event.event_id)!.attention_event_id,next.event_id);assert.deepEqual(f.db.get(notification.event_id),oldNotice);assert.deepEqual(f.db.getJob(f.failed.current_attempt_id),oldJob);
+  if(status==="blocked") {
+    const nextPath=path.join(f.config.resultsDir,"next-attention.json");f.db.beginDispatch(next.event_id,nextPath);f.db.markWaiting(next.event_id);
+    f.db.saveCompleted(next.event_id,{schema_version:1,event_id:next.event_id,status:"completed",summary:"delivered",completed_at:new Date().toISOString(),actions:[
+      {tool:"dona_slack.post_message",...target,message_ts:"123.457"},{tool:"dona_slack.set_agent_session_status",...target,status:"suspended"}
+    ]},nextPath);
+    const answer=f.db.enqueue(eventEnvelope("answer-after-retry")).row;
+    f.db.tasks.prepareSteer(task.task_id,answer.event_id,f.db.tasks.get(task.task_id)!.revision,"回答して続行");
+    f.db.beginJobSteer(job.job_id,answer.event_id);f.db.markJobSteerAccepted(job.job_id,answer.event_id);f.db.tasks.finishSteer(task.task_id,answer.event_id);
+    f.db.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"answered and done",completed_at:new Date().toISOString()},job.result_path);
+    assert.deepEqual(f.db.listJobsNeedingNotification().map(row=>row.job_id),[job.job_id]);
+    const final=f.db.enqueueJobNotification(job.job_id).row;assert.equal(JSON.parse(final.payload_json).group.transition,"all_terminal");
+  }
+ }finally{await f.dispose();}
+});
