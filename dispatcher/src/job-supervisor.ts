@@ -231,9 +231,9 @@ export class JobSupervisor {
     return this.serialized(initial.current_attempt_id,async()=>{
       if(!this.runtime.questions||!this.runtime.approveRequest)throw Error("task_approval_unavailable");
       const job=this.database.getJob(initial.current_attempt_id)!,request=(await this.runtime.questions(job.agent_name,true)).find(q=>q.question_id===questionId);
-      const task=this.database.tasks.assertOwner(id,eventId),event=this.database.get(eventId)!;
+      const task=this.database.tasks.assertOwner(id,eventId);
       if(!request||request.kind!=="approval"||JSON.stringify([request.generation,request.thread_id])!==this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id||task.current_attempt_id!==job.job_id)throw Error("task_approval_not_current");
-      if(event.source!=="slack"||Date.parse(event.occurred_at)<Date.parse(request.created_at))throw Error("task_approval_requires_user_reply");
+      if(!this.database.hasWorkerApprovalReply(job.job_id,questionId,eventId))throw Error("task_approval_requires_user_reply");
       if(request.answer_hash===createHash("sha256").update(stableStringify({accepted})).digest("hex")&&["answering","resolved"].includes(request.state))return {task_id:id,question_id:questionId,state:request.state};
       if(task.revision!==revision||task.desired_state!=="running"||task.stop_state!=="none"||!["active","waiting"].includes(task.state))throw Error("task_approval_not_current");
       const response=await this.runtime.approveRequest(job.agent_name,questionId,accepted);

@@ -448,3 +448,20 @@ for(const reason of ["invalid_result","cancel_acceptance_unknown","ambiguous_ste
   assert.equal(f.db.getJob(job.job_id)?.last_error_code,reason);assert.equal(f.db.list().filter(e=>e.event_type==="worker_question").length,0);
  }finally{await f.dispose();}
 });
+
+test("承認は通知後に取り込んだ所有者の返信だけを許可し時計差を使わない",async()=>{
+ const f=await fixture();try{
+  const job=f.db.getJob(f.task.current_attempt_id)!;
+  f.db.beginJobPreparation(job.job_id,new Date(job.available_at));f.db.setJobRuntime(job.job_id,"w","p",JSON.stringify(["g","t"]));f.db.beginJobDispatch(job.job_id);f.db.markJobRunning(job.job_id);
+  const before=f.db.enqueue({...eventEnvelope("before-approval"),occurred_at:"2099-01-01T00:00:00.000Z"}).row;
+  const request={question_id:"approval",agent:job.agent_name,generation:"g",thread_id:"t",turn_id:"turn",rpc_id_json:"1",kind:"approval" as const,payload_json:"{}",state:"pending" as const,answer_hash:null,created_at:"2000-01-01T00:00:00.000Z"};
+  let sent=0;f.runtime.questions=async()=>[request];f.runtime.approveRequest=async()=>{sent++;return {...request,state:"resolved"};};
+  const supervisor=f.supervisor();
+  await assert.rejects(supervisor.approveTaskRequest(f.task.task_id,before.event_id,f.db.tasks.get(f.task.task_id)!.revision,request.question_id,true),/requires_user_reply/);
+  f.db.enqueueWorkerQuestion(job.job_id,request);
+  const revision=f.db.tasks.get(f.task.task_id)!.revision;
+  for(const event of [f.event,before])await assert.rejects(supervisor.approveTaskRequest(f.task.task_id,event.event_id,revision,request.question_id,true),/requires_user_reply/);
+  const after=f.db.enqueue({...eventEnvelope("after-approval"),occurred_at:"1999-01-01T00:00:00.000Z"}).row;
+  await supervisor.approveTaskRequest(f.task.task_id,after.event_id,revision,request.question_id,true);assert.equal(sent,1);
+ }finally{await f.dispose();}
+});

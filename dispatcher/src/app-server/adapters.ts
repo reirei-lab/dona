@@ -26,7 +26,15 @@ function result(row:AgentRecord|null,error?:string):HerdrCommandResult {
 export class AppServerAgentClient implements HerdrClient {
   readonly client:RuntimeClient;
   constructor(socket:string,readonly name:string,private readonly waitMs:number){this.client=new RuntimeClient(socket,95_000);}
-  async get():Promise<HerdrCommandResult>{try{return result(await this.client.status(this.name));}catch{return result(null,"runtime_observation_unknown");}}
+  async get():Promise<HerdrCommandResult>{try{
+    const row=await this.client.status(this.name);
+    // 前turnの失敗と、次の独立eventを受け取れる状態は区別する。失敗eventは再送しない。
+    if(row?.role==="main"&&row.state==="interrupted") {
+      if(row.recovery_hint?.reason==="capacity_wait"&&Date.parse(row.recovery_hint.retry_after??"")>Date.now())return result(null,"runtime_capacity_wait");
+      return result({...row,state:"idle"});
+    }
+    return result(row);
+  }catch{return result(null,"runtime_observation_unknown");}}
   async prompt(text:string,_signal?:AbortSignal,key?:string):Promise<HerdrCommandResult>{return this.submit(text,key);}
   async submit(text:string,key?:string):Promise<HerdrCommandResult>{
     if(!key)return result(null,"runtime_operation_key_required");
@@ -42,7 +50,9 @@ export class AppServerAgentClient implements HerdrClient {
   async wait(signal?:AbortSignal):Promise<HerdrCommandResult>{
     const until=Date.now()+this.waitMs;
     do {
-      const observed=await this.get();if(!observed.ok||observed.agentStatus!=="working")return observed;
+      let observed:HerdrCommandResult;
+      try{observed=result(await this.client.status(this.name));}catch{observed=result(null,"runtime_observation_unknown");}
+      if(!observed.ok||observed.agentStatus!=="working")return observed;
       if(signal?.aborted)return {...observed,ok:false,aborted:true};
       await new Promise(resolve=>setTimeout(resolve,250));
     }while(Date.now()<until);

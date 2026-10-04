@@ -33,3 +33,21 @@ test("入力なしの即時終了をEPIPEで失敗扱いせず、実入力の送
  const sent=await runProcess("/bin/sh",["-c","exec 0<&-; sleep 0.05"],5000,undefined,false,"input".repeat(1000000));
  assert.equal(sent.ok,false);assert.match(sent.stderr,/EPIPE|pipe|closed/i);
 });
+
+for(const scenario of ["branch_only","different_base","registered_elsewhere"] as const)test(`worktree準備中断後の${scenario}を照合する`,async()=>{
+ const {root,config}=await tempConfig(),repo=path.join(config.jobsWorkspaceRoot,"github","owner","repo","repository"),worktree=path.join(config.jobsWorkspaceRoot,"github","owner","repo","worktrees","job_retry");
+ config.jobCommandTimeoutMs=10000;await fs.mkdir(repo,{recursive:true});
+ const git=(...args:string[])=>execFileSync(config.gitPath,["-C",repo,...args],{encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
+ try{
+  git("init");git("-c","user.name=Test","-c","user.email=test@example.invalid","commit","--allow-empty","-m","base");git("remote","add","origin","https://github.com/owner/repo.git");git("update-ref","refs/dona/bases/job_retry","HEAD");
+  if(scenario==="different_base")git("-c","user.name=Test","-c","user.email=test@example.invalid","commit","--allow-empty","-m","other");
+  git("branch","dona/job_retry");
+  if(scenario==="registered_elsewhere")git("worktree","add",path.join(root,"other"),"dona/job_retry");
+  const row={job_id:"job_retry",agent_name:"worker_retry",workspace_path:worktree,workspace_json:JSON.stringify({kind:"github",repository:"owner/repo"})} as JobRow;
+  const provider=new JobWorkspace(config);
+  if(scenario==="branch_only"){
+   assert.equal((await provider.createGitHubWorktree(row,"owner/repo",undefined)).ok,true);
+   assert.equal(execFileSync(config.gitPath,["-C",worktree,"symbolic-ref","HEAD"],{encoding:"utf8"}).trim(),"refs/heads/dona/job_retry");
+  }else await assert.rejects(provider.createGitHubWorktree(row,"owner/repo",undefined),scenario==="different_base"?/base_mismatch/:/worktree_registration/);
+ }finally{await fs.rm(root,{recursive:true,force:true});}
+});

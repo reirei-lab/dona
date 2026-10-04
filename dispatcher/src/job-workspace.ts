@@ -14,7 +14,24 @@ export class JobWorkspace {
     if(args[0]==="workspace")return {ok:true,stdout:"{}",stderr:"",exitCode:0,timedOut:false,aborted:false};
     if(args[0]!=="worktree"||args[1]!=="create")throw Error("workspace_command_invalid");
     const value=(key:string)=>{const i=args.indexOf(key);if(i<0||!args[i+1])throw Error("workspace_argument_missing");return args[i+1]!;};
-    return runProcess(this.config.gitPath,["-C",value("--cwd"),"worktree","add","-b",value("--branch"),value("--path"),value("--base")],timeout,signal);
+    const cwd=value("--cwd"),branch=value("--branch"),target=value("--path"),base=value("--base");
+    const existing=await runProcess(this.config.gitPath,["-C",cwd,"show-ref","--verify",`refs/heads/${branch}`],timeout,signal);
+    if(existing.ok) {
+      if(existing.stdout.trim().split(/\s+/)[0]!==base)throw Error("runtime_existing_branch_base_mismatch");
+      const listed=await runProcess(this.config.gitPath,["-C",cwd,"worktree","list","--porcelain","-z"],timeout,signal);
+      if(!listed.ok)throw commandError("Git worktree registration inspection failed",listed);
+      const tokens=listed.stdout.split("\0");
+      if(tokens.includes(`branch refs/heads/${branch}`)||tokens.includes(`worktree ${target}`))throw Error("runtime_existing_worktree_registration");
+      if(await exists(target)) {
+        const stat=await fs.lstat(target);
+        if(stat.isSymbolicLink()||!stat.isDirectory()||(await fs.readdir(target)).length)throw Error("runtime_existing_worktree_content");
+      }
+      return runProcess(this.config.gitPath,["-C",cwd,"worktree","add",target,branch],timeout,signal);
+    }
+    // show-ref --verify は存在しないrefにも128を返すため、quietの終了値で不在を再確認する。
+    const absent=await runProcess(this.config.gitPath,["-C",cwd,"show-ref","--verify","--quiet",`refs/heads/${branch}`],timeout,signal);
+    if(absent.exitCode!==1||absent.timedOut||absent.aborted)throw commandError("Git branch absence could not be verified",absent);
+    return runProcess(this.config.gitPath,["-C",cwd,"worktree","add","-b",branch,target,base],timeout,signal);
   }
   async createGitHubWorktree(
     row: JobRow,
@@ -72,7 +89,7 @@ export class JobWorkspace {
         "--label", jobWorkspaceLabel(row.workspace_json, row.agent_name),
         "--no-focus",
       ], 120_000, signal);
-      if (!created.ok) throw commandError("Herdr worktree creation failed", created);
+      if (!created.ok) throw commandError("Git worktree creation failed", created);
       await this.verifyWorktreeIdentity(row, repositoryPath, persistedBaseSha, signal);
       return created;
     }
@@ -290,7 +307,7 @@ export class JobWorkspace {
       "--label", jobWorkspaceLabel(row.workspace_json, row.agent_name),
       "--no-focus",
     ], 120_000, signal);
-    if (!created.ok) throw commandError("Herdr worktree creation failed", created);
+    if (!created.ok) throw commandError("Git worktree creation failed", created);
     await this.verifyWorktreeIdentity(row, repositoryPath, baseSha, signal);
     return created;
   }

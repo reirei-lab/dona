@@ -129,6 +129,7 @@ export class DispatcherWorker {
     if (this.stopping || preflight.aborted) return;
     const current=this.database.get(row.event_id);
     if(current?.status!==row.status) return;
+    if(preflight.errorCode==="runtime_capacity_wait")return;
     if (!preflight.ok || !preflight.agentStatus) {
       const updated = this.database.recordPreDispatchFailure(
         row.event_id,
@@ -240,6 +241,11 @@ export class DispatcherWorker {
     if (waited.aborted || this.stopping) return;
     if (!waited.ok) {
       const errorCode = waited.errorCode ?? (waited.timedOut ? "agent_wait_timeout" : "agent_wait_failed");
+      if(errorCode==="runtime_turn_interrupted") {
+        // turnの終端は既知だが、外部操作の完了はResultでしか確定しない。再送せず次eventへ進む。
+        if(!await this.tryComplete(row,false))this.database.markNeedsReview(row.event_id,errorCode,"Main turn ended without a Result; accepted prompt was not resent");
+        this.logCurrentTransition(row,started);return;
+      }
       if (unavailableAgentErrors.has(errorCode)) {
         const unavailableSince = unavailableAgentErrors.has(row.last_error_code ?? "")
           ? Date.parse(row.updated_at)

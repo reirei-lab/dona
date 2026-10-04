@@ -18,6 +18,18 @@ def proc(pid, parent=1, state='S', start='Thu Oct 1 12:00:00 2026'):
     return dict(pid=pid, parent=parent, uid=os.getuid(), state=state, start=start)
 
 
+class RuntimeLaunchdScopeTests(unittest.TestCase):
+    def test_offline_runtime_observation_uses_four_service_scope(self):
+        live = m.common.Launchd(service_labels=m.LABELS)
+        with patch.object(m.common.subprocess, 'run', return_value=subprocess.CompletedProcess([],1,b'',b'Could not find service')) as run:
+            self.assertIsNone(live.observe(m.RUNTIME_LABEL))
+            self.assertTrue(run.call_args.args[0][-1].endswith('/'+m.RUNTIME_LABEL))
+            with self.assertRaisesRegex(RuntimeError,'label_scope'):
+                live.observe('dev.unrelated.service')
+            with self.assertRaisesRegex(RuntimeError,'label_scope'):
+                m.common.Launchd().observe(m.RUNTIME_LABEL)
+
+
 class ProcessTests(unittest.TestCase):
     def test_freezes_parent_before_enumerating_children_and_kills_reverse_order(self):
         root, child, newcomer, unrelated = 800001, 800002, 800003, 800004

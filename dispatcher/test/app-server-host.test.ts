@@ -71,3 +71,14 @@ test("全processが停止済みなら空のreceiptで旧worker履歴を保持し
   const store=new RuntimeStore(runtime);try{const row=store.agent("worker")!;assert.equal(row.state,"stopped");assert.equal(row.pid,null);assert.equal((store.db.prepare("SELECT processes_json FROM stops").get() as {processes_json:string}).processes_json,"[]");}finally{store.close();}
  }finally{await fs.rm(root,{recursive:true,force:true});}
 });
+
+test("100件の解決済み履歴があっても古い未回答・回答中の要求を取得できる",async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-question-history-")),database=path.join(root,"runtime.db"),socket=path.join(root,"runtime.sock");
+ const host=await serveRuntime({socket,database,codex:process.execPath,buildSha:"test"}),store=new RuntimeStore(database);
+ try{
+  store.put({name:"worker",generation:"g",role:"worker",cwd:root,release:root,thread_id:"t",turn_id:null,pid:null,process_start:null,state:"stopped",request_hash:"h",config_json:"{}",sequence:0});
+  for(let i=0;i<105;i++)store.addQuestion({question_id:`q-${i}`,agent:"worker",generation:i===104?"old":"g",thread_id:"t",turn_id:"turn",rpc_id_json:String(i),kind:i===0?"approval":"question",payload_json:"{}",state:i===0?"pending":i===1?"answering":"resolved",answer_hash:null,created_at:new Date(i*1000).toISOString()});
+  const rows=await new RuntimeClient(socket).questions("worker",true);
+  assert.equal(rows.length,102);assert.ok(rows.some(q=>q.question_id==="q-0"));assert.ok(rows.some(q=>q.question_id==="q-1"));assert.ok(!rows.some(q=>q.question_id==="q-104"));
+ }finally{store.close();await new Promise<void>(resolve=>host.close(()=>resolve()));await fs.rm(root,{recursive:true,force:true});}
+});

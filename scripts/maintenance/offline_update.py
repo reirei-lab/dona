@@ -449,7 +449,7 @@ class Runner:
         for name, expected in self.plan['bundle'].items():
             require(common.file_digest(run/name) == expected, 'runner_changed')
         require(Path(__file__).resolve() == (run/'offline_update.py').resolve(), 'use_prepared_runner')
-        self.live = common.Launchd()
+        self.live = common.Launchd(service_labels=LABELS)
         self.g = Path(self.plan['generation'])
         self.node = self.plan['node']
         self.policy = read_json(self.g/'control/policy.json')

@@ -1261,6 +1261,14 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
+  hasWorkerApprovalReply(jobId:string,questionId:string,eventId:string):boolean {
+    // Dispatcherの永続sequenceを使い、Slack/host間の時計差を認可に用いない。
+    return this.db.prepare(`SELECT 1 FROM events notification JOIN events reply ON reply.sequence>notification.sequence
+      WHERE notification.source='dona_job' AND notification.event_type='worker_question'
+      AND notification.external_event_id=? AND json_extract(notification.subject_json,'$.job_id')=?
+      AND json_extract(notification.payload_json,'$.request_kind')='approval' AND reply.event_id=? AND reply.source='slack'`).get(`question:${questionId}`,jobId,eventId)!==undefined;
+  }
+
   getJob(jobId: string): JobRow | undefined {
     return this.db.prepare("SELECT * FROM jobs WHERE job_id = ?").get(jobId) as JobRow | undefined;
   }

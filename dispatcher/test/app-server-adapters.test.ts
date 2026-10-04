@@ -143,3 +143,13 @@ test("既存workspace・成果・進捗directoryの権限を再正規化して�
   assert.equal(await fs.readFile(path.join(job.workspace_path,"kept"),"utf8"),"uncommitted work");
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+test("mainの失敗turnはwaitで中断を返し、次eventは上限解除後に受け付ける",async()=>{
+ const client=new AppServerAgentClient("unused","main",100);
+ let agent={name:"main",role:"main",state:"interrupted",generation:"g",thread_id:"t",recovery_hint:{reason:"capacity_wait",retry_after:new Date(Date.now()+60000).toISOString()}} as AgentRecord;
+ client.client.status=async()=>agent;
+ assert.equal((await client.get()).errorCode,"runtime_capacity_wait");assert.equal((await client.wait()).errorCode,"runtime_turn_interrupted");
+ agent={...agent,recovery_hint:{reason:"capacity_wait",retry_after:new Date(0).toISOString()}};
+ assert.equal((await client.get()).ok,true);assert.equal((await client.get()).agentStatus,"idle");assert.equal((await client.wait()).errorCode,"runtime_turn_interrupted");
+ for(const reason of ["authorization_required","configuration_error"] as const){agent={...agent,recovery_hint:{reason}};assert.equal((await client.get()).ok,true);}
+});
