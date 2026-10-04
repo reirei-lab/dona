@@ -11,7 +11,7 @@ import { z } from "zod";
 import { readApprovalRecordGraph } from "./record-relations.js";
 import { approvalIndexKey, type ApprovalIndexIdentity, type ApprovalIndexList } from "./index-codec.js";
 import { approvalRecordAliases, approvalRecordPrimary, approvalRecordActive } from "./record-indexes.js";
-import { readApprovalListHead, verifyApprovalListMembership } from "./index-list.js";
+import { readApprovalListHead, readApprovalListPage, verifyApprovalListMembership } from "./index-list.js";
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const scopeSchema = z.strictObject({ instance_id: id, workspace_id: id });
 export class ApprovalRecordRepositoryError extends Error {
@@ -20,6 +20,7 @@ export class ApprovalRecordRepositoryError extends Error {
 type Of<K extends ApprovalRecordKind> = Extract<ApprovalRecord, { kind: K }>;
 type Selector = Extract<ApprovalIndexIdentity, { kind: "alias" }>["selector"];
 export interface ApprovalRecordListHead { readonly count: number; readonly records: readonly ApprovalRecord[]; readonly truncated: boolean }
+export interface ApprovalRecordListPage { readonly count: number; readonly records: readonly ApprovalRecord[]; readonly next_after: string | null; readonly has_more: boolean }
 const aliasKinds: Record<Selector["name"], ApprovalRecordKind> = {
   request_creation: "request", decision_id: "decision", consume_id: "consume", consume_decision: "consume", consume_attempt: "consume",
   execution_request: "execution", execution_consume: "execution", notification_request_kind: "notification", notification_message: "notification",
@@ -98,6 +99,26 @@ export class ApprovalRecordRepository {
       });
     } catch { throw new ApprovalRecordRepositoryError(); }
   }
+  readListPageInState(state: VerifiedAuditState, list: ApprovalIndexList, after: string | null, limit: number): ApprovalRecordListPage {
+    try {
+      approvalIndexKey(this.scope, { kind: "manifest", list });
+      return this.withPlan(state, plan => {
+        if (after !== null) {
+          const cursor = this.record(plan, list.record_kind, after);
+          if (cursor === null || (list.membership === "active" && !approvalRecordActive(cursor))) throw Error();
+          this.verifyIndexes(plan, cursor);
+        }
+        const page = readApprovalListPage(plan, list, after, limit), records: ApprovalRecord[] = []; let bytes = 0;
+        for (const primary of page.ids) {
+          const record = this.record(plan, list.record_kind, primary);
+          if (record === null || (list.membership === "active" && !approvalRecordActive(record))) throw Error();
+          this.verifyIndexes(plan, record); bytes += Buffer.byteLength(encodeApprovalRecord(record, this.scope).canonical);
+          if (bytes > 32 * 1024 * 1024) throw Error(); records.push(record);
+        }
+        return Object.freeze({ count: page.count, records: Object.freeze(records), next_after: page.next_after, has_more: page.has_more });
+      });
+    } catch { throw new ApprovalRecordRepositoryError(); }
+  }
   private record(plan: ApprovalMetadataPlan, kind: ApprovalRecordKind, primary: string): ApprovalRecord | null {
     return readApprovalRecordGraph(this.scope, plan, (type, key) => this.sql.read(type, key), kind, primary);
   }
@@ -128,7 +149,8 @@ export class ApprovalRecordRepository {
   }
   private withPlan(state: VerifiedAuditState, read: (plan: ApprovalMetadataPlan) => ApprovalRecord | null): ApprovalRecord | null;
   private withPlan(state: VerifiedAuditState, read: (plan: ApprovalMetadataPlan) => ApprovalRecordListHead): ApprovalRecordListHead;
-  private withPlan(state: VerifiedAuditState, read: (plan: ApprovalMetadataPlan) => ApprovalRecord | null | ApprovalRecordListHead): ApprovalRecord | null | ApprovalRecordListHead {
+  private withPlan(state: VerifiedAuditState, read: (plan: ApprovalMetadataPlan) => ApprovalRecordListPage): ApprovalRecordListPage;
+  private withPlan(state: VerifiedAuditState, read: (plan: ApprovalMetadataPlan) => ApprovalRecord | null | ApprovalRecordListHead | ApprovalRecordListPage): ApprovalRecord | null | ApprovalRecordListHead | ApprovalRecordListPage {
     assertCurrentAuditReadState(this.db, state);
     const bindings = state.resource_bindings.filter(value => value.resource_id === "approval_records"
       && value.scope.instance_id === this.scope.instance_id && value.scope.tenant_id === this.scope.workspace_id);

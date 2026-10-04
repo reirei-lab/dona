@@ -3,7 +3,7 @@ import { ApprovalHistoryTransaction } from "../../src/approval/history-transacti
 import { ApprovalRecordMutation } from "../../src/approval/record-mutation.js";
 import { test } from "node:test";
 import { decisionFixture } from "./fixtures/decision.js";
-import { scope } from "./fixtures/broker.js";
+import { scope, fixture, intent, grant } from "./fixtures/broker.js";
 import { executionFixture } from "./fixtures/execution.js";
 import { ApprovalOperations, ApprovalOperationsError } from "../../src/approval/operations.js";
 
@@ -188,4 +188,32 @@ test("terminal requestのpresentation updateもunknownとneeds_reviewへ集計�
     assert.equal(health.counts?.needs_review, Number(nextState === "needs_review"));
   }
   assert.equal(f.read().row.state, "rejected");
+});
+
+test("expiryはSQL全件countなしで監査付きlistの全pageを進める", t => {
+  const f = fixture(t), expected: string[] = [];
+  for (let i = 0; i < 3; i++) {
+    const current = grant(), operationSlot = "operation_" + i;
+    current.snapshot.request_source.operation_slot = operationSlot; f.setGrant(current);
+    const created = f.broker.create("create_" + i, { ...intent, operation_slot: operationSlot });
+    if (created.status === "denied") throw Error(); expected.push(created.request_handle);
+  }
+  const operations = new ApprovalOperations(f.db, f.providers, scope), original = f.db.prepare.bind(f.db);
+  f.db.prepare = ((sql: string) => {
+    assert.equal(/select\s+count\(\*\)\s+from\s+main\.approval_requests/i.test(sql), false);
+    return original(sql);
+  }) as typeof f.db.prepare;
+  try {
+    const seen: string[] = []; let after: string | null = null;
+    for (let page = 0; page < 3; page++) {
+      const result = operations.expiryPage({ limit: 1, after });
+      assert.deepEqual(result.request_handles, []);
+      assert.equal(result.has_more, page < 2);
+      assert.notEqual(result.next_after, null); seen.push(result.next_after!); after = result.next_after;
+    }
+    assert.deepEqual(seen, expected);
+    assert.throws(() => operations.expiryPage({ limit: 1, after: "not_a_member" }), ApprovalOperationsError);
+    f.db.prepare("UPDATE approval_requests SET revision=revision+1 WHERE request_id=?").run(after);
+    assert.throws(() => operations.expiryPage({ limit: 1, after }), ApprovalOperationsError);
+  } finally { f.db.prepare = original; }
 });

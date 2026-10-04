@@ -61,23 +61,16 @@ export class ApprovalOperations {
         const mark = this.observation(state), effective = mark.effective_utc;
         // Scan every request in the bounded page before filtering. Filtering on
         // unauthenticated SQL state/expiry could silently hide a due request.
-        const total = this.db.prepare("SELECT count(*) FROM main.approval_requests WHERE instance_id=? AND workspace_id=?")
-          .pluck().get(this.scope.instance_id, this.scope.workspace_id);
-        if (total !== this.records.readListHeadInState(state, { record_kind: "request", membership: "all" }, 1).count) throw Error();
-        const rows = this.db.prepare(`SELECT request_id FROM main.approval_requests
-          WHERE instance_id=? AND workspace_id=? AND request_id>?
-          ORDER BY request_id LIMIT ?`).all(this.scope.instance_id, this.scope.workspace_id, page.after ?? "", page.limit + 1) as { request_id: string }[];
-        const selected = rows.slice(0, page.limit);
+        const selected = this.records.readListPageInState(state, { record_kind: "request", membership: "all" }, page.after, page.limit);
         const due: string[] = [];
-        for (const row of selected) {
-          const request = this.records.readInState(state, "request", id.parse(row.request_id));
-          if (request === null || request.row.instance_id !== this.scope.instance_id || request.row.workspace_id !== this.scope.workspace_id) throw Error();
+        for (const request of selected.records) {
+          if (request.kind !== "request" || request.row.instance_id !== this.scope.instance_id || request.row.workspace_id !== this.scope.workspace_id) throw Error();
           this.lifecycle.verifyClock(request, mark, state);
           if (request.row.state === "approved" ? request.row.consume_expires_at !== null && request.row.consume_expires_at <= effective
-            : requestStates.slice(0, 4).includes(request.row.state as never) && request.row.expires_at <= effective) due.push(row.request_id);
+            : requestStates.slice(0, 4).includes(request.row.state as never) && request.row.expires_at <= effective) due.push(request.row.request_id);
         }
         return Object.freeze({ request_handles: Object.freeze(due),
-          next_after: selected.length ? selected.at(-1)!.request_id : null, has_more: rows.length > page.limit });
+          next_after: selected.next_after, has_more: selected.has_more });
       }) as ApprovalOperationsPage;
     } catch { throw new ApprovalOperationsError(); }
   }
