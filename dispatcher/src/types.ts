@@ -35,7 +35,7 @@ export type JobGroupTransition = "progress" | "attention" | "all_terminal";
 
 export interface EventEnvelope {
   schema_version: 1;
-  source: "slack" | "web" | "dona_job" | "dona_update" | "dona_schedule";
+  source: "slack" | "web" | "dona_job" | "dona_update" | "dona_schedule" | "dona_approval";
   external_event_id: string;
   type: string;
   occurred_at: string;

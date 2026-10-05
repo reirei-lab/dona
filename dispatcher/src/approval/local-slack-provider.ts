@@ -49,9 +49,24 @@ export class LocalSlackApprovalProvider implements ExternalSlackPort {
   messages.sort((a,b)=>a.ts.localeCompare(b.ts));if(messages[0]?.ts!==target.thread_ts)throw Error("external_approval_thread_unavailable");
   return {messages,identity,channel};
  }
- async observe(target:ExternalTarget):Promise<SlackTargetObservation>{
+ private async requester(target:ExternalTarget,userId:string){
+  if(!/^[UW][A-Z0-9]+$/.test(userId))throw Error("external_approval_requester_invalid");
+  const response=await this.api("users.info",{user:userId}),user=object(response.user);
+  if(response.ok!==true||user.id!==userId||user.team_id!==this.workspaceId||user.deleted!==false||user.is_bot!==false)throw Error("external_approval_requester_unavailable");
+  let cursor="";const seen=new Set<string>();
+  for(let page=0;page<20;page++){
+   const value=await this.api("conversations.members",{channel:target.channel_id,limit:200,...(cursor?{cursor}:{})});
+   if(value.ok!==true||!Array.isArray(value.members)||value.members.some((id:unknown)=>typeof id!=="string"))throw Error("external_approval_access_unavailable");
+   if(value.members.includes(userId))return;
+   const next=object(value.response_metadata).next_cursor;if(typeof next!=="string"&&next!==undefined)throw Error("external_approval_access_unavailable");
+   if(!next||seen.has(next))throw Error("external_approval_requester_denied");seen.add(next);cursor=next;
+  }
+  throw Error("external_approval_access_limit");
+ }
+ async observe(target:ExternalTarget,requesterId?:string):Promise<SlackTargetObservation>{
   const {messages,identity,channel}=await this.thread(target);
-  return {target:{...target},observed_at:new Date().toISOString(),bot_user_id:identity.user_id,bot_id:identity.bot_id,
+  if(requesterId)await this.requester(target,requesterId);
+  return {target:{...target},...(requesterId?{requester_id:requesterId,requester_authorized:true}:{}),observed_at:new Date().toISOString(),bot_user_id:identity.user_id,bot_id:identity.bot_id,
    workspace_name:String(identity.team??this.workspaceId).slice(0,128),channel_name:String(channel.name??target.channel_id).slice(0,128),
    revision:{complete:true,items:messages.map(m=>({message_ts:m.ts,edited_ts:timestamp(object(m.edited).ts)?object(m.edited).ts:null,
     content_hmac_sha256:createHmac("sha256",this.revisionKey).update("dona.local-approval.thread.v1\0").update(canonical(m)).digest("hex")}))}};

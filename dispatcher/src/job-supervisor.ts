@@ -343,6 +343,9 @@ export class JobSupervisor {
     } catch(error) {
       if(!(error instanceof JobResultNotFoundError)) {this.database.tasks.wait(task,"result_conflict");return;}
     }
+    if(job.last_error_code==="runtime_external_approval_pending"&&task.desired_state==="running"&&task.stop_state==="none"){
+      this.database.tasks.wait(task,"external_approval",30_000);return;
+    }
     if(job.last_error_code==="runtime_question_pending"&&task.desired_state==="running"&&task.stop_state==="none"&&this.runtime.questions) {
       const pending=await this.runtime.questions(job.agent_name);
       if(pending.length){this.database.tasks.wait(task,"human_input");return;}

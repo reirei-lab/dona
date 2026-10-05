@@ -37,3 +37,13 @@ factoryは既存Dispatcherと同じ正規DB fileを `openSecurityDatabase` で�
 処理途中に失敗した場合はsafe-offのまま停止する。DB、auxiliary DB、Keychainの部分成果を照合し、同じscopeを自動削除・再生成・再試行しない。`doctor()` のreadyは現在のanchor/clock/keyを確認した結果であり、Slack接続・WebAuthn enrollment・Task実行までの成功を意味しない。boot identity変更、期限切れkey、anchor不一致、credential欠落ではready:falseを維持する。既存checkpointがあるDBへ新しいgenesisを作らない。
 
 今回の開発でnative libraryのbuildと隔離contractテストを行うが、本番Keychain item作成、host署名変更、credential生成、実Slack投稿は行わない。
+
+## Runtimeからの要求と継続
+
+固定dynamic tool `dona_request_thread_reply(operation_slot, text)` はCodex 0.160.0の `item/tool/call` を使う。workspace、Slack requester、宛先、Task IDをtool入力に含めない。Runtimeがcurrent agent/generation/thread/turn/callへ束縛し、Dispatcherはworkerの登録済みAttempt binding、またはmainの受理済みevent→turn対応と保存Slack eventを照合する。同一turnに複数source対応があれば推測せず拒否する。自由入力source IDを既存MCPへ追加して認可を広げない。
+
+`DispatcherDatabase.createExternalApprovalIngress(runtime, service, config, wake)` が本体connectionを所有するcheckpoint/outboxへ接続し、常駐laneの `tick()` で受理・実行・結果照合を進める。coreは別の保護connectionを維持する。`authorizeSource` はこのingressの現在source照合へ接続する。Slack requesterは `users.info` とbounded `conversations.members` で存在・非bot・現在membershipを確認し、Macの承認者IDへ置き換えない。
+
+mainは暗号化requestの作成後にpending handleを受け取り、そのeventを完了できる。terminal結果は保存済みreply targetへの新しい `dona_approval` eventとする。workerは `task_external_approval_checkpoints` と同じtool callを保ち、通常のnative質問/実行承認とは混ぜない。tool responseはserverRequest/resolvedで確認するまで回答中とし、応答不明だけでTaskを再開しない。Runtime再起動で失われた未完了callはexpiredとして停止し、承認の再実行権限にしない。task cancel/pauseやAttempt置換後のsourceではconsume/sendを開始しない。
+
+承認者はdevice/revisionを含むauthority全体のhashを監査済みdecisionのactor IDへ束縛する。補助JSONだけでauthorityを作れず、consume/start/送信直前にも現在grantを確認する。要求端末Aと承認端末Bが異なる場合もBの失効を無視しない。内部event/expiryの走査はimmutable履歴のcursorをboundedに巡回し、先頭の接続障害だけで後続要求を永久に止めない。

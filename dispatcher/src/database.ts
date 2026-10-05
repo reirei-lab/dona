@@ -1,3 +1,4 @@
+import {LocalExternalApprovalIngress} from "./approval/local-ingress.js";
 import {archiveRuntimeBinding, installRuntimeBindingArchive, type JobRuntimeBinding} from "./runtime-binding-archive.js";
 import { OperatorAuthRegistry } from "./dashboard/operator-auth.js";
 import { OperatorWebAuthn } from "./dashboard/operator-webauthn.js";
@@ -1605,6 +1606,9 @@ export class DispatcherDatabase {
     return changed === 1;
   }
 
+  createExternalApprovalIngress(runtime:ConstructorParameters<typeof LocalExternalApprovalIngress>[2],service:ConstructorParameters<typeof LocalExternalApprovalIngress>[3],config:ConstructorParameters<typeof LocalExternalApprovalIngress>[4],wake:()=>void=()=>{}){
+    return new LocalExternalApprovalIngress(this.db,this,runtime,service,config,wake);
+  }
   getJobByAgent(name:string):JobRow|undefined {
     return this.db.prepare("SELECT * FROM jobs WHERE agent_name=? ORDER BY created_at DESC LIMIT 1").get(name) as JobRow|undefined;
   }
