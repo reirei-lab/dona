@@ -15,6 +15,8 @@ export interface DashboardTaskSnapshot {
   task: DashboardTask; attempts: DashboardAttempt[]; fingerprint: string;
   /** Internal read-only identity evidence; never project this field to the browser. */
   runtime_binding: {agent_name:string;generation:string;thread_id:string} | null;
+  selected_attempt_id: string;
+  result: {status: string; summary: string; completed_at: string; output?: string; artifacts: {display_name:string;kind:string}[]} | null;
   runtime_binding_state: "missing" | "invalid" | "verified";
 }
 /** This reader never instantiates DispatcherDatabase: starting an observer must
@@ -48,20 +50,42 @@ export class DashboardTaskReader {
       return {items, next: null};
     })();
   }
-  snapshot(id: string): DashboardTaskSnapshot | null {
-    if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) throw Error("dashboard_query_invalid");
+  snapshot(id: string, attemptId?: string): DashboardTaskSnapshot | null {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(id) || (attemptId !== undefined && !/^[A-Za-z0-9_-]{1,128}$/.test(attemptId))) throw Error("dashboard_query_invalid");
     return this.sql.transaction(() => {
       const task = this.sql.prepare(`${projection} WHERE t.task_id = ?`).get(id) as DashboardTask | undefined;
       if (!task) return null;
       const attempts = this.sql.prepare(`SELECT a.attempt_id,a.number,j.status,a.outcome,a.created_at,a.ended_at,j.agent_name
         FROM task_attempts a JOIN jobs j ON j.job_id=a.attempt_id WHERE a.task_id=? ORDER BY a.number`).all(id) as DashboardAttempt[];
       if (attempts.length > 100) throw Error("dashboard_attempt_limit");
+      const selected_attempt_id = attemptId ?? task.current_attempt_id;
+      const selected = attempts.find(attempt => attempt.attempt_id === selected_attempt_id);
+      if (!selected) return null;
+      const resultRow = this.sql.prepare("SELECT result_json FROM jobs WHERE job_id=?").get(selected_attempt_id) as {result_json:string|null};
+      let result: DashboardTaskSnapshot["result"] = null;
+      if (["completed","failed","cancelled"].includes(selected.status) && resultRow.result_json && resultRow.result_json.length <= 1_048_576) try {
+        const value:unknown=JSON.parse(resultRow.result_json);
+        if(value && typeof value === "object" && !Array.isArray(value)) {
+          const row=value as Record<string,unknown>;
+          if(row.job_id===selected_attempt_id && row.status===selected.status && typeof row.completed_at==="string" && row.completed_at.length<=64 && Number.isFinite(Date.parse(row.completed_at)))
+            {
+            const output=row.output as {format?:unknown;text?:unknown}|undefined;
+            result={status:selected.status,summary:typeof row.summary==="string"?row.summary.slice(0,8192):"",completed_at:row.completed_at,
+              ...(output&&["text","markdown"].includes(String(output.format))&&typeof output.text==="string"?{output:output.text.slice(0,16384)}:{}),
+              artifacts:Array.isArray(row.artifacts)?row.artifacts.slice(0,32).flatMap(item=>{
+                if(!item||typeof item!=="object"||Array.isArray(item))return [];
+                const artifact=item as Record<string,unknown>;
+                return typeof artifact.display_name==="string"&&typeof artifact.kind==="string"&&/^[a-z_]{1,32}$/.test(artifact.kind)?[{display_name:artifact.display_name.slice(0,160),kind:artifact.kind}]:[];
+              }):[]};
+          }
+        }
+      } catch { /* Invalid Result envelopes never authorize a raw projection. */ }
       const identity = this.sql.prepare(`SELECT identity_version,herdr_agent_session_id,agent_name,recorded_at,generation_nonce
-        FROM job_live_session_identities WHERE job_id=?`).get(task.current_attempt_id) as {
+        FROM job_live_session_identities WHERE job_id=?`).get(selected_attempt_id) as {
           identity_version:number;herdr_agent_session_id:string;agent_name:string;recorded_at:string;generation_nonce:string;
         } | undefined;
       let runtime_binding: DashboardTaskSnapshot["runtime_binding"] = null;
-      if (identity?.identity_version === 1 && identity.agent_name === attempts.find(attempt=>attempt.attempt_id===task.current_attempt_id)?.agent_name) {
+      if (identity?.identity_version === 1 && identity.agent_name === selected.agent_name) {
         try {
           if(typeof identity.herdr_agent_session_id!=="string"||identity.herdr_agent_session_id.length>512)throw Error();
           const tuple:unknown = JSON.parse(identity.herdr_agent_session_id);
@@ -69,9 +93,21 @@ export class DashboardTaskReader {
             runtime_binding={agent_name:identity.agent_name,generation:tuple[0] as string,thread_id:tuple[1] as string};
         } catch { /* Missing/legacy/malformed identities never authorize a history read. */ }
       }
-      const fingerprint = createHash("sha256").update(JSON.stringify({task, attempts, identity:identity??null})).digest("hex");
-      const runtime_binding_state:DashboardTaskSnapshot["runtime_binding_state"]=runtime_binding?"verified":identity?"invalid":"missing";
-      return {task, attempts, fingerprint, runtime_binding, runtime_binding_state};
+      // New releases retain immutable bindings after worker cleanup. Older DBs
+      // remain readable, but absent history never permits an inferred binding.
+      let archived: unknown[] = [];
+      if (this.sql.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_runtime_bindings'").get()) {
+        archived=this.sql.prepare("SELECT job_id,task_id,agent_name,generation,thread_id,recorded_at FROM job_runtime_bindings WHERE job_id=? ORDER BY recorded_at DESC LIMIT 2").all(selected_attempt_id);
+        const rows=archived as {job_id:string;task_id:string|null;agent_name:string;generation:string;thread_id:string;recorded_at:string}[];
+        if (!identity && rows.length) {
+          const row=rows[0]!;
+          if(row.task_id===id && row.agent_name===selected.agent_name && /^[A-Za-z0-9_-]{1,160}$/.test(row.generation) && /^[A-Za-z0-9_-]{1,160}$/.test(row.thread_id) && Number.isFinite(Date.parse(row.recorded_at)) && rows[1]?.recorded_at!==row.recorded_at)
+            runtime_binding={agent_name:row.agent_name,generation:row.generation,thread_id:row.thread_id};
+        }
+      }
+      const fingerprint = createHash("sha256").update(JSON.stringify({task, attempts, selected_attempt_id, result, archived, identity:identity??null})).digest("hex");
+      const runtime_binding_state:DashboardTaskSnapshot["runtime_binding_state"]=runtime_binding?"verified":identity||archived.length?"invalid":"missing";
+      return {task, attempts, selected_attempt_id, result, fingerprint, runtime_binding, runtime_binding_state};
     })();
   }
 }

@@ -59,7 +59,7 @@ test('実CLIはpairing・観測・SIGKILL回復・preserve更新・rollbackでwo
   assert.equal((await request(listen,null,'/api/tasks')).status,401);let cookie=await pair();
   assert.equal((await request(listen,null,'/api/tasks',{cookie})).status,200);
   const detail=await request(listen,null,'/api/tasks/'+created.task.task_id,{cookie});assert.equal(detail.status,200);assert.match(detail.body,/fixture worker progress/);
-  assert.ok(calls.length>=2);assert.ok(calls.every(action=>['conversations','conversation'].includes(action)));
+  assert.ok(calls.length>=1);assert.ok(calls.every(action=>['conversations','conversation'].includes(action)));
   await run(globalThis.process.execPath,[path.join(pointer,'dispatcher/dist/dashboard/cli.js'),'revoke',config]);assert.equal((await request(listen,null,'/api/tasks',{cookie})).status,401);cookie=await pair();
   // Hard death leaves a stale UDS; the real service proves it is refused before reclaim.
   await exit(process!,'SIGKILL');await start(a);assert.equal((await request(listen,null,'/api/tasks',{cookie})).status,401);

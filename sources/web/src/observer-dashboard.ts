@@ -1,18 +1,18 @@
 import { createHash } from "node:crypto";
 
-/** Read-only observer surface, separate from the OIDC command dashboard.
+/** Read-only sections of the paired operator dashboard.
  * The service authenticates every API read; this module grants no authority. */
 const script = String.raw`(() => {
 'use strict';
 const byId = id => document.getElementById(id);
 const list = byId('tasks'), detail = byId('detail'), connection = byId('connection');
-let selected = null, generation = 0, pageAfter = null, next = null, stopped = false, polling = false;
-const labels = {active:'実行中',capacity_wait:'実行枠の空き待ち',rate_limit_wait:'利用上限の回復待ち',retry_exhausted:'再試行上限',running:'実行中',waiting:'待機中',queued:'実行待ち',paused:'一時停止',completed:'完了',failed:'失敗',cancelled:'取消済み',human_input:'質問への回答待ち',rate_limit:'利用上限の回復待ち',retry_limit:'再試行上限',retry_wait:'再試行待ち',unknown:'状態未確認'};
+let selected = null, selectedAttempt = null, selectedMain = null, capabilities = [], generation = 0, pageAfter = null, next = null, stopped = false, polling = false;
+const labels = {preparing:'実行準備中',dispatching:'起動処理中',blocked:'入力・承認待ち',needs_review:'確認が必要',cancelling:'取消処理中',inProgress:'進行中',declined:'拒否済み',active:'実行中',capacity_wait:'実行枠の空き待ち',rate_limit_wait:'利用上限の回復待ち',retry_exhausted:'再試行上限',running:'実行中',waiting:'待機中',queued:'実行待ち',paused:'一時停止',completed:'完了',failed:'失敗',cancelled:'取消済み',human_input:'質問への回答待ち',rate_limit:'利用上限の回復待ち',retry_limit:'再試行上限',retry_wait:'再試行待ち',unknown:'状態未確認'};
 const label = value => labels[value] || String(value || '未確認');
 const node = (tag, text, className) => { const n = document.createElement(tag); if(text !== undefined) n.textContent = String(text); if(className) n.className = className; return n; };
 const validId = id => typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id);
 function clearPrivate(message, auth) {
-  generation++; list.replaceChildren(); detail.replaceChildren(node('p',message)); next = null; byId('next').disabled = true;
+  generation++; capabilities=[]; byId('main-conversations').replaceChildren(); byId('main-panel').hidden=true; list.replaceChildren(); detail.replaceChildren(node('p',message)); next = null; byId('next').disabled = true;
   connection.textContent = message; connection.dataset.state = 'disconnected';
   if(auth) { stopped = true; byId('pairing').hidden = false;byId('logout').hidden=true; }
 }
@@ -26,15 +26,30 @@ async function read(url) {
 }
 function renderDetail(value) {
   const task = value?.snapshot?.task;
-  if(!task || task.task_id!==selected || !Array.isArray(value.snapshot.attempts)) throw Error();
+  if(!task || task.task_id!==selected || (selectedAttempt && value.snapshot.selected_attempt_id!==selectedAttempt) || !Array.isArray(value.snapshot.attempts)) throw Error();
   const content = document.createDocumentFragment();
   content.append(node('h2',task.task_key || task.task_id),node('p',task.task_id,'muted'),node('p','Task: '+label(task.state)+(task.wait_reason?' · '+label(task.wait_reason):''),'state'));
   content.append(node('p','ワーカー: '+label(task.worker_status)+' · 更新 '+task.updated_at,'muted'));
   content.append(node('h3','実行履歴'));
   const attempts = node('ol');
-  for(const attempt of value.snapshot.attempts) attempts.append(node('li','Attempt '+attempt.number+' · '+label(attempt.status)+(attempt.outcome?' · '+label(attempt.outcome):'')));
+  for(const attempt of value.snapshot.attempts) {
+    const item=node('li'),button=node('button','Attempt '+attempt.number+' · '+label(attempt.status)+(attempt.outcome?' · '+label(attempt.outcome):''));button.type='button';button.dataset.attempt=attempt.attempt_id;
+    button.setAttribute('aria-pressed',String(attempt.attempt_id===(selectedAttempt || value.snapshot.selected_attempt_id || task.current_attempt_id)));
+    button.disabled=!validId(attempt.attempt_id);
+    button.addEventListener('click',()=>{selectedAttempt=attempt.attempt_id;generation++;detail.replaceChildren(node('p','実行履歴を取得しています…'));void detailRead();});item.append(button);attempts.append(item);
+  }
   content.append(attempts,node('h3','ワーカーの会話'));
-  const runtime = value.runtime;
+  if(task.next_check_at)content.append(node('p','次の確認予定: '+task.next_check_at,'muted'));
+  if(value.snapshot.result) {
+    const result=value.snapshot.result;content.append(node('h3','実行結果'),node('p',result.completed_at,'muted'),node('pre',result.summary));
+    if(result.output)content.append(node('pre',result.output));
+    for(const artifact of result.artifacts || [])content.append(node('p',artifact.display_name+' · '+artifact.kind));
+  }
+  appendConversation(content,value.runtime);
+  const focus=document.activeElement?.dataset?.attempt;detail.replaceChildren(content);if(focus)Array.from(detail.querySelectorAll('button')).find(b=>b.dataset.attempt===focus)?.focus({preventScroll:true});
+}
+function appendConversation(content,runtime) {
+
   if(runtime?.status==='observed') {
     const c = runtime.conversation;
     if(!Array.isArray(c.items)) throw Error();
@@ -50,12 +65,11 @@ function renderDetail(value) {
     }
     content.append(messages);
   } else content.append(node('p',({unavailable:'会話を現在取得できません。Taskの状態とは別の接続状態です。',not_started:'会話はまだ開始されていません。',forbidden:'この接続では会話の閲覧が許可されていません。'})[runtime?.status] || '会話の状態を確認できません。','notice'));
-  detail.replaceChildren(content);
 }
 async function detailRead() {
   if(!selected || stopped) return;
   const id=selected, token=++generation;
-  try { const value=await read('/api/tasks/'+encodeURIComponent(id)); if(token!==generation || id!==selected || stopped)return; renderDetail(value); }
+  try { const value=await read('/api/tasks/'+encodeURIComponent(id)+(selectedAttempt?'?attempt='+encodeURIComponent(selectedAttempt):'')); if(token!==generation || id!==selected || stopped)return; renderDetail(value); }
   catch(error) { if(token!==generation || id!==selected || stopped)return; clearPrivate(error.auth?'接続の認証が必要です。':'接続が切れています。表示を消去しました。',error.auth); }
 }
 function renderList(value) {
@@ -66,7 +80,7 @@ function renderList(value) {
     if(!validId(task.task_id)) throw Error();
     const button=node('button',(task.task_key || task.task_id)+' · '+label(task.state)); button.type='button'; button.dataset.task=task.task_id;
     button.setAttribute('aria-pressed',String(task.task_id===selected));
-    button.addEventListener('click',()=> {selected=task.task_id; generation++; detail.replaceChildren(node('p','会話を取得しています…'));
+    button.addEventListener('click',()=> {selected=task.task_id; selectedAttempt=null;selectedMain=null; generation++; detail.replaceChildren(node('p','会話を取得しています…'));
       for(const b of list.querySelectorAll('button')) b.setAttribute('aria-pressed',String(b.dataset.task===selected)); void detailRead(); });
     content.append(button);
   }
@@ -76,11 +90,30 @@ function renderList(value) {
 }
 async function refresh() {
   if(polling || stopped)return; polling=true; const token=generation;
-  try {const value=await read('/api/tasks'+(pageAfter?'?after='+encodeURIComponent(pageAfter):''));
+  try {const session=await read('/api/session');if(token!==generation || stopped)return;capabilities=Array.isArray(session.capabilities)?session.capabilities:[];await mainList();const value=await read('/api/tasks'+(pageAfter?'?after='+encodeURIComponent(pageAfter):''));
     if(token!==generation || stopped)return; renderList(value); connection.textContent='接続中 · 5秒ごとに更新';connection.dataset.state='connected';
-    await detailRead();
+    if(selectedMain)await mainRead();else await detailRead();
   } catch(error) {if(token===generation && !stopped)clearPrivate(error.auth?'接続の認証が必要です。':'接続が切れています。表示を消去しました。',error.auth);}
   finally {polling=false;}
+}
+async function mainList() {
+  const allowed=capabilities.includes('conversations:main:read');byId('main-panel').hidden=!allowed;
+  if(!allowed){byId('main-conversations').replaceChildren();return;}
+  const token=generation,value=await read('/api/conversations/main');if(token!==generation||stopped)return;
+  const box=document.createDocumentFragment();
+  for(const entry of value.items || []) {
+    if(typeof entry.name!=='string'||typeof entry.generation!=='string'||!/^[A-Za-z0-9_-]{1,160}$/.test(entry.name)||!/^[A-Za-z0-9_-]{1,160}$/.test(entry.generation))throw Error();
+    const button=node('button',entry.name+' · '+entry.generation+(entry.connected?' · 接続中':' · 保存された履歴'));button.type='button';button.dataset.main=entry.name+':'+entry.generation;
+    button.addEventListener('click',()=>{selectedMain={name:entry.name,generation:entry.generation};selected=null;selectedAttempt=null;generation++;detail.replaceChildren(node('p','Dona本体の会話を取得しています…'));void mainRead();});box.append(button);
+  }
+  const focused=document.activeElement?.dataset?.main;byId('main-conversations').replaceChildren(box);
+  if(focused)Array.from(byId('main-conversations').querySelectorAll('button')).find(b=>b.dataset.main===focused)?.focus({preventScroll:true});
+}
+async function mainRead() {
+  if(!selectedMain||stopped)return;const target=selectedMain,token=++generation;
+  try {const value=await read('/api/conversations/main/'+encodeURIComponent(target.name)+'/'+encodeURIComponent(target.generation));if(token!==generation||selectedMain!==target||stopped)return;
+    const content=document.createDocumentFragment();content.append(node('h2','Dona本体の会話'),node('p','このDona全体にまたがる発言です。特定のTaskの会話ではありません。','notice'));appendConversation(content,value);detail.replaceChildren(content);
+  }catch(error){if(token===generation&&!stopped)clearPrivate(error.auth?'接続の認証が必要です。':'接続が切れています。表示を消去しました。',error.auth);}
 }
 byId('pair-form').addEventListener('submit',async event=>{event.preventDefault();const code=byId('code').value;byId('code').value='';const button=byId('pair-submit');button.disabled=true;
   try {const r=await fetch('/api/pair',{method:'POST',credentials:'same-origin',redirect:'error',headers:{'content-type':'application/json'},body:JSON.stringify({code})});
@@ -106,5 +139,5 @@ export function observerDashboardPage(): {status: 200; headers: Record<string,st
   return {status:200,headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store","referrer-policy":"no-referrer",
     "x-content-type-options":"nosniff","x-frame-options":"DENY",
     "content-security-policy":`default-src 'none'; script-src 'sha256-${digest(script)}'; style-src 'sha256-${digest(style)}'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`},
-    body:`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dona · 作業の観測</title><style>${style}</style></head><body><a class="skip" href="#detail">詳細へ移動</a><header><h1>Dona · 作業の観測</h1><p class="muted">Taskとワーカーの進行状況を閲覧します。作業の実行・取消・質問への回答はSlackで行ってください。</p><p id="connection" role="status" aria-live="polite">接続を確認しています…</p><section id="pairing" hidden><h2>この端末を接続する</h2><p>Macで発行した接続コードを入力すると、このDonaのすべてのTaskとワーカーの会話を閲覧できます。実行・変更の権限は付与されません。</p><form id="pair-form"><label for="code">接続コード</label><input id="code" autocomplete="off" type="password" required maxlength="256"><button id="pair-submit" type="submit">閲覧用に接続する</button></form><p id="pair-status" role="status"></p></section><button id="logout" type="button">この端末を解除</button><button id="refresh" type="button">更新</button></header><main class="layout"><nav aria-label="Task一覧"><h2>Task一覧</h2><div id="tasks"></div><div class="controls"><button id="first" type="button">先頭へ</button><button id="next" type="button" disabled>次のページ</button></div></nav><section id="detail" class="panel" tabindex="-1" aria-label="Taskの詳細"><p>Taskを選ぶと実行履歴と会話を表示します。</p></section></main><script>${script}</script></body></html>`};
+    body:`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dona · 作業の観測</title><style>${style}</style></head><body><a class="skip" href="#detail">詳細へ移動</a><header><h1>Dona · 作業の観測</h1><p class="muted">Taskとワーカーの進行状況を閲覧します。Macで付与された権限の範囲で利用できます。</p><p id="connection" role="status" aria-live="polite">接続を確認しています…</p><section id="pairing" hidden><h2>この端末を接続する</h2><p>Macで発行した接続コードを入力すると、このDonaのすべてのTaskとワーカーの会話を閲覧できます。Dona本体の会話や操作の権限は、Macで明示的に付与された場合だけ利用できます。</p><form id="pair-form"><label for="code">接続コード</label><input id="code" autocomplete="off" type="password" required maxlength="256"><button id="pair-submit" type="submit">閲覧用に接続する</button></form><p id="pair-status" role="status"></p></section><button id="logout" type="button">この端末を解除</button><button id="refresh" type="button">更新</button></header><main class="layout"><nav aria-label="Task一覧"><section id="main-panel" hidden><h2>Dona本体</h2><div id="main-conversations"></div></section><h2>Task一覧</h2><div id="tasks"></div><div class="controls"><button id="first" type="button">先頭へ</button><button id="next" type="button" disabled>次のページ</button></div></nav><section id="detail" class="panel" tabindex="-1" aria-label="Taskの詳細"><p>Taskを選ぶと実行履歴と会話を表示します。</p></section></main><script>${script}</script></body></html>`};
 }

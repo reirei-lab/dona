@@ -58,7 +58,7 @@ test("service再起動でcookieを失効し、実Taskの継続とsnapshotを維�
   db.beginJobPreparation(task.current_attempt_id);db.setJobRuntime(task.current_attempt_id,"workspace","pane",JSON.stringify(["g1","thread"]));
   const reader=new DashboardTaskReader(config.databasePath);const before=db.tasks.get(task.task_id);
   let runtimeReads=0;
-  const runtime={async conversations(){runtimeReads++;return {items:[],next:null};},async conversation(){throw Error("unexpected history");}};
+  const runtime={async conversations(){runtimeReads++;return {items:[],next:null};},async conversation(){runtimeReads++;throw Error("history unavailable");}};
   const options={origin:"https://observer.example",port,controlSocket:socket,version:"test",page:{status:200,headers:{},body:"observer"},reader,observer:new DashboardObserver(reader,runtime)};
   let server=new DashboardServer(options);
   try{
