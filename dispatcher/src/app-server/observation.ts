@@ -26,7 +26,7 @@ export function sanitizeObservationText(value:string,limit=8192):string {
   if(value.length>131072)return "[上限を超える内容を省略]";
   let text=value.replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|$))/g,"").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g,"");
   const decodedText=decodedObservationText(text);
-  for(const match of credentialFields(decodedText)){const rest=decodedText.slice(match.index!+match[0].length);if(/^[ \t]*(?:\r?\n|[\[{])/.test(rest))return "[機密情報を含む内容を省略]";}
+  for(const match of credentialFields(decodedText)){const rest=decodedText.slice(match.index!+match[0].length);if(/^[ \t]*(?:\r?\n|[\[{]|[|>][+-]?[0-9]?[ \t]*(?:\r?\n|$))/.test(rest))return "[機密情報を含む内容を省略]";}
   if(/-----BEGIN [^-]*PRIVATE KEY|DONA_(?:JOB|EVENT)_(?:BEGIN|END)/i.test(decodedText))return "[保護された内容を省略]";
   text=text.split("\n").map(line=>{
     const decoded=decodedObservationText(line);

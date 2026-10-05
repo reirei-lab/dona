@@ -73,3 +73,10 @@ test("diff headerとhunk本文を区別しplus/minusで始まるコード行も�
  const diff="--- a/file.ts\n+++ b/file.ts\n@@ -1,3 +1,3 @@\n+++counter;\n---counter;\n+++ userText\n--- userText\n context\ndiff --git a/next b/next\n--- a/next\n+++ b/next\n@@ -1 +1 @@\n+new\n-old";
  const item=projectItem({id:"f",type:"fileChange",changes:[{path:"src/file.ts",kind:{type:"update"},diff}]},turn)!;assert.equal(item.files?.[0]?.additions,3);assert.equal(item.files?.[0]?.deletions,3);
 });
+
+test("YAML block scalarの既知credential値も次行へ残さない",()=>{
+ for(const indicator of ['|','|-','>','>+']){
+  const text=`AWS_SECRET_ACCESS_KEY: ${indicator}\n  sensitive-placeholder\nnext: public`;
+  assert.ok(!sanitizeObservationText(text).includes('sensitive-placeholder'));
+ }
+});
