@@ -16,7 +16,28 @@ const identifier=(x:unknown):string|undefined=>typeof x==="string"&&/^[a-zA-Z0-9
 /** 識別子全体を採り、provider prefix/version suffixを含む既知credential名を共通判定する。 */
 function credentialFields(text:string):RegExpMatchArray[] {
   return [...text.matchAll(/\b([A-Za-z_][A-Za-z0-9_-]*(?:[ ]+key)?)\b["']?\s*[:=]/gi)]
-    .filter(match=>/(?:token|password|secret|apikey|authorization|cookie|credential|accesskey|privatekey)/i.test(match[1]!.replace(/[_ -]/g,"")));
+    .filter(match=>{const key=match[1]!.replace(/[_ -]/g,"").toLowerCase();return /(?:token|password|passwd|passphrase|secret|apikey|authorization|cookie|credential|accesskey|privatekey)/.test(key)||key==="auth"||key==="rediscliauth"||key==="npmconfigauth"||key==="sshpass"||key.endsWith("pwd");});
+}
+/** 既知CLIの認証optionを検出する表示用検査。shellとして評価せず、該当fieldを保守的に省略する。 */
+function hasCredentialCli(text:string):boolean {
+  const tools:[RegExp,string,Set<string>,string][]=[
+    [/\bcurl\b/,"uUHbEx",new Set(["user","proxy-user","oauth2-bearer","header","proxy-header","cookie","cert","pass","proxy","preproxy","proxy1.0","proxy-cert","proxy-pass","tlspassword","proxy-tlspassword","tlsuser","proxy-tlsuser","socks4","socks4a","socks5","socks5-hostname"]),"sSfvkLIOiNgq#012346"],
+    [/\b(?:mysql|mariadb|mysqldump|mysqladmin)\b/,"p",new Set(["password","password1","password2","password3"]),"vVqfBCNnstW"],
+    [/\bredis-cli\b/,"a",new Set(["pass"]),"cvr"],
+    [/\bsshpass\b/,"p",new Set([]),"vV"],
+  ];
+  for(const [tool,sensitive,longFlags,noValue] of tools){
+    if(!tool.test(text))continue;
+    for(const raw of text.split(/\s+/)){
+      const token=raw.replace(/^["'`]+|["'`;`]+$/g,"");
+      if(token.startsWith("--")){if(longFlags.has(token.slice(2).split("=")[0]!))return true;continue;}
+      if(!token.startsWith("-")||token==="-")continue;
+      // -sSuVALUE等のclusterを認識。-XGETのGETをoptionと誤読しない。
+      for(const flag of token.slice(1)){if(sensitive.includes(flag))return true;if(!noValue.includes(flag))break;}
+    }
+    if(tool.source.includes("redis-cli")&&/\bAUTH[ \t]+\S+/i.test(text))return true;
+  }
+  return false;
 }
 function unescapeObservationText(value:string):string {
   return value.replace(/\\+u([0-9a-f]{4})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16))).replace(/\\\//g,"/").replace(/\\+(["'])/g,"$1");
@@ -37,7 +58,9 @@ function decodedObservationText(value:string,inspect?:(stage:string)=>void):stri
 export function sanitizeObservationText(value:string,limit=8192):string {
   if(value.length>131072)return "[上限を超える内容を省略]";
   let text=value.replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|$))/g,"").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g,"");
-  const decodedText=decodedObservationText(text);
+  let credentialCli=false;
+  const decodedText=decodedObservationText(text,stage=>{if(hasCredentialCli(stage))credentialCli=true;});
+  if(credentialCli)return "[認証optionを含む内容を省略]";
   if(/\\+(?:u[0-9a-f]{4}|["'/])|%[0-9a-f]{2}/i.test(decodedText))return "[多重encodeされた内容を省略]";
   // YAML tag/anchor/commentや複数行scalarも含め、既知credential assignmentがあるfield全体を省略する。
   if(credentialFields(decodedText).length>0)return "[機密情報を含む内容を省略]";

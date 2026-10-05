@@ -143,3 +143,21 @@ test("URI userinfoはJSON/percent各層の区切り変化前に検査する",()=
  }
  const publicUri=encodeURIComponent('postgres://db.internal/app');assert.equal(sanitizeObservationText(publicUri),publicUri);
 });
+
+test("既知password別名のassignmentを省略しauthor等の通常fieldは保持する",()=>{
+ for(const key of ["MYSQL_PWD","REDISCLI_AUTH","NPM_CONFIG__AUTH","_auth","SSHPASS","AUTH","passwd","DB_PASSWD","PG_PASSPHRASE","service_pwd"]){
+  for(const text of [`${key}=sensitive-placeholder`,JSON.stringify({[key]:"sensitive-placeholder"}),`${key}: | # value\n  sensitive-placeholder`])assert.ok(!sanitizeObservationText(text).includes("sensitive-placeholder"));
+ }
+ assert.equal(sanitizeObservationText('author="alice"\nAUTHORS=3'),'author="alice"\nAUTHORS=3');
+});
+test("既知CLIの認証optionはshort/cluster/long/JSON形式を保守的に省略する",()=>{
+ const commands=[
+  ...["-u alice:sensitive-placeholder","-ualice:sensitive-placeholder","-sSualice:sensitive-placeholder","-Ualice:sensitive-placeholder","-H X-Custom:sensitive-placeholder","-b session=sensitive-placeholder","-E cert.pem:sensitive-placeholder","-x alice:sensitive-placeholder@proxy","--user=alice:sensitive-placeholder","--proxy-user alice:sensitive-placeholder","--oauth2-bearer sensitive-placeholder","--proxy-header X-Custom:sensitive-placeholder","--cookie session=sensitive-placeholder","--cert cert.pem:sensitive-placeholder","--pass sensitive-placeholder","--proxy alice:sensitive-placeholder@proxy","--proxy-cert cert.pem:sensitive-placeholder","--proxy-pass sensitive-placeholder","--tlspassword sensitive-placeholder","--proxy-tlspassword sensitive-placeholder"].map(flags=>`curl ${flags} https://example.com`),
+  "mysql -psensitive-placeholder","mysql --password=sensitive-placeholder","mysql -vvpsensitive-placeholder","redis-cli -a sensitive-placeholder PING","redis-cli --pass=sensitive-placeholder PING","redis-cli AUTH sensitive-placeholder","sshpass -p sensitive-placeholder ssh host",
+ ];
+ for(const command of commands)for(const text of [command,JSON.stringify({command}),encodeURIComponent(command)]){
+  assert.ok(!sanitizeObservationText(text).includes("sensitive-placeholder"),command);
+  assert.ok(!JSON.stringify(projectItem({id:"cmd",type:"commandExecution",command:text,aggregatedOutput:text},turn)).includes("sensitive-placeholder"),command);
+ }
+ for(const command of ["npm test","git diff --stat","curl -sS https://example.com","curl -XGET https://example.com","mysql --version","redis-cli -p 6379 PING"])assert.equal(sanitizeObservationText(command),command);
+});
