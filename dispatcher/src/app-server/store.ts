@@ -9,6 +9,7 @@ export interface AgentRecord {
   state:"starting"|"idle"|"working"|"waiting"|"interrupted"|"unknown"|"stopped";
   request_hash:string; config_json:string; sequence:number;
   startup_ready?:boolean;
+  startup_state?:"not_sent"|"sending"|"ready";
   recovery_hint?:{reason:"capacity_wait"|"authorization_required"|"configuration_error";retry_after?:string};
 }
 export interface QuestionRecord {
@@ -25,7 +26,9 @@ export class RuntimeStore {
     if(fs.existsSync(file)&&fs.lstatSync(file).isSymbolicLink())throw Error("runtime_database_symlink");
     this.db=new Database(file);fs.chmodSync(file,0o600);
     this.db.pragma("journal_mode=WAL");this.db.pragma("synchronous=FULL");this.db.pragma("busy_timeout=5000");
-    this.db.exec(`CREATE TABLE IF NOT EXISTS agents(
+    this.db.exec(`CREATE TABLE IF NOT EXISTS observation_item_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),sequence INTEGER NOT NULL);
+      INSERT OR IGNORE INTO observation_item_sequence VALUES(1,0);
+      CREATE TABLE IF NOT EXISTS agents(
       name TEXT PRIMARY KEY,generation TEXT NOT NULL,role TEXT NOT NULL,cwd TEXT NOT NULL,release TEXT NOT NULL,
       thread_id TEXT,turn_id TEXT,pid INTEGER,process_start TEXT,state TEXT NOT NULL,
       request_hash TEXT NOT NULL,config_json TEXT NOT NULL,sequence INTEGER NOT NULL DEFAULT 0);
@@ -39,7 +42,14 @@ export class RuntimeStore {
       CREATE TABLE IF NOT EXISTS observation_items(agent TEXT NOT NULL,generation TEXT NOT NULL,item_id TEXT NOT NULL,item_json TEXT NOT NULL,observed_at TEXT NOT NULL,PRIMARY KEY(agent,generation,item_id));
       CREATE TABLE IF NOT EXISTS observation_events(sequence INTEGER PRIMARY KEY AUTOINCREMENT,agent TEXT NOT NULL,generation TEXT NOT NULL,observed_at TEXT NOT NULL,event_json TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS observation_scope ON observation_events(agent,generation,sequence);
+      CREATE INDEX IF NOT EXISTS observation_expiry ON observation_events(observed_at);
       CREATE TABLE IF NOT EXISTS observation_cursors(agent TEXT NOT NULL,generation TEXT NOT NULL,last_sequence INTEGER NOT NULL DEFAULT 0,discarded_through INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(agent,generation));`);
+    if(!(this.db.prepare("PRAGMA table_info(observation_items)").all() as {name:string}[]).some(c=>c.name==="sequence")){
+      this.db.exec("ALTER TABLE observation_items ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0");
+      this.db.prepare("UPDATE observation_items SET sequence=rowid").run();
+      this.db.prepare("UPDATE observation_item_sequence SET sequence=COALESCE((SELECT MAX(sequence) FROM observation_items),0)").run();
+    }
+    this.expireObservations();
   }
   agent(name:string):AgentRecord|undefined {return this.db.prepare("SELECT * FROM agents WHERE name=?").get(name) as AgentRecord|undefined;}
   agents():AgentRecord[] {return this.db.prepare("SELECT * FROM agents ORDER BY name").all() as AgentRecord[];}
@@ -58,14 +68,15 @@ export class RuntimeStore {
   addQuestion(row:QuestionRecord):void{this.db.prepare("INSERT INTO questions VALUES(@question_id,@agent,@generation,@thread_id,@turn_id,@rpc_id_json,@kind,@payload_json,@state,@answer_hash,@created_at)").run(row);}
   cacheItem(agent:string,generation:string,item:ConversationItem):void {
     this.db.transaction(()=>{
-      this.db.prepare("INSERT INTO observation_items VALUES(?,?,?,?,?) ON CONFLICT(agent,generation,item_id) DO UPDATE SET item_json=excluded.item_json,observed_at=excluded.observed_at").run(agent,generation,`${item.turn_id}:${item.id}`,JSON.stringify(item),new Date().toISOString());
-      const rows=this.db.prepare("SELECT item_id,length(CAST(item_json AS BLOB)) AS bytes FROM observation_items WHERE agent=? AND generation=? ORDER BY observed_at DESC,item_id DESC").all(agent,generation) as {item_id:string;bytes:number}[];
+      const sequence=(this.db.prepare("UPDATE observation_item_sequence SET sequence=sequence+1 WHERE singleton=1 RETURNING sequence").get() as {sequence:number}).sequence;
+      this.db.prepare("INSERT INTO observation_items(agent,generation,item_id,item_json,observed_at,sequence) VALUES(?,?,?,?,?,?) ON CONFLICT(agent,generation,item_id) DO UPDATE SET item_json=excluded.item_json,observed_at=excluded.observed_at,sequence=excluded.sequence").run(agent,generation,`${item.turn_id}:${item.id}`,JSON.stringify(item),new Date().toISOString(),sequence);
+      const rows=this.db.prepare("SELECT item_id,length(CAST(item_json AS BLOB)) AS bytes FROM observation_items WHERE agent=? AND generation=? ORDER BY sequence DESC").all(agent,generation) as {item_id:string;bytes:number}[];
       let bytes=0;for(let i=0;i<rows.length;i++){bytes+=rows[i]!.bytes;if(i>=200||bytes>524288)this.db.prepare("DELETE FROM observation_items WHERE agent=? AND generation=? AND item_id=?").run(agent,generation,rows[i]!.item_id);}
     }).immediate();
   }
   cachedItems(agent:string,generation:string):ConversationItem[] {
     this.db.prepare("DELETE FROM observation_items WHERE observed_at<?").run(new Date(Date.now()-86400_000).toISOString());
-    return (this.db.prepare("SELECT item_json FROM observation_items WHERE agent=? AND generation=? ORDER BY observed_at,item_id").all(agent,generation) as {item_json:string}[]).map(r=>JSON.parse(r.item_json) as ConversationItem);
+    return (this.db.prepare("SELECT item_json FROM observation_items WHERE agent=? AND generation=? ORDER BY sequence").all(agent,generation) as {item_json:string}[]).map(r=>JSON.parse(r.item_json) as ConversationItem);
   }
   observe(agent:string,generation:string,event:Omit<ObservationEvent,"sequence"|"observed_at">):void {
     this.db.transaction(()=>{
@@ -73,6 +84,14 @@ export class RuntimeStore {
       const seq=Number(this.db.prepare("INSERT INTO observation_events(agent,generation,observed_at,event_json) VALUES(?,?,?,?)").run(agent,generation,now,JSON.stringify(event)).lastInsertRowid);
       this.db.prepare("INSERT INTO observation_cursors(agent,generation,last_sequence) VALUES(?,?,?) ON CONFLICT(agent,generation) DO UPDATE SET last_sequence=excluded.last_sequence").run(agent,generation,seq);
       this.pruneObservations(agent,generation);
+    }).immediate();
+  }
+  expireObservations():void {
+    this.db.transaction(()=>{
+      const cutoff=new Date(Date.now()-86400_000).toISOString();
+      this.db.prepare("UPDATE observation_cursors SET discarded_through=MAX(discarded_through,COALESCE((SELECT MAX(sequence) FROM observation_events e WHERE e.agent=observation_cursors.agent AND e.generation=observation_cursors.generation AND observed_at<?),0)) WHERE EXISTS (SELECT 1 FROM observation_events e WHERE e.agent=observation_cursors.agent AND e.generation=observation_cursors.generation AND observed_at<?)").run(cutoff,cutoff);
+      this.db.prepare("DELETE FROM observation_events WHERE observed_at<?").run(cutoff);
+      this.db.prepare("DELETE FROM observation_items WHERE observed_at<?").run(cutoff);
     }).immediate();
   }
   pruneObservations(agent:string,generation:string):void {
@@ -88,8 +107,9 @@ export class RuntimeStore {
       this.pruneObservations(agent,generation);
       const watermark=this.db.prepare("SELECT last_sequence,discarded_through FROM observation_cursors WHERE agent=? AND generation=?").get(agent,generation) as {last_sequence:number;discarded_through:number}|undefined;
       const rows=this.db.prepare("SELECT * FROM observation_events WHERE agent=? AND generation=? AND sequence>? ORDER BY sequence LIMIT 1000").all(agent,generation,after??0) as {sequence:number;observed_at:string;event_json:string}[];
-      const events=rows.map(r=>({...JSON.parse(r.event_json),sequence:r.sequence,observed_at:r.observed_at} as ObservationEvent));
-      return {events,cursor:watermark?.last_sequence??0,oldest_sequence:(this.db.prepare("SELECT MIN(sequence) AS seq FROM observation_events WHERE agent=? AND generation=?").get(agent,generation) as {seq:number|null}).seq??watermark?.last_sequence??0,gap:(after??0)<(watermark?.discarded_through??0)||(after!==undefined&&after>(watermark?.last_sequence??0))||events.some(e=>e.kind==="gap")};
+      const events:ObservationEvent[]=[];let bytes=0,clipped=false;
+      for(const row of rows){const event={...JSON.parse(row.event_json),sequence:row.sequence,observed_at:row.observed_at} as ObservationEvent;bytes+=Buffer.byteLength(JSON.stringify(event));if(bytes>262144){clipped=true;break;}events.push(event);}
+      return {events,cursor:clipped?events.at(-1)?.sequence??after??0:watermark?.last_sequence??0,oldest_sequence:(this.db.prepare("SELECT MIN(sequence) AS seq FROM observation_events WHERE agent=? AND generation=?").get(agent,generation) as {seq:number|null}).seq??watermark?.last_sequence??0,gap:clipped||(after??0)<(watermark?.discarded_through??0)||(after!==undefined&&after>(watermark?.last_sequence??0))||events.some(e=>e.kind==="gap")};
     }).immediate();
   }
   close():void{this.db.close();}
