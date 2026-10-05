@@ -1,3 +1,4 @@
+import {commandRejectionSchema} from './operator-rejection.js';
 import http from "node:http";
 import {OperatorStream} from "./operator-stream.js";
 import fs from "node:fs";
@@ -119,7 +120,7 @@ export class DashboardServer {
       if(req.method==='POST'&&url.pathname==='/api/approvals/decide'&&!url.search){
         const body=await this.body(req);if(Object.keys(body).some(key=>!['ceremony_id','response'].includes(key)))throw Error('body_invalid');
         const result=await this.options.backend.call('external/decide',{...body,token});
-        if(!await recheck())return;this.reply(res,200,result);return;
+        if(!await recheck())return;this.reply(res,commandRejectionSchema.safeParse(result).success?409:200,result);return;
       }
       const external=/^\/api\/approvals\/([A-Za-z0-9_-]{1,128})(?:\/(options|status))?$/.exec(url.pathname);
       if(external&&!url.search&&((req.method==='GET'&&external[2]!=='options')||(req.method==='POST'&&external[2]==='options'))){
@@ -133,7 +134,7 @@ export class DashboardServer {
         const body=await this.body(req);
         if(Object.keys(body).some(key=>!(native[1]==='options'?['input']:['ceremony_id','response']).includes(key)))throw Error('body_invalid');
         const result=await this.options.backend.call('native/'+native[1],{...body,token});
-        if(!await recheck())return;this.reply(res,200,result);return;
+        if(!await recheck())return;this.reply(res,commandRejectionSchema.safeParse(result).success?409:200,result);return;
       }
       const credential=/^\/api\/credential(?:\/(options|register))?$/.exec(url.pathname);
       if(credential&&!url.search&&((!credential[1]&&req.method==='GET')||(credential[1]&&req.method==='POST'))){
@@ -146,7 +147,7 @@ export class DashboardServer {
       if(req.method==='POST'&&url.pathname==='/api/tasks'&&!url.search){
         const input=await this.body(req);
         const result=await this.options.backend.call('commands/create',{token,input});
-        if(!await recheck())return;this.reply(res,200,result);return;
+        if(!await recheck())return;this.reply(res,commandRejectionSchema.safeParse(result).success?409:200,result);return;
       }
       const command=/^\/api\/tasks\/([A-Za-z0-9_-]{1,128})\/(cancel|questions\/([A-Za-z0-9_-]{1,128})\/reply)$/.exec(url.pathname);
       if(command&&req.method==='POST'&&!url.search){
@@ -154,7 +155,7 @@ export class DashboardServer {
         if('task_id' in input||'question_id' in input)throw Error('body_invalid');
         const operation=command[2]==='cancel'?'cancel':'question_reply';
         const result=await this.options.backend.call('commands/'+operation,{token,input:{...input,task_id:command[1],...(command[3]?{question_id:command[3]}:{})}});
-        if(!await recheck())return;this.reply(res,200,result);return;
+        if(!await recheck())return;this.reply(res,commandRejectionSchema.safeParse(result).success?409:200,result);return;
       }
       const receipt=/^\/api\/commands\/([A-Za-z0-9_-]{1,128})$/.exec(url.pathname);
       if(req.method==='GET'&&receipt){

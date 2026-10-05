@@ -181,7 +181,7 @@ async function credentialStatus() {
 }
 async function credentialPost(url,body) {
   if(!csrf)throw Error();const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);
-  try{const response=await fetch(url,{method:'POST',credentials:'same-origin',redirect:'error',signal:controller.signal,headers:{'content-type':'application/json','x-csrf-token':csrf},body:JSON.stringify(body)});if(!response.ok)throw Error();return await response.json();}finally{clearTimeout(timer);}
+  try{const response=await fetch(url,{method:'POST',credentials:'same-origin',redirect:'error',signal:controller.signal,headers:{'content-type':'application/json','x-csrf-token':csrf},body:JSON.stringify(body)});const value=await response.json();if(!response.ok&&!(response.status===409&&value?.rejection?.not_committed===true))throw Error();return value;}finally{clearTimeout(timer);}
 }
 byId('credential-register').addEventListener('click',async()=>{const button=byId('credential-register'),epoch=authEpoch;button.disabled=true;
   try {const ceremony=await credentialPost('/api/credential/options',{});if(epoch!==authEpoch)return;const json=ceremony.options;
@@ -194,7 +194,11 @@ byId('credential-register').addEventListener('click',async()=>{const button=byId
 });
 function savePending(value) {pending=value;try{if(value)sessionStorage.setItem('dona.pending-command',JSON.stringify(value));else sessionStorage.removeItem('dona.pending-command');}catch{}showPending();}
 function showPending() {byId('reconcile').hidden=!pending;byId('submit-task').disabled=!!pending;if(pending)byId('command-status').textContent='受付を照合する操作があります。自動で再送しません。受付ID: '+pending.request_id;}
+function rejected(value,requestId,operation) {
+  const r=value?.rejection;return r?.not_committed===true&&r.request_id===requestId&&r.operation===operation&&['invalid','conflict','unavailable'].includes(r.code);
+}
 function accepted(value) {
+  if(pending&&rejected(value,pending.request_id,pending.operation)){savePending(null);byId('command-status').textContent='この操作は受け付けられませんでした。最新の内容を確認して、改めて操作してください。';if(selected)void detailRead();return;}
   if(!value?.receipt || !pending || value.receipt.request_id!==pending.request_id || value.receipt.operation!==pending.operation)throw Error();
   const receipt=value.receipt;savePending(null);byId('command-status').textContent=(receipt.operation==='cancel'?'取消を受け付けました。停止完了はTaskの状態で確認してください。':receipt.operation==='question_reply'?'回答を受け付けました。Donaがワーカーへ届けます。':receipt.operation==='native_approval'?'承認判断を受け付けました。ワーカーへの反映はTaskの状態で確認してください。':'依頼を受け付けました。')+' Task: '+receipt.task_id;
   if(capabilities.includes('tasks:read')){selected=receipt.task_id;selectedAttempt=null;selectedMain=null;rememberSelection();void detailRead();}
@@ -211,7 +215,7 @@ async function command(url,operation,input,button) {
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);
   try {const response=await fetch(url,{method:'POST',credentials:'same-origin',redirect:'error',signal:controller.signal,headers:{'content-type':'application/json','x-csrf-token':csrf},body:JSON.stringify({...input,request_id})});
     if(epoch!==authEpoch)return;if(response.status===401||response.status===403){clearPrivate('操作の権限を確認できません。受付IDを保存しています。',true);return;}
-    if(!response.ok)throw Error();accepted(await response.json());
+    const value=await response.json();if(!response.ok&&!(response.status===409&&rejected(value,request_id,operation)))throw Error();accepted(value);
   }catch {if(epoch===authEpoch)await reconcile();}finally{clearTimeout(timer);button.disabled=!!pending;}
 }
 async function loadQuestions(taskId,target) {
@@ -345,6 +349,7 @@ async function externalDecide(decision) {
     const credential=await navigator.credentials.get({publicKey});if(epoch!==authEpoch||selection!==externalEpoch||!credential)return;
     const response=typeof credential.toJSON==='function'?credential.toJSON():{id:credential.id,rawId:toBase64(credential.rawId),type:credential.type,clientExtensionResults:credential.getClientExtensionResults(),response:{clientDataJSON:toBase64(credential.response.clientDataJSON),authenticatorData:toBase64(credential.response.authenticatorData),signature:toBase64(credential.response.signature),userHandle:credential.response.userHandle?toBase64(credential.response.userHandle):null}};
     sent=true;const result=await credentialPost('/api/approvals/decide',{ceremony_id:ceremony.ceremony_id,response});if(epoch!==authEpoch)return;
+    if(rejected(result,id,'external_approval')){if(externalPending===id)externalSavePending(null);byId('external-status').textContent='この判断は受け付けられませんでした。最新の内容を確認して、改めて判断してください。';if(selection===externalEpoch)void externalRead(true);return;}
     if(['decided','reused'].includes(result.status))externalTracked=id;
     byId('external-status').textContent=['decided','reused'].includes(result.status)?'判断を受け付けました。外部操作の実行成功はまだ確認していません。':'判断の受理を確認できません。';await externalStatus();
   }catch(error){if(epoch!==authEpoch)return;if(!sent)byId('external-status').textContent='承認操作が中断されたため、判断は送信していません。';else await externalStatus();}

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import {rejectedCommand} from "./operator-rejection.js";
 import type { DispatcherDatabase } from "../database.js";
 import { OperatorAuthError } from "./operator-auth.js";
 import type { RegistrationResponseJSON } from "@simplewebauthn/server";
@@ -31,7 +32,9 @@ export async function operatorRequest(database:DispatcherDatabase, route:string,
   if(route.startsWith('commands/')) {
     if(!context)throw new OperatorAuthError('denied');
     const body=z.strictObject({token:z.string().max(128),input:z.unknown()}).parse(input);
-    const result=operatorCommand(database,context,{...body,operation:route.slice('commands/'.length)});
+    let result;
+    try {result=operatorCommand(database,context,{...body,operation:route.slice('commands/'.length)});}
+    catch(error){return rejectedCommand(database,body.token,route.slice('commands/'.length),body.input,error);}
     if(route!=='commands/receipt')context.wake();
     return result;
   }

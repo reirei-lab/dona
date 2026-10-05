@@ -59,3 +59,17 @@ test('Slack起点Taskには取消と通常質問を出さずnative承認の取�
  await page.goto('https://operator.test/');await page.getByRole('button',{name:'Slack依頼 · 待機中'}).click();await expect(page.locator('#detail h2')).toHaveText('Slack依頼');
  await expect.poll(()=>nativeReads).toBe(1);await expect(page.getByRole('button',{name:'このTaskを取り消す'})).toHaveCount(0);await expect(page.getByRole('button',{name:'回答をDonaに送る'})).toHaveCount(0);
 });
+
+for(const responseKind of ['rejected','unknown','wrong-request'] as const)test(`確定拒否だけが新規依頼を可能にする: ${responseKind}`,async({page})=>{
+ let posts=0,lookups=0;
+ await page.route('https://operator.test/**',async route=>{const url=new URL(route.request().url());if(url.pathname==='/'){await route.fulfill(observerDashboardPage());return;}let value:unknown;let status=200;
+  if(url.pathname==='/api/session')value={csrf:'csrf',capabilities:['tasks:submit']};
+  else if(url.pathname==='/api/tasks'){posts++;const body=route.request().postDataJSON();status=responseKind==='unknown'?503:409;value=responseKind==='unknown'?{error:'observation_unavailable'}:{rejection:{request_id:responseKind==='wrong-request'?'other':body.request_id,operation:'create',code:'invalid',not_committed:true}};}
+  else if(url.pathname.startsWith('/api/commands/')){lookups++;value={receipt:null};}
+  else throw Error(url.pathname);
+  await route.fulfill({status,contentType:'application/json',body:JSON.stringify(value)});
+ });
+ await page.goto('https://operator.test/');await page.getByLabel('Donaへの依頼').fill('依頼');const button=page.getByRole('button',{name:'依頼する',exact:true});await button.click();
+ if(responseKind==='rejected'){await expect(page.locator('#command-status')).toContainText('受け付けられませんでした');await expect(button).toBeEnabled();await button.click();await expect.poll(()=>posts).toBe(2);expect(lookups).toBe(0);}
+ else{await expect(page.locator('#command-status')).toContainText('まだ確認できません');await expect(button).toBeDisabled();expect(posts).toBe(1);}
+});

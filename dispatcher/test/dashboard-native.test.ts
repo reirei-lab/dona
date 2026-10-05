@@ -42,9 +42,37 @@ test('署名後にnative要求が変わった場合はeventを作らず、権限
   const f=await fixture();try{
     const options=await operatorRequest(f.db,'native/options',{token:f.pair.token,input:f.input},f.context) as {ceremony_id:string;options:{challenge:string}};
     f.q.payload_json=JSON.stringify({command:'changed'});
-    await assert.rejects(operatorRequest(f.db,'native/decide',{token:f.pair.token,ceremony_id:options.ceremony_id,response:f.device.assert(options.options.challenge)},f.context));
+    const rejected=await operatorRequest(f.db,'native/decide',{token:f.pair.token,ceremony_id:options.ceremony_id,response:f.device.assert(options.options.challenge)},f.context);
+    assert.deepEqual(rejected,{rejection:{request_id:'decision',operation:'native_approval',code:'conflict',not_committed:true}});
     assert.equal(f.db.getLocalDashboardReceipt(f.authority,'decision'),undefined);assert.equal(f.wakes(),0);
     f.auth.revoke(f.pair.session.device_id);
     await assert.rejects(operatorRequest(f.db,'native/options',{token:f.pair.token,input:f.input},f.context));
   }finally{await f.close();}
+});
+
+test('native判断のcommit後のwake失敗は確定拒否にせずreceiptを保持する',async()=>{
+ const f=await fixture();try{
+  const options=await operatorRequest(f.db,'native/options',{token:f.pair.token,input:f.input},f.context) as {ceremony_id:string;options:{challenge:string}};
+  await assert.rejects(operatorRequest(f.db,'native/decide',{token:f.pair.token,ceremony_id:options.ceremony_id,response:f.device.assert(options.options.challenge)},{...f.context,wake(){throw Error('after_commit');}}),/after_commit/);
+  assert.equal(f.db.getLocalDashboardReceipt(f.authority,'decision')?.operation,'native_approval');
+ }finally{await f.close();}
+});
+test('未消費ceremonyの期限切れは判断未受理として返し、receiptを作らない',async t=>{
+ const f=await fixture();try{
+  const options=await operatorRequest(f.db,'native/options',{token:f.pair.token,input:f.input},f.context) as {ceremony_id:string;options:{challenge:string}};
+  const now=performance.now.bind(performance);t.mock.method(performance,'now',()=>now()+121000);
+  const result=await operatorRequest(f.db,'native/decide',{token:f.pair.token,ceremony_id:options.ceremony_id,response:f.device.assert(options.options.challenge)},f.context);
+  assert.deepEqual(result,{rejection:{request_id:'decision',operation:'native_approval',code:'conflict',not_committed:true}});
+  assert.equal(f.db.getLocalDashboardReceipt(f.authority,'decision'),undefined);
+ }finally{t.mock.restoreAll();await f.close();}
+});
+test('同じceremonyの並行送信は二つ目を未受理と断言せず、先行判断を一度だけ保存する',async()=>{
+ const f=await fixture();try{
+  const options=await operatorRequest(f.db,'native/options',{token:f.pair.token,input:f.input},f.context) as {ceremony_id:string;options:{challenge:string}};
+  let release!:()=>void,arrived!:()=>void;const gate=new Promise<void>(r=>{release=r;}),entered=new Promise<void>(r=>{arrived=r;});
+  const body={token:f.pair.token,ceremony_id:options.ceremony_id,response:f.device.assert(options.options.challenge)};
+  const first=operatorRequest(f.db,'native/decide',body,{...f.context,readQuestions:async()=>{arrived();await gate;return[f.q];}});
+  await entered;await assert.rejects(operatorRequest(f.db,'native/decide',body,f.context));release();
+  const result=await first as {receipt:{operation:string}};assert.equal(result.receipt.operation,'native_approval');assert.equal(f.wakes(),1);
+ }finally{await f.close();}
 });

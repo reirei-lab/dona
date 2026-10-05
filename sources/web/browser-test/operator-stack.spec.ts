@@ -23,6 +23,12 @@ test('実HTTPS browserから実Dispatcherへ依頼・取消・質問を送り、
   await page.getByLabel('接続コード').fill(issued.body.code);await page.getByRole('button',{name:'この端末を接続する',exact:true}).click();
   await page.getByLabel('Donaへの依頼').fill('ブラウザからの依頼');await page.getByRole('button',{name:'依頼する',exact:true}).click();
   await expect(page.locator('#command-status')).toContainText('依頼を受け付けました');expect(posts).toBe(1);expect(f.db.tasks.scanSnapshot()).toHaveLength(1);
+  // Browser submits a stale revision through the real HTTP/BFF/Dispatcher path.
+  let stale=true;
+  await page.route('**/cancel',async route=>{if(stale){stale=false;const input=route.request().postDataJSON();await route.continue({postData:JSON.stringify({...input,revision:input.revision+1})});}else await route.continue();});
+  page.once('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'このTaskを取り消す'}).click();
+  await expect(page.locator('#command-status')).toContainText('受け付けられませんでした');await expect(page.getByRole('button',{name:'このTaskを取り消す'})).toBeEnabled();
+  expect(f.db.tasks.scanSnapshot()[0]!.desired_state).toBe('running');
   page.once('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'このTaskを取り消す'}).click();await expect(page.locator('#command-status')).toContainText('取消を受け付けました');expect(f.db.tasks.scanSnapshot()[0]!.state).toBe('cancelled');
   await page.getByLabel('Donaへの依頼').fill('質問を必要とする依頼');await page.getByRole('button',{name:'依頼する',exact:true}).click();await expect(page.locator('#command-status')).toContainText('依頼を受け付けました');expect(posts).toBe(2);
   const active=f.db.tasks.scanSnapshot().find(task=>task.desired_state==='running')!;const pending=f.startQuestion(active.task_id,'question','browser_question');

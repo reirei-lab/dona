@@ -1,3 +1,4 @@
+import {rejectedCommand} from "./operator-rejection.js";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { AuthenticationResponseJSON } from "@simplewebauthn/server";
@@ -42,14 +43,20 @@ export async function operatorNativeRequest(database:DispatcherDatabase,context:
   }
   if(route!=='decide')throw new OperatorAuthError('invalid');
   const body=z.strictObject({token:z.string().max(128),ceremony_id:z.string().uuid(),response:z.record(z.string(),z.unknown())}).parse(raw);
-  const map=requests(database),saved=map.get(body.ceremony_id);
+  // Keep an expired, unconsumed ceremony long enough to report a precommit rejection.
+  const map=pending.get(database),saved=map?.get(body.ceremony_id);
   if(!saved||saved.token!==body.token)throw new OperatorAuthError('denied');
-  const proof=await security.verify(body.token,body.ceremony_id,body.response as unknown as AuthenticationResponseJSON);
+  // Consume before any await: duplicate ceremony requests cannot race a commit.
+  map!.delete(body.ceremony_id);
+  let proof;
+  try {proof=await security.verify(body.token,body.ceremony_id,body.response as unknown as AuthenticationResponseJSON);
   if(await current(database,context,body.token,saved.input)!==saved.intent.presentation_digest)throw new OperatorAuthError('conflict');
-  const result=operatorNativeApproval(database,{token:body.token,input:saved.input},(authority,_input,commit)=>{
+  }catch(error){return rejectedCommand(database,body.token,'native_approval',saved.input,error,true);}
+  let result,commitStarted=false;
+  try {result=operatorNativeApproval(database,{token:body.token,input:saved.input},(authority,_input,commit)=>{
     if(!security.verifyReceipt(proof,saved.intent,'approvals:native')||authority.device_id!==proof.device_id
       ||authority.instance_id!==proof.instance_id||authority.owner_id!==proof.owner_id||authority.grant_revision!==proof.grant_revision)throw new OperatorAuthError('denied');
-    return commit();
-  });
-  map.delete(body.ceremony_id);context.wake();return result;
+    commitStarted=true;return commit();
+  });}catch(error){return rejectedCommand(database,body.token,'native_approval',saved.input,error,!commitStarted);}
+  context.wake();return result;
 }

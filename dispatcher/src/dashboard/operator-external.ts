@@ -1,3 +1,5 @@
+import {ExternalApprovalPrecommitError} from '../approval/local-external-service.js';
+import {commandRejection} from './operator-rejection.js';
 import { z } from 'zod';
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server';
 import type { DispatcherDatabase } from '../database.js';
@@ -45,10 +47,22 @@ export async function operatorExternalRequest(database:DispatcherDatabase,contex
   }
   if(route!=='decide')throw new OperatorAuthError('invalid');
   const input=z.strictObject({token,ceremony_id:z.string().uuid(),response:z.record(z.string(),z.unknown())}).parse(raw);
-  const map=requests(database),saved=map.get(input.ceremony_id);
+  // Keep an expired, unconsumed ceremony long enough to report a precommit rejection.
+  const map=pending.get(database),saved=map?.get(input.ceremony_id);
   if(!saved||saved.token!==sessionToken)throw new OperatorAuthError('denied');
-  const proof=await security.verify(sessionToken,input.ceremony_id,input.response as unknown as AuthenticationResponseJSON);
+  map!.delete(input.ceremony_id);
+  const rejectBeforeDecision=()=>{
+    // A new validation failure must not hide a previously committed decision.
+    if(service.status(authority(),saved.intent.request_id).decision)throw Error('external_approval_reconciliation_required');
+    return commandRejection(saved.intent.request_id,'external_approval');
+  };
+  let proof;
+  try {proof=await security.verify(sessionToken,input.ceremony_id,input.response as unknown as AuthenticationResponseJSON);
   if(!security.verifyReceipt(proof,saved.intent,'approvals:external'))throw new OperatorAuthError('denied');
-  const result=await service.decide(authority(),proof);
-  authority();map.delete(input.ceremony_id);return result;
+  }catch {return rejectBeforeDecision();}
+  let result;
+  try {result=await service.decide(authority(),proof);}
+  catch(error){if(error instanceof ExternalApprovalPrecommitError)return rejectBeforeDecision();throw error;}
+  authority();
+  return result.status==='denied'?rejectBeforeDecision():result;
 }
