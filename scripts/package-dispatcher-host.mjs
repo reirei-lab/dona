@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // unsigned stagingのみ。署名はMac operatorが別途実行する。
 import fs from 'node:fs';import path from 'node:path';import {spawnSync} from 'node:child_process';import {fileURLToPath} from 'node:url';
+import {decodeProvisioningProfilePlist} from './dispatcher-host-profile.mjs';
 import {bundleId,sha256,profileContract,copyTree,plist,assertHostNodeMajor} from './dispatcher-host-artifact.mjs';
 const [build,release,destination,profilePath,team,group]=process.argv.slice(2);
 const root=fileURLToPath(new URL('../',import.meta.url));
@@ -12,8 +13,7 @@ try{
  if(manifest.schema_version!==1||manifest.arch!==process.arch||JSON.stringify(manifest.node)!==JSON.stringify(pin)||
  manifest.host_source_sha256!==sha256(Buffer.concat(['main.cc','bootstrap.inc'].map(name=>fs.readFileSync(path.join(root,'native/dispatcher-host',name)))))||manifest.binary_sha256!==sha256(binary))throw Error();
  const cms=spawnSync('/usr/bin/security',['cms','-D','-i',profilePath],{encoding:'utf8',maxBuffer:1024*1024});if(cms.status!==0)throw Error();
- const json=spawnSync('/usr/bin/plutil',['-convert','json','-o','-','-'],{input:cms.stdout,encoding:'utf8',maxBuffer:1024*1024});if(json.status!==0)throw Error();
- const ent=profileContract(JSON.parse(json.stdout),team,group);
+ const ent=profileContract(decodeProvisioningProfilePlist(cms.stdout),team,group);
  const releaseManifest=JSON.parse(fs.readFileSync(path.join(release,'release-manifest.json'),'utf8'));if(!/^[a-f0-9]{40}$/.test(releaseManifest.sha))throw Error();
  assertHostNodeMajor(releaseManifest.node_version,pin.version);
  fs.mkdirSync(destination,{mode:0o700});const app=path.join(destination,'DonaDispatcher.app'),contents=path.join(app,'Contents');

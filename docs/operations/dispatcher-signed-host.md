@@ -12,6 +12,44 @@ Bundle IDは `dev.dona.dispatcher.host`、Keychain groupは `<AppIdentifierPrefi
 
 profileは `Contents/embedded.provisionprofile`、entitlementsは `com.apple.application-identifier`、`com.apple.developer.team-identifier`、1個だけの `keychain-access-groups` とJIT許可。Hardened Runtimeを有効にする。library validation解除、DYLD injection、debug attach、unsigned executable memory許可は付けない。必要なnative dependencyは同じTeamで署名する。
 
+## 利用者がprofileを取得する手順
+
+2026-10-05にApple公式手順と本リポジトリのprofile contractを照合した。利用者が用意する最小成果物は、このMacの既存Developer ID Application identityを許可した `.provisionprofile` である。秘密鍵のexportや共有は不要。App Storeへのapp登録・提出も不要である。
+
+1. [Certificates, Identifiers & Profiles](https://developer.apple.com/account/resources/identifiers/list)で利用するTeamを確認する。Identifiers → ＋ → App IDsへ進み、DescriptionをDona用と分かる名前、Explicit Bundle IDを `dev.dona.dispatcher.host` とする。同じIDが自Teamに既に存在する場合は再作成せず確認する。他Teamに登録済みで使えない場合は、任意IDへ置換して進めずhostの固定identity変更として別途判断する。[AppleのApp ID登録手順](https://developer.apple.com/help/account/identifiers/register-an-app-id/)
+2. 必要なcapabilityはKeychain Sharingである。利用するaccess groupは `AppIdentifierPrefix.dev.dona.approval`。portalにKeychain Sharingの選択項目があれば有効にする。項目が独立表示されない場合も、生成profileの `keychain-access-groups` がそのgroupまたは同prefixの `*` を許可することを下記で確認する。App Groups、iCloud、Push、Data Protection checkboxを代用として有効にしない。Hardened Runtime/JITはhostの署名entitlementsで設定し、追加のAppサービスを要求しない。[対応capability](https://developer.apple.com/help/account/reference/supported-capabilities-macos/)、[Keychain共有](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps)
+3. Profiles → ＋ → Distributionの **Developer ID** → Continueで上のApp IDを選び、このMacで秘密鍵を保持する **Developer ID Application** certificateを選ぶ。profile名を付け、Generate → Downloadする。Mac App Development、Mac App Store、Developer ID Installerは今回の配備契約と異なる。Developer ID profileの作成画面でcertificateが出ない場合はTeam/権限を確認する。[Apple DTSによるprofile作成案内](https://developer.apple.com/forums/thread/700341)
+4. ダウンロードしたfileは最初 `~/Downloads/` に保存される。本人だけが管理する絶対path、例えば `/Users/<login>/Library/Application Support/Dona/signing/dispatcher.provisionprofile` に配置する。親directoryは0700、fileは0600、symlinkは使わず、active bundleへ直接上書きしない。profile自体に秘密鍵は含まれないが、全文や証明書・端末識別子はSlack/PRへ貼らない。Xcodeへのdouble-click登録はこのinstallerの必須条件ではない。
+5. ローカルterminalで `security find-identity -v -p codesigning` を確認し、選択したDeveloper ID Applicationのidentityが有効であることを照合する。出力はMac内に留める。既存identityが使えればcertificateを新設しない。証明書だけがあって秘密鍵がない状態やcloud-only identityは、現installerのlocal `codesign` で使えるとは扱わない。
+
+App ID/capabilityの変更にはAccount HolderまたはAdminが必要。Developer ID certificateの新規作成はAccount Holderが必要で、cloud-managed証明書には別の権限条件がある。権限不足、契約同意待ち、対象Teamを選べない場合はそのTeamの管理者へ依頼し、他Teamのprofile流用、development profile化、署名/entitlement検査の解除で続行しない。[App capabilityの権限](https://developer.apple.com/help/account/identifiers/enable-app-capabilities/)、[Developer ID certificateの権限](https://developer.apple.com/help/account/certificates/create-developer-id-certificates/)
+
+### ダウンロード後のread-only検証
+
+repository rootで次を実行する。`TEAM_ID`と`PREFIX.dev.dona.approval`はprivate設定に記録する実値へ置き換える。Team IDとAppIdentifierPrefixが同じとは推測しない。これはprofileの構造・期限・許可fieldの検証であり、署名済みartifactのOS起動許可やKeychain readyの証明ではない。
+
+```sh
+node --input-type=module - '/absolute/private/dispatcher.provisionprofile' TEAM_ID PREFIX.dev.dona.approval <<'JS'
+import {spawnSync} from 'node:child_process';
+import {decodeProvisioningProfilePlist} from './scripts/dispatcher-host-profile.mjs';
+import {profileContract} from './scripts/dispatcher-host-artifact.mjs';
+try {
+  const [file, team, group] = process.argv.slice(2);
+  const decoded = spawnSync('/usr/bin/security', ['cms', '-D', '-i', file], {
+    encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024,
+  });
+  if (decoded.status !== 0 || decoded.error) throw Error();
+  profileContract(decodeProvisioningProfilePlist(decoded.stdout), team, group);
+  console.log('profile_contract: verified');
+} catch {
+  console.error('profile_contract: unverified');
+  process.exitCode = 1;
+}
+JS
+```
+
+合格条件はmacOS platform、exact App IDとprefix、Team、許可group、未失効、`ProvisionsAllDevices:true`、debug許可なし。Date/Dataを含むprofile全体の `plutil -convert json` は使用しない。証明書とprofileを選んだ後のprivate署名設定JSON作成、build、署名、artifact doctorは配備担当が実施できる。profile取得だけで切替やKeychain provisionを開始せず、後述のexact plan承認・TTY確認へ進む。OSの最終検証は署名後の `doctor-dispatcher-host.mjs` と実host起動で行う。
+
 ## buildとstage
 
 以下はartifact準備だけで、署名、account変更、Keychain書込み、launchd操作を行わない。入力pathは絶対pathにする。

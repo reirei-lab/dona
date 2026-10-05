@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';import path from 'node:path';import {spawnSync} from 'node:child_process';
+import {decodeProvisioningProfilePlist} from './dispatcher-host-profile.mjs';
 import {bundleId,profileContract,assertNativeDoctor} from './dispatcher-host-artifact.mjs';
 const [app,expectedTeam,expectedGroup]=process.argv.slice(2);
 const result={artifact:'unverified',profile:'unverified',host:'not_started',native:'unverified',protected_state:'not_checked',slack:'not_checked',activation_allowed:false};
@@ -9,7 +10,7 @@ try {
  const c=path.join(app,'Contents'),contract=JSON.parse(fs.readFileSync(path.join(c,'Resources/host-contract.json'),'utf8'));
  if(contract.team!==expectedTeam||contract.group!==expectedGroup||contract.bundle_id!==bundleId)throw Error();
  run('/usr/bin/codesign',['--verify','--strict','--deep','--all-architectures','-R',`anchor apple generic and certificate leaf[subject.OU] = "${expectedTeam}" and identifier "${bundleId}"`,app]);result.artifact='verified';
- const profile=JSON.parse(run('/usr/bin/plutil',['-convert','json','-o','-','-'],run('/usr/bin/security',['cms','-D','-i',path.join(c,'embedded.provisionprofile')])));
+ const profile=decodeProvisioningProfilePlist(run('/usr/bin/security',['cms','-D','-i',path.join(c,'embedded.provisionprofile')]));
  const expected=profileContract(profile,expectedTeam,expectedGroup);
  const actual=JSON.parse(run('/usr/bin/plutil',['-convert','json','-o','-','-'],run('/usr/bin/codesign',['-d','--entitlements',':-',app])));
  for(const [key,value] of Object.entries(expected))if(JSON.stringify(actual[key])!==JSON.stringify(value))throw Error();

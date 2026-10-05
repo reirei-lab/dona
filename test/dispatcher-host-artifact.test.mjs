@@ -48,3 +48,11 @@ test('固定native smokeはmemory DBとkeytarロードだけを行い、native�
   fs.writeFileSync(path.join(sqlite,'index.cjs'),`throw Error('NODE_MODULE_VERSION mismatch')`);r=run();assert.equal(r.status,1);assert.equal(r.stdout,'');
  }finally{fs.rmSync(d,{recursive:true,force:true});}
 });
+
+test('実profile形式のDate/Dataを契約fieldだけへ投影し証明書や端末情報を返さない',async()=>{
+ const {decodeProvisioningProfilePlist}=await import('../scripts/dispatcher-host-profile.mjs');
+ const xml=plist(profile()).replace('<string>2099-01-01T00:00:00Z</string>','<date>2099-01-01T00:00:00Z</date>').replace('</dict></plist>','<key>DeveloperCertificates</key><array><data>ZmFrZS1jZXJ0aWZpY2F0ZQ==</data></array><key>ProvisionedDevices</key><array><string>PRIVATE-DEVICE</string></array><key>UUID</key><string>PRIVATE-PROFILE</string></dict></plist>');
+ const decoded=decodeProvisioningProfilePlist(xml);assert.equal(profileContract(decoded,team,group)['com.apple.application-identifier'],team+'.dev.dona.dispatcher.host');assert.equal(decoded.ExpirationDate,'2099-01-01T00:00:00+00:00');assert.doesNotMatch(JSON.stringify(decoded),/DeveloperCertificates|ProvisionedDevices|PRIVATE|fake-certificate/);
+ assert.throws(()=>decodeProvisioningProfilePlist('invalid private content'),/^Error: dispatcher_host_profile_invalid$/);
+ const expired=decodeProvisioningProfilePlist(xml.replace('2099-01-01','2020-01-01'));assert.throws(()=>profileContract(expired,team,group));
+});
