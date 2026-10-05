@@ -20,7 +20,7 @@ export interface DashboardAuthority {
   conversation(id: string): boolean;
 }
 export interface ObservedTask {
-  snapshot: Omit<DashboardTaskSnapshot,"runtime_binding">;
+  snapshot: Pick<DashboardTaskSnapshot,"task"|"attempts"|"fingerprint">;
   runtime: {status: "observed"; conversation: ConversationContent} | {status: "unavailable" | "not_started" | "forbidden"};
 }
 /** The authority callback is evaluated again after runtime I/O. A revoked
@@ -34,9 +34,9 @@ export class DashboardObserver {
     if (!before) return null;
     let observed: ObservedTask["runtime"] = {status: "forbidden"};
     if (authority.conversation(id)) {
-      observed = {status: "not_started"};
+      observed = {status: "unavailable"};
       try {
-        if(!before.runtime_binding) return {snapshot:publicSnapshot(before),runtime:{status:"not_started"}};
+        if(!before.runtime_binding) return {snapshot:publicSnapshot(before),runtime:{status:before.runtime_binding_state==="missing"&&before.task.worker_status==="queued"?"not_started":"unavailable"}};
         const binding=before.runtime_binding;
         const expectedAgent = before.attempts.find(row => row.attempt_id === before.task.current_attempt_id)?.agent_name;
         if (!expectedAgent) throw Error("observation_attempt_missing");
@@ -114,6 +114,6 @@ function publicConversation(value: ConversationContent): ConversationContent {
   return result;
 }
 
-function publicSnapshot(value:DashboardTaskSnapshot):Omit<DashboardTaskSnapshot,"runtime_binding"> {
+function publicSnapshot(value:DashboardTaskSnapshot):Pick<DashboardTaskSnapshot,"task"|"attempts"|"fingerprint"> {
   return {task:value.task,attempts:value.attempts,fingerprint:value.fingerprint};
 }
