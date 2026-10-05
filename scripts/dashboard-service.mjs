@@ -32,7 +32,7 @@ try{
    else{
      // An update must explicitly stop this service first. Never bootout another service.
      const existing=spawnSync('/bin/launchctl',['print',target],{encoding:'utf8',timeout:5000,maxBuffer:8192});
-     if(existing.error||existing.status===0)throw Error('dashboard_service_stop_required');
+     if(existing.error||existing.status!==113)throw Error('dashboard_service_stop_required');
      const directory=path.join(os.homedir(),'Library/LaunchAgents');fs.mkdirSync(directory,{recursive:true,mode:0o700});
      const info=fs.lstatSync(directory);if(!info.isDirectory()||info.isSymbolicLink()||info.uid!==process.getuid()||(info.mode&0o022))fail();
      const file=path.join(directory,label+'.plist');
