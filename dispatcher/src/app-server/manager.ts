@@ -3,12 +3,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { AppServerRpc,type RpcMessage,RpcFailure,RpcSpawnFailure } from "./rpc.js";
 import {stableStringify} from "../validation.js";
+import {projectHistory,projectNotification,projectItem,type ConversationIdentity,type ConversationSnapshot} from "./observation.js";
 import { RuntimeStore,type AgentRecord,type QuestionRecord } from "./store.js";
 import { identity,processes,same,stopScope,type ProcessIdentity } from "./process.js";
 
 export const hash=(value:unknown)=>createHash("sha256").update(stableStringify(value)).digest("hex");
 export interface StartAgent {attemptId?:string;name:string;role:"main"|"worker";cwd:string;release:string;args:string[];threadConfig:Record<string,unknown>}
-export type RpcFactory=(args:string[],cwd:string)=>AppServerRpc;
+export type RpcFactory=(args:string[],cwd:string,agent?:AgentRecord,attach?:boolean)=>AppServerRpc;
 const object=(x:unknown):Record<string,unknown>=>x!==null&&typeof x==="object"&&!Array.isArray(x)?x as Record<string,unknown>:{};
 
 export class AppServerManager {
@@ -16,16 +17,18 @@ export class AppServerManager {
   private resets=new Map<string,string>();
   private queues=new Map<string,Promise<unknown>>();
   private recoveryAfter=new Map<string,number>();
-  constructor(readonly store:RuntimeStore,private readonly factory:RpcFactory) {
+  constructor(readonly store:RuntimeStore,private readonly factory:RpcFactory,private readonly reconnect=false) {
     store.db.exec("CREATE TABLE IF NOT EXISTS main_readiness(agent TEXT PRIMARY KEY,generation TEXT NOT NULL)");
     store.db.exec("CREATE TABLE IF NOT EXISTS turn_outcomes(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,state TEXT NOT NULL)");
     store.db.exec("CREATE TABLE IF NOT EXISTS main_recoveries(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,input_json TEXT NOT NULL)");
     store.db.exec("CREATE TABLE IF NOT EXISTS recovery_hints(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,reason TEXT NOT NULL,retry_after TEXT)");
     store.db.exec("CREATE TABLE IF NOT EXISTS stops(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,processes_json TEXT NOT NULL,state TEXT NOT NULL)");
+    for(const row of store.agents())if(row.state!=="stopped")store.observe(row.name,row.generation,{kind:"gap"});
     // 再接続していないprocessをidleとみなさない。永続receiptは残す。
     store.db.prepare("UPDATE questions SET state='expired' WHERE state IN ('pending','answering')").run();
     store.db.prepare("UPDATE agents SET state='unknown',sequence=sequence+1 WHERE state<>'stopped'").run();
   }
+  closeConnections():void {for(const rpc of this.connections.values())rpc.closeConnection();this.connections.clear();}
   serialized<T>(name:string,action:()=>Promise<T>):Promise<T> {
     const previous=this.queues.get(name)??Promise.resolve();const next=previous.catch(()=>{}).then(action);
     this.queues.set(name,next);void next.finally(()=>{if(this.queues.get(name)===next)this.queues.delete(name);}).catch(()=>{});return next;
@@ -49,7 +52,7 @@ export class AppServerManager {
       }).immediate();
       let rpc:AppServerRpc;
       try {
-        rpc=this.factory(input.args,input.cwd);this.connections.set(input.name,rpc);
+        rpc=this.factory(input.args,input.cwd,row);this.connections.set(input.name,rpc);
         // PIDなしの非同期spawn errorだけを待つ。PIDがある場合はawait前にidentityを保存する。
         if(!rpc.child.pid)await rpc.confirmSpawn();
       }catch(error){
@@ -63,13 +66,7 @@ export class AppServerManager {
       const pid=rpc.child.pid;if(!pid)throw Error("runtime_spawn_identity_missing");
       const processIdentity=identity(pid);if(!processIdentity)throw Error("runtime_process_identity_missing");
       row.pid=pid;row.process_start=processIdentity.start;this.store.put(row);
-      rpc.on("request",(message:RpcMessage)=>this.onRequest(row,message));
-      rpc.on("notification",(message:RpcMessage)=>this.onNotification(row,message));
-      rpc.on("disconnect",()=>{
-        if(!this.store.db.open||this.store.agent(row.name)?.generation!==row.generation)return;
-        this.store.db.prepare("UPDATE questions SET state='expired' WHERE agent=? AND generation=? AND state IN ('pending','answering')").run(row.name,row.generation);
-        if(this.store.agent(row.name)?.state!=="stopped")this.store.change(row.name,row.generation,{state:"unknown"});
-      });
+      this.bind(row,rpc);
       try {
         await rpc.initialize();
         const params={...input.threadConfig,cwd:input.cwd,...(row.thread_id?{threadId:row.thread_id,excludeTurns:true}:{})};
@@ -78,6 +75,42 @@ export class AppServerManager {
         this.store.change(row.name,row.generation,{thread_id:thread.id,state:"idle"});
         return this.store.agent(row.name)!;
       } catch(error){this.store.change(row.name,row.generation,{state:"unknown"});throw error;}
+  }
+  private bind(row:AgentRecord,rpc:AppServerRpc):void {
+      rpc.on("request",(message:RpcMessage)=>this.onRequest(row,message));
+      rpc.on("notification",(message:RpcMessage)=>this.onNotification(row,message));
+      rpc.on("disconnect",()=>{
+        if(!this.store.db.open||this.store.agent(row.name)?.generation!==row.generation)return;
+        this.store.db.prepare("UPDATE questions SET state='expired' WHERE agent=? AND generation=? AND state IN ('pending','answering')").run(row.name,row.generation);
+        this.store.observe(row.name,row.generation,{kind:"gap"});
+        if(this.store.agent(row.name)?.state!=="stopped")this.store.change(row.name,row.generation,{state:"unknown"});
+      });
+  }
+  private observationIdentity(row:AgentRecord):ConversationIdentity {
+    const input=JSON.parse(row.config_json) as StartAgent;
+    return {name:row.name,generation:row.generation,role:row.role,thread_id:row.thread_id,attempt_id:input.attemptId??null,state:this.status(row.name)?.state??"unknown",connected:!!this.connections.get(row.name)?.connected,observed_at:new Date().toISOString()};
+  }
+  conversations(after=""):{items:ConversationIdentity[];next:string|null} {
+    if(after.length>128)throw Error("runtime_conversation_cursor_invalid");
+    const rows=this.store.db.prepare("SELECT * FROM agents WHERE name>? ORDER BY name LIMIT 101").all(after) as AgentRecord[];
+    return {items:rows.slice(0,100).map(row=>this.observationIdentity(row)),next:rows.length>100?rows[99]!.name:null};
+  }
+  async conversation(name:string,generation:string,afterSequence?:number):Promise<ConversationSnapshot> {
+    if(afterSequence!==undefined&&(!Number.isSafeInteger(afterSequence)||afterSequence<0))throw Error("runtime_conversation_cursor_invalid");
+    const row=this.store.agent(name);if(!row||row.generation!==generation)throw Error("runtime_conversation_not_current");
+    // watermarkを履歴要求前に固定する。履歴と通知の重なりはあり得るが、要求中の通知を飛ばさない。
+    const observations=this.store.observations(name,generation,afterSequence),rpc=this.connections.get(name);
+    let history:{items:ConversationSnapshot["items"];truncated:boolean}={items:this.store.cachedItems(name,generation),truncated:true},gap=observations.gap;
+    if(row.thread_id&&rpc?.connected){
+      try {const metadata=object(await rpc.request("thread/read",{threadId:row.thread_id,includeTurns:false}));
+        if(object(metadata.thread).id!==row.thread_id)throw Error("runtime_conversation_identity_mismatch");
+        const page=object(await rpc.request("thread/turns/list",{threadId:row.thread_id,limit:20,sortDirection:"desc",itemsView:"full"}));
+        const result=projectHistory({thread:{id:row.thread_id,turns:Array.isArray(page.data)?[...page.data].reverse():[]}});
+        history={items:result.items,truncated:result.truncated||typeof page.nextCursor==="string"};
+      }catch{gap=true;}
+    }else gap=true;
+    const current=this.store.agent(name);if(!current||current.generation!==generation||current.thread_id!==row.thread_id)throw Error("runtime_conversation_not_current");
+    return {...this.observationIdentity(current),...observations,...history,gap};
   }
   status(name:string):AgentRecord|undefined {
     const row=this.store.agent(name);if(!row)return;
@@ -139,6 +172,8 @@ export class AppServerManager {
       return;
     }
     if(p.threadId!==row.thread_id)return;
+    const observation=projectNotification(message.method,p);if(observation)this.store.observe(row.name,row.generation,observation);
+    if(message.method==="item/completed"&&typeof p.turnId==="string"){const item=projectItem(p.item,p.turnId);if(item)this.store.cacheItem(row.name,row.generation,item);}
     if(message.method==="turn/started") {
       const turn=object(p.turn);if(typeof turn.id==="string"){
         this.store.db.prepare("DELETE FROM turn_outcomes WHERE agent=? AND generation=?").run(agent.name,agent.generation);
@@ -244,6 +279,24 @@ export class AppServerManager {
   async recover():Promise<void> {
     for(const candidate of this.store.agents()) {
       if((this.recoveryAfter.get(candidate.name)??0)>Date.now())continue;
+      if(this.reconnect&&candidate.state!=="stopped"&&candidate.pid&&identity(candidate.pid)?.start===candidate.process_start&&!this.store.db.prepare("SELECT 1 FROM stops WHERE agent=? AND generation=?").get(candidate.name,candidate.generation)){
+        this.recoveryAfter.set(candidate.name,Date.now()+30_000);
+        await this.serialized(candidate.name,async()=>{
+          const row=this.store.agent(candidate.name);if(!row||row.generation!==candidate.generation)return;
+          if(this.store.db.prepare("SELECT 1 FROM stops WHERE agent=? AND generation=?").get(row.name,row.generation))return;
+          const input=JSON.parse(row.config_json) as StartAgent;
+          let rpc=this.connections.get(row.name),initialize=false;
+          if(!rpc?.connected){rpc=this.factory(input.args,input.cwd,row,true);this.connections.set(row.name,rpc);this.bind(row,rpc);initialize=true;}
+          try {if(initialize)await rpc.initialize();if(row.thread_id){
+            const result=object(await rpc.request("thread/read",{threadId:row.thread_id,includeTurns:false})),thread=object(result.thread);
+            if(thread.id!==row.thread_id)throw Error("runtime_conversation_identity_mismatch");
+            // 再接続で失われた質問の回答権限は復元しない。idleだけをread証拠から回復する。
+            if(object(thread.status).type==="idle"&&this.store.agent(row.name)?.state==="unknown")this.store.change(row.name,row.generation,{state:"idle",turn_id:null});
+          }}
+          catch{rpc.closeConnection();}
+        }).catch(()=>{});
+        continue;
+      }
       const intent=this.store.db.prepare("SELECT 1 FROM main_recoveries WHERE agent=? AND generation=?").get(candidate.name,candidate.generation);
       const pending=this.store.db.prepare("SELECT 1 FROM stops WHERE agent=? AND generation=?").get(candidate.name,candidate.generation);
       if(!intent&&!pending&&(candidate.role!=="main"||this.status(candidate.name)?.state!=="unknown"))continue;

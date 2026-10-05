@@ -25,13 +25,15 @@
     "dotenv": "^17.2.2",
     "moment-timezone": "0.5.48",
     "ulid": "^3.0.2",
+    "ws": "8.21.0",
     "zod": "^4.5.4"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.3.0",
+    "@types/ws": "^8.18.1",
+    "esbuild": "0.28.2",
     "tsx": "^4.20.5",
-    "typescript": "^7.0.2",
-    "esbuild": "0.28.2"
+    "typescript": "^7.0.2"
   }
 }
