@@ -1,3 +1,4 @@
+import {localApprovalCredential} from './local-credential.js';
 import {createHmac} from 'node:crypto';
 import type {DispatcherDatabase} from '../database.js';
 import type {DispatcherConfig} from '../config.js';
@@ -9,19 +10,6 @@ import {LocalExternalApprovalService} from './local-external-service.js';
 import {LocalSlackApprovalProvider} from './local-slack-provider.js';
 import type {LocalExternalApprovalIngress} from './local-ingress.js';
 
-/** Fixed sibling modules from the same signed release; no configurable module,
- * credential command, or browser-provided path is loaded. */
-async function credential(alias:string):Promise<()=>Promise<string>> {
- const base=new URL('../../../',import.meta.url);
- const [{loadStoredSlackBotToken},{MacOSKeychainStore},{loadRuntimeConfig}]=await Promise.all([
-  import(new URL('sources/slack/dist/credentials.js',base).href),
-  import(new URL('sources/slack/dist/keychain.js',base).href),
-  import(new URL('sources/slack/dist/config.js',base).href),
- ]);
- if(!loadRuntimeConfig().workspaces.includes(alias))throw Error('local_approval_workspace_unavailable');
- const keychain=new MacOSKeychainStore();
- return ()=>loadStoredSlackBotToken(alias,keychain);
-}
 export interface LocalApprovalLoop {start():void;stop():Promise<void>}
 /** One outstanding tick; shutdown waits for an in-flight effect before DB close. */
 export function approvalLoop(tick:()=>Promise<unknown>,failure:()=>void,interval=1000):LocalApprovalLoop {
@@ -40,7 +28,7 @@ export async function openLocalApprovalService(database:DispatcherDatabase,confi
  try{
   native=new NativeLocalApprovalConnection(sql,nativeConfig);
   if(!native.doctor().ready)throw Error('local_approval_setup_required');
-  const token=await credential(nativeConfig.slack_workspace_alias);
+  const token=await localApprovalCredential(nativeConfig.slack_workspace_alias);
   const revisionKey=createHmac('sha256',native.keys.content(null).secret).update('dona.local-approval.thread-revision.v1').digest();
   const slack=new LocalSlackApprovalProvider(nativeConfig.scope.workspace_id,token,revisionKey);
   let ingress:LocalExternalApprovalIngress;
