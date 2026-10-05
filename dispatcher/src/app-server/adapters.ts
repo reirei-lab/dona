@@ -85,6 +85,7 @@ export class AppServerJobRuntime implements JobAgentRuntime {
   answerQuestion(name:string,id:string,answers:Record<string,{answers:string[]}>){return this.client.answer(name,id,answers);}
   disableProgress():void{this.progressEnabled=false;}
   async prepare(row:JobRow,signal?:AbortSignal):Promise<PreparedJobRuntime>{
+    if(row.source==="web")throw Error("runtime_profile_unavailable");
     const workspace=workspaceFromJob(row),provisioner=new JobWorkspace(this.config);
     const expected=workspace.kind==="scratch"?path.join(this.config.jobsWorkspaceRoot,"scratch",workspaceJobId(row)):
       path.join(this.config.jobsWorkspaceRoot,"github",...workspace.repository.split("/"),"worktrees",workspaceJobId(row));

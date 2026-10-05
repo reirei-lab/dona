@@ -1,0 +1,15 @@
+# Web commandとTaskの移行境界
+
+Webのsubmitは、検証済みsessionのinstance・tenant・principalを、実際の`source: web` event、Job（Attempt）、Task、command receiptへ同一transactionで結合する。Slack actor/eventは生成しない。同じrequest keyとpayloadは同一receipt・Taskを返し、異なるpayloadはconflictにする。応答が失われた場合も新しいrequest keyで再作成しない。
+
+現在のproduction App ServerはWeb専用`analysis.read_only.v1` providerを組み込んでいない。Web Taskは`waiting / runtime_profile_unavailable`、Jobは`blocked`で受付を保存し、supervisorの実行・回復候補から除く。これは実行成功ではない。既存のsnapshot permit、sandbox、固定inference brokerの認可を満たすproviderと実際のworkerを接続するまでは、設定値だけで待機を解除してはならない。通常のCodex workerへ渡すことも許可しない。
+
+取消は従来の`/api/jobs/{current_attempt_id}/cancel`に`request_id`、`task_id`、`revision`を渡す。Dispatcherはowner、Task/current Attempt/revision、receiptを同一transactionで検査する。`cancel_requested`は停止要求の永続受付、`cancelled`は未起動または停止確認後の取消完了を表す。同じreceiptの照合はrevisionが進んだ後にも可能だが、別payloadや別Attemptへ転用できない。ブラウザからnative questionへの回答やTask retry/steerは提供しない。
+
+## 既存データとrollback
+
+旧Web Job/receiptは削除せず、表示と同一submitのreceipt照合を維持する。既存receiptを読んだだけでTaskへ採用せず、TaskのないJobへの新しい取消は`migration_required`で拒否する。旧workerの実際の停止、所有者、保存Result、未確定の外部作用をoperatorが照合する移行手順が整うまでは操作を再開しない。
+
+既存Task schemaを再利用するためreceipt tableの破壊的migrationはない。新規Taskに対するowner/event/Attemptの対応は永続化される。ただし旧binaryはTask cancellation contractやWeb profile待機を理解しないため、Web受付後の旧binaryへの無条件rollbackはサポートしない。受付前の整合snapshotを使うか、Web受付を停止して新Task/receiptを照合する。DBだけを戻して稼働workerを消したことにはしない。
+
+#371の残作業は、認可されたsnapshotと固定inference brokerを使うread-only providerの実接続、実行中workerの停止・restart・Attempt追加の統合検証である。この基盤だけをもってIssue全体やWeb本番利用の完了にはしない。

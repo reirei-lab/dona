@@ -105,11 +105,9 @@ test("public TLSからWeb Adapter・認証UDS・Dispatcher queue・DB receiptま
   const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
   const jobs = new DispatcherDatabase(config.databasePath); t.after(() => jobs.close());
   let cancelFailure = false;
-  const controls = { wake() {}, async cancelWeb(jobId: string, identity: {instance_id:string;tenant_id:string;principal_id:string}) {
-    if (cancelFailure) throw new TypeError("fixture internal failure");
-    const before = jobs.assertWebJobOwner(jobId, identity), row = jobs.beginWebJobCancellation(jobId, identity);
-    jobs.markJobCancelled(jobId, "fixture"); return { row: jobs.getJob(jobId)!, duplicate: before.status === "cancelled" || row.status === "cancelled" };
-  } };
+  const cancelTask=jobs.cancelWebTask.bind(jobs);
+  jobs.cancelWebTask=input=>{if(cancelFailure)throw Error("fixture failure");return cancelTask(input);};
+  const controls = { wake() {} };
   const configuredPolicy = await tlsPolicy();
   const f = await fixture(t, configuredPolicy, { commands: repository => new WebCommandBroker(repository, jobs, controls as never, config) });
   const policy = f.local.policy;
@@ -131,6 +129,7 @@ test("public TLSからWeb Adapter・認証UDS・Dispatcher queue・DB receiptま
   const headers = { cookie: cookieHeader, origin: policy.origin, "sec-fetch-site": "same-origin", "content-type": "application/json", "x-dona-csrf": csrf };
   const created = await request(policy, "/api/jobs", "POST", headers, body); assert.equal(created.status, 201, created.body);
   const first = JSON.parse(created.body); assert.equal(first.outcome, "created"); assert.equal(jobs.getJob(first.job.job_id)?.source, "web");
+  assert.equal(first.task.wait_reason,"runtime_profile_unavailable");assert.equal(jobs.tasks.canRun(jobs.getJob(first.job.job_id)!),false);
   const reused = await request(policy, "/api/jobs", "POST", headers, body); assert.equal(reused.status, 200, reused.body);
   assert.equal(JSON.parse(reused.body).outcome, "reused"); assert.equal(jobs.listJobs().length, 1);
   const lostBody = JSON.stringify({ request_id: randomBytes(32).toString("base64url"), objective: "response loss", workspace: { kind: "scratch" } });
@@ -138,11 +137,11 @@ test("public TLSからWeb Adapter・認証UDS・Dispatcher queue・DB receiptま
   loseResponse = false; const reconciled = await request(policy, "/api/jobs", "POST", headers, lostBody);
   assert.equal(reconciled.status, 200, reconciled.body); assert.equal(JSON.parse(reconciled.body).outcome, "reused"); assert.equal(jobs.listJobs().length, 2);
   const reconcileJob = JSON.parse(reconciled.body).job.job_id as string;
-  jobs.beginJobPreparation(reconcileJob); jobs.beginJobDispatch(reconcileJob); jobs.markJobRunning(reconcileJob);
-  jobs.saveJobResult(reconcileJob, { schema_version: 1, job_id: reconcileJob, status: "completed", summary: "done",
-    completed_at: f.local.now() }, jobs.getJob(reconcileJob)!.result_path);
+  const reconcileTask=jobs.tasks.forAttempt(reconcileJob)!;
+  jobs.cancelWebTask({...scope,principal_id:JSON.parse(jobs.get(reconcileTask.source_event_id)!.subject_json).principal_id,
+    task_id:reconcileTask.task_id,attempt_id:reconcileJob,revision:reconcileTask.revision,idempotency_key:"e".repeat(64)});
   const postCancel = (jobId: string) => request(policy, `/api/jobs/${jobId}/cancel`, "POST", headers,
-    JSON.stringify({ request_id: randomBytes(32).toString("base64url") }));
+    JSON.stringify({ request_id: randomBytes(32).toString("base64url"), ...(jobs.tasks.forAttempt(jobId)?{task_id:jobs.tasks.forAttempt(jobId)!.task_id,revision:jobs.tasks.forAttempt(jobId)!.revision}:{}) }));
   const terminal = await postCancel(reconcileJob); assert.equal(terminal.status, 409); assert.deepEqual(JSON.parse(terminal.body), { error: "terminal" });
   const foreign = jobs.createWebJob({ instance_id: scope.instance_id, tenant_id: scope.tenant_id, principal_id: "other",
     idempotency_key: "f".repeat(64), objective: "other", workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir);
@@ -161,12 +160,12 @@ test("public TLSからWeb Adapter・認証UDS・Dispatcher queue・DB receiptま
     const race = await request(policy, "/api/jobs", "POST", headers, JSON.stringify({ request_id: randomBytes(32).toString("base64url"),
       objective: "cancel race " + suffix, workspace: { kind: "scratch" } })); raceJobs.push(JSON.parse(race.body).job.job_id as string);
   }
-  const sharedCancel = JSON.stringify({ request_id: randomBytes(32).toString("base64url") });
-  const raced = await Promise.all(raceJobs.map(jobId => request(policy, `/api/jobs/${jobId}/cancel`, "POST", headers, sharedCancel)));
+  const sharedRequest = randomBytes(32).toString("base64url");
+  const raced = await Promise.all(raceJobs.map(jobId => request(policy, `/api/jobs/${jobId}/cancel`, "POST", headers, JSON.stringify({request_id:sharedRequest,task_id:jobs.tasks.forAttempt(jobId)!.task_id,revision:jobs.tasks.forAttempt(jobId)!.revision}))));
   assert.deepEqual(raced.map(value => value.status).sort(), [200, 409]);
   assert.deepEqual(raced.map(value => JSON.parse(value.body).error).filter(Boolean), ["idempotency_conflict"]);
   assert.equal(raceJobs.filter(jobId => jobs.getJob(jobId)?.status === "cancelled").length, 1);
-  const cancelBody = JSON.stringify({ request_id: randomBytes(32).toString("base64url") });
+  const cancelBody = JSON.stringify({ request_id: randomBytes(32).toString("base64url"), task_id:first.task.task_id, revision:first.task.revision });
   loseResponse = true; const cancelled = await request(policy, `/api/jobs/${first.job.job_id}/cancel`, "POST", headers, cancelBody);
   assert.equal(cancelled.status, 503, cancelled.body); loseResponse = false;
   const duplicate = await request(policy, `/api/jobs/${first.job.job_id}/cancel`, "POST", headers, cancelBody);

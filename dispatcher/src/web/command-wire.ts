@@ -17,10 +17,10 @@ export const webCommandInputSchema = z.strictObject({ codec_version: z.literal(1
 export type WebCommandInput = z.infer<typeof webCommandInputSchema>;
 const projection = z.strictObject({ job_id: id, status: z.string().min(1).max(32) });
 export const webCommandResultSchema = z.discriminatedUnion("status", [
-  z.strictObject({ status: z.literal("succeeded"), outcome: z.enum(["created", "reused", "cancelled", "already_cancelled"]),
-    receipt_id: z.string().min(1).max(96), job: projection }),
+  z.strictObject({ status: z.literal("succeeded"), outcome: z.enum(["created", "reused", "cancelled", "already_cancelled", "cancel_requested"]),
+    receipt_id: z.string().min(1).max(96), job: projection, task: z.strictObject({ task_id: id, current_attempt_id: id, revision: z.number().int().positive(), state: z.string().min(1).max(32), wait_reason: z.string().max(128).nullable() }).optional() }),
   z.strictObject({ status: z.literal("denied"), reason: z.enum(["invalid_request", "identity_unavailable", "scope_denied",
-    "idempotency_conflict", "quota_exceeded", "not_found", "owner_mismatch", "terminal", "scheduled_policy", "acceptance_unknown", "internal_error"]) }),
+    "idempotency_conflict", "quota_exceeded", "not_found", "owner_mismatch", "terminal", "scheduled_policy", "acceptance_unknown", "internal_error", "revision_conflict", "migration_required"]) }),
 ]);
 export type WebCommandResult = z.infer<typeof webCommandResultSchema>;
 export class WebCommandWireError extends Error { constructor() { super("web_command_unverified"); this.name = "WebCommandWireError"; } }

@@ -1644,6 +1644,34 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
+  createWebTask(input: WebCommandIdentity & { idempotency_key: string; objective: string; workspace: CreateJobRequest["workspace"] },
+    workspaceRoot:string,resultDir:string) {
+    return this.db.transaction(()=>{
+      const created=this.createWebJob(input,workspaceRoot,resultDir);
+      const task=created.outcome==="created"?this.tasks.attachWebAttempt(created.row,input.idempotency_key):this.tasks.forAttempt(created.row.job_id);
+      // A legacy receipt is historical evidence, not permission to adopt its worker.
+      return {...created,row:this.getJobRequired(created.row.job_id),task};
+    }).immediate();
+  }
+
+  cancelWebTask(input:WebCommandIdentity & {task_id:string;attempt_id:string;revision:number;idempotency_key:string}) {
+    return this.db.transaction(()=>{
+      this.assertWebJobOwner(input.attempt_id,input);
+      const task=this.tasks.forAttempt(input.attempt_id);
+      if(!task||task.task_id!==input.task_id)throw new Error("web_task_migration_required");
+      const receiptId=`web_cancel_${input.idempotency_key}`;
+      const digest=createHash("sha256").update(JSON.stringify({task_id:input.task_id,attempt_id:input.attempt_id,revision:input.revision})).digest("hex");
+      const prior=this.getWebCommandReceipt(receiptId,input);
+      if(prior){
+        if(prior.operation!=="cancel"||prior.canonical_sha256!==digest||prior.job_id!==input.attempt_id)throw new Error("web_command_conflict");
+        return {task,receipt:prior,duplicate:true};
+      }
+      const updated=this.tasks.cancelWeb(task.task_id,input.attempt_id,input.revision);
+      const receipt=this.recordWebCancelReceipt(receiptId,digest,input,input.attempt_id);
+      return {task:updated,receipt,duplicate:false};
+    }).immediate();
+  }
+
   getWebCommandReceipt(receiptId: string, identity: WebCommandIdentity): WebCommandReceipt | undefined {
     const row = this.db.prepare("SELECT * FROM web_command_receipts WHERE receipt_id=?").get(receiptId) as WebCommandReceipt | undefined;
     return row && row.instance_id === identity.instance_id && row.tenant_id === identity.tenant_id
