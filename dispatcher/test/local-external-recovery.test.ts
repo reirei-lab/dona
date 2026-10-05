@@ -72,3 +72,34 @@ test("consume後でmarker未作成の旧claimは無効化後だけ安全に回�
  const evidence=f.service.recoveryEvidence(source,id);assert.equal(evidence.effect,"not_sent");assert.ok(evidence.attempt_id);
  await f.service.executePending();assert.equal(f.counts().sends,0);
 });
+async function manual(t:{after(fn:()=>void):void}){
+ const f=setup(t),id=await requested(f);await approve(f,id);f.setSend({outcome:"unknown"});await f.service.executePending();f.service.sourceUnavailable(source,id);
+ const {LocalApprovalOperations,installLocalOperationsSchema}=await import("../src/approval/local-operations.js");installLocalOperationsSchema(f.db);
+ let receipt:ExternalSendResult={outcome:"accepted",receipt_ref:"slack_exact"};
+ const keys={content:()=>content,wrapping:()=>wrapping,notification:()=>notification,wrappingVersion:()=>wrapping,notificationVersion:()=>notification,execution:()=>executionKey};
+ const ops=new LocalApprovalOperations(f.db,f.providers,scope,keys,{owner_id:source.owner_id,authorize:()=>true},{reconcile:async()=>receipt});
+ const apply=async()=>{const p=await ops.previewReconcile(id,"固定markerに一致する実provider照合結果");return ops.applyReconcile(p.confirmation);};
+ return {...f,id,ops,apply,setReceipt:(v:ExternalSendResult)=>{receipt=v;}};
+}
+test("needs_reviewはoperatorがexact受理を照合・監査commitした時だけacceptedとなる",async t=>{
+ const f=await manual(t);
+ const preview=await f.ops.previewReconcile(f.id,"固定markerの受理をproviderで確認しました");
+ assert.equal(f.service.recoveryEvidence(source,f.id).effect,"unknown");
+ assert.equal(f.ops.applyReconcile(preview.confirmation).state,"needs_review");
+ const evidence=f.make().recoveryEvidence(source,f.id);assert.equal(evidence.effect,"accepted");assert.equal(evidence.receipt_ref,"slack_exact");
+ assert.equal(f.counts().sends,1);assert.equal(f.service.sourceUnavailable(source,f.id).execution?.state,"needs_review");
+ assert.equal(f.make().recoveryEvidence(source,f.id).effect,"accepted");
+});
+test("raw proof差替え・削除は監査eventと一致せずunknownへ戻る",async t=>{
+ const f=await manual(t);await f.apply();const row=f.db.prepare("SELECT evidence_id,proof_json FROM local_approval_operation_evidence").get() as {evidence_id:string;proof_json:string};
+ const proof=JSON.parse(row.proof_json);proof.receipt.receipt_ref="forged";
+ f.db.prepare("UPDATE local_approval_operation_evidence SET proof_json=? WHERE evidence_id=?").run(JSON.stringify(proof),row.evidence_id);
+ assert.equal(f.service.recoveryEvidence(source,f.id).effect,"unknown");
+ f.db.prepare("DELETE FROM local_approval_operation_evidence WHERE evidence_id=?").run(row.evidence_id);
+ assert.equal(f.service.recoveryEvidence(source,f.id).effect,"unknown");
+});
+test("unknown照合は解除せず後続の確定受理は採用し矛盾receiptは拒否する",async t=>{
+ const f=await manual(t);f.setReceipt({outcome:"unknown"});await f.apply();assert.equal(f.service.recoveryEvidence(source,f.id).effect,"unknown");
+ f.setReceipt({outcome:"accepted",receipt_ref:"slack_exact"});await f.apply();assert.equal(f.service.recoveryEvidence(source,f.id).effect,"accepted");
+ f.setReceipt({outcome:"accepted",receipt_ref:"different"});await f.apply();assert.equal(f.service.recoveryEvidence(source,f.id).effect,"unknown");
+});

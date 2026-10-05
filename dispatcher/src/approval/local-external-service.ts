@@ -1,3 +1,4 @@
+import {z} from "zod";
 import {invalidateLocalApprovals} from "./local-invalidation.js";
 import type {VerifiedAuditState} from "../audit/codec.js";
 import {stableStringify} from "../validation.js";
@@ -25,6 +26,9 @@ import {externalSourceSchema,type ExternalApprovalSource,externalAuthoritySchema
  type ExternalApprovalAuthPort,type ExternalSlackPort,type SlackTargetObservation,type ExternalSendResult} from "./local-external-types.js";
 import {externalRichText} from "./local-slack-provider.js";
 export type {ExternalApprovalAuthority,ExternalApprovalIntent,ExternalApprovalStepUp,ExternalApprovalAuthPort} from "./local-external-types.js";
+const recoveryProofSchema=z.strictObject({scope:z.strictObject({instance_id:z.string(),workspace_id:z.string()}),owner:z.string(),requestId:z.string(),attemptId:z.string(),fence:z.number().int(),
+ receipt:z.discriminatedUnion("outcome",[z.strictObject({outcome:z.literal("accepted"),receipt_ref:z.string().min(1)}),z.strictObject({outcome:z.literal("unknown")}),z.strictObject({outcome:z.literal("rejected"),receipt_ref:z.string().min(1),reason:z.string()})]),
+ reasonDigest:z.string().regex(/^[a-f0-9]{64}$/),markerDigest:z.string().regex(/^[a-f0-9]{64}$/),expires:z.number().finite()});
 type Request=Extract<ApprovalRecord,{kind:"request"}>;
 const hash=(value:unknown)=>createHash("sha256").update(stableStringify(value)).digest("hex");
 const tx=()=>"local_"+randomUUID().replaceAll("-","");
@@ -188,9 +192,35 @@ export class LocalExternalApprovalService {
    if(!marker)return execution.row.state==="needs_review"?{...evidence,effect:"not_sent"}:evidence;
    verifyApprovalExecutionMarker(marker,this.keys.execution(marker.marker.key_version));
    if(execution.row.receipt_ref&&["succeeded","failed"].includes(execution.row.state))return {...evidence,effect:execution.row.state==="succeeded"?"accepted":"not_sent",receipt_ref:execution.row.receipt_ref};
-   // needs_review上の手動照合proofだけではledger終端を推測しない。
-   return evidence;
+   const receipt=execution.row.state==="needs_review"?this.manualRecoveryReceipt(state,source,requestId,execution.row.attempt_id,execution.row.fence,hash(marker)):null;
+   return receipt?{...evidence,effect:"accepted",receipt_ref:receipt}:evidence;
   });}catch{return unknown;}
+ }
+ /** 既存operator照合のcommitを監査eventから辿る。台帳自体を書換えたり、
+  * unknown/rejectedの人間判断を新しい送信許可へ変換したりしない。 */
+ private manualRecoveryReceipt(state:VerifiedAuditState,source:ExternalApprovalSource,requestId:string,attemptId:string,fence:number,markerDigest:string):string|null{
+  const checkpoint=this.db.prepare("SELECT checkpoint_json FROM security_audit_checkpoint WHERE singleton=1").pluck().get() as string;
+  // 過去の矛盾証拠まで検証できないretention後は自動解除しない。
+  if(JSON.parse(checkpoint).sequence!==0)return null;
+  const rows=this.db.prepare("SELECT record_json FROM security_audit_records WHERE sequence<=? AND json_extract(record_json,'$.event.action')='approval_execution' AND json_extract(record_json,'$.event.session_ref') LIKE 'proof_%' ORDER BY sequence LIMIT 101").all(state.anchor.sequence) as Array<{record_json:string}>;
+  if(rows.length>100)return null;
+  let accepted:string|null=null;
+  for(const row of rows){
+   const event=JSON.parse(row.record_json).event;
+   const stored=this.db.prepare("SELECT proof_json FROM local_approval_operation_evidence WHERE evidence_id=?").get(event.resource_id) as {proof_json:string}|undefined;
+   if(!stored)return null;
+   const raw=JSON.parse(stored.proof_json);if(event.session_ref!=="proof_"+hash(raw))return null;
+   const proof=recoveryProofSchema.parse(raw);
+   if(proof.requestId!==requestId)continue;
+   if(event.scope.instance_id!==this.scope.instance_id||event.scope.tenant_id!==this.scope.workspace_id||event.actor.kind!=="operator"||event.actor.id!==source.owner_id||event.operation!=="slack.post_thread_reply.v1"||event.outcome!=="pending"||event.reason!=="none"||
+    proof.scope.instance_id!==this.scope.instance_id||proof.scope.workspace_id!==this.scope.workspace_id||proof.owner!==source.owner_id||proof.attemptId!==attemptId||proof.fence!==fence||proof.markerDigest!==markerDigest||Date.parse(event.occurred_at)>proof.expires)return null;
+   if(proof.receipt.outcome==="rejected")return null;
+   if(proof.receipt.outcome==="accepted"){
+    if(accepted!==null&&accepted!==proof.receipt.receipt_ref)return null;
+    accepted=proof.receipt.receipt_ref;
+   }
+  }
+  return accepted;
  }
  sourceStatus(source:ExternalApprovalSource,requestId:string){
   if(!this.sourceAllowed(source))throw Error("external_approval_unauthorized");
