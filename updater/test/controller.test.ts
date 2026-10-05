@@ -3025,3 +3025,58 @@ test('target SHAが一致してもNodeで起動した場合はsigned update成�
  assert.notEqual(f.database.get(response.request_id as string)?.state,'succeeded');
  }finally{f.database.close();}
 });
+async function taskGenerationFixture(){
+ const f=await signedFixture();
+ const {schema_version:_,...compatibility}=JSON.parse(await fs.readFile(new URL('../../config/release-compatibility.json',import.meta.url),'utf8'));
+ const rollout=JSON.parse(await fs.readFile(new URL('../../config/schema-rollout.json',import.meta.url),'utf8'));
+ f.policy.compatibility=compatibility;f.policy.task_generation_update={mode:'forward_only',schema:4,task_execution_version:1};
+ f.git.targetCompatibility=compatibility;f.git.targetRollout=rollout;f.build.compatibility=compatibility;
+ const current=await f.store.readCurrentManifest();await fs.writeFile(path.join(f.policy.release_root,currentSha,'release-manifest.json'),JSON.stringify({...current,compatibility}));
+ f.runtime.setHealthCompatibility(currentSha,compatibility);f.runtime.setHealthCompatibility(targetSha,compatibility);f.runtime.actualAppSchema=4;f.runtime.appSchemaStateResult={user_version:4,integrity_ok:true,foreign_key_violations:0};
+ Object.assign(f.build,{prepareSignedHost:async()=>{},verifySignedHost:async()=>{}});
+ return f;
+}
+test('実schema4 manifestの明示forward-only更新はDB保持/rollback不可をexact planへ表示して完了する',async()=>{
+ const f=await taskGenerationFixture();try{
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string;activation_mode:string;database_policy:string;automatic_rollback:boolean;rollback_compatible:boolean};
+ assert.equal(plan.activation_mode,'forward_only');assert.equal(plan.database_policy,'preserve');assert.equal(plan.automatic_rollback,false);assert.equal(plan.rollback_compatible,false);
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'task-generation-forward'});f.dispatcher.terminal=true;await f.controller.processNext();
+ assert.equal(f.database.get(response.request_id as string)?.state,'succeeded');assert.equal(f.runtime.calls.includes('migrateAppSchema'),false);
+ }finally{f.database.close();}
+});
+test('実schema4は明示policy無し/DB異世代/承認後policy driftを拒否する',async()=>{
+ const f=await taskGenerationFixture();try{
+ delete f.policy.task_generation_update;await assert.rejects(f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget}),/rollback_compatible/);
+ f.policy.task_generation_update={mode:'forward_only',schema:4,task_execution_version:1};f.runtime.appSchemaStateResult.user_version=3;
+ await assert.rejects(f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget}),/database_unverified/);
+ f.runtime.appSchemaStateResult.user_version=4;const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});delete f.policy.task_generation_update;
+ const plan=response.plan as {plan_id:string;plan_hash:string};assert.throws(()=>f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'drift'}),/policy_drift/);
+ assert.equal(f.runtime.calls.includes('stopDispatcher'),false);
+ }finally{f.database.close();}
+});
+test('実schema4 target開始後の失敗は旧payload/DBへrollbackせずneeds_reviewを維持する',async()=>{
+ const f=await taskGenerationFixture();try{
+ f.runtime.targetMainStartRejectedOnce=true;const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string};
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'no-rollback'});f.dispatcher.terminal=true;await f.controller.processNext();
+ assert.equal(f.database.get(response.request_id as string)?.state,'needs_review');assert.equal((await f.store.observe()).current_sha,targetSha);
+ assert.equal(f.database.runtimeOperation(response.request_id as string,'start_previous_dispatcher'),undefined);assert.equal(f.database.runtimeOperation(response.request_id as string,'start_previous_main_agent'),undefined);
+ }finally{f.database.close();}
+});
+test('実schema4 unsignedからsignedへの初回forward-only切替も同じplan契約で完了する',async()=>{
+ const f=await taskGenerationFixture();try{
+ const health=f.runtime.dispatcherHealth.bind(f.runtime);f.runtime.dispatcherHealth=async()=>{const h=await health();return {...h,runtime_host:h.build_sha===targetSha?'signed-v1':'node'};};
+ const directions:string[]=[];Object.assign(f.runtime,{planDispatcherHostTransition:async()=>'f'.repeat(64),verifyDispatcherHostOriginal:async()=>{},applyDispatcherHostTransition:async(_t:unknown,d:string)=>{directions.push(d);}});
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string;activation_mode:string;signed_host_transition:string};
+ assert.equal(plan.activation_mode,'forward_only');assert.equal(plan.signed_host_transition,'f'.repeat(64));f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'schema4-initial-signed'});f.dispatcher.terminal=true;await f.controller.processNext();
+ assert.equal(f.database.get(response.request_id as string)?.state,'succeeded');assert.equal(directions.includes('original'),false);assert.ok(directions.includes('target'));
+ }finally{f.database.close();}
+});
+test('実schema4 target開始の応答不明は再送せずneeds_reviewでread-only照合する',async()=>{
+ const f=await taskGenerationFixture();try{
+ let starts=0;f.runtime.startDispatcher=async()=>{starts++;return {...ok,exit_code:null,timed_out:true};};
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string};
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'forward-unknown-start'});f.dispatcher.terminal=true;await f.controller.processNext();
+ assert.equal(f.database.get(response.request_id as string)?.state,'needs_review');assert.equal(starts,1);assert.equal((await f.store.observe()).current_sha,targetSha);
+ await f.controller.reconcile(response.request_id as string);assert.equal(starts,1);assert.equal(f.database.get(response.request_id as string)?.state,'needs_review');
+ }finally{f.database.close();}
+});

@@ -62,4 +62,17 @@ stable updaterはconfigとprofile bytesのdigestをplan hashへ結び、applyと
 
 初回unsigned→signedでは、control設定に署名policyを導入しても既存Nodeのplistを保つ。update plan作成時に、現在のexact SHAと既知のNode引数、plist全体のsnapshotをprivate control-rootへ保存し、そのdigestをplan hashに束縛する。承認後にtarget signed artifactを検証し、worker安全確認とDispatcher停止確認を経て、plistをsigned host引数へ原子的に切り替える。実行途中のplist driftは拒否する。targetの完了判定にはSHAに加え `runtime_host:signed-v1` が必要となる。
 
-初回planに束縛された旧SHAへ戻す場合だけ、保存済みの旧plistを復元できる。これはDB/Task schemaのrollback許可ではない。`rollback_safe:false`、不可逆migration、停止未確認など既存の条件を引き続き適用する。通常signed policyに汎用unsigned fallbackは設けない。stable updater管理DBはplan/snapshot digest保持のためschema9へ移行し、schema8以前のbinaryへ管理DBを戻して起動しない。
+初回planに束縛された旧SHAへ戻す場合だけ、保存済みの旧plistを復元できる。これはDB/Task schemaのrollback許可ではない。`rollback_safe:false`、不可逆migration、停止未確認など既存の条件を引き続き適用する。通常signed policyに汎用unsigned fallbackは設けない。stable updater管理DBはplan/snapshot digestとforward-only契約保持のためschema10へ移行し、schema9以前のbinaryへ管理DBを戻して起動しない。
+
+## Task世代を保持するforward-only導入
+
+現行のschema4 manifestは `rollback_safe:false` であり、従来のrollback可能updateとは別の明示設定が必要になる。新mainを取得しCI/reviewを確認した後、Mac上で次の環境設定をinstallerの `--upgrade-control <既存の絶対generation-root>` に渡す。
+
+- `DONA_SIGNED_HOST_CONFIG`：前述のprivate署名設定JSON。
+- `DONA_TASK_GENERATION_UPDATE=forward_only`：schema4を保持して進め、target起動後に自動rollbackしないことの明示設定。
+
+rendererは `task_generation_update:{mode:"forward_only",schema:4,task_execution_version:1}` をpolicyへ保存し、以降のcontrol更新でも保持する。この段階では旧unsigned Dispatcherの引数を維持する。次に通常の `plan_self_update` を実行し、exact main SHA・plan hash・署名host切替・`activation_mode:forward_only`・`database_policy:preserve`・`automatic_rollback:false` を確認する。そのexact planへの利用者承認後だけ `apply_self_update` へ進む。profile不足・署名doctor失敗ならprepareで停止し、切替しない。
+
+このmodeは既存とtargetのprotocol/configが同じで、双方のread/write schemaがexact4、Task execution versionが1のときだけ使える。plan、prepare、停止後のpointer変更直前にDBのuser_version4・integrity・FKをread-only検査する。v2/v3→4 migration、schema低下、DB reset、全DBのbackup/restoreは行わない。保護された承認payload/Keychain anchorのbackup制限も変えない。
+
+target Dispatcherの開始intent以降に失敗した場合は、旧payloadの再起動やDB/Keychain巻戻しを行わず `needs_review` とする。受理不明のstartを再送せずversion healthと永続receiptで照合する。停止前の失敗は既存runtimeを維持できるが、停止後の失敗では受付停止が続く可能性がある。これはplanの自動rollback不可表示に含まれる運用上の制約である。復旧には現在のDBと保護anchorを保った修正版の前進配備を判断する。管理DBはこのplan契約を保持するschema10となり、旧updater binaryへdowngradeしない。

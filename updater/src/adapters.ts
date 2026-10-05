@@ -1,3 +1,4 @@
+import {isTaskGenerationRollout} from './task-generation-update.js';
 import fs from "node:fs/promises";
 import {randomUUID} from "node:crypto";
 import fsSync from "node:fs";
@@ -202,6 +203,7 @@ export class RealGit implements GitPort {
       "--git-dir", this.cachePath, "show", `${targetSha}:config/schema-rollout.json`,
     ]));
     const value = JSON.parse(raw) as Partial<SchemaRollout>;
+    if(isTaskGenerationRollout(value))return value;
     const commonValid = value.schema_version === 1 && typeof value.phase === "string" &&
       Number.isInteger(value.database_schema) && typeof value.multi_job_enabled === "boolean";
     const bootstrapValid = Array.isArray(value.capabilities) &&

@@ -65,6 +65,17 @@ if(hostInput || fs.existsSync(existingPolicy)) {
     !/^[A-Z0-9]{10}$/.test(signedHost.team_id)||!(/^[A-Z0-9]{10}\.dev\.dona\.approval$/).test(signedHost.access_group)||
     !/^[a-fA-F0-9]{40}$/.test(signedHost.signing_identity_sha1)||!path.isAbsolute(signedHost.provisioning_profile)))throw Error("signed_host_config_invalid");
 }
+const taskInput=process.argv[7];
+if(taskInput && taskInput!=="forward_only")throw Error("task_generation_update_mode_invalid");
+let taskGenerationUpdate;
+if(fs.existsSync(existingPolicy)){
+ const info=fs.lstatSync(existingPolicy);if(!info.isFile()||info.isSymbolicLink()||info.uid!==process.getuid())throw Error("existing_policy_not_private");
+ taskGenerationUpdate=JSON.parse(fs.readFileSync(existingPolicy,"utf8")).task_generation_update;
+ if(taskGenerationUpdate&&(info.mode&0o077))throw Error("existing_policy_not_private");
+}
+const expectedTaskMode={mode:"forward_only",schema:4,task_execution_version:1};
+if(taskInput)taskGenerationUpdate=expectedTaskMode;
+if(taskGenerationUpdate && (Object.keys(taskGenerationUpdate).sort().join(',')!=="mode,schema,task_execution_version"||Object.entries(expectedTaskMode).some(([k,v])=>taskGenerationUpdate[k]!==v)))throw Error("task_generation_update_mode_invalid");
 const xml = (value) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
 fs.mkdirSync(destination, { recursive: true, mode: 0o700 });
 for (const name of ["dev.dona.updater", "dev.dona.dispatcher", "dev.dona.slack-adapter"]) {
@@ -79,6 +90,7 @@ for (const name of ["dev.dona.updater", "dev.dona.dispatcher", "dev.dona.slack-a
 
 if(signedHost)fs.writeFileSync(path.join(destination,"signed-host.json"),JSON.stringify(signedHost),{mode:0o600});
 const policy = {
+  ...(taskGenerationUpdate ? {task_generation_update:taskGenerationUpdate} : {}),
   ...(signedHost ? {signed_host:signedHost} : {}),
   schema_version: 1,
   policy_version: "2026-09-03.2",

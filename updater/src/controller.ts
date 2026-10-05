@@ -1,3 +1,4 @@
+import {isTaskGenerationRollout,sameTaskGeneration,validTaskGenerationPolicy} from './task-generation-update.js';
 import { ulid } from "ulid";
 import path from "node:path";
 
@@ -77,6 +78,7 @@ function rolloutMatchesTargetCompatibility(
   compatibility: ReleaseManifest["compatibility"],
   transition?: UpdatePolicy["compatibility_transitions"][number],
 ): boolean {
+  if(compatibility.app_schema_write===4)return isTaskGenerationRollout(rollout);
   if (compatibility.app_schema_write === 3) {
     const expected = transition ? {
       ...schemaV3ActivationRollout,
@@ -150,7 +152,9 @@ export class UpdateController {
       compatibility: git.target_compatibility,
     };
     const rollbackCompatible = releaseCompatibilityMatches(current.compatibility, targetManifest.compatibility);
-    if (!rollbackCompatible && !transition) throw new Error("target_is_not_rollback_compatible_with_current_release");
+    const forwardOnly=validTaskGenerationPolicy(this.policy.task_generation_update)&&sameTaskGeneration(current.compatibility,targetManifest.compatibility)&&isTaskGenerationRollout(git.target_rollout);
+    if(forwardOnly)await this.verifyTaskDatabase();
+    if (!rollbackCompatible && !transition && !forwardOnly) throw new Error("target_is_not_rollback_compatible_with_current_release");
     if (current.compatibility.app_schema_write === 2 && targetManifest.compatibility.app_schema_write === 3 &&
       !transition && current.sha !== schemaV3BridgeSha) {
       throw new Error("schema_activation_bridge_identity_unverified");
@@ -166,6 +170,7 @@ export class UpdateController {
     const hostTransition=this.policy.signed_host && this.runtime.planDispatcherHostTransition
       ? await this.runtime.planDispatcherHostTransition(current.sha,git.target_sha) : null;
     const result = this.database.createPlan(request, {
+      activation_mode:forwardOnly ? "forward_only" : null,
       signed_host_transition:hostTransition,
       signed_host_digest:signedHostPolicyDigest(this.policy),
       current_sha: current.sha,
@@ -195,6 +200,7 @@ export class UpdateController {
   apply(request: ApplyRequest): Record<string, unknown> {
     const plan = this.database.getPlan(request.plan_id);
     if(!plan || (plan.signed_host_digest ?? null)!==signedHostPolicyDigest(this.policy))throw new Error("signed_host_plan_drift");
+    if(plan.activation_mode==="forward_only"&&!validTaskGenerationPolicy(this.policy.task_generation_update))throw Error("task_generation_policy_drift");
     const result = this.database.approve(request, this.clock.now());
     return {
       schema_version: 1,
@@ -376,6 +382,7 @@ export class UpdateController {
     ) {
       this.database.terminal(claimed.request_id, claimed.fence, "succeeded", "reconciled_target_health", {}, this.clock.now());
     } else if (
+      claimed.activation_mode!=="forward_only" &&
       observation.current_sha === claimed.current_sha &&
       observation.previous_sha === claimed.target_sha &&
       observation.receipt?.request_id === claimed.request_id &&
@@ -497,6 +504,7 @@ export class UpdateController {
         if(row.signed_host_transition){if(!this.runtime.verifyDispatcherHostOriginal || !this.runtime.applyDispatcherHostTransition)throw Error("host_transition_runtime_unavailable");await this.runtime.verifyDispatcherHostOriginal(this.hostTransition(row)!);}
         else await this.build.verifySignedHost!(path.join(this.policy.release_root,row.current_sha),activeManifest);
       }
+      if(row.activation_mode==="forward_only"){if(!sameTaskGeneration(activeManifest.compatibility,JSON.parse(row.compatibility_json)))throw Error("task_generation_contract_drift");await this.verifyTaskDatabase();}
       if (activeManifest.sha !== row.current_sha) {
         throw new Error("planned_current_release_is_no_longer_active");
       }
@@ -897,6 +905,7 @@ export class UpdateController {
           workerBeforeActivation.error_code ?? "active_worker_handoff_unavailable");
         return;
       }
+      if(row.activation_mode==="forward_only"){await this.verifyTaskDatabase();this.assertLease(row);}
       const releasePath = `${this.policy.release_root}/${row.target_sha}`;
       if(row.signed_host_transition)await this.runtime.applyDispatcherHostTransition!(this.hostTransition(row)!,"target");
       this.assertLease(row);
@@ -1006,6 +1015,7 @@ export class UpdateController {
   }
 
   private async resumeRollback(row: UpdateRow, knownPaneId?: string): Promise<void> {
+    if(row.activation_mode==="forward_only"){this.needsReview(row,"forward_only_rollback_forbidden");return;}
     this.assertLease(row);
     const previousManifest = await this.releases.releaseManifest(row.current_sha);
     this.assertLease(row);
@@ -1361,7 +1371,7 @@ export class UpdateController {
   private async observeTerminal(row: UpdateRow): Promise<TerminalObservation | undefined> {
     const observation = await this.releases.observe();
     const activeSha = observation.current_sha;
-    if (!activeSha) return undefined;
+    if (!activeSha || (row.activation_mode==="forward_only"&&activeSha!==row.target_sha)) return undefined;
     const activeRelease = path.join(this.policy.release_root, activeSha);
     const [dispatcherHealth, slackHealth, mainAgent, activeManifest] = await Promise.all([
       this.runtime.dispatcherHealth(),
@@ -1369,7 +1379,7 @@ export class UpdateController {
       this.runtime.mainAgentStatus(activeRelease),
       this.releases.releaseManifest(activeSha),
     ]);
-    if (!activeManifest || !this.healthMatches(dispatcherHealth, activeSha, false, activeManifest.compatibility) ||
+    if (!activeManifest || !this.hostMatches(row,dispatcherHealth,activeSha) || !this.healthMatches(dispatcherHealth, activeSha, false, activeManifest.compatibility) ||
       !this.healthMatches(slackHealth, activeSha, true, activeManifest.compatibility)) return undefined;
 
     const captured = this.database.runtimeOperation(row.request_id, "legacy_confirmation");
@@ -1476,6 +1486,7 @@ export class UpdateController {
   }
 
   private deferOrReview(row: UpdateRow, code: string, message: string): void {
+    if(row.activation_mode==="forward_only"&&this.database.runtimeOperation(row.request_id,"start_target_dispatcher")){this.needsReview(row,code,message);return;}
     const current = this.database.get(row.request_id);
     if (!current || current.fence !== row.fence || current.completed_at !== null) return;
     const now = this.clock.now();
@@ -1962,6 +1973,7 @@ export class UpdateController {
   private async restoreQuiescedServices(
     row: UpdateRow, causeCode: string, dispatcherQuiesced = true, slackQuiesced = true,
   ): Promise<void> {
+    if(row.activation_mode==="forward_only"&&this.database.runtimeOperation(row.request_id,"start_target_dispatcher")){this.needsReview(row,"forward_only_old_payload_restart_forbidden");return;}
     const pointerBeforeRecovery = await this.releases.observe();
     this.assertLease(row);
     if (pointerBeforeRecovery.current_sha !== row.current_sha) {
@@ -2266,6 +2278,7 @@ export class UpdateController {
 
   private hostTransition(row:UpdateRow){return row.signed_host_transition ? {digest:row.signed_host_transition,from_sha:row.current_sha,to_sha:row.target_sha} : undefined;}
   private async startDispatcherFor(row:UpdateRow,sha:string):Promise<CommandResult>{
+    if(row.activation_mode==="forward_only"&&sha===row.current_sha&&this.database.runtimeOperation(row.request_id,"start_target_dispatcher"))throw Error("forward_only_old_payload_restart_forbidden");
     const transition=this.hostTransition(row);
     if(transition){
       if(!this.runtime.applyDispatcherHostTransition)throw Error("host_transition_runtime_unavailable");
@@ -2275,7 +2288,10 @@ export class UpdateController {
     return this.runtime.startDispatcher();
   }
 
+  private async verifyTaskDatabase():Promise<void>{const state=await this.runtime.appSchemaState();if(state.user_version!==4||!state.integrity_ok||state.foreign_key_violations!==0)throw Error("task_generation_database_unverified");}
+
   private assertLease(row: UpdateRow): void {
+    if(row.activation_mode==="forward_only"&&!validTaskGenerationPolicy(this.policy.task_generation_update))throw Error("task_generation_policy_drift");
     if((row.signed_host_digest ?? null)!==signedHostPolicyDigest(this.policy))throw new Error("signed_host_plan_drift");
     this.database.assertLease(row.request_id, row.fence, this.owner, this.clock.now());
   }

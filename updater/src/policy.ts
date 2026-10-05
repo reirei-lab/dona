@@ -1,3 +1,4 @@
+import {validTaskGenerationPolicy,taskGenerationPolicy} from './task-generation-update.js';
 import fs from "node:fs";
 import path from "node:path";
 import {createHash} from "node:crypto";
@@ -6,6 +7,7 @@ import type { Compatibility, CompatibilityTransition } from "./types.js";
 import { fullSha, ValidationError } from "./validation.js";
 
 export interface UpdatePolicy {
+  task_generation_update?: typeof taskGenerationPolicy;
   signed_host?: { team_id: string; access_group: string; signing_identity_sha1: string; provisioning_profile: string };
   schema_version: 1;
   policy_version: string;
@@ -111,7 +113,7 @@ export function parsePolicy(input: unknown): UpdatePolicy {
     "output_limit_bytes", "diagnostic_log_limit_bytes", "diagnostic_aggregate_limit_bytes", "diagnostic_retention_days",
     "disk_floor_bytes", "retain_successful", "required_checks", "require_verified_signature", "compatibility",
   ];
-  const extras = Object.keys(value).filter((key) => ![...policyKeys, "compatibility_transitions", "signed_host"].includes(key));
+  const extras = Object.keys(value).filter((key) => ![...policyKeys, "compatibility_transitions", "signed_host", "task_generation_update"].includes(key));
   const missing = policyKeys.filter((key) => !(key in value));
   if (extras.length || missing.length) throw new ValidationError("policy fields do not match schema");
   if (value.schema_version !== 1 || value.repository !== "hiragram/dona" || value.default_branch !== "main") {
@@ -206,6 +208,7 @@ export function parsePolicy(input: unknown): UpdatePolicy {
   if (diagnosticAggregateLimitBytes < diagnosticLogLimitBytes * 2) {
     throw new ValidationError("diagnostic_aggregate_limit_bytes must cover both command and observation logs");
   }
+  if(value.task_generation_update!==undefined&&!validTaskGenerationPolicy(value.task_generation_update))throw new ValidationError("task_generation_update is invalid");
   let signedHost: UpdatePolicy["signed_host"];
   if (value.signed_host !== undefined) {
     const h = record(value.signed_host, "signed_host");
@@ -218,6 +221,7 @@ export function parsePolicy(input: unknown): UpdatePolicy {
       provisioning_profile:absolute(h.provisioning_profile,"signed_host.provisioning_profile")};
   }
   return {
+    ...(value.task_generation_update ? {task_generation_update:taskGenerationPolicy} : {}),
     ...(signedHost ? { signed_host: signedHost } : {}),
     schema_version: 1,
     policy_version: value.policy_version,

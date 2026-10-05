@@ -537,11 +537,11 @@ test('署名hostのrenderは指定設定と既存policyを保持し固定binary�
   const config={team_id:'ABCDEFGHIJ',access_group:'ABCDEFGHIJ.dev.dona.approval',signing_identity_sha1:'a'.repeat(40),provisioning_profile:path.join(home,'host.provisionprofile')};
   const file=path.join(home,'host.json');await fs.writeFile(file,JSON.stringify(config),{mode:0o600});
   const script=fileURLToPath(new URL('../../scripts/render-self-update-templates.mjs',import.meta.url)),dest=path.join(home,'rendered');
-  await execute(process.execPath,[script,dest,'a'.repeat(40),base,'',file],{env:{...process.env,PATH:`${bin}:${process.env.PATH}`}});
-  const policy=JSON.parse(await fs.readFile(path.join(dest,'policy.json'),'utf8'));assert.deepEqual(policy.signed_host,config);
+  await execute(process.execPath,[script,dest,'a'.repeat(40),base,'',file,'forward_only'],{env:{...process.env,PATH:`${bin}:${process.env.PATH}`}});
+  const policy=JSON.parse(await fs.readFile(path.join(dest,'policy.json'),'utf8'));assert.deepEqual(policy.signed_host,config);assert.deepEqual(policy.task_generation_update,{mode:"forward_only",schema:4,task_execution_version:1});
   const plist=await fs.readFile(path.join(dest,'dev.dona.dispatcher.plist'),'utf8');assert.match(plist,/current\/signed-host\/DonaDispatcher.app\/Contents\/MacOS\/DonaDispatcher/);assert.doesNotMatch(plist,/current\/dispatcher\/dist\/cli.js/);
   await fs.mkdir(policy.control_root,{recursive:true});await fs.copyFile(path.join(dest,'policy.json'),path.join(policy.control_root,'policy.json'));await fs.chmod(path.join(policy.control_root,'policy.json'),0o600);
   const next=path.join(home,'rendered-next');await execute(process.execPath,[script,next,'b'.repeat(40),base],{env:{...process.env,PATH:`${bin}:${process.env.PATH}`}});
-  assert.deepEqual(JSON.parse(await fs.readFile(path.join(next,'policy.json'),'utf8')).signed_host,config);
+  const preserved=JSON.parse(await fs.readFile(path.join(next,'policy.json'),'utf8'));assert.deepEqual(preserved.signed_host,config);assert.deepEqual(preserved.task_generation_update,policy.task_generation_update);
  }finally{await fs.rm(home,{recursive:true,force:true});}
 });
