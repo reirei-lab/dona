@@ -12,10 +12,15 @@ import { DashboardServer } from "./server.js";
 
 async function main():Promise<void>{
   const [command,file,...extra]=process.argv.slice(2);
-  if(!file||!['serve','pair','revoke','status'].includes(command??''))throw Error('dashboard_arguments_invalid');
+  if(!file||!['serve','pair','revoke','status','doctor'].includes(command??''))throw Error('dashboard_arguments_invalid');
   const capabilities:string[]=[];let deviceId:string|undefined;
   for(let i=0;i<extra.length;i+=2){if(!extra[i+1])throw Error('dashboard_arguments_invalid');if(command==='pair'&&extra[i]==='--capability')capabilities.push(extra[i+1]!);else if(command==='revoke'&&extra[i]==='--device'&&!deviceId)deviceId=extra[i+1];else throw Error('dashboard_arguments_invalid');}
   const config=readDashboardConfig(file);
+  if(command==='doctor'){
+    const status=await new DashboardOperatorClient(config.dispatcher_socket).call<{database:string;runtime:string;operator:string;external:{configured:boolean;ready:boolean;reason?:string}}>('admin/health',{});
+    const ready=status.database==='ready'&&status.runtime==='ready'&&status.operator==='ready'&&(!status.external.configured||status.external.ready);
+    process.stdout.write(JSON.stringify({config:'ready',ready,...status})+'\n');if(!ready)process.exitCode=1;return;
+  }
   if(command==='serve'){
     // Resolve only the paired Web artifact from this immutable release.
     const moduleUrl=new URL('../../../sources/web/dist/observer-dashboard.js',import.meta.url);

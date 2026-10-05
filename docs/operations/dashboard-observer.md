@@ -71,3 +71,9 @@ version応答はservice起動の証拠であり、Tailscale経由のTLS、ブラ
 Mac の `pair` コマンドには `--capability` を複数指定できます。省略時は `tasks:read` と `conversations:worker:read` だけです。Dona 本体の会話は `--capability conversations:main:read` を明示します。指定した集合がそのコードの付与範囲になるため、Task も見る場合は各 read capability を併記してください。操作権限も Mac で明示した範囲に限られます。
 
 `revoke --device <device_id>` は対象端末を失効させ、引数なしは全端末を失効させます。`status` は Dispatcher の認可状態を表示します。接続コードは引き続き対話 terminal の `pair` だけに表示し、service log へ記録しません。
+
+## 起動後の診断
+
+`node dispatcher/dist/dashboard/cli.js doctor /absolute/path/dashboard.json` は設定の検証後、private Dispatcher socketを通してDB・Runtime接続・operator・外部承認の保護状態を個別に照会する。`external.configured: false` は外部承認未設定であり、利用可能を意味しない。設定済みの機能が不健全な場合は終了code 1となる。これはHTTPSの別端末到達や実Slack操作の成功とは別の確認である。
+
+外部承認を有効にするDispatcherは `DONA_LOCAL_APPROVAL_CONFIG` にMacで管理する0600の設定ファイルを指定する。設定・署名・Keychain整合性の検査に失敗したときは外部承認を利用不可として診断に示す。他のTask閲覧やDispatcher受付を、初期設定の不足だけで停止しない。provisionは常駐serviceから自動実行しない。
