@@ -71,3 +71,13 @@ test("RealGit uses an isolated fixed branch, exact SHA, FF-only ancestry, and de
     await removeTree(root);
   }
 });
+test('RealGitはrepositoryの現schema4 rolloutをexact SHAから読み、変更された契約を拒否する',async()=>{
+ const {root,policy}=await tempPolicy();try{
+ const work=path.join(root,'source'),remote=path.join(root,'remote.git');await git(['init','--initial-branch=main',work]);await git(['-C',work,'config','user.name','Dona Test']);await git(['-C',work,'config','user.email','test@example.invalid']);await fs.mkdir(path.join(work,'config'));
+ for(const name of ['release-compatibility.json','schema-rollout.json'])await fs.copyFile(new URL('../../config/'+name,import.meta.url),path.join(work,'config',name));
+ await git(['-C',work,'add','.']);await git(['-C',work,'commit','-m','schema4 fixture']);const sha=await git(['-C',work,'rev-parse','HEAD']);await git(['clone','--bare',work,remote]);await git(['-C',work,'remote','add','origin',remote]);
+ const adapter=new RealGit({...policy,canonical_remote:remote,required_checks:[]});const result=await adapter.refresh(sha);
+ assert.equal(result.target_compatibility.app_schema_write,4);assert.equal(result.target_compatibility.rollback_safe,false);assert.deepEqual(result.target_rollout,JSON.parse(await fs.readFile(new URL('../../config/schema-rollout.json',import.meta.url),'utf8')));
+ await fs.writeFile(path.join(work,'config/schema-rollout.json'),JSON.stringify({...result.target_rollout,online_migration:true}));await git(['-C',work,'commit','-am','invalid rollout']);await git(['-C',work,'push','origin','main']);await assert.rejects(adapter.refresh(sha),/target_schema_rollout_is_invalid/);
+ }finally{await removeTree(root);}
+});

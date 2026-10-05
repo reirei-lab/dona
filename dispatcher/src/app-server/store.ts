@@ -12,6 +12,7 @@ export interface AgentRecord {
   startup_state?:"not_sent"|"sending"|"ready";
   recovery_hint?:{reason:"capacity_wait"|"authorization_required"|"configuration_error";retry_after?:string};
 }
+export interface ArchivedConversation {name:string;generation:string;role:"main"|"worker";thread_id:string;attempt_id:string|null;recorded_at:string}
 export interface QuestionRecord {
   question_id:string; agent:string; generation:string; thread_id:string; turn_id:string;
   rpc_id_json:string; kind:"question"|"approval"|"elicitation";
@@ -49,15 +50,38 @@ export class RuntimeStore {
       this.db.prepare("UPDATE observation_items SET sequence=rowid").run();
       this.db.prepare("UPDATE observation_item_sequence SET sequence=COALESCE((SELECT MAX(sequence) FROM observation_items),0)").run();
     }
+    this.db.exec(`CREATE TABLE IF NOT EXISTS conversation_bindings(name TEXT NOT NULL,generation TEXT NOT NULL,
+      role TEXT NOT NULL,thread_id TEXT NOT NULL,attempt_id TEXT,recorded_at TEXT NOT NULL,PRIMARY KEY(name,generation));
+      CREATE TRIGGER IF NOT EXISTS conversation_bindings_no_update BEFORE UPDATE ON conversation_bindings BEGIN SELECT RAISE(ABORT,'conversation_binding_immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS conversation_bindings_no_delete BEFORE DELETE ON conversation_bindings BEGIN SELECT RAISE(ABORT,'conversation_binding_immutable'); END;`);
+    this.db.transaction(()=>{for(const row of this.agents())this.archiveConversation(row);}).immediate();
     this.expireObservations();
   }
   agent(name:string):AgentRecord|undefined {return this.db.prepare("SELECT * FROM agents WHERE name=?").get(name) as AgentRecord|undefined;}
   agents():AgentRecord[] {return this.db.prepare("SELECT * FROM agents ORDER BY name").all() as AgentRecord[];}
+  private archiveConversation(agent:AgentRecord):void {
+    if(!agent.thread_id)return;
+    const input=JSON.parse(agent.config_json) as {attemptId?:string};
+    const archived=this.archivedConversation(agent.name,agent.generation);
+    if(archived){if(archived.thread_id!==agent.thread_id||archived.role!==agent.role||archived.attempt_id!==(input.attemptId??null))throw Error("runtime_conversation_binding_conflict");return;}
+    this.db.prepare("INSERT INTO conversation_bindings VALUES(?,?,?,?,?,?)").run(agent.name,agent.generation,agent.role,agent.thread_id,input.attemptId??null,new Date().toISOString());
+  }
+  archivedConversation(name:string,generation:string):ArchivedConversation|undefined {
+    return this.db.prepare("SELECT * FROM conversation_bindings WHERE name=? AND generation=?").get(name,generation) as ArchivedConversation|undefined;
+  }
+  conversationHistory(name:string,afterGeneration=""):{items:ArchivedConversation[];next:string|null} {
+    const rows=this.db.prepare("SELECT * FROM conversation_bindings WHERE name=? AND generation>? ORDER BY generation LIMIT 101").all(name,afterGeneration) as ArchivedConversation[];
+    return {items:rows.slice(0,100),next:rows.length>100?rows[99]!.generation:null};
+  }
   put(agent:AgentRecord):void {
+    this.db.transaction(()=>{
+    const previous=this.agent(agent.name);if(previous)this.archiveConversation(previous);
+    this.archiveConversation(agent);
     this.db.prepare(`INSERT INTO agents VALUES(@name,@generation,@role,@cwd,@release,@thread_id,@turn_id,@pid,@process_start,@state,@request_hash,@config_json,@sequence)
       ON CONFLICT(name) DO UPDATE SET generation=excluded.generation,role=excluded.role,cwd=excluded.cwd,release=excluded.release,
       thread_id=excluded.thread_id,turn_id=excluded.turn_id,pid=excluded.pid,process_start=excluded.process_start,state=excluded.state,
       request_hash=excluded.request_hash,config_json=excluded.config_json,sequence=excluded.sequence`).run(agent);
+    }).immediate();
   }
   change(name:string,generation:string,values:Partial<Pick<AgentRecord,"state"|"thread_id"|"turn_id">>):void {
     const row=this.agent(name);if(!row||row.generation!==generation)return;

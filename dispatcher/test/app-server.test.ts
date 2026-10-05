@@ -239,3 +239,75 @@ for(const method of ["item/commandExecution/requestApproval","item/fileChange/re
   await manager.prompt(agent.name,"denied","OS承認");await until(()=>store.agent(agent.name)?.state==="idle");assert.equal(store.questions(agent.name).length,0);
  }finally{const row=store.agent("main");if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+test("外部reply dynamic toolは実turnへ束縛しnative質問と分離する",async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-app-external-")),script=path.join(root,"fake.mjs");
+ const tool=fake.replace("method:'item/tool/requestUserInput'","method:'item/tool/call'").replace("itemId:'item-test',questions:[{id:'choice',question:'どちら？',isSecret:false,options:null}]","callId:'call-external',namespace:null,tool:'dona_request_thread_reply',arguments:{operation_slot:'reply_one',text:'確認した本文'}");
+ await fs.writeFile(script,tool);const store=new RuntimeStore(path.join(root,"runtime.db")),manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));
+ try{
+  assert.throws(()=>manager.external.accept({} as never,{} as never),/runtime_external_unavailable/);
+  manager.external.availability(true);
+  const agent=await manager.start({name:"main-external",role:"main",cwd:root,release:root,args:[],threadConfig:{}});
+  const eventId="evt_01m3e2ht7qs79vf480z5qefeat";
+  await manager.prompt(agent.name,eventId,"承認を要求");await until(()=>manager.external.pending().length===1);
+  const row=manager.externalRequests()[0]!;assert.equal(row.source_event_id,eventId);assert.equal(row.attempt_id,null);assert.equal(row.text,"確認した本文");assert.notEqual((store.db.prepare("SELECT text FROM external_tool_requests WHERE request_id=?").get(row.request_id) as {text:string}).text,row.text);assert.equal(store.questions(agent.name).length,0);
+  manager.external.availability(false);
+  assert.equal(manager.external.pending().length,1);
+  assert.throws(()=>manager.external.accept({} as never,{} as never),/runtime_external_unavailable/);
+  assert.equal(manager.status(agent.name)?.state,"waiting");manager.resolveExternal(agent.name,row.request_id,{request_id:"approval",state:"pending"});
+  await until(()=>manager.status(agent.name)?.state==="idle");assert.equal(manager.external.get(row.request_id)?.text,"");
+  assert.equal(manager.resolveExternal(agent.name,row.request_id,{request_id:"approval",state:"pending"}).state,"resolved");
+  assert.throws(()=>manager.resolveExternal(agent.name,row.request_id,{request_id:"other",state:"pending"}),/conflict/);
+ }finally{const row=store.agent("main-external");if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("外部draftはmemoryだけに保持しRuntime再起動で失効する",async()=>{
+ const {ExternalToolQueue}=await import("../src/app-server/external-tools.js"),root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-external-memory-")),store=new RuntimeStore(path.join(root,"runtime.db"));
+ try{const queue=new ExternalToolQueue(store);queue.availability(true);
+  const row=queue.accept({name:"main",generation:"g",thread_id:"t",turn_id:"turn",role:"main",config_json:"{}"} as any,{id:1,method:"item/tool/call",params:{threadId:"t",turnId:"turn",callId:"call",tool:"dona_request_thread_reply",arguments:{operation_slot:"slot",text:"private draft"}}});
+  assert.equal(queue.get(row.request_id)?.text,"private draft");const persisted=JSON.stringify(store.db.prepare("SELECT * FROM external_tool_requests").all());assert.ok(!persisted.includes("private draft"));
+  const other=queue.accept({name:"main",generation:"g2",thread_id:"t2",turn_id:"turn2",role:"main",config_json:"{}"} as any,{id:2,method:"item/tool/call",params:{threadId:"t2",turnId:"turn2",callId:"call",tool:"dona_request_thread_reply",arguments:{operation_slot:"slot",text:"next draft"}}});
+  queue.expireAgent("main","g");assert.equal(queue.get(row.request_id)?.state,"expired");assert.equal(queue.get(other.request_id)?.text,"next draft");
+  queue.expireRestart();assert.equal(queue.get(other.request_id)?.state,"expired");assert.equal(queue.get(row.request_id)?.text,"");assert.equal(queue.get(row.request_id)?.state,"expired");assert.throws(()=>queue.resolve(row.request_id,{request_id:null,state:"pending"}),/expired/);
+ }finally{store.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+for(const [label,params]of [
+ ['未知tool',{tool:'unknown_external_tool'}],
+ ['typed余分field',{arguments:{operation_slot:'slot',text:'draft',owner_id:'forged'}}],
+ ['本文上限超過',{arguments:{operation_slot:'slot',text:'x'.repeat(3001)}}],
+ ['thread差替え',{threadId:'wrong-thread'}],
+] as const)test(`実App Server request入口で${label}を拒否し要求を保存しない`,async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'dona-external-wire-deny-')),script=path.join(root,'fake.mjs'),response=path.join(root,'response.json');
+ const request={id:'question-1',method:'item/tool/call',params:{threadId:'thread-test',turnId:'turn-test',callId:'call',namespace:null,tool:'dona_request_thread_reply',arguments:{operation_slot:'slot',text:'draft'},...params}};
+ const code=fake.replace("import readline from 'node:readline';","import readline from 'node:readline';import fs from 'node:fs';")
+  .replace("send({id:'question-1',method:'item/tool/requestUserInput',params:{threadId:'thread-test',turnId:'turn-test',itemId:'item-test',questions:[{id:'choice',question:'どちら？',isSecret:false,options:null}]}});",`send(${JSON.stringify(request)});`)
+  .replace("if(r.id==='question-1'&&r.result){",`if(r.id==='question-1'&&(r.result||r.error)){fs.writeFileSync(${JSON.stringify(response)},JSON.stringify(r));`);
+ await fs.writeFile(script,code);const store=new RuntimeStore(path.join(root,'runtime.db')),manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));
+ try{
+  manager.external.availability(true);const agent=await manager.start({name:'main-denial',role:'main',cwd:root,release:root,args:[],threadConfig:{}});
+  await manager.prompt(agent.name,'evt_'+'0'.repeat(26),'request');await until(()=>manager.status(agent.name)?.state==='idle');
+  const denied=JSON.parse(await fs.readFile(response,'utf8'));assert.ok(denied.error||denied.result?.success===false);
+  assert.equal(store.db.prepare('SELECT COUNT(*) FROM external_tool_requests').pluck().get(),0);assert.deepEqual(store.questions(agent.name),[]);
+ }finally{const row=store.agent('main-denial');if(row&&row.state!=='stopped')await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("worker外部callは同じturn内でも発生時のoperationを保持し未確定steer中は拒否する",async()=>{
+ const {ExternalToolQueue}=await import("../src/app-server/external-tools.js"),root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-external-provenance-")),store=new RuntimeStore(path.join(root,"runtime.db"));
+ try{const queue=new ExternalToolQueue(store);queue.availability(true);
+  const agent={name:"worker",generation:"g",thread_id:"t",turn_id:"turn",role:"worker",config_json:JSON.stringify({attemptId:"job_fixture"})} as any;
+  const message=(call:string)=>({id:call,method:"item/tool/call",params:{threadId:"t",turnId:"turn",callId:call,tool:"dona_request_thread_reply",arguments:{operation_slot:call,text:"draft"}}});
+  assert.throws(()=>queue.accept(agent,message("missing")),/source_unavailable/);
+  const receipt=JSON.stringify({generation:"g",threadId:"t",turnId:"turn"});
+  store.db.prepare("INSERT INTO operations VALUES(?,?,'fixture','accepted',?)").run("worker","attempt:job_fixture",receipt);
+  const old=queue.accept(agent,message("before"));assert.equal(old.operation_key,"attempt:job_fixture");
+  store.db.prepare("INSERT INTO operations VALUES(?,?,'fixture','sending',NULL)").run("worker","steer:evt_fixture");
+  assert.throws(()=>queue.accept(agent,message("during")),/source_unavailable/);
+  store.db.prepare("UPDATE operations SET state='unknown' WHERE operation_key=?").run("steer:evt_fixture");
+  assert.throws(()=>queue.accept(agent,message("unknown")),/source_unavailable/);
+  store.db.prepare("UPDATE operations SET state='accepted',result_json=? WHERE operation_key=?").run(receipt,"steer:evt_fixture");
+  const next=queue.accept(agent,message("after"));assert.equal(next.operation_key,"steer:evt_fixture");
+  assert.equal(queue.source(queue.get(old.request_id)!).operation_key,"attempt:job_fixture");
+  queue.expireRestart();assert.equal(queue.get(old.request_id)?.state,"expired");assert.equal(queue.get(next.request_id)?.state,"expired");
+ }finally{store.close();await fs.rm(root,{recursive:true,force:true});}
+});

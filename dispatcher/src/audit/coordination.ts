@@ -48,21 +48,25 @@ function databasePathIdentity(filename: string): string {
 /** Open an existing owner-only database after checking the configured path itself.
  * Runtime provisioning must create the private file separately; this never
  * resolves aliases, creates a database, or registers an already-open connection. */
-export function openSecurityDatabase(filename: string): Database.Database {
+function openSecurityDatabaseMode(filename: string, readonly: boolean): Database.Database {
   let db: Database.Database | undefined;
   try {
     const identity = databasePathIdentity(filename);
-    db = new Database(filename, { fileMustExist: true });
+    db = new Database(filename, { fileMustExist: true, readonly });
     db.pragma("recursive_triggers = ON");
     if (databasePathIdentity(filename) !== identity) throw new SecurityCoordinationError();
     verifyOpenDatabaseFile(db);
-    opened.set(db, { filename, identity });
+    if (!readonly) opened.set(db, { filename, identity });
     return db;
   } catch {
     try { db?.close(); } catch { /* Preserve the redacted open error. */ }
     throw new SecurityCoordinationError();
   }
 }
+
+/** 既存candidateをread-onlyで検査する。write coordinationへは登録しない。 */
+export function openSecurityReadOnlyDatabase(filename: string): Database.Database { return openSecurityDatabaseMode(filename, true); }
+export function openSecurityDatabase(filename: string): Database.Database { return openSecurityDatabaseMode(filename, false); }
 
 /** Publish an owner-only empty file without ever opening/closing an extra fd on
  * the published SQLite inode while another connection may hold POSIX locks. */

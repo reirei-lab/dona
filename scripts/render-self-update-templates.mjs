@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {resolveLocalApprovalInstallConfig} from "./local-approval-install-config.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repository = path.dirname(scriptDir);
@@ -53,16 +54,49 @@ if (transitionFile.schema_version !== 1 || !Array.isArray(transitionFile.transit
   throw new Error("Unsupported compatibility transition schema");
 }
 
+let signedHost;
+const hostInput=process.argv[6];
+const existingPolicy=path.join(values.CONTROL_ROOT,"policy.json");
+if(hostInput || fs.existsSync(existingPolicy)) {
+  const file=hostInput || existingPolicy, info=fs.lstatSync(file);
+  if(!path.isAbsolute(file)||!info.isFile()||info.isSymbolicLink()||info.uid!==process.getuid())throw Error("signed_host_config_not_private");
+  const input=JSON.parse(fs.readFileSync(file,"utf8"));signedHost=hostInput?input:input.signed_host;
+  if((hostInput&&!signedHost)||((hostInput||signedHost)&&(info.mode&0o077)!==0))throw Error("signed_host_config_not_private");
+  if(signedHost && (Object.keys(signedHost).sort().join(',')!=='access_group,provisioning_profile,signing_identity_sha1,team_id'||
+    !/^[A-Z0-9]{10}$/.test(signedHost.team_id)||!(/^[A-Z0-9]{10}\.dev\.dona\.approval$/).test(signedHost.access_group)||
+    !/^[a-fA-F0-9]{40}$/.test(signedHost.signing_identity_sha1)||!path.isAbsolute(signedHost.provisioning_profile)))throw Error("signed_host_config_invalid");
+}
+const taskInput=process.argv[7];
+if(taskInput && taskInput!=="forward_only")throw Error("task_generation_update_mode_invalid");
+let taskGenerationUpdate;
+if(fs.existsSync(existingPolicy)){
+ const info=fs.lstatSync(existingPolicy);if(!info.isFile()||info.isSymbolicLink()||info.uid!==process.getuid())throw Error("existing_policy_not_private");
+ taskGenerationUpdate=JSON.parse(fs.readFileSync(existingPolicy,"utf8")).task_generation_update;
+ if(taskGenerationUpdate&&(info.mode&0o077))throw Error("existing_policy_not_private");
+}
+const expectedTaskMode={mode:"forward_only",schema:4,task_execution_version:1};
+if(taskInput)taskGenerationUpdate=expectedTaskMode;
+if(taskGenerationUpdate && (Object.keys(taskGenerationUpdate).sort().join(',')!=="mode,schema,task_execution_version"||Object.entries(expectedTaskMode).some(([k,v])=>taskGenerationUpdate[k]!==v)))throw Error("task_generation_update_mode_invalid");
+const localApprovalConfig=resolveLocalApprovalInstallConfig(process.argv[8],process.argv[9],values.CONFIG_ROOT);
 const xml = (value) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
 fs.mkdirSync(destination, { recursive: true, mode: 0o700 });
 for (const name of ["dev.dona.updater", "dev.dona.dispatcher", "dev.dona.slack-adapter"]) {
   let body = fs.readFileSync(path.join(repository, "launchd", `${name}.plist.in`), "utf8");
   for (const [key, value] of Object.entries(values)) body = body.replaceAll(`__${key}__`, xml(value));
+  if(name==="dev.dona.dispatcher" && signedHost && (!fs.existsSync(path.join(values.RUNTIME_ROOT,"current")) || fs.existsSync(path.join(values.RUNTIME_ROOT,"current/signed-host/DonaDispatcher.app")))) body=body.replace(
+    `<string>${xml(values.NODE)}</string>\n    <string>${xml(values.RUNTIME_ROOT)}/current/dispatcher/dist/cli.js</string>`,
+    `<string>${xml(values.RUNTIME_ROOT)}/current/signed-host/DonaDispatcher.app/Contents/MacOS/DonaDispatcher</string>`);
+  if(name==="dev.dona.dispatcher" && localApprovalConfig) body=body.replace(
+    "<key>EnvironmentVariables</key>\n  <dict>",
+    `<key>EnvironmentVariables</key>\n  <dict>\n    <key>DONA_LOCAL_APPROVAL_CONFIG</key><string>${xml(localApprovalConfig)}</string>`);
   if (/__[A-Z_]+__/.test(body)) throw new Error(`Unresolved template token in ${name}`);
   fs.writeFileSync(path.join(destination, `${name}.plist`), body, { mode: 0o600 });
 }
 
+if(signedHost)fs.writeFileSync(path.join(destination,"signed-host.json"),JSON.stringify(signedHost),{mode:0o600});
 const policy = {
+  ...(taskGenerationUpdate ? {task_generation_update:taskGenerationUpdate} : {}),
+  ...(signedHost ? {signed_host:signedHost} : {}),
   schema_version: 1,
   policy_version: "2026-09-03.2",
   repository: "hiragram/dona",

@@ -1,3 +1,7 @@
+import {LocalExternalApprovalIngress} from "./approval/local-ingress.js";
+import {archiveRuntimeBinding, installRuntimeBindingArchive, type JobRuntimeBinding} from "./runtime-binding-archive.js";
+import { OperatorAuthRegistry } from "./dashboard/operator-auth.js";
+import { OperatorWebAuthn } from "./dashboard/operator-webauthn.js";
 import { TaskRepository, taskMayAcceptLateResult } from "./task-execution.js";
 import { jobSnapshot, workspaceJobId, handoffKey, type HandoffRecord, type WorkerObservation } from "./job-handoff.js";
 import { createHash, randomUUID, randomBytes } from "node:crypto";
@@ -32,6 +36,7 @@ import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
 import type { RegistryPrincipal } from "./web/domain.js";
 import { createJobDisplayLabel } from "./job-display-label.js";
+import { LocalDashboardCommands, type LocalDashboardAuthority, type LocalDashboardCreate, type LocalDashboardCancel, type LocalDashboardQuestionReply } from "./local-dashboard-commands.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding, type JobBinding } from "./job-routing.js";
 import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
 import {
@@ -1046,6 +1051,9 @@ export class DispatcherDatabase {
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
   readonly tasks: TaskRepository;
+  readonly operatorAuth: OperatorAuthRegistry;
+  operatorWebAuthn: OperatorWebAuthn | undefined;
+  readonly localDashboard: LocalDashboardCommands;
   private readonly schemaWrite: 2 | 3;
   private webJobProjectionReady = false;
   private readonly migrationHook: DispatcherMigrationHook;
@@ -1182,10 +1190,18 @@ export class DispatcherDatabase {
       } catch(error) { return (error as NodeJS.ErrnoException).code==="ENOENT"; }
     });
     this.tasks = new TaskRepository(this.db, this);
+    this.operatorAuth = new OperatorAuthRegistry(this.db);
+    installRuntimeBindingArchive(this.db);
+    this.localDashboard = new LocalDashboardCommands(this.db,this,this.jobAdmissionLimits.jobsPerEventMax);
   }
 
   close(): void {
     this.db.close();
+  }
+
+  configureOperatorOrigin(origin:string):void {
+    this.operatorWebAuthn=new OperatorWebAuthn(this.db,this.operatorAuth,origin);
+    this.operatorAuth.resetSessions();
   }
 
   assertReadableWritable(): void {
@@ -1443,13 +1459,15 @@ export class DispatcherDatabase {
       : {};
     const subject = JSON.parse(sourceEvent.subject_json) as Record<string, unknown>;
     const webSource = sourceEvent.source === "web" && sourceEvent.reply_target_json === null;
-    const workspaceId = webSource ? stringValue(subject.tenant_id) : stringValue(replyTarget.workspace_id);
+    const binding = readEventJobBinding(this.db, sourceEvent.event_id);
+    const localOwner=binding?.owner.kind==="local_dashboard"?binding.owner:undefined;
+    const workspaceId = webSource ? (localOwner?.instance_id??stringValue(subject.tenant_id)) : stringValue(replyTarget.workspace_id);
     const channelId = webSource ? undefined : stringValue(replyTarget.channel_id);
     const threadTs = webSource ? undefined : stringValue(replyTarget.thread_ts);
-    if (webSource && (!workspaceId || !stringValue(subject.instance_id) || !stringValue(subject.principal_id))) {
+    if (webSource && !localOwner && (!workspaceId || !stringValue(subject.instance_id) || !stringValue(subject.principal_id))) {
       throw new Error(`Event ${sourceEvent.event_id} does not have a Web principal`);
     }
-    const binding = readEventJobBinding(this.db, sourceEvent.event_id);
+    if (localOwner && (!webSource || sourceEvent.event_type!=="local_task_submit" || subject.instance_id!==localOwner.instance_id || subject.owner_id!==localOwner.owner_id))throw Error("local_dashboard_owner_mismatch");
     if (!webSource && !binding) throw new Error(`Event ${sourceEvent.event_id} does not have an authorized job owner`);
     if (binding?.owner.kind === "schedule" && parsedRequest.workspace.kind !== "scratch") {
       throw new ScheduledJobCreationError("scheduled_workspace_mismatch", "Scheduled work permits only a scratch workspace");
@@ -1537,7 +1555,7 @@ export class DispatcherDatabase {
         workspaceId,
         channelId,
         threadTs,
-        webSource ? stringValue(subject.principal_id) : stringValue(subject.actor_id),
+        webSource ? (localOwner?.owner_id??stringValue(subject.principal_id)) : stringValue(subject.actor_id),
         parsedRequest.objective,
         workspaceJson,
         timestamp,
@@ -1588,6 +1606,9 @@ export class DispatcherDatabase {
     return changed === 1;
   }
 
+  createExternalApprovalIngress(runtime:ConstructorParameters<typeof LocalExternalApprovalIngress>[2],service:ConstructorParameters<typeof LocalExternalApprovalIngress>[3],config:ConstructorParameters<typeof LocalExternalApprovalIngress>[4],wake:()=>void=()=>{}){
+    return new LocalExternalApprovalIngress(this.db,this,runtime,service,config,wake);
+  }
   getJobByAgent(name:string):JobRow|undefined {
     return this.db.prepare("SELECT * FROM jobs WHERE agent_name=? ORDER BY created_at DESC LIMIT 1").get(name) as JobRow|undefined;
   }
@@ -1597,11 +1618,12 @@ export class DispatcherDatabase {
       if(!job||!task||task.current_attempt_id!==jobId||task.desired_state!=="running"||task.stop_state!=="none"||
         !(["running","blocked"].includes(job.status)||(job.status==="needs_review"&&taskMayAcceptLateResult(job)))||question.state!=="pending"||question.agent!==job.agent_name||JSON.stringify([question.generation,question.thread_id])!==this.getJobLiveSessionIdentity(jobId)?.herdr_agent_session_id)return;
       const source=this.getRequired(job.source_event_id),binding=readEventJobBinding(this.db,job.source_event_id);
-      if(!binding||binding.owner.kind!=="slack_thread")return;
-      const envelope:EventEnvelope={schema_version:1,source:"dona_job",type:"worker_question",external_event_id:`question:${question.question_id}`,
-        occurred_at:question.created_at,subject:{job_id:jobId,source_event_id:job.source_event_id,workspace_id:job.workspace_id!,channel_id:job.channel_id!,thread_ts:job.thread_ts!,actor_id:job.actor_id!},
+      if(!binding||!["slack_thread","local_dashboard"].includes(binding.owner.kind))return;
+      const local=binding.owner.kind==="local_dashboard"?binding.owner:undefined;
+      const envelope:EventEnvelope={schema_version:1,source:local?"web":"dona_job",type:"worker_question",external_event_id:`question:${question.question_id}`,
+        occurred_at:question.created_at,subject:{job_id:jobId,source_event_id:job.source_event_id,...(local?{instance_id:local.instance_id,owner_id:local.owner_id}:{workspace_id:job.workspace_id!,channel_id:job.channel_id!,thread_ts:job.thread_ts!,actor_id:job.actor_id!})},
         payload:{task_id:task.task_id,question_id:question.question_id,request_kind:question.kind},
-        reply_target:JSON.parse(source.reply_target_json!),trace:{job_id:jobId,source_event_id:job.source_event_id}};
+        reply_target:source.reply_target_json?JSON.parse(source.reply_target_json):null,trace:{job_id:jobId,source_event_id:job.source_event_id}};
       const result=this.enqueue(envelope,new Date(question.created_at));
       if(result.payloadMismatch)throw Error("task_question_notification_conflict");
       insertEventJobBinding(this.db,result.row.event_id,binding);
@@ -1610,7 +1632,13 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
-  hasWorkerApprovalReply(jobId:string,questionId:string,eventId:string):boolean {
+  hasWorkerApprovalReply(jobId:string,questionId:string,eventId:string,accepted?:boolean):boolean {
+    if(this.get(eventId)?.source==="web"){
+      const event=this.get(eventId);if(!event||event.source!=="web"||event.event_type!=="worker_question_reply")return false;
+      const payload=JSON.parse(event.payload_json);
+      try{this.assertTaskApprovalOwner(payload.task_id,eventId);}catch{return false;}
+      return typeof accepted==="boolean"&&this.localDashboard.matchesRecordedReply(eventId,jobId,questionId,"approval",accepted);
+    }
     // Dispatcherの永続sequenceを使い、Slack/host間の時計差を認可に用いない。
     return this.db.prepare(`SELECT 1 FROM events notification JOIN events reply ON reply.sequence>notification.sequence
       WHERE notification.source='dona_job' AND notification.event_type='worker_question'
@@ -1660,6 +1688,38 @@ export class DispatcherDatabase {
       return { outcome: "created" as const, row: created.row, receipt };
     }).immediate();
   }
+
+  createLocalDashboardTask(authority:LocalDashboardAuthority,input:LocalDashboardCreate,workspaceRoot:string,resultDir:string) {
+    return this.localDashboard.create(authority,input,workspaceRoot,resultDir);
+  }
+  cancelLocalDashboardTask(authority:LocalDashboardAuthority,input:LocalDashboardCancel) {
+    return this.localDashboard.cancel(authority,input);
+  }
+  enqueueLocalDashboardQuestionReply(authority:LocalDashboardAuthority,input:LocalDashboardQuestionReply) {
+    return this.localDashboard.reply(authority,input);
+  }
+  getDashboardNativeApprovalTask(authority:LocalDashboardAuthority,taskId:string) {
+    const result=this.localDashboard.nativeApprovalTask(authority,taskId);
+    return {...result,session_identity:this.getJobLiveSessionIdentity(result.row.job_id)?.herdr_agent_session_id??null};
+  }
+  /** operatorの承認receiptは元Task ownerを変更せず、この要求だけに権限を与える。 */
+  assertTaskApprovalOwner(taskId:string,eventId:string,sameThread=false) {
+    const event=this.get(eventId);
+    if(event?.source==="web"&&event.event_type==="worker_question_reply") {
+      const payload=JSON.parse(event.payload_json),task=this.tasks.get(taskId);
+      if(task&&payload.task_id===taskId&&task.current_attempt_id===payload.attempt_id&&payload.request_kind==="approval"&&
+        this.localDashboard.matchesRecordedReply(eventId,task.current_attempt_id,payload.question_id,"approval",payload.accepted))return task;
+    }
+    return this.tasks.assertOwner(taskId,eventId,sameThread);
+  }
+  getLocalDashboardTask(authority:LocalDashboardAuthority,taskId:string) {
+    const result=this.localDashboard.task(authority,taskId);
+    return {...result,session_identity:this.getJobLiveSessionIdentity(result.row.job_id)?.herdr_agent_session_id??null};
+  }
+  getLocalDashboardReceipt(authority:LocalDashboardAuthority,requestId:string) {
+    return this.localDashboard.receipt(authority,requestId);
+  }
+  hasLocalDashboardJobOwner(jobId:string):boolean {return this.localDashboard.isLocalJob(jobId);}
 
   createWebTask(input: WebCommandIdentity & { idempotency_key: string; objective: string; workspace: CreateJobRequest["workspace"] },
     workspaceRoot:string,resultDir:string) {
@@ -2032,6 +2092,7 @@ export class DispatcherDatabase {
         updated_at=? WHERE job_id=? AND herdr_workspace_id IS NOT NULL
         AND (status IN ('completed','failed','cancelled') OR (status='needs_review' AND last_error_code='workspace_cleanup_failed'))`).run(nowUtc(),jobId).changes;
       if(changed===1) {
+        archiveRuntimeBinding(this.db,this.getJobLiveSessionIdentity(jobId));
         this.db.prepare("UPDATE legacy_job_agents_to_stop SET stopped_at=COALESCE(stopped_at,?) WHERE job_id=?")
           .run(nowUtc(),jobId);
         this.db.prepare("DELETE FROM job_live_session_identities WHERE job_id=?").run(jobId);
@@ -2300,11 +2361,13 @@ export class DispatcherDatabase {
       const existing=this.getJobLiveSessionIdentity(jobId);
       const sameIdentity=agentSessionId!==undefined&&existing?.herdr_agent_session_id===agentSessionId
         &&existing.herdr_workspace_id===herdrWorkspaceId&&existing.herdr_pane_id===herdrPaneId&&existing.agent_name===agentName;
+      archiveRuntimeBinding(this.db,existing);
       if(!sameIdentity)this.db.prepare("DELETE FROM job_live_session_identities WHERE job_id=?").run(jobId);
       if (agentSessionId !== undefined&&!sameIdentity) this.db.prepare(`INSERT INTO job_live_session_identities(
         job_id,identity_version,herdr_agent_session_id,herdr_workspace_id,herdr_pane_id,agent_name,recorded_at,generation_nonce)
         SELECT job_id,1,?,?,?,?,?,? FROM jobs WHERE job_id=?`)
         .run(agentSessionId,herdrWorkspaceId,herdrPaneId,agentName,at.toISOString(),randomUUID(),jobId);
+      archiveRuntimeBinding(this.db,this.getJobLiveSessionIdentity(jobId));
     }).immediate();
   }
 
@@ -2314,7 +2377,17 @@ export class DispatcherDatabase {
       if(!row||row.status!=="needs_review"||row.last_error_code!=="runtime_preparation_unknown"||this.getJobLiveSessionIdentity(jobId)||workspaceId!==row.herdr_workspace_id||paneId!==row.herdr_pane_id||sessionId.length>512)throw Error("runtime_preparation_identity_changed");
       this.db.prepare(`INSERT INTO job_live_session_identities(job_id,identity_version,herdr_agent_session_id,herdr_workspace_id,herdr_pane_id,agent_name,recorded_at,generation_nonce) VALUES(?,1,?,?,?,?,?,?)`)
         .run(jobId,sessionId,workspaceId,paneId,row.agent_name,new Date().toISOString(),randomUUID());
+      archiveRuntimeBinding(this.db,this.getJobLiveSessionIdentity(jobId));
     }).immediate();
+  }
+
+  getJobRuntimeBinding(jobId:string,generation:string):JobRuntimeBinding|undefined {
+    return this.db.prepare("SELECT * FROM job_runtime_bindings WHERE job_id=? AND generation=?").get(jobId,generation) as JobRuntimeBinding|undefined;
+  }
+
+  listJobRuntimeBindings(jobId:string,afterGeneration=""):{items:JobRuntimeBinding[];next:string|null} {
+    const rows=this.db.prepare("SELECT * FROM job_runtime_bindings WHERE job_id=? AND generation>? ORDER BY generation LIMIT 101").all(jobId,afterGeneration) as JobRuntimeBinding[];
+    return {items:rows.slice(0,100),next:rows.length>100?rows[99]!.generation:null};
   }
 
   getJobLiveSessionIdentity(jobId: string): LiveSessionIdentityRow | undefined {
@@ -3478,7 +3551,7 @@ export class DispatcherDatabase {
   }
 
   private assertJobCompletionBinding(job: JobRow): void {
-    if (job.source === "web") {
+    if (job.source === "web" && !this.hasLocalDashboardJobOwner(job.job_id)) {
       const event = this.getRequired(job.source_event_id);
       const subject = JSON.parse(event.subject_json) as Record<string, unknown>;
       if (event.source !== "web" || event.reply_target_json !== null

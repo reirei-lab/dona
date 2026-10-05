@@ -11,6 +11,7 @@ export interface ConversationContent extends ObservedConversation {
 }
 export interface ObservationRuntime {
   conversations(after?: string): Promise<{items: ObservedConversation[]; next: string | null}>;
+  conversationHistory?(name: string, afterGeneration?: string): Promise<{items: {name:string;generation:string;role:"main"|"worker";thread_id:string|null;attempt_id:string|null;recorded_at:string}[];next:string|null}>;
   conversation(name: string, generation: string, afterSequence?: number): Promise<ConversationContent>;
 }
 export interface DashboardAuthority {
@@ -18,61 +19,91 @@ export interface DashboardAuthority {
   revision: string;
   task(id: string): boolean;
   conversation(id: string): boolean;
+  mainConversation?(): boolean;
 }
 export interface ObservedTask {
-  snapshot: Pick<DashboardTaskSnapshot,"task"|"attempts"|"fingerprint">;
+  snapshot: Pick<DashboardTaskSnapshot,"task"|"attempts"|"fingerprint"|"selected_attempt_id"|"result">;
   runtime: {status: "observed"; conversation: ConversationContent} | {status: "unavailable" | "not_started" | "forbidden"};
 }
 /** The authority callback is evaluated again after runtime I/O. A revoked
  * browser or superseded Attempt cannot receive an earlier private response. */
 export class DashboardObserver {
   constructor(private readonly tasks: DashboardTaskReader, private readonly runtime: ObservationRuntime) {}
-  async detail(id: string, authorize: () => DashboardAuthority | null, afterSequence?: number): Promise<ObservedTask | null> {
+  async detail(id: string, authorize: () => DashboardAuthority | null, afterSequence?: number, attemptId?: string): Promise<ObservedTask | null> {
     const authority = authorize();
     if (!authority?.task(id)) return null;
-    const before = this.tasks.snapshot(id);
+    const before = this.tasks.snapshot(id, attemptId);
     if (!before) return null;
     let observed: ObservedTask["runtime"] = {status: "forbidden"};
     if (authority.conversation(id)) {
       observed = {status: "unavailable"};
       try {
-        if(!before.runtime_binding) return {snapshot:publicSnapshot(before),runtime:{status:before.runtime_binding_state==="missing"&&before.task.worker_status==="queued"?"not_started":"unavailable"}};
+        if(!before.runtime_binding) return {snapshot:publicSnapshot(before),runtime:{status:before.runtime_binding_state==="missing"&&before.attempts.find(row=>row.attempt_id===before.selected_attempt_id)?.status==="queued"?"not_started":"unavailable"}};
         const binding=before.runtime_binding;
-        const expectedAgent = before.attempts.find(row => row.attempt_id === before.task.current_attempt_id)?.agent_name;
+        const expectedAgent = before.attempts.find(row => row.attempt_id === before.selected_attempt_id)?.agent_name;
         if (!expectedAgent) throw Error("observation_attempt_missing");
         const started = performance.now();
-        let cursor: string | undefined;
-        const seen = new Set<string>();
-        // Bounded runtime inventory: do not scan personal Codex sessions.
-        for (let page = 0; page < 100; page++) {
-          const result = await withinDeadline(this.runtime.conversations(cursor), started);
-          const currentAuthority = authorize();
-          if (!currentAuthority || currentAuthority.revision !== authority.revision || !currentAuthority.task(id) || !currentAuthority.conversation(id)) return null;
-          if (performance.now() - started > 5000 || result.items.length > 100) throw Error("observation_inventory_limit");
-          const matches = result.items.filter(row => row.role === "worker" && row.attempt_id === before.task.current_attempt_id);
-          if (matches.length > 1) throw Error("observation_identity_ambiguous");
-          const match = matches[0];
-          if (match && (match.name !== expectedAgent || match.name!==binding.agent_name || match.generation!==binding.generation || match.thread_id!==binding.thread_id)) throw Error("observation_identity_changed");
-          if (match) {
-            const content = await withinDeadline(this.runtime.conversation(match.name,match.generation,afterSequence), started);
-            if (performance.now() - started > 5000 || content.name !== match.name || content.generation !== match.generation || content.role !== "worker"
-              || content.thread_id !== match.thread_id || content.attempt_id !== before.task.current_attempt_id) throw Error("observation_identity_changed");
-            observed = {status: "observed", conversation: publicConversation(content)}; break;
-          }
-          if (result.next === null) break;
-          if (seen.has(result.next) || page === 99) throw Error("observation_inventory_incomplete");
-          seen.add(result.next); cursor = result.next;
-        }
+        // Exact durable binding authorizes cached history even after inventory
+        // cleanup. Runtime still checks the generation and never resumes it.
+        const content = await withinDeadline(this.runtime.conversation(expectedAgent,binding.generation,afterSequence),started);
+        if(content.name!==binding.agent_name||content.generation!==binding.generation||content.thread_id!==binding.thread_id||content.role!=="worker"||content.attempt_id!==before.selected_attempt_id)throw Error("observation_identity_changed");
+        observed={status:"observed",conversation:publicConversation(content)};
       } catch { observed = {status: "unavailable"}; }
     }
     const current = authorize();
     if (!current || current.revision !== authority.revision || !current.task(id)) return null;
-    const after = this.tasks.snapshot(id);
+    const after = this.tasks.snapshot(id, attemptId);
     if (!after) return null;
-    if (after.fingerprint !== before.fingerprint) return {snapshot: publicSnapshot(after), runtime: {status: "unavailable"}};
+    if (after.fingerprint !== before.fingerprint) return {snapshot: publicSnapshot(after, current.conversation(id)), runtime: {status: "unavailable"}};
     if (!current.conversation(id)) observed = {status: "forbidden"};
-    return {snapshot: publicSnapshot(after), runtime: observed};
+    return {snapshot: publicSnapshot(after, current.conversation(id)), runtime: observed};
   }
+  async mainList(authorize:()=>DashboardAuthority|null):Promise<{items:ObservedConversation[];next:null}|null> {
+    const authority=authorize(); if(!authority?.mainConversation?.())return null;
+    const started=performance.now(),items:ObservedConversation[]=[];let cursor:string|undefined;const seen=new Set<string>();
+    for(let page=0;page<100;page++) {
+      const result=await withinDeadline(this.runtime.conversations(cursor),started);
+      if(!sameMainAuthority(authorize(),authority))return null;
+      if(result.items.length>100)throw Error("observation_inventory_limit");
+      for(const row of result.items)if(row.role==="main"&&row.attempt_id===null) {
+        items.push(mainMetadata(row));
+        if(this.runtime.conversationHistory) {
+          let after:string|undefined;const historyCursors=new Set<string>();
+          for(let n=0;n<10;n++) {
+            const history=await withinDeadline(this.runtime.conversationHistory(row.name,after),started);
+            if(!sameMainAuthority(authorize(),authority))return null;
+            if(history.items.length>100)throw Error("observation_inventory_limit");
+            for(const old of history.items)if(old.name===row.name&&old.role==="main"&&old.attempt_id===null&&old.generation!==row.generation)
+              items.push(mainMetadata({...old,connected:false,observed_at:old.recorded_at,state:"unknown"}));
+            if(history.next===null)break;
+            if(historyCursors.has(history.next)||n===9)throw Error("observation_inventory_incomplete");
+            historyCursors.add(history.next);after=history.next;
+          }
+        }
+      }
+      if(items.length>1000)throw Error("observation_inventory_limit");
+      if(result.next===null)break;
+      if(seen.has(result.next)||page===99)throw Error("observation_inventory_incomplete");seen.add(result.next);cursor=result.next;
+    }
+    if(!sameMainAuthority(authorize(),authority))return null;
+    const identities=new Set<string>();
+    for(const row of items){const key=JSON.stringify([row.name,row.generation]);if(identities.has(key))throw Error("observation_identity_ambiguous");identities.add(key);}
+    return {items,next:null};
+  }
+  async mainDetail(name:string,generation:string,authorize:()=>DashboardAuthority|null,afterSequence?:number):Promise<ObservedTask["runtime"]|null> {
+    const authority=authorize();if(!authority?.mainConversation?.())return null;
+    try {
+      const inventory=await this.mainList(authorize);
+      if(!inventory||!sameMainAuthority(authorize(),authority))return null;
+      const match=inventory.items.find(row=>row.name===name&&row.generation===generation);
+      if(!match)return {status:"unavailable"};
+      const content=await withinDeadline(this.runtime.conversation(name,generation,afterSequence),performance.now());
+      if(!sameMainAuthority(authorize(),authority))return null;
+      if(content.name!==name||content.generation!==generation||content.role!=="main"||content.attempt_id!==null||content.thread_id!==match.thread_id)throw Error("observation_identity_changed");
+      return {status:"observed",conversation:publicConversation(content)};
+    }catch {return sameMainAuthority(authorize(),authority)?{status:"unavailable"}:null;}
+  }
+
 }
 
 async function withinDeadline<T>(operation: Promise<T>, started: number): Promise<T> {
@@ -114,6 +145,14 @@ function publicConversation(value: ConversationContent): ConversationContent {
   return result;
 }
 
-function publicSnapshot(value:DashboardTaskSnapshot):Pick<DashboardTaskSnapshot,"task"|"attempts"|"fingerprint"> {
-  return {task:value.task,attempts:value.attempts,fingerprint:value.fingerprint};
+function publicSnapshot(value:DashboardTaskSnapshot, includeResult=true):Pick<DashboardTaskSnapshot,"task"|"attempts"|"fingerprint"|"selected_attempt_id"|"result"> {
+  return {task:value.task,attempts:value.attempts,fingerprint:value.fingerprint,selected_attempt_id:value.selected_attempt_id,result:includeResult?value.result:null};
+}
+
+function sameMainAuthority(current:DashboardAuthority|null,before:DashboardAuthority):boolean {
+  return !!current&&current.revision===before.revision&&current.mainConversation?.()===true;
+}
+function mainMetadata(row:ObservedConversation):ObservedConversation {
+  const projected=publicConversation({...row,items:[],events:[],cursor:0,oldest_sequence:0,gap:false,truncated:false});
+  return {name:projected.name,generation:projected.generation,role:projected.role,thread_id:projected.thread_id,attempt_id:projected.attempt_id,connected:projected.connected,observed_at:projected.observed_at,state:projected.state};
 }

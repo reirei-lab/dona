@@ -55,6 +55,7 @@ test("固定Codex 0.160.0でUnix WebSocketのinitialize・履歴・通知を隔�
 });
 
 const fakeUnix=`import http from 'node:http';import fs from 'node:fs';import {WebSocketServer} from ${JSON.stringify(new URL('../node_modules/ws/wrapper.mjs',import.meta.url).href)};
+process.umask(0o077);
 const socket=process.argv[process.argv.indexOf('--listen')+1].slice(7);const server=http.createServer();const ws=new WebSocketServer({server});
 ws.on('connection',client=>client.on('message',bytes=>{const r=JSON.parse(bytes);fs.appendFileSync('calls',r.method+'\\n');const send=value=>client.send(JSON.stringify(value));
  if(r.method==='initialize')send({id:r.id,result:{}});
@@ -102,6 +103,8 @@ test("runtime host再起動後も同じworkerへ接続し内部read APIを提供
  try{
   agent=await client.start({name:"worker",role:"worker",attemptId:"job-host",cwd:root,release:root,args:[],threadConfig:{}});
   assert.equal((await client.conversations()).items[0]?.attempt_id,"job-host");
+  assert.equal((await client.conversationHistory(agent.name)).items[0]?.generation,agent.generation);
+  assert.deepEqual((await client.conversationHistory("unregistered")).items,[]);
   assert.equal((await client.conversation(agent.name,agent.generation)).items[0]?.text,"進捗");
   await new Promise<void>((r,j)=>host.close(e=>e?j(e):r()));host=await serveRuntime(config);
   let snapshot=await client.conversation(agent.name,agent.generation);

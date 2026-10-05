@@ -307,6 +307,18 @@ describe("Dona Slack MCP server", () => {
         event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
       });
 
+      // dona_approvalの現在通知IDを指定したwire契約。source認可をmockしない。
+      const approvalEventId="evt_01m1zfewbjx8v0844yrrkqwzc8",savedTarget={channel_id:"C123",thread_ts:"1.2"};
+      const approvalResult=await client.callTool({name:"post_message",arguments:{workspace:"company",...savedTarget,
+        text:"承認済みの外部操作は実行成功しました。",event_id:approvalEventId,reply_broadcast:false,mrkdwn:true,parse:"none"}});
+      assert.equal(approvalResult.isError,undefined);
+      assert.deepEqual(fake.posts.at(-1),{channelId:savedTarget.channel_id,threadTs:savedTarget.thread_ts,
+        text:"承認済みの外部操作は実行成功しました。",replyBroadcast:false,mrkdwn:true,parse:"none",
+        identityBlockId:`dona-job-${createHash("sha256").update(approvalEventId).digest("hex").slice(0,32)}`});
+      assert.deepEqual(approvalResult.structuredContent,{workspace:"company",...savedTarget,message_ts:"2.3",
+        body_sha256:createHash("sha256").update("承認済みの外部操作は実行成功しました。").digest("hex"),
+        event_id:approvalEventId,reply_broadcast:false,mrkdwn:true,parse:"none"});
+
       const mentionResult = await client.callTool({
         name: "post_message",
         arguments: {

@@ -1,3 +1,5 @@
+import {RuntimeClient} from "./app-server/client.js";
+import {openLocalApprovalService} from "./approval/local-service.js";
 import { assertTaskGenerationFile } from "./task-execution.js";
 import type { DispatcherConfig } from "./config.js";
 import { DispatcherApi } from "./api.js";
@@ -56,7 +58,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     new SystemClock(), createLogger("dispatcher_slack_reminders"), Math.min(config.queuePollMs, 60_000));
   jobSupervisor = new JobSupervisor(
     database,
-    new AppServerJobRuntime(config, jobProgress !== undefined,id=>database.getJobLiveSessionIdentity(id)?.herdr_agent_session_id??undefined,id=>!!database.tasks.forAttempt(id)),
+    new AppServerJobRuntime(config, jobProgress !== undefined,id=>database.getJobLiveSessionIdentity(id)?.herdr_agent_session_id??undefined,id=>!!database.tasks.forAttempt(id),id=>database.hasLocalDashboardJobOwner(id)),
     config,
     createLogger("dispatcher_jobs"),
     () => worker.wake(),
@@ -79,6 +81,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     new UpdaterClient(config.updaterSocketPath, config.jobCommandTimeoutMs),
     {
       async quiesce() {
+        await external?.stop();
         await scheduler.stop();
         await reminderPublisher.stop();
         worker.quiesceAfterCurrent();
@@ -92,9 +95,17 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     () => scheduler.wake(),
     scheduler,
   );
+  let external:Awaited<ReturnType<typeof openLocalApprovalService>>;
   let stopWebJobProjectionMaintenance:(()=>void)|undefined;
 
   try {
+    try {
+      external=await openLocalApprovalService(database,config,()=>{worker.wake();jobSupervisor.wake();},()=>apiLogger.warn("External approval tick unavailable",{error_code:"local_approval_tick_unavailable"}));
+    } catch {
+      apiLogger.warn("External approval setup requires operator attention",{error_code:"local_approval_setup_required"});
+    }
+    api.setExternalHealth(()=>external?{configured:true,...external.health()}:{configured:!!config.localApprovalConfigPath,ready:false,reason:"setup_required"});
+    api.setExternalApproval(external?.service);
     await api.start();
     // Clear stale/expired outbox fences before due materialization decides overlap for a newer occurrence.
     database.scheduler.recover(new SystemClock().now(), true);
@@ -119,6 +130,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       api.disableJobProgress();
       }
     }
+    if(external)await external.start();
+    else await new RuntimeClient(runtimeSocket(config),5000).externalAvailability(false).catch(()=>{});
     worker.start();
     scheduler.start();
     reminderPublisher.start();
@@ -135,6 +148,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     if (reminderPublisher.isRunning()) await reminderPublisher.stop();
     if (worker.isRunning()) await worker.stop();
     await api.stop();
+    await external?.close();
     database.close();
     updateNotificationDatabase.close();
     jobProgressStore?.close();
@@ -149,6 +163,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       apiLogger.info("Graceful shutdown started", { signal });
       try {
         stopWebJobProjectionMaintenance?.();
+        await external?.stop();
         api.beginShutdown();
         await api.stop();
         await scheduler.stop();
@@ -156,6 +171,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
         await updateNotificationWorker.stop();
         await jobSupervisor.stop();
         await worker.stop();
+        await external?.close();
         database.close();
         updateNotificationDatabase.close();
         jobProgressStore?.close();

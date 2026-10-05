@@ -43,7 +43,7 @@ static NSDictionary *scope(id value) {
     if (!keysEqual(value, @[@"access_group", @"instance_id", @"purpose"])) return nil;
     if (!matches(value[@"access_group"], @"^[A-Z0-9]{10}\\.[A-Za-z0-9.-]+$", 256) ||
         !matches(value[@"instance_id"], @"^[A-Za-z0-9_-]{1,128}$", 128) ||
-        ![@[@"audit_anchor", @"clock_mark", @"binding_generation", @"policy_generation"] containsObject:value[@"purpose"]]) return nil;
+        ![@[@"audit_anchor", @"clock_mark", @"binding_generation", @"policy_generation", @"approval_key"] containsObject:value[@"purpose"]]) return nil;
     return value;
 }
 
@@ -65,8 +65,8 @@ static NSMutableDictionary *query(NSDictionary *identity) {
 
 static NSDictionary *readHead(NSDictionary *identity) {
     NSMutableDictionary *request = query(identity);
-    // Request two, not all: a duplicate must never be mistaken for one head.
-    request[(__bridge id)kSecMatchLimit] = @2;
+    // Inspect every match: a duplicate must never be mistaken for one head.
+    request[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitAll;
     request[(__bridge id)kSecAttrSynchronizable] = (__bridge id)kSecAttrSynchronizableAny;
     request[(__bridge id)kSecReturnAttributes] = @YES;
     request[(__bridge id)kSecReturnData] = @YES;
@@ -151,5 +151,38 @@ NSData *DonaKeychainCasProcessRequest(NSData *input) {
         NSData *output = [NSJSONSerialization dataWithJSONObject:response
             options:NSJSONWritingSortedKeys | NSJSONWritingWithoutEscapingSlashes error:NULL];
         return output && output.length <= 16383 ? output : nil;
+    }
+}
+
+// Separate entry point: create revision 1 exactly once, never overwrite or repair.
+NSData *DonaKeychainProvisionRequest(NSData *input) {
+    @autoreleasepool {
+        NSDictionary *result = @{@"codec_version": @1, @"status": @"unverified"};
+        @try {
+            if (input.length > 0 && input.length <= 16384) {
+                NSDictionary *request = [NSJSONSerialization JSONObjectWithData:input options:0 error:NULL];
+                NSDictionary *identity = scope(request[@"scope"]);
+                NSData *value = decodeValue(request[@"value"]);
+                if (keysEqual(request, @[@"codec_version", @"scope", @"value"]) && [request[@"codec_version"] isKindOfClass:[NSNumber class]] && CFGetTypeID((__bridge CFTypeRef)request[@"codec_version"]) != CFBooleanGetTypeID() && [request[@"codec_version"] isEqual:@1] && identity && value) {
+                    NSMutableDictionary *item = query(identity);
+                    item[(__bridge id)kSecAttrAccount] = account(1);
+                    item[(__bridge id)kSecAttrSynchronizable] = @NO;
+                    item[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
+                    item[(__bridge id)kSecValueData] = value;
+                    // Check the service domain, including a previously advanced head.
+                    NSMutableDictionary *check = query(identity);
+                    check[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitAll;
+                    CFTypeRef found = NULL;
+                    OSStatus observed = SecItemCopyMatching((__bridge CFDictionaryRef)check, &found);
+                    if (found) CFRelease(found);
+                    if (observed == errSecItemNotFound && SecItemAdd((__bridge CFDictionaryRef)item, NULL) == errSecSuccess) {
+                        NSDictionary *head = readHead(identity);
+                        if (head && [head[@"revision"] unsignedLongLongValue] == 1 && [head[@"value"] isEqual:value])
+                            result = @{@"codec_version": @1, @"status": @"changed", @"revision": @1, @"value": [value base64EncodedStringWithOptions:0]};
+                    }
+                }
+            }
+        } @catch (NSException *exception) { (void)exception; }
+        return [NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingSortedKeys error:NULL];
     }
 }

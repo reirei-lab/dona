@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import {spawnSync} from 'node:child_process';
 import {pathToFileURL} from 'node:url';
+import {inspectDashboardInstallation} from './dashboard-doctor.mjs';
 import {writeDashboardPlist} from './dashboard-plist.mjs';
 const label='dev.dona.dashboard';
 const [operation,releaseArg,configArg,logsArg,...extra]=process.argv.slice(2);
@@ -11,7 +12,7 @@ const fail=()=>{throw Error('dashboard_service_invalid');};
 function run(args){const result=spawnSync('/bin/launchctl',args,{encoding:'utf8',timeout:15000,maxBuffer:8192});if(result.error||result.status!==0)throw Error('dashboard_service_operation_failed');return result.stdout;}
 function privateDirectory(file){if(!path.isAbsolute(file)||fs.realpathSync(file)!==file)fail();const s=fs.lstatSync(file);if(!s.isDirectory()||s.uid!==process.getuid()||(s.mode&0o777)!==0o700)fail();}
 try{
- if(process.platform!=='darwin'||extra.length||!['render','install','start','stop','status'].includes(operation))fail();
+ if(process.platform!=='darwin'||extra.length||!['render','install','doctor','start','stop','status'].includes(operation))fail();
  const domain=`gui/${process.getuid()}`,target=`${domain}/${label}`;
  if(['start','stop','status'].includes(operation)){
    if(releaseArg||configArg||logsArg)fail();
@@ -24,7 +25,7 @@ try{
    const manifest=JSON.parse(fs.readFileSync(path.join(release,'release-manifest.json'),'utf8'));
    if(!/^[a-f0-9]{40}$/.test(manifest.sha)||!/^[a-f0-9]{64}$/.test(manifest.lock_hashes?.['sources/web']))fail();
    const {readDashboardConfig}=await import(pathToFileURL(path.join(release,'dispatcher/dist/dashboard/config.js')).href);
-   const config=readDashboardConfig(configArg);privateDirectory(path.dirname(config.control_socket));privateDirectory(logsArg);
+   const config=readDashboardConfig(configArg);if(typeof config.dispatcher_socket!=='string'||!path.isAbsolute(config.dispatcher_socket))throw Error('dashboard_dispatcher_socket_required');if(operation!=='doctor'){privateDirectory(path.dirname(config.control_socket));privateDirectory(logsArg);}
    let executableRelease=release;
    if(config.active_release_pointer){
      const {readDashboardRelease}=await import(pathToFileURL(path.join(release,'dispatcher/dist/dashboard/release-pointer.js')).href);
@@ -35,7 +36,8 @@ try{
    let template=fs.readFileSync(new URL('../launchd/dev.dona.dashboard.plist.in',import.meta.url),'utf8');
    for(const [name,value]of Object.entries({NODE:fs.realpathSync(process.execPath),RELEASE:executableRelease,CONFIG:configArg,LOG_ROOT:logsArg}))template=template.replaceAll(`__${name}__`,xml(value));
    if(/__[A-Z_]+__/.test(template))fail();
-   if(operation==='render')process.stdout.write(template);
+   if(operation==='doctor'){const report=inspectDashboardInstallation(config,logsArg);process.stdout.write(JSON.stringify(report,null,2)+'\n');if(!report.ready)process.exitCode=1;}
+   else if(operation==='render')process.stdout.write(template);
    else{
      // An update must explicitly stop this service first. Never bootout another service.
      const existing=spawnSync('/bin/launchctl',['print',target],{encoding:'utf8',timeout:5000,maxBuffer:8192});
@@ -48,4 +50,4 @@ try{
      process.stdout.write('Web serviceを登録用に配置しました。startで起動してください。\n');
    }
  }
-}catch{process.stderr.write('dashboard_service_operation_failed\n');process.exitCode=1;}
+}catch(error){process.stderr.write(error.message==='dashboard_dispatcher_socket_required'?'dashboard_dispatcher_socket_required: configへ現在世代のDispatcher UDSを設定してください。\n':'dashboard_service_operation_failed: release・owner-only設定・dispatcher_socket・control/log directoryを確認してください。\n');process.exitCode=1;}

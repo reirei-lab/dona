@@ -225,21 +225,22 @@ export class JobSupervisor {
     } catch {this.logger.warn("Worker question reconciliation deferred",{error_code:"runtime_questions_unavailable"});}
   }
   async taskQuestions(id:string,eventId:string):Promise<unknown> {
-    const task=this.database.tasks.assertOwner(id,eventId),job=this.database.getJob(task.current_attempt_id)!;
+    const task=this.database.assertTaskApprovalOwner(id,eventId),job=this.database.getJob(task.current_attempt_id)!;
     if(!this.runtime.questions)throw Error("task_questions_unavailable");
     const questions=await this.runtime.questions(job.agent_name,true);
-    const fresh=this.database.tasks.assertOwner(id,eventId);
+    const fresh=this.database.assertTaskApprovalOwner(id,eventId);
     if(fresh.current_attempt_id!==job.job_id)throw Error("task_revision_conflict");
-    return {task_id:id,revision:fresh.revision,questions:questions.filter(q=>JSON.stringify([q.generation,q.thread_id])===this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id).map(q=>({question_id:q.question_id,kind:q.kind,state:q.state,request:JSON.parse(q.payload_json)}))};
+    const source=this.database.get(eventId)!,operatorApproval=source.source==="web"&&source.event_type==="worker_question_reply"&&JSON.parse(source.payload_json).request_kind==="approval"?JSON.parse(source.payload_json).question_id:undefined;
+    return {task_id:id,revision:fresh.revision,questions:questions.filter(q=>(!operatorApproval||(q.kind==="approval"&&q.question_id===operatorApproval))&&JSON.stringify([q.generation,q.thread_id])===this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id).map(q=>({question_id:q.question_id,kind:q.kind,state:q.state,request:JSON.parse(q.payload_json)}))};
   }
   async approveTaskRequest(id:string,eventId:string,revision:number,questionId:string,accepted:boolean):Promise<unknown> {
-    const initial=this.database.tasks.assertOwner(id,eventId,true);
+    const initial=this.database.assertTaskApprovalOwner(id,eventId,true);
     return this.serialized(initial.current_attempt_id,async()=>{
       if(!this.runtime.questions||!this.runtime.approveRequest)throw Error("task_approval_unavailable");
       const job=this.database.getJob(initial.current_attempt_id)!,request=(await this.runtime.questions(job.agent_name,true)).find(q=>q.question_id===questionId);
-      const task=this.database.tasks.assertOwner(id,eventId,true);
+      const task=this.database.assertTaskApprovalOwner(id,eventId,true);
       if(!request||request.kind!=="approval"||JSON.stringify([request.generation,request.thread_id])!==this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id||task.current_attempt_id!==job.job_id)throw Error("task_approval_not_current");
-      if(!this.database.hasWorkerApprovalReply(job.job_id,questionId,eventId))throw Error("task_approval_requires_user_reply");
+      if(!this.database.hasWorkerApprovalReply(job.job_id,questionId,eventId,accepted))throw Error("task_approval_requires_user_reply");
       if(request.answer_hash===createHash("sha256").update(stableStringify({accepted})).digest("hex")&&["answering","resolved"].includes(request.state))return {task_id:id,question_id:questionId,state:request.state};
       if(task.revision!==revision||task.desired_state!=="running"||task.stop_state!=="none"||!["active","waiting"].includes(task.state))throw Error("task_approval_not_current");
       const response=await this.runtime.approveRequest(job.agent_name,questionId,accepted);
@@ -250,6 +251,10 @@ export class JobSupervisor {
     const initial=this.database.tasks.assertOwner(id,eventId);
     return this.serialized(initial.current_attempt_id,async()=>{
       let task=this.database.tasks.assertOwner(id,eventId);const job=this.database.getJob(task.current_attempt_id)!;
+      const source=this.database.get(eventId)!;
+      if(source.source==="web"&&source.event_type==="worker_question_reply"){
+        if(!this.database.localDashboard.matchesRecordedReply(eventId,job.job_id,questionId,"question",answers))throw Error("task_question_reply_mismatch");
+      }
       const old= (await this.runtime.questions?.(job.agent_name,true))?.find(q=>q.question_id===questionId);
       task=this.database.tasks.assertOwner(id,eventId);
       if(task.current_attempt_id!==job.job_id)throw Error("task_revision_conflict");
@@ -338,6 +343,17 @@ export class JobSupervisor {
     } catch(error) {
       if(!(error instanceof JobResultNotFoundError)) {this.database.tasks.wait(task,"result_conflict");return;}
     }
+    // 外部tool待機が未確定steerのreceipt待ちを上書きしてはいけない。
+    if(task.desired_state==="running"&&(task.steer_pending_event_id||task.wait_reason==="steer_acceptance_unknown"||job.steer_state==="dispatching")) {this.database.tasks.wait(task,"steer_acceptance_unknown",60_000);return;}
+    const externalRecovery=this.database.tasks.externalApprovalRecovery(job.job_id);
+    if(task.desired_state==="running"&&externalRecovery.state!=="ready") {this.database.tasks.wait(task,externalRecovery.state==="unknown"?"external_effect_unknown":"external_approval",30_000);return;}
+    if(job.last_error_code==="runtime_external_approval_pending"&&task.desired_state==="running"&&task.stop_state==="none"){
+      if(!this.runtime.observeWorker){this.database.tasks.wait(task,"observation_unknown");return;}
+      const observed=await this.observeWorker(job);
+      if(observed.state==="waiting"||observed.state==="working"){this.database.tasks.wait(task,"external_approval",30_000);return;}
+      if(observed.state==="unknown"){this.database.tasks.wait(task,"observation_unknown");return;}
+      // 消失したtool callを人間待ちと偽らない。下の停止確認を経て通常のAttempt回復へ進む。
+    }
     if(job.last_error_code==="runtime_question_pending"&&task.desired_state==="running"&&task.stop_state==="none"&&this.runtime.questions) {
       const pending=await this.runtime.questions(job.agent_name);
       if(pending.length){this.database.tasks.wait(task,"human_input");return;}
@@ -361,7 +377,7 @@ export class JobSupervisor {
     if(task.stop_state==="stopped") {this.database.tasks.replaceStopped(task.task_id,this.config.jobResultsDir);this.wake();return;}
     if(task.desired_state==="running"&&task.stop_state==="none") {
       const reason=taskRecoveryReason(job);
-      if(reason!=="observation_unknown"&&job.last_error_code!=="runtime_question_pending"&&task.wait_reason!=="resume_requested"&&!capacityWait) {this.database.tasks.wait(task,reason);return;}
+      if(reason!=="observation_unknown"&&job.last_error_code!=="runtime_question_pending"&&job.last_error_code!=="runtime_external_approval_pending"&&task.wait_reason!=="resume_requested"&&!capacityWait) {this.database.tasks.wait(task,reason);return;}
     }
     if(!this.runtime.observeWorker||!this.runtime.retireWorker||!this.runtime.workerRetired){this.database.tasks.wait(task,"observation_unknown");return;}
     if(task.stop_state==="none"||task.stop_state==="not_sent") {

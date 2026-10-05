@@ -88,8 +88,8 @@ test("会話はdurable generation/threadへ束縛し、bindingの欠落・不一
     const bind=(generation:string,thread:string)=>db.setJobRuntime(task.current_attempt_id,'workspace','pane',JSON.stringify([generation,thread]));
     db.setJobRuntime(task.current_attempt_id,'workspace','pane','legacy-unverified-identity');
     assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'unavailable');assert.equal(inventoryCalls,0);
-    bind('generation_wrong','thread_one');assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'unavailable');assert.equal(historyCalls,0);
-    bind('generation_one','thread_wrong');assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'unavailable');assert.equal(historyCalls,0);
+    bind('generation_wrong','thread_one');assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'unavailable');assert.equal(historyCalls,1);
+    bind('generation_other','thread_wrong');assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'unavailable');assert.equal(historyCalls,2);
     bind('generation_one','thread_one');
     const good=await observer.detail(task.task_id,authority);assert.equal(good!.runtime.status,'observed');assert.equal(JSON.stringify(good).includes('runtime_binding'),false);assert.equal(JSON.stringify(good).includes('herdr_agent_session_id'),false);
     history=()=>({...content,thread_id:'thread_wrong'});assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'unavailable');history=()=>content;
@@ -106,7 +106,7 @@ test("会話未開始はidentity未登録のqueuedだけとし、準備済み・
   const event=db.enqueue(eventEnvelope('observer-started-meaning')).row;
   const create=(key:string)=>db.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:key,objective:'観測',workspace:{kind:'scratch'}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
   const task=create('meaning');reader=new DashboardTaskReader(config.databasePath);let calls=0;
-  const observer=new DashboardObserver(reader,{async conversations(){calls++;return{items:[],next:null};},async conversation(){throw Error('unexpected history');}});
+  const observer=new DashboardObserver(reader,{async conversations(){calls++;return{items:[],next:null};},async conversation(){calls++;throw Error('history unavailable');}});
   const authority=()=>({revision:'1',task:()=>true,conversation:()=>true});
   assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'not_started');assert.equal(calls,0);
   db.beginJobPreparation(task.current_attempt_id);
@@ -119,5 +119,62 @@ test("会話未開始はidentity未登録のqueuedだけとし、準備済み・
   assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'unavailable');assert.equal(calls,2);
   const failedWithoutBinding=create('failed-without-binding');db.beginJobPreparation(failedWithoutBinding.current_attempt_id);db.recordJobPreparationFailure(failedWithoutBinding.current_attempt_id,'failed','fixture failure',1);
   assert.equal((await observer.detail(failedWithoutBinding.task_id,authority))!.runtime.status,'unavailable');assert.equal(calls,2);
+ }finally{reader?.close();db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test('cleanup後の過去AttemptをTask所属とarchiveへ束縛しResultを許可された本文だけへ投影する',async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);let reader:DashboardTaskReader|undefined;
+ const {default:Database}=await import('better-sqlite3');
+ try {
+  const event=db.enqueue(eventEnvelope('observer-history')).row;
+  const create=(key:string)=>db.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:key,objective:'観測',workspace:{kind:'scratch'}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  const task=create('history'),foreign=create('foreign');db.beginJobPreparation(task.current_attempt_id);
+  db.setJobRuntime(task.current_attempt_id,'workspace','pane',JSON.stringify(['generation','thread']));
+  db.markJobRuntimeCleaned(task.current_attempt_id);
+  const sql=new Database(config.databasePath);
+  sql.prepare("UPDATE tasks SET stop_state='stopped',state='waiting' WHERE task_id=?").run(task.task_id);
+  const successor=db.tasks.replaceStopped(task.task_id,config.jobResultsDir)!;
+  assert.notEqual(successor.job_id,task.current_attempt_id);
+  sql.prepare("UPDATE jobs SET status='completed',result_json=? WHERE job_id=?").run(JSON.stringify({job_id:task.current_attempt_id,status:'completed',summary:'<script>visible plain text</script>',completed_at:new Date().toISOString(),output:{format:'markdown',text:'完了内容'},secret_path:'/private/hidden',artifacts:[{display_name:'報告',kind:'report',path:'/private/artifact'}]}),task.current_attempt_id);sql.close();
+  reader=new DashboardTaskReader(config.databasePath);
+  assert.equal(reader.snapshot(task.task_id,foreign.current_attempt_id),null);
+  const content:ConversationContent={name:db.getJob(task.current_attempt_id)!.agent_name,generation:'generation',thread_id:'thread',role:'worker',attempt_id:task.current_attempt_id,connected:false,observed_at:new Date().toISOString(),state:'unknown',items:[],events:[],cursor:0,oldest_sequence:0,gap:true,truncated:true};
+  const observer=new DashboardObserver(reader,{async conversations(){throw Error('inventory must not be required');},async conversation(){return content;}});
+  const authority=()=>({revision:'1',task:()=>true,conversation:()=>true});
+  const detail=await observer.detail(task.task_id,authority,undefined,task.current_attempt_id);
+  assert.equal(detail!.runtime.status,'observed');assert.equal(detail!.snapshot.selected_attempt_id,task.current_attempt_id);assert.equal(detail!.snapshot.task.current_attempt_id,successor.job_id);assert.equal(detail!.snapshot.attempts.length,2);
+  assert.equal(detail!.snapshot.result?.summary,'<script>visible plain text</script>');assert.equal(detail!.snapshot.result?.output,'完了内容');assert.equal(JSON.stringify(detail).includes('/private/'),false);
+  assert.equal((await observer.detail(task.task_id,()=>({...authority(),conversation:()=>false})))!.snapshot.result,null);
+ }finally{reader?.close();db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test('Dona本体の履歴は別grantを要求しrole/threadの一致とI/O中失効を検証する',async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath),reader=new DashboardTaskReader(config.databasePath);
+ try {
+  const main:ConversationContent={name:'dona_main',generation:'current',role:'main',thread_id:'thread',attempt_id:null,connected:true,observed_at:new Date().toISOString(),state:'working',items:[{id:'item',turn_id:'turn',kind:'assistant_message',text:'main visible'}],events:[],cursor:0,oldest_sequence:0,gap:false,truncated:false};
+  let grant=false,change=()=>{};
+  const auth=()=>({revision:'1',task:()=>true,conversation:()=>true,mainConversation:()=>grant});
+  const observer=new DashboardObserver(reader,{async conversations(){return{items:[main],next:null};},async conversationHistory(){return{items:[{...main,generation:'old',recorded_at:main.observed_at}],next:null};},async conversation(_name,generation){change();return{...main,generation};}});
+  assert.equal(await observer.mainList(auth),null);grant=true;
+  assert.deepEqual((await observer.mainList(auth))!.items.map(row=>row.generation),['current','old']);
+  assert.equal((await observer.mainDetail('dona_main','old',auth))!.status,'observed');
+  assert.equal((await observer.mainDetail('other','old',auth))!.status,'unavailable');
+  change=()=>{grant=false;};assert.equal(await observer.mainDetail('dona_main','old',auth),null);
+ }finally{reader.close();db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test('通常操作UIのowner hintはsource名でなく現在Attemptの永続owner bindingから作る',async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);let reader:DashboardTaskReader|undefined;
+ try{
+  const event=db.enqueue(eventEnvelope('observer-owner-hint')).row;
+  const slack=db.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:'slack-owned',objective:'fixture',workspace:{kind:'scratch'}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  const local=db.createLocalDashboardTask({instance_id:'instance',owner_id:'operator',device_id:'device',grant_revision:1},{request_id:'local-hint',objective:'fixture',workspace:{kind:'scratch'}},config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  reader=new DashboardTaskReader(config.databasePath);
+  assert.equal(reader.snapshot(slack.task_id)!.task.local_operator_owned,false);assert.equal(reader.snapshot(local.task_id)!.task.local_operator_owned,true);
+  const list=reader.list(()=>true);assert.equal(list.items.find(row=>row.task_id===slack.task_id)!.local_operator_owned,false);assert.equal(list.items.find(row=>row.task_id===local.task_id)!.local_operator_owned,true);
+  const {default:Database}=await import('better-sqlite3'),sql=new Database(config.databasePath);
+  sql.prepare("UPDATE jobs SET source='web' WHERE job_id=?").run(slack.current_attempt_id);sql.close();
+  assert.equal(reader.snapshot(slack.task_id)!.task.local_operator_owned,false);
+  assert.equal(JSON.stringify(reader.snapshot(local.task_id)).includes('owner_json'),false);
  }finally{reader?.close();db.close();await fs.rm(root,{recursive:true,force:true});}
 });

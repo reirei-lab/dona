@@ -1,3 +1,4 @@
+import {runtimeBindingTriggers} from "./runtime-binding-archive.js";
 /** mainのDispatcher migrationが所有する既知triggerの固定定義。
  * DBから観測した定義を信頼済みとして登録しない。変更時は宣言元DDLと
  * audit/approvalへの副作用をreviewし、改変拒否testを通して更新する。 */
@@ -70,6 +71,6 @@ const dispatcherCoreTriggers: readonly { name: string; tbl_name: string; sql: st
 ];
 
 export function isDispatcherCoreTrigger(row: { name: string; tbl_name: string; sql: string }): boolean {
-  return dispatcherCoreTriggers.some(expected => expected.name === row.name
+  return [...dispatcherCoreTriggers,...runtimeBindingTriggers].some(expected => expected.name === row.name
     && expected.tbl_name === row.tbl_name && expected.sql === row.sql);
 }

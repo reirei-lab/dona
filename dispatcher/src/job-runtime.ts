@@ -52,8 +52,8 @@ function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void
   }
 }
 
-export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disabledMcpServers:readonly string[] = [], progressEnabled = true, executablePaths:readonly string[] = []): string[] {
-  if(row.source==="web")throw Error("runtime_profile_unavailable");
+export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disabledMcpServers:readonly string[] = [], progressEnabled = true, executablePaths:readonly string[] = [], localDashboardOwned=false): string[] {
+  if(row.source==="web"&&!localDashboardOwned)throw Error("runtime_profile_unavailable");
   const resultDirectory=path.dirname(row.result_path);
   const expectedResultPath=path.join(config.jobResultsDir,row.job_id,"result.json");
   if(row.result_path!==expectedResultPath) throw new Error("Job result path does not match the Dispatcher-generated job path");

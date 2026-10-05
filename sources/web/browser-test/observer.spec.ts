@@ -10,7 +10,8 @@ async function setup(page:Page,options:{pauseA?:Promise<void>;deny?:()=>boolean}
     if(path==='/'){await route.fulfill(observerDashboardPage());return;}
     if(options.deny?.()){await route.fulfill({status:401,contentType:'application/json',body:'{}'});return;}
     let value:unknown;
-    if(path==='/api/tasks')value={items:[task('task_a'),task('task_b')],next:null};
+    if(path==='/api/session')value={csrf:'fixture',capabilities:['tasks:read']};
+    else if(path==='/api/tasks')value={items:[task('task_a'),task('task_b')],next:null};
     else if(path==='/api/tasks/task_a'){if(options.pauseA)await options.pauseA;value=detail('task_a');}
     else if(path==='/api/tasks/task_b')value=detail('task_b');
     else throw Error('unexpected request '+path);
@@ -34,7 +35,7 @@ test('認証失効でprivate表示を消去し接続scopeを示す',async({page}
   let deny=false;await setup(page,{deny:()=>deny});await page.getByRole('button',{name:'task_a · 待機中'}).click();
   await expect(page.locator('#detail')).toContainText('task_a');deny=true;await page.getByRole('button',{name:'更新',exact:true}).click();
   await expect(page.locator('#tasks')).toBeEmpty();await expect(page.locator('#detail')).not.toContainText('task_a');
-  await expect(page.locator('#pairing')).toBeVisible();await expect(page.locator('#pairing')).toContainText('すべてのTask');
+  await expect(page.locator('#pairing')).toBeVisible();await expect(page.locator('#pairing')).toContainText('付与された範囲');
 });
 test('mobileとkeyboardで閲覧できpoll後も選択buttonのfocusを維持する',async({page})=>{
   await page.setViewportSize({width:375,height:800});await setup(page);const button=page.getByRole('button',{name:'task_b · 待機中'});
@@ -47,4 +48,22 @@ test('bfcache復帰時は表示を消して接続を再検証する',async({page
   await page.evaluate(()=>window.dispatchEvent(new PageTransitionEvent('pagehide',{persisted:true})));deny=true;
   await page.evaluate(()=>window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:true})));
   await expect(page.locator('#pairing')).toBeVisible();await expect(page.locator('#detail')).not.toContainText('task_a');
+});
+test('過去AttemptのResultをplain text表示しmainは独立capabilityから選択する',async({page})=>{
+ const requests:string[]=[];
+ await page.route('https://observer.test/**',async route=>{
+  const url=new URL(route.request().url());requests.push(url.pathname+url.search);
+  if(url.pathname==='/'){await route.fulfill(observerDashboardPage());return;}
+  let value:unknown;
+  if(url.pathname==='/api/session')value={csrf:'test',capabilities:['conversations:main:read','tasks:read']};
+  else if(url.pathname==='/api/conversations/main')value={items:[{name:'dona_main',generation:'old_main',connected:false}],next:null};
+  else if(url.pathname.startsWith('/api/conversations/main/'))value=detail('main').runtime;
+  else if(url.pathname==='/api/tasks')value={items:[task('task_a')],next:null};
+  else {const selected=url.searchParams.get('attempt')||'attempt_current';value={...detail('task_a'),snapshot:{task:task('task_a'),selected_attempt_id:selected,attempts:[{attempt_id:'attempt_old',number:1,status:'completed'},{attempt_id:'attempt_current',number:2,status:'running'}],result:selected==='attempt_old'?{summary:'<a href="https://private.test">実結果</a>',output:'保存された出力',artifacts:[],completed_at:at}:null}};}
+  await route.fulfill({contentType:'application/json',body:JSON.stringify(value)});
+ });
+ await page.goto('https://observer.test/');await page.getByRole('button',{name:'task_a · 待機中'}).click();
+ await page.getByRole('button',{name:'Attempt 1 · 完了'}).click();await expect(page.locator('#detail')).toContainText('保存された出力');await expect(page.locator('#detail a')).toHaveCount(0);
+ expect(requests).toContain('/api/tasks/task_a?attempt=attempt_old');
+ await page.getByRole('button',{name:/dona_main/}).click();await expect(page.locator('#detail h2')).toHaveText('Dona本体の会話');await expect(page.locator('#detail')).toContainText('特定のTaskの会話ではありません');
 });

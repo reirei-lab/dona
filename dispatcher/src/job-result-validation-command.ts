@@ -25,7 +25,11 @@ export function nodeLibraryDirectoriesFromLoadedObjects(objects: readonly string
     }))];
 }
 
+const signedHost = () => (process as typeof process & { donaHost?: string }).donaHost === "signed-v1";
+function signedHostBundle(): string { return path.resolve(path.dirname(process.execPath), "../.."); }
+
 export function jobResultValidationCommand(scheduled: boolean): string[] {
+  if (signedHost()) return [process.execPath, "validate-job-result"];
   if (scheduled) {
     // dyldのHomebrew opt symlink走査はroot denyで拒否されるため、許可した実体からロードする。
     const loader = process.platform === "darwin" && nodeLibraryDirectories().length
@@ -38,5 +42,6 @@ export function jobResultValidationCommand(scheduled: boolean): string[] {
 }
 
 export function jobResultValidationReadPaths(): readonly string[] {
-  return [...new Set([process.execPath, realpathSync(process.execPath), bundledValidator, ...nodeLibraryDirectories()])];
+  return [...new Set([process.execPath, realpathSync(process.execPath), bundledValidator,
+    ...(signedHost() ? [signedHostBundle()] : nodeLibraryDirectories())])];
 }

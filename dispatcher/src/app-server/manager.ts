@@ -1,3 +1,4 @@
+import {ExternalToolQueue,externalReplyTool} from "./external-tools.js";
 import { createHash,randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -13,11 +14,13 @@ export type RpcFactory=(args:string[],cwd:string,agent?:AgentRecord,attach?:bool
 const object=(x:unknown):Record<string,unknown>=>x!==null&&typeof x==="object"&&!Array.isArray(x)?x as Record<string,unknown>:{};
 
 export class AppServerManager {
+  readonly external:ExternalToolQueue;
   private connections=new Map<string,AppServerRpc>();
   private resets=new Map<string,string>();
   private queues=new Map<string,Promise<unknown>>();
   private recoveryAfter=new Map<string,number>();
   constructor(readonly store:RuntimeStore,private readonly factory:RpcFactory,private readonly reconnect=false,private readonly processSample=processes) {
+    this.external=new ExternalToolQueue(store);this.external.expireRestart();
     store.db.exec("CREATE TABLE IF NOT EXISTS startup_phases(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,phase TEXT NOT NULL)");
     store.db.exec("CREATE TABLE IF NOT EXISTS main_readiness(agent TEXT PRIMARY KEY,generation TEXT NOT NULL)");
     store.db.exec("CREATE TABLE IF NOT EXISTS turn_outcomes(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,state TEXT NOT NULL)");
@@ -71,7 +74,7 @@ export class AppServerManager {
       this.bind(row,rpc);
       try {
         await rpc.initialize();
-        const params={...input.threadConfig,cwd:input.cwd,...(row.thread_id?{threadId:row.thread_id,excludeTurns:true}:{})};
+        const params={...input.threadConfig,...(object(input.threadConfig.config)["features.default_mode_request_user_input"]!==false?{dynamicTools:[externalReplyTool]}:{}),cwd:input.cwd,...(row.thread_id?{threadId:row.thread_id,excludeTurns:true}:{})};
         this.store.db.prepare("UPDATE startup_phases SET phase='sending' WHERE agent=? AND generation=?").run(row.name,row.generation);
         const result=object(await rpc.request(row.thread_id?"thread/resume":"thread/start",params,90_000));
         const thread=object(result.thread);if(typeof thread.id!=="string")throw Error("runtime_thread_identity_missing");
@@ -94,6 +97,7 @@ export class AppServerManager {
       rpc.on("disconnect",()=>{
         if(!this.store.db.open||this.store.agent(row.name)?.generation!==row.generation)return;
         this.store.db.prepare("UPDATE questions SET state='expired' WHERE agent=? AND generation=? AND state IN ('pending','answering')").run(row.name,row.generation);
+        this.external.expireAgent(row.name,row.generation);
         this.store.observe(row.name,row.generation,{kind:"gap"});
         if(this.store.agent(row.name)?.state!=="stopped")this.store.change(row.name,row.generation,{state:"unknown"});
       });
@@ -108,9 +112,21 @@ export class AppServerManager {
     const sample=this.processSample();
     return {items:rows.slice(0,100).map(row=>this.observationIdentity(row,sample)),next:rows.length>100?rows[99]!.name:null};
   }
+  conversationHistory(name:string,afterGeneration="") {
+    if(name.length>160||afterGeneration.length>160)throw Error("runtime_conversation_cursor_invalid");
+    return this.store.conversationHistory(name,afterGeneration);
+  }
   async conversation(name:string,generation:string,afterSequence?:number):Promise<ConversationSnapshot> {
     if(afterSequence!==undefined&&(!Number.isSafeInteger(afterSequence)||afterSequence<0))throw Error("runtime_conversation_cursor_invalid");
-    const row=this.store.agent(name);if(!row||row.generation!==generation)throw Error("runtime_conversation_not_current");
+    const row=this.store.agent(name);
+    if(!row||row.generation!==generation){
+      const archived=this.store.archivedConversation(name,generation);if(!archived)throw Error("runtime_conversation_not_current");
+      // 過去generationはDonaが観測済みの投影だけ。現workerや個人Codexへ接続しない。
+      this.store.expireObservations();
+      return {name:archived.name,generation:archived.generation,role:archived.role,thread_id:archived.thread_id,
+        attempt_id:archived.attempt_id,state:"unknown",connected:false,archived:true,observed_at:new Date().toISOString(),
+        ...this.store.observations(name,generation,afterSequence),items:this.store.cachedItems(name,generation),gap:true,truncated:true};
+    }
     // watermarkを履歴要求前に固定する。履歴と通知の重なりはあり得るが、要求中の通知を飛ばさない。
     const observations=this.store.observations(name,generation,afterSequence),rpc=this.connections.get(name);
     let history:{items:ConversationSnapshot["items"];truncated:boolean}={items:this.store.cachedItems(name,generation),truncated:true},gap=observations.gap;
@@ -154,6 +170,11 @@ export class AppServerManager {
     }
     if(typeof threadId!=="string"||threadId!==current.thread_id||typeof turnId!=="string"||turnId!==current.turn_id) {
       this.connections.get(agent.name)?.reject(message.id,"Request identity is not current");return;
+    }
+    if(message.method==="item/tool/call") {
+      try{this.external.accept(current,message);this.store.change(agent.name,agent.generation,{state:"waiting"});}
+      catch{this.connections.get(agent.name)?.respond(message.id,{success:false,contentItems:[{type:"inputText",text:"external_approval_request_denied"}]});}
+      return;
     }
     const kind=message.method==="item/tool/requestUserInput"?"question":message.method?.includes("requestApproval")?"approval":message.method==="mcpServer/elicitation/request"?"elicitation":undefined;
     if(!kind){this.connections.get(agent.name)?.reject(message.id);return;}
@@ -202,12 +223,13 @@ export class AppServerManager {
       if(reason)this.store.db.prepare("INSERT INTO recovery_hints VALUES(?,?,?,?) ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,reason=excluded.reason,retry_after=excluded.retry_after").run(agent.name,agent.generation,reason,reason==="capacity_wait"?(this.resets.get(agent.name)??new Date(Date.now()+900_000).toISOString()):null);
       this.store.db.prepare("INSERT INTO turn_outcomes VALUES(?,?,?) ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,state=excluded.state").run(agent.name,agent.generation,turn.status==="completed"?"idle":"interrupted");
       // 非同期質問はturnが完了しても未解決であり得る。serverRequest/resolvedを終端証拠にする。
-      this.store.change(agent.name,agent.generation,{turn_id:null,state:this.store.questions(agent.name).length?"waiting":turn.status==="completed"?"idle":"interrupted"});
+      this.store.change(agent.name,agent.generation,{turn_id:null,state:this.store.questions(agent.name).length||this.external.waiting(agent.name)?"waiting":turn.status==="completed"?"idle":"interrupted"});
     } else if(message.method==="serverRequest/resolved") {
+      this.external.resolved(agent.name,agent.generation,p.requestId);
       this.store.db.prepare("UPDATE questions SET state=CASE WHEN state='answering' THEN 'resolved' ELSE 'expired' END WHERE agent=? AND generation=? AND rpc_id_json=? AND state IN ('pending','answering')")
         .run(agent.name,agent.generation,JSON.stringify(p.requestId));
       const terminal=this.store.db.prepare("SELECT state FROM turn_outcomes WHERE agent=? AND generation=?").get(agent.name,agent.generation) as {state:"idle"|"interrupted"}|undefined;
-      if(this.store.questions(agent.name).length===0)this.store.change(agent.name,agent.generation,{state:row.turn_id?"working":terminal?.state??"idle"});
+      if(this.store.questions(agent.name).length===0&&!this.external.waiting(agent.name))this.store.change(agent.name,agent.generation,{state:row.turn_id?"working":terminal?.state??"idle"});
     }
   }
   async prompt(name:string,key:string,text:string):Promise<unknown> {
@@ -234,6 +256,15 @@ export class AppServerManager {
         throw error;
       }
     });
+  }
+  externalRequests(){return this.external.pending().map(row=>{try{return this.external.source(row);}catch{return {...row,source_event_id:null};}});}
+  resolveExternal(name:string,id:string,result:{request_id:string|null;state:string}){
+    const row=this.external.get(id),agent=this.store.agent(name),rpc=this.connections.get(name);
+    if(!row||row.agent!==name||!agent||agent.generation!==row.generation||agent.thread_id!==row.thread_id||!rpc?.connected)throw Error("runtime_external_not_current");
+    const resolved=this.external.resolve(id,result);
+    if(row.state==="pending")rpc.respond(JSON.parse(row.rpc_id_json),{success:true,contentItems:[{type:"inputText",text:resolved.result_json!}]});
+    if(!this.external.waiting(name)&&!this.store.questions(name).length)this.store.change(name,agent.generation,{state:agent.turn_id?"working":"idle"});
+    return {request_id:id,state:resolved.state};
   }
   async answer(name:string,id:string,answers:Record<string,{answers:string[]}>):Promise<QuestionRecord> {
     return this.serialized(name,async()=>{
@@ -286,6 +317,7 @@ export class AppServerManager {
     this.store.db.transaction(()=>{
       this.store.db.prepare("UPDATE stops SET state='stopped' WHERE agent=? AND generation=?").run(name,generation);
       this.store.db.prepare("UPDATE questions SET state='expired' WHERE agent=? AND generation=? AND state IN ('pending','answering')").run(name,generation);
+      this.external.expireAgent(name,generation);
       this.store.change(name,generation,{state:"stopped",turn_id:null});
     }).immediate();
     this.connections.delete(name);return this.store.agent(name)!;

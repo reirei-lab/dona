@@ -2,6 +2,7 @@ import type {AgentRecord} from "./store.js";
 
 export interface ConversationIdentity {
   name:string;generation:string;role:"main"|"worker";thread_id:string|null;attempt_id:string|null;
+  archived?:boolean;
   state:AgentRecord["state"];connected:boolean;observed_at:string;
 }
 export interface ConversationItem {id:string;turn_id:string;kind:"assistant_message"|"tool_progress";text?:string;status?:string;tool_type?:string;truncated?:boolean}

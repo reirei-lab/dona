@@ -46,11 +46,16 @@ export async function serveRuntime(config:HostConfig):Promise<http.Server> {
     try {
       let text="";for await(const chunk of request){text+=String(chunk);if(Buffer.byteLength(text)>1_048_576)throw Error("runtime_request_limit");}
       const p=JSON.parse(text) as Record<string,unknown>;if(typeof p.action!=="string")throw Error("runtime_action_invalid");
-      if(!["list","start","pendingQuestions","conversations"].includes(p.action)&&typeof p.name!=="string")throw Error("runtime_name_required");
+      if(!["list","start","pendingQuestions","conversations","externalRequests","externalRequest","externalAvailability"].includes(p.action)&&typeof p.name!=="string")throw Error("runtime_name_required");
       const name=p.name as string;
       let result:unknown;
       switch(p.action) {
+        case "externalAvailability":if(typeof p.enabled!=="boolean")throw Error("runtime_external_availability_invalid");result=manager.external.availability(p.enabled);break;
+        case "externalRequests":result=manager.externalRequests();break;
+        case "externalRequest":if(typeof p.id!=="string")throw Error("runtime_external_id_invalid");result=manager.external.get(p.id)??null;break;
+        case "resolveExternal":if(typeof p.id!=="string"||!p.result||typeof p.result!=="object"||Array.isArray(p.result))throw Error("runtime_external_result_invalid");result=manager.resolveExternal(name,p.id,p.result as {request_id:string|null;state:string});break;
         case "conversations":if(p.after!==undefined&&typeof p.after!=="string")throw Error("runtime_conversation_cursor_invalid");result=manager.conversations(p.after as string|undefined);break;
+        case "conversationHistory":if(p.afterGeneration!==undefined&&typeof p.afterGeneration!=="string")throw Error("runtime_conversation_cursor_invalid");result=manager.conversationHistory(name,p.afterGeneration as string|undefined);break;
         case "conversation":if(typeof p.generation!=="string"||(p.afterSequence!==undefined&&typeof p.afterSequence!=="number"))throw Error("runtime_conversation_request_invalid");result=await manager.conversation(name,p.generation,p.afterSequence as number|undefined);break;
         case "list":result=store.agents().map(r=>manager.status(r.name));break;
         case "status":result=manager.status(name)??null;break;

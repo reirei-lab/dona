@@ -5,6 +5,25 @@
 - 対象: [Issue #15](https://github.com/hiragram/dona/issues/15)
 - 関連Epic: [Issue #26](https://github.com/hiragram/dona/issues/26)
 
+## 現在の契約との照合（2026-10-05、Issue #15）
+
+現在の個人operator契約は[ADR 0006](0006-personal-dashboard.md)を優先します。以下の「置換」は旧要件の実装完了を意味しません。本節以降のSlack supervisor・二者bootstrap等の記述と[旧fixture](fixtures/supervisor-approval-contracts.md)は設計履歴として残します。保持するcoreの不変条件と、現在の入口・本人性証明を分けて読みます。
+
+| 論点 | 現在の扱い | コードと検証先（この文書と同じcheckoutで照合） |
+| --- | --- | --- |
+| typed catalog | **保持**。`slack.post_thread_reply.v1`のみ。exact target/draft、broadcast禁止、special mention禁止、明示user最大3名、shared channel拒否。未知operationや任意MCP実行へ拡張しない | `dispatcher/src/approval/local-external-service.ts`、`local-slack-provider.ts`、`dispatcher/test/local-external-approval.test.ts` |
+| Slack supervisor / 二者登録 / OIDC | **置換**。Macで明示付与したinstance/operator/device/grant revisionを使う。Slack requesterは元eventから導出し、operatorをSlack actorへ偽装しない | `dispatcher/src/dashboard/operator-auth.ts`、`dispatcher/src/approval/local-ingress.ts`、`dispatcher/test/dashboard-operator-auth.test.ts` |
+| Slack interactive proof / high-impact second factor | **置換**。exact action・decision・session/device/grantへ束縛したWebAuthn確認。UV必須、2分以内かつrequest期限以内。個人platform passkeyを許可し、旧hardware attestation・non-backup・独立二者を完成したとは扱わない | `dispatcher/src/dashboard/operator-webauthn.ts`、`dispatcher/test/dashboard-operator-webauthn.test.ts`、`dashboard-external.test.ts` |
+| request / decision / consume / execution分離 | **保持**。approvedは外部送信成功ではない。transactional one-shot consume、fence、現在のrequesterアクセスとapprover端末grantをconsume/送信直前にも再検証 | `dispatcher/src/approval/{decision-broker,consume-broker,execution-broker,local-external-service}.ts`、`dispatcher/test/approval/consume-concurrency.ts`、`dispatcher/test/local-external-approval.test.ts` |
+| TTL / replay / TOCTOU / unknown | **保持**。request・consume・execution・payload期限を分離し、snapshot/revision driftを拒否。応答喪失後はread-only reconcileのみでblind retryしない | `dispatcher/src/approval/{clock,local-external-service,local-operations}.ts`、`dispatcher/test/approval/decision-broker.ts`、`dispatcher/test/local-approval-operations.test.ts` |
+| job / schema-v3 / resume | **置換**。Task/AttemptとApp Serverのagent/generation/thread/turn/callへ束縛する。worker待機は同一Attemptのcheckpoint、main受付はpending handleを返して解放し、terminalは内部outboxで通知。承認が旧worker停止証明や新Attempt作成権限を代替しない | [ADR 0004](0004-task-attempt-execution.md)、`dispatcher/src/approval/local-ingress.ts`、`dispatcher/src/task-checkpoint.ts`、`dispatcher/test/local-external-approval.test.ts` |
+| approval-requiredの範囲 | **置換・一部未検証**。workerのDona管理下Slack投稿は承認必須。mainの通常返信・集約・結果通知は維持。workerの承認待ち本文をmainへ代理投稿させる迂回は禁止するが、任意のResult本文から代理投稿を機械的に識別・拒否する実装は未完 | `dispatcher/src/job-prompt.ts`、`dispatcher/src/app-server/adapters.ts`、`dispatcher/src/approval/local-ingress.ts`、`dispatcher/test/app-server-adapters.test.ts`。prompt上の禁止を機械的な全経路遮断の証拠にしない |
+| host境界 | **置換**。MacのXcode・Simulator等を直接使う実行を維持する。Dona workerからSlack MCPを外すことと、同一OS利用者の任意client・資格情報まで隔離することは別。後者を保証しない | [ADR 0006](0006-personal-dashboard.md)、`dispatcher/src/app-server/adapters.ts`、`dispatcher/test/app-server-adapters.test.ts` |
+| protected state / rotation / recovery | **保持、手続は個人operatorへ置換**。DB外のprotected head、監査、key version、exactなMac保守確認を維持。rotation/reboot復旧で旧pendingを復活させない。旧二者break-glassを実装したとは扱わない | `dispatcher/src/approval/local-native.ts`、`dispatcher/test/local-approval-native.test.ts`、[個人承認の運用](../operations/local-external-approval.md) |
+| retention / backup / safe-off | **保持**。期限超過本文を削除しconsume/fence/監査を保持。backupは明示allowlistのmetadata専用、新規restoreも起動不可のまま。旧pendingの再送や任意DBの上書きを許可しない | `dispatcher/src/approval/{local-operations,local-backup}.ts`、`dispatcher/test/local-approval-operations.test.ts` |
+
+この照合表はコードと試験の参照表であり、current-head CI/review成功、integration/main包含、production activationの宣言ではありません。提出時にそれぞれを別々にread-backします。署名profile、実Keychain、実service、別端末接続、許可範囲内の実Slack検証はfixture成功から推定せず、未確認の間は最終gateを未完了とします。Codex native承認は別権限・別台帳でありDona外部操作承認を代替しません。
+
 ## Context
 
 Donaは会話の文脈から操作の危険性を評価できる一方、その評価や自然言語の「承認」をsecurity proofにはできません。本ADRは、transport-neutralなapplication approval coreとSlack固有の本人性証明の境界、承認要求から外部実行結果までのlifecycle、利用者への表示、運用時の安全側defaultを決定します。

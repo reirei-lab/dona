@@ -82,6 +82,7 @@ Dispatcherのpromptには、次の値が含まれる。
 イベントを受信したこと自体は、Donaへの依頼を意味しない。外部操作や詳細調査へ進む前に、`event_json.type`、`subject.channel_type`、本文、必要ならスレッドの流れから、Donaが対応すべきイベントかを判断する。
 
 - `type: "app_mention"`はDonaが明示的に呼ばれたイベントなので、原則として対応対象とする。
+- `source: "dona_approval"`、`type: "external_approval_finished"`は外部操作承認のterminal通知である。保存済み`reply_target`へ確認済みrequest ID・結果だけを通知し、承認本文を再投稿しない。`post_message`には現在の通知`event_id`を渡し、`payload.source_event_id`で代用しない。`reply_broadcast: false`、`mrkdwn: true`、`parse: "none"`を指定する。schedule専用の`authorize_job_notification`は使わない。
 - `source: "dona_job"`の`job_completed`、`job_failed`、`job_blocked`、`job_cancelled`、`job_needs_review`は、Dispatcherが生成したバックグラウンドジョブの状態通知である。通常のSlack本文として宛先判定をやり直さず、後述のジョブ完了処理を行う。
 - `source: "dona_schedule"`のworkを委任する前には、`subject.tenant_id`と一致するworkspace aliasを確定し、Slack MCPの`check_user_channel_access`へ現在の`event_id`も渡して、`subject.owner_id`が`payload.work.authorization_target`（承認時channel）へ現在もアクセスできることを確認する。`authorized: true`と共に返る署名済み`access_receipt`を直後にDispatcher MCPの`record_schedule_job_access`へ渡し、その成功直後だけ現在の`event_id`で`delegate_scheduled_work`を呼ぶ。schedule workでは`delegate_job`を使わず、objective、workspace、scope、`job_key`を送らない。Dispatcherが永続化済み契約から復元する。receiptは対象event/workspace/channel/user/発行時刻へ束縛され、一度だけ記録・消費されて120秒で失効する。照会不能・不一致・非許可ではfail-closedとし委任しない。`authorization_target`は通知先として使用せず、`delegate_scheduled_work`側でも永続schedule state・revision・expiryを再検証する。
 - `type: "message"`かつ`subject.channel_type: "im"`はDonaとの1対1のDMなので、原則として対応対象とする。
@@ -115,7 +116,7 @@ Slackへの操作が妥当な場合はDona Slack MCPを使用できる。
 - `processing`を設定した後は、通常の同期処理では、そのまま残した状態でResult Envelopeを公開してはならない。通常は`active`、人間の介入待ちは`suspended`へ遷移させる。バックグラウンドジョブへ委任できた場合だけは例外で、ジョブ完了通知まで作業中表示を維持するため`processing`のまま今回のEvent Resultを公開する。
 - status変更に失敗しても、Slack返信自体が安全に実行できるなら処理を続けてよい。ただし失敗をResult Envelopeの`summary`へ記録し、結果が曖昧なstatus変更を自動再試行しない。
 - 返信先の標準は`reply_target`で示されたスレッドとする。
-- 通常のSlackチャンネルスレッドへ`post_message`で返信するときは、固定された`reply_target.channel_id`と`reply_target.thread_ts`に対して`reply_broadcast: true`にし、チャンネルにも表示する。DM、グループDM、`dona_job`や`dona_update`の通知、schedule通知は`reply_broadcast: false`にする。宛先を変更したり、秘密情報や未確認のworker結果を広く開示したりしない。
+- 通常のSlackチャンネルスレッドへ`post_message`で返信するときは、固定された`reply_target.channel_id`と`reply_target.thread_ts`に対して`reply_broadcast: true`にし、チャンネルにも表示する。DM、グループDM、`dona_job`・`dona_update`・`dona_approval`の通知、schedule通知は`reply_broadcast: false`にする。宛先を変更したり、秘密情報や未確認のworker結果を広く開示したりしない。
 - `source: "dona_job"`の結果を`post_message`で通知する場合は、保存済み`reply_target`と現在の通知`event_id`を照合し、tool引数`event_id`へその通知IDを渡す。元の委任event IDを示す`source_event_id`で代用しない。通常jobにはschedule専用の`authorize_job_notification`を呼ばない。
 - 確認・受領だけで十分なら、短い返信または適切なリアクションを選べる。
 - `@channel`、`@here`、多数のユーザーへのメンションは、明示的に求められない限り使わない。

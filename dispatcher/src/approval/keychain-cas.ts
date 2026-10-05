@@ -5,7 +5,7 @@ const identifier = z.string().max(128).regex(/^[A-Za-z0-9_-]+$/).refine(value =>
 const scopeSchema = z.strictObject({
   access_group: z.string().max(256).regex(/^[A-Z0-9]{10}\.[A-Za-z0-9.-]+$/).refine(value => !/\s/.test(value)),
   instance_id: identifier,
-  purpose: z.enum(["audit_anchor", "clock_mark", "binding_generation", "policy_generation"]),
+  purpose: z.enum(["audit_anchor", "clock_mark", "binding_generation", "policy_generation", "approval_key"]),
 });
 export type KeychainCasScope = z.infer<typeof scopeSchema>;
 export interface KeychainCasEntry { revision: number; value: Uint8Array }
