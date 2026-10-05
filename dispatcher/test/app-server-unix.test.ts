@@ -110,3 +110,45 @@ test("runtime host再起動後も同じworkerへ接続し内部read APIを提供
   await assert.rejects(client.conversation(agent.name,"stale"),/not_current/);
  }finally{if(agent)await client.stop(agent.name,agent.generation);await new Promise<void>(r=>host.close(()=>r()));fs.rmSync(root,{recursive:true,force:true});}
 });
+
+test("未送信startupは停止確認後に再試行でき、曖昧なthread作成は再送しない",async()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),"dr-start-"));fs.chmodSync(root,0o700);const script=path.join(root,"fake.mjs");fs.writeFileSync(script,fakeUnix);
+ const store=new RuntimeStore(path.join(root,"runtime.db"));let failInitialize=true,ambiguous=false,spawned=0;
+ const manager=new AppServerManager(store,(_args,cwd,row)=>{
+  spawned++;const rpc=new AppServerRpc(process.execPath,[script],cwd,process.env,{socketPath:path.join(root,row!.generation.slice(0,8))});
+  if(failInitialize)rpc.initialize=async()=>{throw Error("handshake failed");};
+  if(ambiguous){const original=rpc.request.bind(rpc);rpc.request=(method,params,timeout)=>method==='thread/start'?Promise.reject(new Error('response lost')):original(method,params,timeout);}
+  return rpc;
+ },true);
+ const input={name:"worker",role:"worker" as const,cwd:root,release:root,args:[],threadConfig:{}};
+ try {
+  await assert.rejects(manager.start(input),/runtime_start_not_sent/);assert.equal(manager.status("worker")?.state,"stopped");assert.equal(manager.status("worker")?.startup_state,"not_sent");
+  failInitialize=false;const started=await manager.start(input);assert.equal(started.state,"idle");await manager.stop(started.name,started.generation);
+  ambiguous=true;store.change(started.name,started.generation,{thread_id:null});await assert.rejects(manager.start(input),/response lost/);assert.equal(manager.status("worker")?.startup_state,"sending");
+  const count=spawned;await manager.recover();assert.equal(spawned,count);await assert.rejects(manager.start(input),/recovery_required/);
+ }finally{const row=store.agent("worker");if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);manager.closeConnections();store.close();fs.rmSync(root,{recursive:true,force:true});}
+});
+
+test("全世代retention・cache受信順・長文と通知byte上限を保持する",async()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),"dr-expiry-")),file=path.join(root,"runtime.db");let store=new RuntimeStore(file);
+ try{
+  store.observe("old","old-generation",{kind:"item/agentMessage/delta",text:"secret"});
+  store.cacheItem("old","old-generation",{id:"old",turn_id:"turn",kind:"assistant_message",text:"secret"});
+  store.db.prepare("UPDATE observation_events SET observed_at='2000-01-01T00:00:00Z'").run();store.db.prepare("UPDATE observation_items SET observed_at='2000-01-01T00:00:00Z'").run();store.close();store=new RuntimeStore(file);
+  assert.equal((store.db.prepare("SELECT COUNT(*) AS n FROM observation_events").get() as {n:number}).n,0);assert.equal(store.cachedItems("old","old-generation").length,0);assert.equal(store.observations("old","old-generation",0).gap,true);
+  store.cacheItem("current","g",{id:"z",turn_id:"turn",kind:"tool_progress"});store.cacheItem("current","g",{id:"a",turn_id:"turn",kind:"assistant_message",text:"after"});store.db.prepare("UPDATE observation_items SET observed_at=?").run(new Date().toISOString());assert.deepEqual(store.cachedItems("current","g").map(x=>x.id),['z','a']);
+  assert.equal(projectHistory({thread:{id:"t",turns:[{id:"turn",items:[{id:"long",type:"agentMessage",text:"x".repeat(9000)}]}]}}).truncated,true);
+  for(let i=0;i<1000;i++)store.observe("current","g",{kind:"item/agentMessage/delta",text:"x".repeat(512)});
+  const bounded=store.observations("current","g",0);assert.ok(Buffer.byteLength(JSON.stringify(bounded.events))<265000);assert.equal(bounded.gap,true);assert.ok(bounded.cursor<1001);assert.ok(store.observations("current","g",bounded.cursor).events.length>0);
+  store.db.prepare("UPDATE observation_events SET observed_at='2000-01-01T00:00:00Z'").run();const manager=new AppServerManager(store,()=>{throw Error('no spawn');});await manager.recover();assert.equal((store.db.prepare("SELECT COUNT(*) AS n FROM observation_events").get() as {n:number}).n,0);
+ }finally{store.close();fs.rmSync(root,{recursive:true,force:true});}
+});
+
+test("100件の会話一覧でprocess tableを一度だけ取得する",()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),"dr-list-")),store=new RuntimeStore(path.join(root,"runtime.db"));let samples=0;
+ try {
+  const manager=new AppServerManager(store,()=>{throw Error('no spawn');},false,()=>{samples++;return [];});
+  for(let i=0;i<100;i++)store.put({name:`worker-${i}`,generation:"g",role:"worker",cwd:root,release:root,thread_id:"t",turn_id:null,pid:2147483647,process_start:"gone",state:"unknown",request_hash:"h",config_json:"{}",sequence:0});
+  assert.equal(manager.conversations().items.length,100);assert.equal(samples,1);
+ }finally{store.close();fs.rmSync(root,{recursive:true,force:true});}
+});

@@ -17,7 +17,8 @@ export class AppServerManager {
   private resets=new Map<string,string>();
   private queues=new Map<string,Promise<unknown>>();
   private recoveryAfter=new Map<string,number>();
-  constructor(readonly store:RuntimeStore,private readonly factory:RpcFactory,private readonly reconnect=false) {
+  constructor(readonly store:RuntimeStore,private readonly factory:RpcFactory,private readonly reconnect=false,private readonly processSample=processes) {
+    store.db.exec("CREATE TABLE IF NOT EXISTS startup_phases(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,phase TEXT NOT NULL)");
     store.db.exec("CREATE TABLE IF NOT EXISTS main_readiness(agent TEXT PRIMARY KEY,generation TEXT NOT NULL)");
     store.db.exec("CREATE TABLE IF NOT EXISTS turn_outcomes(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,state TEXT NOT NULL)");
     store.db.exec("CREATE TABLE IF NOT EXISTS main_recoveries(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,input_json TEXT NOT NULL)");
@@ -48,6 +49,7 @@ export class AppServerManager {
         thread_id:input.role==="worker"?(prior?.thread_id??null):null,turn_id:null,pid:null,process_start:null,state:"starting",request_hash:requestHash,config_json:JSON.stringify(input),sequence:0};
       this.store.db.transaction(()=>{
         this.store.put(row);
+        this.store.db.prepare("INSERT INTO startup_phases VALUES(?,?,'not_sent') ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,phase=excluded.phase").run(row.name,row.generation);
         if(recoveryGeneration)this.store.db.prepare("UPDATE main_recoveries SET generation=? WHERE agent=? AND generation=?").run(row.generation,row.name,recoveryGeneration);
       }).immediate();
       let rpc:AppServerRpc;
@@ -70,11 +72,21 @@ export class AppServerManager {
       try {
         await rpc.initialize();
         const params={...input.threadConfig,cwd:input.cwd,...(row.thread_id?{threadId:row.thread_id,excludeTurns:true}:{})};
+        this.store.db.prepare("UPDATE startup_phases SET phase='sending' WHERE agent=? AND generation=?").run(row.name,row.generation);
         const result=object(await rpc.request(row.thread_id?"thread/resume":"thread/start",params,90_000));
         const thread=object(result.thread);if(typeof thread.id!=="string")throw Error("runtime_thread_identity_missing");
         this.store.change(row.name,row.generation,{thread_id:thread.id,state:"idle"});
+        this.store.db.prepare("UPDATE startup_phases SET phase='ready' WHERE agent=? AND generation=?").run(row.name,row.generation);
         return this.store.agent(row.name)!;
-      } catch(error){this.store.change(row.name,row.generation,{state:"unknown"});throw error;}
+      } catch(error){
+        this.store.change(row.name,row.generation,{state:"unknown"});
+        const phase=this.store.db.prepare("SELECT phase FROM startup_phases WHERE agent=? AND generation=?").get(row.name,row.generation) as {phase:string};
+        if(phase.phase==="not_sent"||(error instanceof RpcFailure&&["not_sent","rejected"].includes(error.acceptance))){
+          this.store.db.prepare("UPDATE startup_phases SET phase='not_sent' WHERE agent=? AND generation=?").run(row.name,row.generation);
+          await this.stopAgent(row.name,row.generation);throw Error("runtime_start_not_sent");
+        }
+        throw error;
+      }
   }
   private bind(row:AgentRecord,rpc:AppServerRpc):void {
       rpc.on("request",(message:RpcMessage)=>this.onRequest(row,message));
@@ -86,14 +98,15 @@ export class AppServerManager {
         if(this.store.agent(row.name)?.state!=="stopped")this.store.change(row.name,row.generation,{state:"unknown"});
       });
   }
-  private observationIdentity(row:AgentRecord):ConversationIdentity {
+  private observationIdentity(row:AgentRecord,sample?:ProcessIdentity[]):ConversationIdentity {
     const input=JSON.parse(row.config_json) as StartAgent;
-    return {name:row.name,generation:row.generation,role:row.role,thread_id:row.thread_id,attempt_id:input.attemptId??null,state:this.status(row.name)?.state??"unknown",connected:!!this.connections.get(row.name)?.connected,observed_at:new Date().toISOString()};
+    return {name:row.name,generation:row.generation,role:row.role,thread_id:row.thread_id,attempt_id:input.attemptId??null,state:this.status(row.name,sample)?.state??"unknown",connected:!!this.connections.get(row.name)?.connected,observed_at:new Date().toISOString()};
   }
   conversations(after=""):{items:ConversationIdentity[];next:string|null} {
     if(after.length>128)throw Error("runtime_conversation_cursor_invalid");
     const rows=this.store.db.prepare("SELECT * FROM agents WHERE name>? ORDER BY name LIMIT 101").all(after) as AgentRecord[];
-    return {items:rows.slice(0,100).map(row=>this.observationIdentity(row)),next:rows.length>100?rows[99]!.name:null};
+    const sample=this.processSample();
+    return {items:rows.slice(0,100).map(row=>this.observationIdentity(row,sample)),next:rows.length>100?rows[99]!.name:null};
   }
   async conversation(name:string,generation:string,afterSequence?:number):Promise<ConversationSnapshot> {
     if(afterSequence!==undefined&&(!Number.isSafeInteger(afterSequence)||afterSequence<0))throw Error("runtime_conversation_cursor_invalid");
@@ -112,18 +125,20 @@ export class AppServerManager {
     const current=this.store.agent(name);if(!current||current.generation!==generation||current.thread_id!==row.thread_id)throw Error("runtime_conversation_not_current");
     return {...this.observationIdentity(current),...observations,...history,gap};
   }
-  status(name:string):AgentRecord|undefined {
+  status(name:string,sample?:ProcessIdentity[]):AgentRecord|undefined {
     const row=this.store.agent(name);if(!row)return;
+    const phase=this.store.db.prepare("SELECT phase FROM startup_phases WHERE agent=? AND generation=?").get(row.name,row.generation) as {phase:"not_sent"|"sending"|"ready"}|undefined;
+    if(phase)row.startup_state=phase.phase;
     if(row.role==="main")row.startup_ready=!!this.store.db.prepare("SELECT 1 FROM main_readiness WHERE agent=? AND generation=?").get(row.name,row.generation);
     const hint=this.store.db.prepare("SELECT reason,retry_after FROM recovery_hints WHERE agent=? AND generation=?").get(name,row.generation) as {reason:"capacity_wait"|"authorization_required"|"configuration_error";retry_after:string|null}|undefined;
     if(hint)row.recovery_hint={reason:hint.reason,...(hint.retry_after?{retry_after:hint.retry_after}:{})};
     if(row.state==="stopped") {
       const stop=this.store.db.prepare("SELECT processes_json FROM stops WHERE agent=? AND generation=? AND state='stopped'").get(name,row.generation) as {processes_json:string}|undefined;
       if(!stop)return {...row,state:"unknown"};
-      const sample=processes();
-      if((JSON.parse(stop.processes_json) as ProcessIdentity[]).some(p=>{const live=sample.find(x=>x.pid===p.pid);return same(p,live)&&!live!.state.includes("Z");}))return {...row,state:"unknown"};
+      const table=sample??this.processSample();
+      if((JSON.parse(stop.processes_json) as ProcessIdentity[]).some(p=>{const live=table.find(x=>x.pid===p.pid);return same(p,live)&&!live!.state.includes("Z");}))return {...row,state:"unknown"};
     }
-    if(row.state!=="stopped"&&(!this.connections.get(name)?.connected||!row.pid||identity(row.pid)?.start!==row.process_start))return {...row,state:"unknown"};
+    if(row.state!=="stopped"&&(!this.connections.get(name)?.connected||!row.pid||(sample??this.processSample()).find(p=>p.pid===row.pid)?.start!==row.process_start))return {...row,state:"unknown"};
     return row;
   }
   private onRequest(agent:AgentRecord,message:RpcMessage):void {
@@ -277,8 +292,13 @@ export class AppServerManager {
   }
   /** workerは停止intentだけ再開する。mainのみ、停止証明の後に新threadで再生成する。 */
   async recover():Promise<void> {
+    this.store.expireObservations();
     for(const candidate of this.store.agents()) {
       if((this.recoveryAfter.get(candidate.name)??0)>Date.now())continue;
+      const phase=this.store.db.prepare("SELECT phase FROM startup_phases WHERE agent=? AND generation=?").get(candidate.name,candidate.generation) as {phase:string}|undefined;
+      if(candidate.state!=="stopped"&&phase?.phase==="not_sent"){
+        await this.serialized(candidate.name,()=>this.stopAgent(candidate.name,candidate.generation)).catch(()=>{});continue;
+      }
       if(this.reconnect&&candidate.state!=="stopped"&&candidate.pid&&identity(candidate.pid)?.start===candidate.process_start&&!this.store.db.prepare("SELECT 1 FROM stops WHERE agent=? AND generation=?").get(candidate.name,candidate.generation)){
         this.recoveryAfter.set(candidate.name,Date.now()+30_000);
         await this.serialized(candidate.name,async()=>{
