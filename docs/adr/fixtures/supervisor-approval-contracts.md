@@ -2,6 +2,24 @@
 
 この文書は[ADR 0001](../0001-supervisor-approval.md)の実装・review用fixtureです。値は説明用であり、production ID、credential、Slack本文ではありません。
 
+## ADR 0006に対応する現在のfixture照合
+
+[ADR 0001の整合表](../0001-supervisor-approval.md)と[ADR 0006](../0006-personal-dashboard.md)を同じrevisionで参照します。下の旧表のSlack button/message座標や二者bindingは旧transportの例です。現在の本人性証明へ読み替える範囲を次に固定し、旧testがpassするだけで個人operator経路を検証したとはしません。
+
+| ケース | 現在の期待値 | 実装・試験の対応 |
+| --- | --- | --- |
+| approve / reject、署名replay、別actionへの転用 | exact presentation/decisionと現在のdevice/session/grantへ束縛したWebAuthnのみ受理。署名期限切れではdecision writeなし。Codex承認とは別 | `dispatcher/src/dashboard/operator-webauthn.ts`、`dispatcher/test/dashboard-operator-webauthn.test.ts`、`dispatcher/test/local-external-approval.test.ts` |
+| 作成端末A・承認端末B、Bだけ失効 | 作成者の権限が残っていてもconsume/外部callを拒否。owner一致だけで許可しない | `dispatcher/src/approval/local-external-service.ts`、`dispatcher/test/local-external-approval.test.ts`の別端末approver失効case |
+| unknown operation、本文・target差替え、アクセス/revision drift | typed catalog外・snapshot不一致・現在アクセス喪失を拒否。本文を一般tool引数として実行しない | `dispatcher/src/approval/local-external-service.ts`、`dispatcher/test/local-external-approval.test.ts` |
+| duplicate decision / concurrent consume / response loss | 外部call最大一回。承認response lossはstatusで照合し、送信response lossは既存markerでread-only reconcileする | `dispatcher/test/dashboard-external.test.ts`、`dispatcher/test/approval/consume-concurrency.ts`、`dispatcher/test/local-external-approval.test.ts` |
+| worker待機 / Runtime世代喪失 / main要求 | exact Attempt/callのcheckpointを保持。旧call喪失は監査付きneeds_reviewとし停止確認なく新Attemptを作らない。mainはpending返却後に受付を継続 | `dispatcher/src/approval/local-ingress.ts`、`dispatcher/test/local-external-approval.test.ts` |
+| request expiry / payload TTL / provider長期不通 | 通信不能でも期限を延長しない。本文だけを削除しconsume/fence/監査を残す | `dispatcher/src/approval/local-operations.ts`、`dispatcher/test/local-approval-operations.test.ts` |
+| rotation / reboot / metadata restore | 旧承認の自動復活・再送なし。新規metadata artifactはsafe-offでありlive DB代替ではない | `dispatcher/test/local-approval-native.test.ts`、`dispatcher/test/local-external-approval.test.ts`、`dispatcher/test/local-approval-operations.test.ts` |
+| worker外部投稿 / main通常返信 / 代理投稿 | workerはtyped承認入口のみ、main通常通知は維持。代理投稿禁止は現在prompt/運用契約を含み、任意本文の機械的代理拒否は未検証・未完 | `dispatcher/src/job-prompt.ts`、`dispatcher/src/app-server/adapters.ts`、`dispatcher/test/app-server-adapters.test.ts`。全main/worker client遮断の合格caseとして扱わない |
+| host開発環境 | Macの直接利用を維持。任意の同OS client・資格情報へのsandbox隔離は期待値に含めない | [ADR 0006の承認境界](../0006-personal-dashboard.md#二種類の承認) |
+
+ここで列挙するtestは隔離fixtureによる契約検証です。実署名profile/Keychainの配備、別端末、実Slack、main包含・activationは別証拠を必要とし、この表だけで合格にはしません。旧表のTTL・one-shot・TOCTOU・曖昧結果・redactionの不変条件は保持し、本人性/transportだけを置換します。
+
 ## Decision transition table
 
 | Case | Initial | Input / current condition | Expected | External write |
