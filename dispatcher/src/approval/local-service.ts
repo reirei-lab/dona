@@ -6,7 +6,7 @@ import type {DispatcherDatabase} from '../database.js';
 import type {DispatcherConfig} from '../config.js';
 import {RuntimeClient} from '../app-server/client.js';
 import {runtimeSocket} from '../app-server/adapters.js';
-import {openSecurityDatabase} from '../audit/coordination.js';
+import {openLocalApprovalDatabase} from './local-database.js';
 import {NativeLocalApprovalConnection,readLocalApprovalNativeConfig} from './local-native.js';
 import {LocalExternalApprovalService} from './local-external-service.js';
 import {LocalSlackApprovalProvider} from './local-slack-provider.js';
@@ -39,7 +39,7 @@ export async function openLocalApprovalService(database:DispatcherDatabase,confi
  if(!config.localApprovalConfigPath)return undefined;
  const nativeConfig=readLocalApprovalNativeConfig(config.localApprovalConfigPath);
  if(nativeConfig.scope.instance_id!==database.operatorAuth.instance_id||nativeConfig.owner_id!==database.operatorAuth.owner_id)throw Error('local_approval_owner_mismatch');
- const sql=openSecurityDatabase(config.databasePath);let native:NativeLocalApprovalConnection|undefined;
+ const sql=openLocalApprovalDatabase(config.databasePath);let native:NativeLocalApprovalConnection|undefined;
  try{
   native=new NativeLocalApprovalConnection(sql,nativeConfig);
   if(!native.doctor().ready)throw Error('local_approval_setup_required');

@@ -1,7 +1,7 @@
 import path from "node:path";
 import {createHash,createHmac} from "node:crypto";
 import {createInterface} from "node:readline/promises";
-import {openSecurityDatabase} from "../audit/coordination.js";
+import {openLocalApprovalDatabase} from "./local-database.js";
 import {NativeLocalApprovalConnection,readLocalApprovalNativeConfig} from "./local-native.js";
 import {LocalApprovalOperations} from "./local-operations.js";
 import {LocalApprovalBackup} from "./local-backup.js";
@@ -22,8 +22,8 @@ export function parseLocalOperationsArguments(args:string[]){
  if(flags["--reason"]&&(flags["--reason"]!.trim().length<8||flags["--reason"]!.length>512))throw Error("invalid_arguments");return {operation:operation as typeof operations[number],flags,apply:flags["--apply"]==="yes"};
 }
 /** 固定signed hostのoperations entry。全エラーをredactし、pathやreasonをstdoutへ出さない。 */
-export async function localOperationsMain(args:string[]){let db:ReturnType<typeof openSecurityDatabase>|undefined,native:NativeLocalApprovalConnection|undefined;
- try{const {operation,flags,apply}=parseLocalOperationsArguments(args),config=readLocalApprovalNativeConfig(flags["--config"]!);db=openSecurityDatabase(flags["--database"]!);
+export async function localOperationsMain(args:string[]){let db:ReturnType<typeof openLocalApprovalDatabase>|undefined,native:NativeLocalApprovalConnection|undefined;
+ try{const {operation,flags,apply}=parseLocalOperationsArguments(args),config=readLocalApprovalNativeConfig(flags["--config"]!);db=openLocalApprovalDatabase(flags["--database"]!);
   const currentOwner=()=>{const row=db!.prepare("SELECT instance_id,owner_id FROM dashboard_operator_identity WHERE singleton=1").get() as {instance_id:string;owner_id:string}|undefined;return process.getuid?.()===process.geteuid?.()&&row?.instance_id===config.scope.instance_id&&row.owner_id===config.owner_id;};
   if(!currentOwner())throw Error();native=new NativeLocalApprovalConnection(db,config);if(!native.doctor().ready)throw Error();
   const operator={owner_id:config.owner_id,authorize:()=>{try{native!.maintenance.requireReady(config.key_version);return currentOwner()&&stableStringify(readLocalApprovalNativeConfig(flags["--config"]!))===stableStringify(config);}catch{return false;}}};

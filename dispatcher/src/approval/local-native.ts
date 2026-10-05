@@ -11,11 +11,11 @@ import type Database from "better-sqlite3";
 import {NativeKeychainPort} from "./native-keychain-port.js";
 import {encodeKeychainCasRequest,parseKeychainCasResponse,type KeychainCasScope} from "./keychain-cas.js";
 import {ProtectedAuditAnchors,ProtectedClockMarks,encodeProtectedHead,type ProtectedHeadPort,type ProtectedHeadEntry} from "./protected-heads.js";
-import {SqliteUsedTransactionNodes,installUsedTransactionNodeSchema} from "./used-transaction-store.js";
+import {SqliteUsedTransactionNodes} from "./used-transaction-store.js";
 import {emptyUsedTransactionRoot,prepareUsedTransactionInsert} from "./used-transactions.js";
 import {advanceClockMark} from "./clock.js";
 import {NativeClockSource} from "./native-clock.js";
-import {openSecurityDatabase} from "../audit/coordination.js";
+import {openLocalApprovalDatabase,createLocalApprovalNodeDatabase} from "./local-database.js";
 import {AuditRepository,installAuditSchema} from "../audit/repository.js";
 import {signAuditCheckpoint,type AuditKey,type AuditEvent} from "../audit/codec.js";
 import {ApprovalTransaction,type ApprovalTransactionProviders} from "./transaction.js";
@@ -63,7 +63,7 @@ export class NativeLocalApprovalConnection {
   try{
    this.native=new NativeKeychainPort();opened.push(this.native);
    this.maintenance=new LocalMaintenanceStore(new HeadPort(this.native,maintenanceScope(this.config)));if(access!==maintenanceAccess)this.maintenance.requireReady(this.config.key_version);
-   this.nodesDb=openSecurityDatabase(this.config.used_nodes_database);opened.push(this.nodesDb);this.nodesDb.pragma("synchronous=FULL");
+   this.nodesDb=openLocalApprovalDatabase(this.config.used_nodes_database);opened.push(this.nodesDb);
    const main=fs.statSync(db.name),aux=fs.statSync(this.config.used_nodes_database);if(main.dev===aux.dev&&main.ino===aux.ino)throw Error();
    const nodes=new SqliteUsedTransactionNodes(this.nodesDb),c=this.config;
    const read=(purpose:z.infer<typeof keySchema>["purpose"],version:number)=>{
@@ -100,8 +100,7 @@ export function provisionNativeLocalApproval(db:Database.Database,input:LocalApp
  for(const table of ["security_audit_checkpoint","security_audit_records","approval_requests"]){if(db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(table)&&db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get())throw Error("local_approval_already_provisioned");}
  const native=new NativeKeychainPort(),clock=new NativeClockSource(),observation=clock.observe();let nodesDb:Database.Database|undefined;
  try{
-  const fd=fs.openSync(c.used_nodes_database,fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_WRONLY,0o600);fs.closeSync(fd);
-  nodesDb=openSecurityDatabase(c.used_nodes_database);nodesDb.pragma("synchronous=FULL");installUsedTransactionNodeSchema(nodesDb);const nodes=new SqliteUsedTransactionNodes(nodesDb);
+  nodesDb=createLocalApprovalNodeDatabase(c.used_nodes_database);const nodes=new SqliteUsedTransactionNodes(nodesDb);
   const keys=new Map<string,z.infer<typeof keySchema>>();
   for(const purpose of keySchema.shape.purpose.options){const key={codec_version:1 as const,purpose,version:c.key_version,state:"active" as const,activated_at:observation.wall_utc,
     signing_expires_at:new Date(Date.parse(observation.wall_utc)+89*86400000).toISOString(),secret_hex:randomBytes(32).toString("hex")};keys.set(purpose,key);native.provision(keyScope(c,purpose,c.key_version),Buffer.from(JSON.stringify(key)));}

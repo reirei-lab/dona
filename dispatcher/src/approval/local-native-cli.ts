@@ -4,7 +4,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import {randomUUID} from 'node:crypto';
 import {createInterface} from 'node:readline/promises';
-import {openSecurityDatabase} from '../audit/coordination.js';
+import {openLocalApprovalDatabase} from './local-database.js';
 import {NativeLocalApprovalConnection,readLocalApprovalNativeConfig,provisionNativeLocalApproval,rotateNativeLocalApproval,recoverNativeLocalApproval,type LocalApprovalNativeConfig} from './local-native.js';
 
 export function parseNativeApprovalArguments(args:string[]){
@@ -31,7 +31,7 @@ export function replaceNativeApprovalConfig(file:string,expected:LocalApprovalNa
 export async function nativeApprovalMain(args:string[]){
  if(args[0]==='operations')return localOperationsMain(args.slice(1));
  const input=parseNativeApprovalArguments(args);let config=readLocalApprovalNativeConfig(input.config);
- const db=openSecurityDatabase(input.database);
+ const db=openLocalApprovalDatabase(input.database);
  try{
   const identity=db.prepare('SELECT instance_id,owner_id FROM dashboard_operator_identity WHERE singleton=1').get() as {instance_id:string;owner_id:string}|undefined;
   if(identity?.instance_id!==config.scope.instance_id||identity.owner_id!==config.owner_id)throw Error('operator_identity_mismatch');

@@ -7,7 +7,9 @@ export async function localApprovalCredential(alias:string):Promise<()=>Promise<
   import(new URL('sources/slack/dist/keychain.js',base).href),
   import(new URL('sources/slack/dist/config.js',base).href),
  ]);
- if(!loadRuntimeConfig().workspaces.includes(alias))throw Error('local_approval_workspace_unavailable');
+ // The private operator config selects the only alias; do not inherit another
+ // service's ambient SLACK_WORKSPACES or load an arbitrary environment file.
+ if(!loadRuntimeConfig({SLACK_WORKSPACES:alias}).workspaces.includes(alias))throw Error('local_approval_workspace_unavailable');
  const keychain=new MacOSKeychainStore();
  return ()=>loadStoredSlackBotToken(alias,keychain);
 }

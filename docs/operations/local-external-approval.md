@@ -30,7 +30,7 @@ constructorのDB connectionと `ApprovalTransactionProviders` はcaller所有と
 
 factoryは既存Dispatcherと同じ正規DB fileを `openSecurityDatabase` で別connectionとして開く。通常の `new Database` connectionを後付け登録して回避しない。connectionはWAL、foreign_keys=ON、synchronous=FULLで使用し、native connectionをcloseしてからbusiness DBをcloseする。`NativeLocalApprovalConnection.close()` 自体はbusiness DBを閉じない。
 
-設定は0600のcontroller-owned JSONとし、`codec_version:1`、`scope:{instance_id,workspace_id}`、`owner_id`、`ledger_id`、`access_group`、`used_nodes_database`、`slack_workspace_alias`、`key_version`を指定する。ブラウザー/MCPへpath、access group、token、keyを渡さない。aliasは既存workspace registryに一致し、providerの `auth.test` が固定workspace IDと一致する必要がある。
+設定は0600のcontroller-owned JSONとし、`codec_version:1`、`scope:{instance_id,workspace_id}`、`owner_id`、`ledger_id`、`access_group`、`used_nodes_database`、`slack_workspace_alias`、`key_version`を指定する。ブラウザー/MCPへpath、access group、token、keyを渡さない。aliasはoperatorが既存Slack credentialの別名として明示する。固定releaseのSlack config validatorへその1件だけを渡し、Dispatcher側の `SLACK_WORKSPACES` や別serviceのenv fileには依存しない。tokenは既存Keychainからのみ読み、providerの `auth.test` が固定workspace IDと一致する必要がある。
 
 初回のみ、署名された実行hostの正しいKeychain access-group entitlementを配備し、Macの対話TTYでinstance/workspace/ownerのexact確認後に `provisionNativeLocalApproval(db,config,confirmation)` を実行する。通常起動・doctor・再起動からこの関数を呼ばない。native provisionは既存service domainが完全に不存在の場合のみrevision 1を一回作成し、既存headの上書き、rotationや修復には使わない。キーはprocess内で生成し、JSON設定やshell引数へ秘密を出力しない。
 
@@ -111,3 +111,14 @@ candidateは常に `metadata_only_never_activate` である。`NativeLocalApprov
 workerのDona管理下MCPは `dona_slack` / `dona_dispatcher` を無効化し、外部投稿要求はhostが実Attempt/turnへ束縛したtyped toolで受ける。承認結果イベントにはrequest IDと状態だけを渡し、exact draftをmainへ転送しない。
 
 一般のworker Result・質問の自由文をmainが要約する場合、その意味が承認回避の代理投稿かを機械的に判別する保証はない。現在の代理投稿禁止は運用指示であり、文面heuristicによる強制や、全managed経路のprovenance強制を実装済みとは扱わない。mainの通常返信・結果通知を維持し、この残境界を理由に #20 / #21 を完了扱いしない。同一OS利用者が別途設定したclient/credentialの完全隔離も保証しない。
+
+
+## 初回導入の順序と中断時の扱い
+
+1. 署名profileとartifact doctorを確認し、まず外部承認未設定の署名Dispatcherへexact planでforward-only更新する。`/health/version`の稼働判定と外部承認readyは別であり、provision前の `external.ready:false` は更新の循環待ちを作らない。新Dispatcherが同じTask4 DBへoperator identityを初期化する。
+2. そのDBの現在instance/operatorと既存Slack workspace/credential aliasを照合し、0600の承認設定を作る。未使用のused-node DB pathを指定し、空fileを事前作成しない。
+3. 正規の保守手順で受付をquiesceし、進行中処理・DispatcherのDB connection終了を確認してから、署名hostのTTY `approval-provision` を使う。CLIは稼働writerの停止代行を行わない。現Task/Attemptやworkerを無確認で停止・再生成しない。
+4. 本体の既存WALは検証し、security connectionごとにFULLとFKを設定・検証する。used-node DBだけは初回の単一link・0600・排他的作成を行い、WAL/FULL/FK設定とschemaの耐久検証を済ませてからKeychain key/headを作る。通常open/doctorは既存DBを作成・journal修復しない。
+5. native doctor後に `DONA_LOCAL_APPROVAL_CONFIG` をinstallerへ明示して設定を保存し、Dispatcherを再起動する。機能別healthと端末のWebAuthn/承認動作を確認する。同じSHAの設定変更を新しいself-update成功と報告しない。
+
+初回の途中失敗では、空またはschema作成途中のused-node fileも保全する。既存fileがあればprovisionは拒否し、自動unlink・再初期化・Keychain削除でやり直さない。Keychain作成より前のDB初期化失敗か、key/head/audit作成途中かを、private file metadata・schemaと正規doctorで照合する。後者や結果不明ではscopeを再発行せずsafe-offのまま保全し、個別の復旧計画を作る。前者であっても手動削除をこの手順の既定にせず、保全と照合を経た別の明示操作として扱う。metadata backupをlive DBの復旧手段にしない。
