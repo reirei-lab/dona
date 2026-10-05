@@ -15,6 +15,7 @@ export interface DashboardTaskSnapshot {
   task: DashboardTask; attempts: DashboardAttempt[]; fingerprint: string;
   /** Internal read-only identity evidence; never project this field to the browser. */
   runtime_binding: {agent_name:string;generation:string;thread_id:string} | null;
+  runtime_binding_state: "missing" | "invalid" | "verified";
 }
 /** This reader never instantiates DispatcherDatabase: starting an observer must
  * not run migrations, recovery or supervisor actions against the active DB. */
@@ -69,7 +70,8 @@ export class DashboardTaskReader {
         } catch { /* Missing/legacy/malformed identities never authorize a history read. */ }
       }
       const fingerprint = createHash("sha256").update(JSON.stringify({task, attempts, identity:identity??null})).digest("hex");
-      return {task, attempts, fingerprint, runtime_binding};
+      const runtime_binding_state:DashboardTaskSnapshot["runtime_binding_state"]=runtime_binding?"verified":identity?"invalid":"missing";
+      return {task, attempts, fingerprint, runtime_binding, runtime_binding_state};
     })();
   }
 }

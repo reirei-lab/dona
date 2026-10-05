@@ -84,10 +84,10 @@ test("会話はdurable generation/threadへ束縛し、bindingの欠落・不一
     const content:ConversationContent={name:db.getJob(task.current_attempt_id)!.agent_name,generation:'generation_one',thread_id:'thread_one',role:'worker',attempt_id:task.current_attempt_id,connected:true,observed_at:new Date().toISOString(),state:'working',items:[{id:'item',turn_id:'turn',kind:'assistant_message',text:'private history'}],events:[],cursor:0,oldest_sequence:0,gap:false,truncated:false};
     let inventoryCalls=0,historyCalls=0,change=()=>{},history=()=>content;
     const observer=new DashboardObserver(reader,{async conversations(){inventoryCalls++;return{items:[content],next:null};},async conversation(){historyCalls++;change();return history();}});
-    assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'not_started');assert.equal(inventoryCalls,0);
+    assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'unavailable');assert.equal(inventoryCalls,0);
     const bind=(generation:string,thread:string)=>db.setJobRuntime(task.current_attempt_id,'workspace','pane',JSON.stringify([generation,thread]));
     db.setJobRuntime(task.current_attempt_id,'workspace','pane','legacy-unverified-identity');
-    assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'not_started');assert.equal(inventoryCalls,0);
+    assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'unavailable');assert.equal(inventoryCalls,0);
     bind('generation_wrong','thread_one');assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'unavailable');assert.equal(historyCalls,0);
     bind('generation_one','thread_wrong');assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'unavailable');assert.equal(historyCalls,0);
     bind('generation_one','thread_one');
@@ -98,4 +98,26 @@ test("会話はdurable generation/threadへ束縛し、bindingの欠落・不一
     const changed=await observer.detail(task.task_id,authority);assert.equal(changed!.runtime.status,'unavailable');assert.equal(JSON.stringify(changed).includes('private history'),false);
     const after=reader.snapshot(task.task_id)!;assert.notEqual(before.fingerprint,after.fingerprint);assert.deepEqual(before.task,after.task);assert.deepEqual(before.attempts,after.attempts);
   }finally{reader?.close();db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("会話未開始はidentity未登録のqueuedだけとし、準備済み・terminal・inventory不在を取得不能と区別する",async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);let reader:DashboardTaskReader|undefined;
+ try{
+  const event=db.enqueue(eventEnvelope('observer-started-meaning')).row;
+  const create=(key:string)=>db.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:key,objective:'観測',workspace:{kind:'scratch'}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  const task=create('meaning');reader=new DashboardTaskReader(config.databasePath);let calls=0;
+  const observer=new DashboardObserver(reader,{async conversations(){calls++;return{items:[],next:null};},async conversation(){throw Error('unexpected history');}});
+  const authority=()=>({revision:'1',task:()=>true,conversation:()=>true});
+  assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'not_started');assert.equal(calls,0);
+  db.beginJobPreparation(task.current_attempt_id);
+  assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'unavailable');assert.equal(calls,0);
+  db.setJobRuntime(task.current_attempt_id,'workspace','pane','["malformed"]');
+  assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'unavailable');assert.equal(calls,0);
+  db.setJobRuntime(task.current_attempt_id,'workspace','pane',JSON.stringify(['generation','thread']));
+  const absent=await observer.detail(task.task_id,authority);assert.equal(absent!.runtime.status,'unavailable');assert.equal(calls,1);assert.equal(JSON.stringify(absent).includes('runtime_binding'),false);
+  db.recordJobPreparationFailure(task.current_attempt_id,'failed','fixture failure',1);
+  assert.equal((await observer.detail(task.task_id,authority))!.runtime.status,'unavailable');assert.equal(calls,2);
+  const failedWithoutBinding=create('failed-without-binding');db.beginJobPreparation(failedWithoutBinding.current_attempt_id);db.recordJobPreparationFailure(failedWithoutBinding.current_attempt_id,'failed','fixture failure',1);
+  assert.equal((await observer.detail(failedWithoutBinding.task_id,authority))!.runtime.status,'unavailable');assert.equal(calls,2);
+ }finally{reader?.close();db.close();await fs.rm(root,{recursive:true,force:true});}
 });
