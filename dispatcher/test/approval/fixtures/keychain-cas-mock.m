@@ -26,7 +26,7 @@ OSStatus DonaFixtureCopyMatching(CFDictionaryRef input, CFTypeRef *result) {
     NSDictionary *query = (__bridge NSDictionary *)input;
     reads++;
     assertBase(query);
-    assert([query[(__bridge id)kSecMatchLimit] isEqual:@2]);
+    assert([query[(__bridge id)kSecMatchLimit] isEqual:(__bridge id)kSecMatchLimitAll]);
     assert([query[(__bridge id)kSecAttrSynchronizable] isEqual:(__bridge id)kSecAttrSynchronizableAny]);
     assert([query[(__bridge id)kSecReturnData] isEqual:@YES]);
     assert([query[(__bridge id)kSecReturnAttributes] isEqual:@YES]);
@@ -79,4 +79,8 @@ OSStatus DonaFixtureUpdate(CFDictionaryRef input, CFDictionaryRef proposed) {
 
 __attribute__((destructor)) static void report(void) {
     fprintf(stderr, "fixture:reads=%u,writes=%u,revision=%llu\n", reads, writes, revision);
+}
+
+OSStatus DonaFixtureAdd(CFDictionaryRef attributes, CFTypeRef *result) {
+    (void)attributes; (void)result; assert(!"runtime CAS must never provision"); return errSecParam;
 }

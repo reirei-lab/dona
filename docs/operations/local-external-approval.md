@@ -23,3 +23,17 @@ constructorのDB connectionと `ApprovalTransactionProviders` はcaller所有と
 ## 配備境界
 
 このcomponent単体ではMac grant、WebAuthn credential、protected-store genesis/key、Slack tokenを作成しない。callerがそれぞれの実providerを接続する必要がある。in-memory fixtureをproduction providerに差し替えない。main/workerからのrequest ingressとTask/Attempt checkpointは別途server-side source契約へ結び、自由入力のsource IDから作成者権限を推測しない。実Slack投稿と本番activationは隔離テストとは別に検証する。
+
+## Native接続と初回provision
+
+`NativeLocalApprovalConnection` はPR #362 (`38fa061d`) のin-process native Keychain portとprotected-headの構成を再利用する。キーはpurpose/version/instance/workspace別のData Protection Keychain item、clock/auditのheadはDB外のCAS item、使用済みtransactionのimmutable nodeは専用DBへ保存する。SQLite backupの復元だけでheadやone-shot fenceを巻き戻せない。
+
+factoryは既存Dispatcherと同じ正規DB fileを `openSecurityDatabase` で別connectionとして開く。通常の `new Database` connectionを後付け登録して回避しない。connectionはWAL、foreign_keys=ON、synchronous=FULLで使用し、native connectionをcloseしてからbusiness DBをcloseする。`NativeLocalApprovalConnection.close()` 自体はbusiness DBを閉じない。
+
+設定は0600のcontroller-owned JSONとし、`codec_version:1`、`scope:{instance_id,workspace_id}`、`owner_id`、`ledger_id`、`access_group`、`used_nodes_database`、`slack_workspace_alias`、`key_version`を指定する。ブラウザー/MCPへpath、access group、token、keyを渡さない。aliasは既存workspace registryに一致し、providerの `auth.test` が固定workspace IDと一致する必要がある。
+
+初回のみ、署名された実行hostの正しいKeychain access-group entitlementを配備し、Macの対話TTYでinstance/workspace/ownerのexact確認後に `provisionNativeLocalApproval(db,config,confirmation)` を実行する。通常起動・doctor・再起動からこの関数を呼ばない。native provisionは既存service domainが完全に不存在の場合のみrevision 1を一回作成し、既存headの上書き、rotationや修復には使わない。キーはprocess内で生成し、JSON設定やshell引数へ秘密を出力しない。
+
+処理途中に失敗した場合はsafe-offのまま停止する。DB、auxiliary DB、Keychainの部分成果を照合し、同じscopeを自動削除・再生成・再試行しない。`doctor()` のreadyは現在のanchor/clock/keyを確認した結果であり、Slack接続・WebAuthn enrollment・Task実行までの成功を意味しない。boot identity変更、期限切れkey、anchor不一致、credential欠落ではready:falseを維持する。既存checkpointがあるDBへ新しいgenesisを作らない。
+
+今回の開発でnative libraryのbuildと隔離contractテストを行うが、本番Keychain item作成、host署名変更、credential生成、実Slack投稿は行わない。

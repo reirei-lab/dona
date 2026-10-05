@@ -32,7 +32,7 @@ export interface ExternalApprovalKeys extends ApprovalCreateKeyLookup {
  notificationVersion(version:number):ApprovalNotificationKey;
  execution(version:number|null):ApprovalExecutionMarkerKey;
 }
-export interface ExternalApprovalPresentation {request_id:string;operation:"slack.post_thread_reply.v1";workspace_id:string;channel_id:string;thread_ts:string;
+export interface ExternalApprovalPresentation {request_id:string;operation:"slack.post_thread_reply.v1";workspace_id:string;channel_id:string;thread_ts:string;workspace_name:string;channel_name:string;
  exact_draft:string;notified_user_ids:string[];expires_at:string;request_revision:number;presentation_revision:number;presentation_digest:string}
 /** Mac grantの追加transport。既存coreの暗号化payload、監査root、clock、decision、
  * consume、execution markerをそのまま使い、別の承認ledgerを作らない。 */
@@ -99,7 +99,7 @@ export class LocalExternalApprovalService {
   const snapshot=this.snapshot(request),observation=await this.slack.observe({workspace_id:this.scope.workspace_id,...snapshot.target});
   if(!this.permitted(request,actor)||this.grant(request,observation,this.now())?.stale_reason!==null)throw Error("external_approval_snapshot_changed");
   const exact=this.text(request),card=this.card(request),base={request_id:requestId,operation:"slack.post_thread_reply.v1" as const,workspace_id:this.scope.workspace_id,...snapshot.target,
-   exact_draft:exact,notified_user_ids:[...snapshot.policy.allowed_user_mentions],expires_at:request.row.expires_at,request_revision:card.row.request_revision,presentation_revision:card.row.presentation_revision};
+   workspace_name:observation.workspace_name,channel_name:observation.channel_name,exact_draft:exact,notified_user_ids:[...snapshot.policy.allowed_user_mentions],expires_at:request.row.expires_at,request_revision:card.row.request_revision,presentation_revision:card.row.presentation_revision};
   if(Date.parse(base.expires_at)<=Date.parse(this.now().effective_utc))throw Error("external_approval_expired");
   const presentation={...base,presentation_digest:hash(base)},reference="web_"+presentation.presentation_digest;
   // Webへの配送証拠は、同じcanonical表示を再構成できるdurable opaque ref。
@@ -130,6 +130,18 @@ export class LocalExternalApprovalService {
     actor_kind:"supervisor",actor_id:actor.owner_id,presentation_ref:card.row.message_ref,presentation_revision:card.row.presentation_revision,...g}:denied;
   },v=>this.keys.content(v),v=>this.keys.wrappingVersion(v),v=>this.keys.notificationVersion(v));
   return broker.decide(tx(),{request_handle:receipt.request_id,authority_ref:receipt.receipt_id,action:receipt.decision,expected_revision:card.row.request_revision,presentation_revision:card.row.presentation_revision});
+ }
+ status(authority:ExternalApprovalAuthority,requestId:string){
+  const actor=this.checked(authority);
+  return this.audit.readVerifiedState(state=>{
+   const r=this.records.readInState(state,"request",requestId);
+   if(!r||r.row.model_version!=="local_operator_v1"||!this.permitted(r,actor))throw Error("external_approval_not_found");
+   const d=this.records.readInState(state,"decision",requestId),e=this.records.readAliasInState(state,{name:"execution_request",request_id:requestId});
+   this.checked(actor);
+   return {request_id:requestId,operation:"slack.post_thread_reply.v1" as const,state:r.row.state,created_at:r.row.created_at,expires_at:r.row.expires_at,
+    decision:d?{kind:d.row.kind,decided_at:d.row.decided_at}:null,
+    execution:e?.kind==="execution"?{state:e.row.state,receipt_ref:e.row.receipt_ref}:null};
+  });
  }
  list(authority:ExternalApprovalAuthority,after:string|null=null){
   const actor=this.checked(authority);

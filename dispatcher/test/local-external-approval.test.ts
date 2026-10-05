@@ -73,3 +73,11 @@ test("異なるdevice claim・偽step-up・同一key別本文・rejectを分離�
  const rejected=await f.service.decide(actor,receipt);assert.equal(rejected.status,"decided");
  assert.equal((await f.service.executePending()).items[0]?.state,"rejected");assert.equal(f.counts().sends,0);
 });
+
+test("exact statusは表示配送・execution writeなしで応答喪失を照合する",async t=>{
+ const f=setup(t),{created}=await approved(f),before=(f.db.prepare("SELECT total_changes() n").get() as {n:number}).n;
+ const status=f.service.status(actor,created.request_handle);
+ assert.equal(status.decision?.kind,"approve");assert.equal(status.execution,null);assert.equal((f.db.prepare("SELECT total_changes() n").get() as {n:number}).n,before);
+ await f.service.executePending();assert.equal(f.service.status(actor,created.request_handle).execution?.state,"succeeded");
+ assert.throws(()=>f.service.status(actor,"absent"));f.setAllowed(false);assert.throws(()=>f.service.status(actor,created.request_handle),/unauthorized/);
+});

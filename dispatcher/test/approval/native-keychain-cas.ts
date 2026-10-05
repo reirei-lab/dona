@@ -35,7 +35,7 @@ if (process.platform === "darwin") test("native CASはSecItem mockだけを使�
   const frontend = fileURLToPath(new URL("./fixtures/keychain-cas-main.m", import.meta.url));
   const environment = { PATH: "/usr/bin:/bin", LC_ALL: "C" };
   execFileSync("/usr/bin/cc", ["-fobjc-arc", "-Wall", "-Wextra", "-Werror",
-    "-DSecItemCopyMatching=DonaFixtureCopyMatching", "-DSecItemUpdate=DonaFixtureUpdate",
+    "-DSecItemCopyMatching=DonaFixtureCopyMatching", "-DSecItemUpdate=DonaFixtureUpdate", "-DSecItemAdd=DonaFixtureAdd",
     "-framework", "Foundation", "-framework", "Security", "-framework", "LocalAuthentication",
     source, fixture, frontend, "-o", binary], { timeout: 30000, maxBuffer: 8192, killSignal: "SIGKILL", env: environment });
   const imports = execFileSync("/usr/bin/nm", ["-u", binary], { encoding: "utf8", timeout: 2000, maxBuffer: 8192 });
