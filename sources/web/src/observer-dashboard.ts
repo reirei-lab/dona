@@ -112,7 +112,7 @@ function appendConversation(content,runtime) {
       const facts=[];if(Number.isFinite(item.exit_code))facts.push('終了コード '+item.exit_code);if(Number.isFinite(item.duration_ms))facts.push('所要時間 '+(item.duration_ms/1000).toLocaleString('ja-JP',{maximumFractionDigits:2})+' 秒');
       if(facts.length)entry.append(node('p',facts.join(' · '),'muted'));
       if(item.error)entry.append(node('h5','エラー'),node('pre',item.error,'notice'));
-      if(Array.isArray(item.files)&&item.files.length){const files=node('ul');for(const file of item.files){const counts=[];if(Number.isFinite(file.additions))counts.push('+'+file.additions);if(Number.isFinite(file.deletions))counts.push('−'+file.deletions);files.append(node('li',({add:'追加',delete:'削除',update:'更新'})[file.change]+' · '+file.path+(counts.length?' ('+counts.join(' / ')+')':'')));}entry.append(node('h5','変更ファイル'),files);}
+      if(Array.isArray(item.files)&&item.files.length){const files=node('ul');for(const file of item.files){const counts=[];if(Number.isFinite(file.additions))counts.push('+'+file.additions);if(Number.isFinite(file.deletions))counts.push('−'+file.deletions);const moved=file.change==='update'&&typeof file.move_path==='string'&&file.move_path.length>0;files.append(node('li',(moved?'移動':({add:'追加',delete:'削除',update:'更新'})[file.change])+' · '+file.path+(moved?' → '+file.move_path:'')+(counts.length?' ('+counts.join(' / ')+')':'')));}entry.append(node('h5','変更ファイル'),files);}
       fold('入力を表示',item.input,'input');
       fold('実行結果を表示',item.output,'output');
       if(item.truncated)entry.append(node('p','この項目の内容は表示上限のため一部省略されています。','notice'));

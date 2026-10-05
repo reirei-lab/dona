@@ -5,7 +5,7 @@ export interface ConversationIdentity {
   archived?:boolean;
   state:AgentRecord["state"];connected:boolean;observed_at:string;
 }
-export interface ConversationFile {path:string;change:"add"|"delete"|"update";additions?:number;deletions?:number}
+export interface ConversationFile {path:string;change:"add"|"delete"|"update";move_path?:string;additions?:number;deletions?:number}
 export interface ConversationItem {id:string;turn_id:string;kind:"user_message"|"assistant_message"|"tool_progress";text?:string;status?:string;tool_type?:string;tool_name?:string;command?:string;input?:string;output?:string;error?:string;files?:ConversationFile[];duration_ms?:number;exit_code?:number;truncated?:boolean}
 export interface ObservationEvent {sequence:number;kind:string;turn_id?:string;item_id?:string;text?:string;observed_at:string}
 export interface ConversationSnapshot extends ConversationIdentity {
@@ -109,7 +109,7 @@ export function sanitizeObservationText(value:string,limit=8192):string {
     const decoded=decodedObservationText(line,stage=>{if(/(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s/]+@/i.test(stage))credentialUri=true;});
     if(credentialUri)return "[機密情報を含む行を省略]";
     if(decoded!==line&&/(?:^|[\s"']|\/)(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains|\.env(?:\.[\w-]+)?|\.netrc|\.pgpass|\.htpasswd|auth\.json|credentials(?:\.json)?)(?:\/|$|[\s"'])/i.test(decoded))return "[保護されたパスを含む行を省略]";
-    if(/(?:xox[a-z]-|xapp-|gh[pousr]_|github_pat_|sk-(?:proj-)?[A-Za-z0-9_-]{8}|\b(?:AKIA|ASIA)[A-Z0-9]{16}|--(?:token|password|secret|api-key|header)\s+\S+|\b(?:Bearer|Basic)\s+\S+|(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s/]+@|(?:files|hooks)\.slack\.com|[?&](?:signature|sig|token|key|x-amz-[\w-]+)=|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/i.test(decoded))return "[機密情報を含む行を省略]";
+    if(/(?:xox[a-z]-|xapp-|gh[pousr]_|github_pat_|\bgl(?:pat|oas|dt|rt|rtr|cbt|ptt|ft|imt|agent|wt|soat|ffct)-|_gitlab_session=|sk-(?:proj-)?[A-Za-z0-9_-]{8}|\b(?:AKIA|ASIA)[A-Z0-9]{16}|--(?:token|password|secret|api-key|header)\s+\S+|\b(?:Bearer|Basic)\s+\S+|(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s/]+@|(?:files|hooks)\.slack\.com|[?&](?:signature|sig|token|key|x-amz-[\w-]+)=|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/i.test(decoded))return "[機密情報を含む行を省略]";
     return line.replace(/(?:~|\/[^\s"'<>]*)\/(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains)(?:\/[^\s"'<>]*)?/g,"[保護されたパス]").replace(/(^|[\s"'<>])(?:[^\s"'<>]*\/)?(?:\.env(?:\.[\w-]+)?|\.netrc|\.pgpass|\.htpasswd|auth\.json|credentials(?:\.json)?)(?=\s|$|["'<>])/g,"$1[保護されたパス]").replace(/\/(?:Users|home)\/[^/\s]+/g,"~");
   }).join("\n");
   return text.slice(0,limit);
@@ -126,7 +126,7 @@ export function sanitizeConversationItem(value:unknown):ConversationItem|undefin
   if(out.kind==="tool_progress"&&["commandExecution","fileChange","mcpToolCall","dynamicToolCall","collabAgentToolCall","webSearch","imageView","imageGeneration","sleep","contextCompaction","enteredReviewMode","exitedReviewMode","subAgentActivity","functionCallOutput"].includes(String(v.tool_type)))out.tool_type=String(v.tool_type);
   if(out.kind==="tool_progress"&&(!metadataOnly||v.tool_type==="sleep")&&Number.isFinite(v.duration_ms)&&Number(v.duration_ms)>=0)out.duration_ms=Number(v.duration_ms);
   if(out.kind==="tool_progress"&&!metadataOnly&&Number.isSafeInteger(v.exit_code))out.exit_code=Number(v.exit_code);
-  if(out.kind==="tool_progress"&&!metadataOnly&&Array.isArray(v.files)){out.files=[];if(v.files.length>20)out.truncated=true;for(const raw of v.files.slice(0,20)){const f=record(raw);if(typeof f.path!=="string"||!["add","delete","update"].includes(String(f.change)))continue;const file:ConversationFile={path:sanitizeObservationText(f.path,1024),change:f.change as ConversationFile["change"]};for(const k of ["additions","deletions"] as const)if(Number.isSafeInteger(f[k])&&Number(f[k])>=0)file[k]=Number(f[k]);out.files.push(file);}}
+  if(out.kind==="tool_progress"&&!metadataOnly&&Array.isArray(v.files)){out.files=[];if(v.files.length>20)out.truncated=true;for(const raw of v.files.slice(0,20)){const f=record(raw);if(typeof f.path!=="string"||!["add","delete","update"].includes(String(f.change)))continue;const file:ConversationFile={path:sanitizeObservationText(f.path,1024),change:f.change as ConversationFile["change"]};if(file.change==="update"&&typeof f.move_path==="string"){file.move_path=sanitizeObservationText(f.move_path,1024);if(f.move_path.length>1024)out.truncated=true;}for(const k of ["additions","deletions"] as const)if(Number.isSafeInteger(f[k])&&Number(f[k])>=0)file[k]=Number(f[k]);out.files.push(file);}}
   if(v.truncated===true)out.truncated=true;return out;
 }
 function requestText(text:string):string|undefined {
@@ -156,8 +156,9 @@ export function projectItem(value:unknown,turnId:string):ConversationItem|undefi
     if(item.type==="fileChange"&&Array.isArray(item.changes)){
       out.files=item.changes.slice(0,20).flatMap(raw=>{
         const f=record(raw),kind=record(f.kind);if(typeof f.path!=="string"||!["add","delete","update"].includes(String(kind.type)))return [];
-        if(typeof f.diff!=="string")return [{path:f.path,change:kind.type as ConversationFile["change"]}];
-        if(f.diff.length>131072){out.truncated=true;return [{path:f.path,change:kind.type as ConversationFile["change"]}];}
+        const file:ConversationFile={path:f.path,change:kind.type as ConversationFile["change"]};if(kind.type==="update"&&typeof kind.move_path==="string")file.move_path=kind.move_path;
+        if(typeof f.diff!=="string")return [file];
+        if(f.diff.length>131072){out.truncated=true;return [file];}
         // Codex FileChange Add/Deleteのdiffはraw content。Updateだけがunified diff。
         if(kind.type==="add"||kind.type==="delete"){
           const lines=f.diff.length===0?0:f.diff.split("\n").length-(f.diff.endsWith("\n")?1:0);
@@ -170,7 +171,7 @@ export function projectItem(value:unknown,turnId:string):ConversationItem|undefi
           if(!inHunk&&/^(?:---|\+\+\+) /.test(line))continue;
           if(line.startsWith("+"))additions++;else if(line.startsWith("-"))deletions++;
         }
-        return [{path:f.path,change:kind.type as ConversationFile["change"],additions,deletions}];
+        return [{...file,additions,deletions}];
       });if(item.changes.length>20)out.truncated=true;
     }
     if(item.type==="collabAgentToolCall"){

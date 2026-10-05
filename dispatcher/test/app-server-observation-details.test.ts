@@ -247,3 +247,31 @@ test("既知設定CLIのcredential name whitespace valueは共通名判定で省
  }
  for(const ordinary of ["aws configure set region us-east-1","git config --global user.name alice","git config set core.editor vim","npm config set registry https://registry.example","We should document aws configure set and the login screen","The token name is explained here","echo secret documentation"])assert.equal(sanitizeObservationText(ordinary),ordinary);
 });
+
+test("GitLab公式の固定token prefixは単独値・encoded値・tool出力でも省略する",()=>{
+ // https://docs.gitlab.com/security/tokens/#token-prefixes (custom PAT prefixは対象外)
+ for(const prefix of ["glpat-","gloas-","gldt-","glrt-","glrtr-","glcbt-","glptt-","glft-","glimt-","glagent-","glwt-","glsoat-","glffct-","_gitlab_session="]){
+  const token=prefix+"1234567890abcdefghij";
+  for(const text of [token,JSON.stringify({value:token}),encodeURIComponent(token),token.replaceAll("g",String.raw`\u0067`)]){
+   assert.ok(!sanitizeObservationText(text).includes("1234567890abcdefghij"),prefix);
+   assert.ok(!JSON.stringify(projectItem({id:"cmd",type:"commandExecution",command:"inspect",aggregatedOutput:text},turn)).includes("1234567890abcdefghij"),prefix);
+  }
+ }
+ assert.equal(sanitizeObservationText("gitlab build passed"),"gitlab build passed");
+});
+
+test("fileChange update移動先はbounded DTOとcache再読で保持し保護pathを除去する",async()=>{
+ const changes=[{path:"src/old.ts",kind:{type:"update",move_path:"src/new.ts"},diff:"@@ -1 +1 @@\n-old\n+new"},{path:"src/no-diff.ts",kind:{type:"update",move_path:"src/moved.ts"}},{path:"src/huge.ts",kind:{type:"update",move_path:"src/moved-huge.ts"},diff:"x".repeat(131073)},{path:"src/null.ts",kind:{type:"update",move_path:null},diff:""},{path:"src/add.ts",kind:{type:"add",move_path:"unexpected"},diff:"new"}];
+ const item=projectItem({id:"moves",type:"fileChange",changes},turn)!;
+ assert.deepEqual(item.files?.[0],{path:"src/old.ts",change:"update",move_path:"src/new.ts",additions:1,deletions:1});
+ assert.equal(item.files?.[1]?.move_path,"src/moved.ts");assert.equal(item.files?.[2]?.move_path,"src/moved-huge.ts");assert.equal(item.files?.[3]?.move_path,undefined);assert.equal(item.files?.[4]?.move_path,undefined);
+ const privateItem=projectItem({id:"private_move",type:"fileChange",changes:[{path:"src/a",kind:{type:"update",move_path:"/Users/alice/.codex/auth.json"},diff:""}]},turn)!;
+ assert.ok(!JSON.stringify(privateItem).includes("alice"));assert.ok(!JSON.stringify(privateItem).includes("auth.json"));
+ const bounded=sanitizeConversationItem({...item,files:[{path:"src/a",change:"update",move_path:"x".repeat(1025)}]})!;assert.equal(bounded.files?.[0]?.move_path?.length,1024);assert.equal(bounded.truncated,true);
+ const fs=await import("node:fs/promises"),os=await import("node:os"),path=await import("node:path"),{RuntimeStore}=await import("../src/app-server/store.js");const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-details-move-")),store=new RuntimeStore(path.join(root,"r.db"));
+ try{
+  store.cacheItem("a","g",item);assert.deepEqual(store.cachedItems("a","g"),[item]);
+  store.db.prepare("UPDATE observation_items SET item_json=?").run(JSON.stringify({...item,files:[{path:"src/a",change:"update",move_path:"/Users/alice/.codex/auth.json",raw:"hidden"}]}));
+  const cached=store.cachedItems("a","g")[0]!;assert.ok(cached.files?.[0]?.move_path);assert.ok(!JSON.stringify(cached).includes("alice"));assert.ok(!JSON.stringify(cached).includes("hidden"));
+ }finally{store.close();await fs.rm(root,{recursive:true,force:true});}
+});
