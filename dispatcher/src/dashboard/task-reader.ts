@@ -9,6 +9,7 @@ export interface DashboardTask {
   task_id: string; task_key: string; revision: number; state: string; desired_state: string;
   progress: string; wait_reason: string | null; current_attempt_id: string;
   attempt_number: number; created_at: string; updated_at: string;
+  local_operator_owned: boolean;
   source: string; worker_status: string; next_check_at: string | null;
 }
 export interface DashboardTaskSnapshot {
@@ -42,7 +43,7 @@ export class DashboardTaskReader {
       const items: DashboardTask[] = [];
       const rows = this.sql.prepare(`${projection} WHERE (? IS NULL OR t.task_id < ?) ORDER BY t.task_id DESC`).iterate(after, after);
       for (const value of rows) {
-        const task = value as DashboardTask;
+        const task = projectTask(value as DashboardTask);
         if (!visible(task)) continue;
         if (items.length === limit) return {items, next: items[items.length - 1]!.task_id};
         items.push(task);
@@ -53,8 +54,9 @@ export class DashboardTaskReader {
   snapshot(id: string, attemptId?: string): DashboardTaskSnapshot | null {
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(id) || (attemptId !== undefined && !/^[A-Za-z0-9_-]{1,128}$/.test(attemptId))) throw Error("dashboard_query_invalid");
     return this.sql.transaction(() => {
-      const task = this.sql.prepare(`${projection} WHERE t.task_id = ?`).get(id) as DashboardTask | undefined;
-      if (!task) return null;
+      const row = this.sql.prepare(`${projection} WHERE t.task_id = ?`).get(id) as DashboardTask | undefined;
+      if (!row) return null;
+      const task=projectTask(row);
       const attempts = this.sql.prepare(`SELECT a.attempt_id,a.number,j.status,a.outcome,a.created_at,a.ended_at,j.agent_name
         FROM task_attempts a JOIN jobs j ON j.job_id=a.attempt_id WHERE a.task_id=? ORDER BY a.number`).all(id) as DashboardAttempt[];
       if (attempts.length > 100) throw Error("dashboard_attempt_limit");
@@ -112,5 +114,10 @@ export class DashboardTaskReader {
   }
 }
 const projection = `SELECT t.task_id,t.task_key,t.revision,t.state,t.desired_state,t.progress,t.wait_reason,t.current_attempt_id,
-  t.attempt_number,t.created_at,t.updated_at,t.next_check_at,j.source,j.status AS worker_status
-  FROM tasks t JOIN jobs j ON j.job_id=t.current_attempt_id`;
+  t.attempt_number,t.created_at,t.updated_at,t.next_check_at,j.source,j.status AS worker_status,
+  CASE WHEN json_valid(b.owner_json) THEN json_extract(b.owner_json,'$.kind')='local_dashboard' ELSE 0 END AS local_operator_owned
+  FROM tasks t JOIN jobs j ON j.job_id=t.current_attempt_id LEFT JOIN job_owner_bindings b ON b.job_id=t.current_attempt_id`;
+function projectTask(row:DashboardTask):DashboardTask {
+  // This UI hint never replaces Dispatcher authorization of the current grant.
+  return {...row,local_operator_owned:(row.local_operator_owned as unknown)===1};
+}

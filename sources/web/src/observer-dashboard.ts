@@ -35,12 +35,12 @@ function renderDetail(value) {
   const content = document.createDocumentFragment();
   content.append(node('h2',task.task_key || task.task_id),node('p',task.task_id,'muted'),node('p','Task: '+label(task.state)+(task.wait_reason?' · '+label(task.wait_reason):''),'state'));
   content.append(node('p','ワーカー: '+label(task.worker_status)+' · 更新 '+task.updated_at,'muted'));
-  if(capabilities.includes('tasks:cancel') && task.desired_state==='running' && !['completed','failed','cancelled'].includes(task.state)) {
+  if(task.local_operator_owned===true && capabilities.includes('tasks:cancel') && task.desired_state==='running' && !['completed','failed','cancelled'].includes(task.state)) {
     const button=node('button','このTaskを取り消す');button.type='button';button.disabled=!!pending;
     button.addEventListener('click',()=>{if(!confirm('このTaskの実行を取り消しますか？ 停止確認が完了するまで取消処理中になります。'))return;void command('/api/tasks/'+encodeURIComponent(task.task_id)+'/cancel','cancel',{attempt_id:task.current_attempt_id,revision:task.revision},button);});content.append(button);
   }
   const questions=node('section');questions.dataset.questions=task.task_id;content.append(questions);
-  if(capabilities.includes('tasks:submit') && task.desired_state==='running')void loadQuestions(task.task_id,questions);
+  if(task.local_operator_owned===true && capabilities.includes('tasks:submit') && task.desired_state==='running')void loadQuestions(task.task_id,questions);
   if(capabilities.includes('approvals:native') && task.desired_state==='running') {const approvals=node('section');content.append(approvals);void loadNativeApprovals(task.task_id,approvals);}
   content.append(node('h3','実行履歴'));
   const attempts = node('ol');

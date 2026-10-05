@@ -20,7 +20,7 @@ test('main会話だけの端末はTask閲覧を要求しない',async({page})=>{
  await page.goto('https://operator.test/');await expect(page.locator('#connection')).toContainText('接続中');expect(paths).not.toContain('/api/tasks');await expect(page.locator('#task-panel')).toBeHidden();
 });
 test('質問文と選択肢からexact Attempt/revisionへの回答をDonaへ送る',async({page})=>{
- let response:any;const task={task_id:'task_one',task_key:'調査',state:'waiting',desired_state:'running',revision:7,current_attempt_id:'attempt_one',worker_status:'blocked',updated_at:'now'};
+ let response:any;const task={local_operator_owned:true,task_id:'task_one',task_key:'調査',state:'waiting',desired_state:'running',revision:7,current_attempt_id:'attempt_one',worker_status:'blocked',updated_at:'now'};
  await page.route('https://operator.test/**',async route=>{const url=new URL(route.request().url());if(url.pathname==='/'){await route.fulfill(observerDashboardPage());return;}let value:unknown;
   if(url.pathname==='/api/session')value={csrf:'csrf',capabilities:['tasks:read','tasks:submit']};
   else if(url.pathname==='/api/tasks')value={items:[task],next:null};
@@ -44,4 +44,18 @@ test('承認権限を持つ端末でパスキーを登録する',async({page})=>
   await route.fulfill({contentType:'application/json',body:JSON.stringify(value)});
  });
  await page.goto('https://operator.test/');await page.getByRole('button',{name:'承認用パスキーを登録'}).click();await expect(page.locator('#credential-status')).toContainText('登録済み');expect(registration.ceremony_id).toBe('ceremony');expect(typeof registration.response.response.attestationObject).toBe('string');
+});
+
+test('Slack起点Taskには取消と通常質問を出さずnative承認の取得だけを維持する',async({page})=>{
+ let nativeReads=0;const task={task_id:'task_slack',task_key:'Slack依頼',local_operator_owned:false,state:'waiting',desired_state:'running',revision:3,current_attempt_id:'attempt_slack',worker_status:'blocked',updated_at:'now'};
+ await page.route('https://operator.test/**',async route=>{const url=new URL(route.request().url());if(url.pathname==='/'){await route.fulfill(observerDashboardPage());return;}let value:unknown;
+  if(url.pathname==='/api/session')value={csrf:'csrf',capabilities:['tasks:read','tasks:submit','tasks:cancel','approvals:native']};
+  else if(url.pathname==='/api/credential')value={registered:true,can_enroll:false};
+  else if(url.pathname==='/api/tasks')value={items:[task],next:null};
+  else if(url.pathname.endsWith('/questions')){expect(url.searchParams.get('kind')).toBe('approval');nativeReads++;value={task_id:task.task_id,current_attempt_id:task.current_attempt_id,revision:3,questions:[]};}
+  else value={snapshot:{task,attempts:[],selected_attempt_id:task.current_attempt_id},runtime:{status:'unavailable'}};
+  await route.fulfill({contentType:'application/json',body:JSON.stringify(value)});
+ });
+ await page.goto('https://operator.test/');await page.getByRole('button',{name:'Slack依頼 · 待機中'}).click();await expect(page.locator('#detail h2')).toHaveText('Slack依頼');
+ await expect.poll(()=>nativeReads).toBe(1);await expect(page.getByRole('button',{name:'このTaskを取り消す'})).toHaveCount(0);await expect(page.getByRole('button',{name:'回答をDonaに送る'})).toHaveCount(0);
 });

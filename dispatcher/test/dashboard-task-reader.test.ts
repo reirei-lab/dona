@@ -162,3 +162,19 @@ test('Dona本体の履歴は別grantを要求しrole/threadの一致とI/O中失
   change=()=>{grant=false;};assert.equal(await observer.mainDetail('dona_main','old',auth),null);
  }finally{reader.close();db.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+test('通常操作UIのowner hintはsource名でなく現在Attemptの永続owner bindingから作る',async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);let reader:DashboardTaskReader|undefined;
+ try{
+  const event=db.enqueue(eventEnvelope('observer-owner-hint')).row;
+  const slack=db.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:'slack-owned',objective:'fixture',workspace:{kind:'scratch'}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  const local=db.createLocalDashboardTask({instance_id:'instance',owner_id:'operator',device_id:'device',grant_revision:1},{request_id:'local-hint',objective:'fixture',workspace:{kind:'scratch'}},config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  reader=new DashboardTaskReader(config.databasePath);
+  assert.equal(reader.snapshot(slack.task_id)!.task.local_operator_owned,false);assert.equal(reader.snapshot(local.task_id)!.task.local_operator_owned,true);
+  const list=reader.list(()=>true);assert.equal(list.items.find(row=>row.task_id===slack.task_id)!.local_operator_owned,false);assert.equal(list.items.find(row=>row.task_id===local.task_id)!.local_operator_owned,true);
+  const {default:Database}=await import('better-sqlite3'),sql=new Database(config.databasePath);
+  sql.prepare("UPDATE jobs SET source='web' WHERE job_id=?").run(slack.current_attempt_id);sql.close();
+  assert.equal(reader.snapshot(slack.task_id)!.task.local_operator_owned,false);
+  assert.equal(JSON.stringify(reader.snapshot(local.task_id)).includes('owner_json'),false);
+ }finally{reader?.close();db.close();await fs.rm(root,{recursive:true,force:true});}
+});
