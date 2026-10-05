@@ -63,7 +63,7 @@ test("pre-activation installs, typechecks and builds each component without runn
     return { ...success, stdout: args[0] === "--version" ? "11.0.0" : "" };
   } } as unknown as ProcessRunner;
   try {
-    for (const component of ["dispatcher", "sources/slack", "updater"]) {
+    for (const component of ["dispatcher", "sources/slack", "sources/web", "updater"]) {
       const directory = path.join(root, component);
       await fs.mkdir(directory, { recursive: true });
       await fs.writeFile(path.join(directory, "package.json"), JSON.stringify({ engines: { node: ">=24.0.0" } }));
@@ -77,6 +77,7 @@ test("pre-activation installs, typechecks and builds each component without runn
     ]), [
       ["dispatcher", "ci"], ["dispatcher", "run", "typecheck"], ["dispatcher", "run", "build"],
       ["sources/slack", "ci"], ["sources/slack", "run", "typecheck"], ["sources/slack", "run", "build"],
+      ["sources/web", "ci"], ["sources/web", "run", "typecheck"], ["sources/web", "run", "build"],
       ["updater", "ci"], ["updater", "run", "typecheck"], ["updater", "run", "build"],
     ]);
   } finally { await removeTree(root); }

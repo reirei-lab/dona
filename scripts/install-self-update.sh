@@ -283,7 +283,7 @@ $GIT_PATH -C "$REPOSITORY_DIR" archive --format=tar --output="$INSTALL_TMP/relea
 
 mkdir -p "$INSTALL_TMP/npm-cache"
 /usr/bin/touch "$INSTALL_TMP/npm-userconfig" "$INSTALL_TMP/npm-globalconfig"
-for component in dispatcher sources/slack updater; do
+for component in dispatcher sources/slack sources/web updater; do
   COMPONENT_DIR="$STAGING_DIR/$component"
   env -i PATH="$(dirname "$NODE_PATH"):$(dirname "$NPM_PATH"):/usr/bin:/bin:/usr/sbin:/sbin" \
     CI=1 NO_COLOR=1 npm_config_cache="$INSTALL_TMP/npm-cache" npm_config_audit=false npm_config_fund=false \
