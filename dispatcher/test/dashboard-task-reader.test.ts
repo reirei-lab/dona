@@ -18,7 +18,7 @@ test("観測readerは非公開Taskを除いてからpageを作り、実行DBを�
       const request = taskRequestSchema.parse({source_event_id:event.event_id,task_key:`observe-${i}`,objective:"secret objective /private/path token",workspace:{kind:"scratch"}});
       ids.push(db.tasks.create(request,config.jobsWorkspaceRoot,config.jobResultsDir).task.task_id);
     }
-    ids.sort();
+    ids.sort().reverse();
     reader = new DashboardTaskReader(config.databasePath);
     const before = ids.map(id => db.tasks.get(id));
     const first = reader.list(task => task.task_id !== ids[0],null,2);

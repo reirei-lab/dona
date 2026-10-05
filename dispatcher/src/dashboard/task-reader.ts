@@ -6,7 +6,7 @@ export interface DashboardAttempt {
   created_at: string; ended_at: string | null; agent_name: string;
 }
 export interface DashboardTask {
-  task_id: string; revision: number; state: string; desired_state: string;
+  task_id: string; task_key: string; revision: number; state: string; desired_state: string;
   progress: string; wait_reason: string | null; current_attempt_id: string;
   attempt_number: number; created_at: string; updated_at: string;
   source: string; worker_status: string; next_check_at: string | null;
@@ -20,8 +20,12 @@ export class DashboardTaskReader {
   private readonly sql: Database.Database;
   constructor(file: string) {
     this.sql = new Database(file, { readonly: true, fileMustExist: true });
-    this.sql.pragma("query_only = ON");
-    this.sql.pragma("busy_timeout = 1000");
+    try {
+      this.sql.pragma("query_only = ON");
+      this.sql.pragma("busy_timeout = 1000");
+      this.sql.prepare(`${projection} LIMIT 0`).all();
+      this.sql.prepare("SELECT a.attempt_id,a.number,a.outcome,a.created_at,a.ended_at,j.agent_name FROM task_attempts a JOIN jobs j ON j.job_id=a.attempt_id LIMIT 0").all();
+    } catch(error) { this.sql.close(); throw error; }
   }
   close(): void { this.sql.close(); }
   /** A caller must supply its current server-side resource authorization.
@@ -30,7 +34,7 @@ export class DashboardTaskReader {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50 || (after !== null && !/^[A-Za-z0-9_-]{1,128}$/.test(after))) throw Error("dashboard_query_invalid");
     return this.sql.transaction(() => {
       const items: DashboardTask[] = [];
-      const rows = this.sql.prepare(`${projection} WHERE t.task_id > ? ORDER BY t.task_id`).iterate(after ?? "");
+      const rows = this.sql.prepare(`${projection} WHERE (? IS NULL OR t.task_id < ?) ORDER BY t.task_id DESC`).iterate(after, after);
       for (const value of rows) {
         const task = value as DashboardTask;
         if (!visible(task)) continue;
@@ -53,6 +57,6 @@ export class DashboardTaskReader {
     })();
   }
 }
-const projection = `SELECT t.task_id,t.revision,t.state,t.desired_state,t.progress,t.wait_reason,t.current_attempt_id,
+const projection = `SELECT t.task_id,t.task_key,t.revision,t.state,t.desired_state,t.progress,t.wait_reason,t.current_attempt_id,
   t.attempt_number,t.created_at,t.updated_at,t.next_check_at,j.source,j.status AS worker_status
   FROM tasks t JOIN jobs j ON j.job_id=t.current_attempt_id`;

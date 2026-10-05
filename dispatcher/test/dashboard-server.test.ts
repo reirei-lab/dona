@@ -43,3 +43,33 @@ test("private controlの一回限りcodeで登録し、cross-origin・未認証�
     assert.equal(reads,1);
   }finally{await server.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+test("service再起動でcookieを失効し、実Taskの継続とsnapshotを維持する",async()=>{
+  const {DispatcherDatabase}=await import("../src/database.js");
+  const {DashboardTaskReader}=await import("../src/dashboard/task-reader.js");
+  const {DashboardObserver}=await import("../src/dashboard/observer.js");
+  const {taskRequestSchema}=await import("../src/task-execution.js");
+  const {tempConfig,eventEnvelope}=await import("./helpers.js");
+  const {root,config}=await tempConfig();const db=new DispatcherDatabase(config.databasePath);
+  const parent=path.join(await fs.realpath(root),"observer");await fs.mkdir(parent,{mode:0o700});
+  const socket=path.join(parent,"c.sock"),port=await freePort();
+  const event=db.enqueue(eventEnvelope("observer-service")).row;
+  const task=db.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:"service-observation",objective:"observe",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  const reader=new DashboardTaskReader(config.databasePath);const before=db.tasks.get(task.task_id);
+  let runtimeReads=0;
+  const runtime={async conversations(){runtimeReads++;return {items:[],next:null};},async conversation(){throw Error("unexpected history");}};
+  const options={origin:"https://observer.example",port,controlSocket:socket,version:"test",page:{status:200,headers:{},body:"observer"},reader,observer:new DashboardObserver(reader,runtime)};
+  let server=new DashboardServer(options);
+  try{
+    await server.start();const code=JSON.parse((await request(port,socket,"/pair",{method:"POST"})).body).code;
+    const paired=await request(port,null,"/api/pair",{method:"POST",body:{code},origin:options.origin});
+    const cookie=paired.headers["set-cookie"]![0]!.split(";")[0]!;
+    const detail=await request(port,null,`/api/tasks/${task.task_id}`,{cookie});assert.equal(detail.status,200);
+    assert.equal(JSON.parse(detail.body).snapshot.task.current_attempt_id,task.current_attempt_id);assert.equal(runtimeReads,1);
+    assert.deepEqual(db.tasks.get(task.task_id),before);
+    await server.close();server=new DashboardServer(options);await server.start();
+    assert.equal((await request(port,null,"/api/tasks",{cookie})).status,401);
+    assert.deepEqual(db.tasks.get(task.task_id),before);
+    assert.equal(runtimeReads,1);
+  }finally{await server.close();reader.close();db.close();await fs.rm(root,{recursive:true,force:true});}
+});
