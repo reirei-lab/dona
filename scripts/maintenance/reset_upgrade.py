@@ -316,6 +316,17 @@ def cleanup_unpublished_generation(generation, identity):
     shutil.rmtree(generation)
 
 
+def build_release_components(release, generation, policy):
+    """manifestが要求する全componentを同じ隔離release内に配置する。"""
+    npm = policy['executables']['npm']
+    for component in ('dispatcher', 'sources/slack', 'sources/web', 'updater'):
+        staging_space(generation, policy)
+        command([npm, 'ci'], cwd=release/component, timeout=900)
+        staging_space(generation, policy)
+        command([npm, 'run', 'build'], cwd=release/component, timeout=180)
+        staging_space(generation, policy, reserve=False)
+
+
 def prepare(run, repository, event_id, job_id, snapshot_old_databases=False):
     require(re.fullmatch(r'evt_[0-9A-HJKMNP-TV-Z]{26}', event_id, re.I), 'event_id')
     require(re.fullmatch(r'job_[0-9a-hjkmnp-tv-z]{26}', job_id, re.I), 'job_id')
@@ -352,12 +363,7 @@ def prepare(run, repository, event_id, job_id, snapshot_old_databases=False):
         target_trust = verify_trust(sha, dict(inv['policy'], required_checks=target_checks))
         npm = inv['policy']['executables']['npm']
         node = inv['policy']['executables']['node']
-        for component in ('dispatcher', 'sources/slack', 'updater'):
-            staging_space(generation, inv['policy'])
-            command([npm, 'ci'], cwd=release/component, timeout=900)
-            staging_space(generation, inv['policy'])
-            command([npm, 'run', 'build'], cwd=release/component, timeout=180)
-            staging_space(generation, inv['policy'], reserve=False)
+        build_release_components(release, generation, inv['policy'])
         command([node, str(release/'scripts/write-release-manifest.mjs'), str(release), sha,
                  command([npm, '--version']), inv['policy']['policy_version']])
         for p in ('config', 'control', 'results', 'job-results', 'run', 'logs'):

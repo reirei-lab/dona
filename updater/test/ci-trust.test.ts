@@ -9,7 +9,7 @@ import type { ProcessRunner, RunOptions } from "../src/process.js";
 import type { CommandResult } from "../src/types.js";
 import { removeTree, targetSha, tempPolicy } from "./helpers.js";
 
-const checks = ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS"];
+const checks = ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS", "Verify sources/web"];
 const success: CommandResult = { exit_code: 0, stdout: "", stderr: "", timed_out: false, output_truncated: false };
 const fixture = (runId = 42) => ({ total_count: checks.length, check_runs: checks.map((name, index) => ({
   name, status: "completed", conclusion: "success", head_sha: targetSha,
@@ -21,7 +21,11 @@ test("CI trust requires all exact checks from one successful main push", async (
   const { root, policy } = await tempPolicy();
   try {
     assert.equal(trustedMainPushRunId(fixture(), targetSha, checks), 42);
+    assert.deepEqual(parsePolicy(policy).required_checks, checks);
     const rejected = [
+      (value: ReturnType<typeof fixture>) => { value.check_runs[4]!.conclusion = "failure"; },
+      (value: ReturnType<typeof fixture>) => { value.check_runs[4]!.conclusion = "skipped"; },
+      (value: ReturnType<typeof fixture>) => { value.check_runs[4]!.status = "in_progress"; },
       (value: ReturnType<typeof fixture>) => { value.check_runs[3]!.conclusion = "skipped"; },
       (value: ReturnType<typeof fixture>) => { value.check_runs[3]!.conclusion = "failure"; },
       (value: ReturnType<typeof fixture>) => { value.check_runs[3]!.status = "in_progress"; },
@@ -34,7 +38,7 @@ test("CI trust requires all exact checks from one successful main push", async (
       mutate(value);
       assert.equal(trustedMainPushRunId(value, targetSha, checks), null);
     }
-    assert.throws(() => parsePolicy({ ...policy, required_checks: checks.slice(0, 3) }), /required_checks/);
+    assert.throws(() => parsePolicy({ ...policy, required_checks: checks.slice(0, 4) }), /required_checks/);
     for (const overrides of [
       {},
       { event: "pull_request" }, { head_branch: "feature" }, { head_sha: "0".repeat(40) },
