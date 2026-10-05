@@ -24,11 +24,11 @@ function credentialFields(text:string):RegExpMatchArray[] {
 /** 設定CLIの既知文脈に限り、name value形式をassignmentと同じcredential名で検査する。 */
 function hasCredentialSetting(value:string):boolean {
   const text=value.replace(/\\+\r?\n/g," ").replace(/\\+[nrt]/g," ");
-  const contexts=/\b(?:aws\b[^\r\n;|&]*?\bconfigure[ \t]+set|(?:npm|pnpm|yarn|gcloud)\b[^\r\n;|&]*?\bconfig[ \t]+set|git\b[^\r\n;|&]*?\bconfig(?:[ \t]+set)?|redis-cli\b[^\r\n;|&]*?\bconfig[ \t]+set)[ \t]+([^\r\n;|&]+)/gi;
+  const contexts=/\b(?:aws\b[^\r\n;|&]*?\bconfigure[ \t]+(?:set|get)|(?:npm|pnpm|yarn|gcloud)\b[^\r\n;|&]*?\bconfig[ \t]+(?:set|get)|git\b[^\r\n;|&]*?\bconfig(?:[ \t]+(?:set|get))?|redis-cli\b[^\r\n;|&]*?\bconfig[ \t]+(?:set|get))[ \t]+([^\r\n;|&]+)/gi;
   for(const match of text.matchAll(contexts)){
     const tokens=match[1]!.split(/\s+/).map(token=>token.replace(/^["']+|["',}]+$/g,""));
-    for(let i=0;i+1<tokens.length;i++){
-      const key=tokens[i]!;if(key.startsWith("-")||!tokens[i+1])continue;
+    for(let i=0;i<tokens.length;i++){
+      const key=tokens[i]!;if(key.startsWith("-"))continue;
       // profile.foo.aws_secret_access_keyやregistryの:_authTokenも同じ既知名へ束縛する。
       if(key.split(/[./:]/).some(credentialName))return true;
     }
@@ -53,10 +53,24 @@ function hasCredentialCli(text:string):boolean {
       if(/(?:^|\s)["']?-(?:p|[v]+p)\S*|(?:^|\s)["']?--password(?:=|\s)/.test(match[1]!))return true;
     }
   }
+  // OpenSSL passphrase sourceはpass:/env:/file:/fd:/stdinを問わず内容を表示しない。
+  for(const match of text.matchAll(/\bopenssl[ \t]+([^\r\n;|&]+)/gi))if(/(?:^|\s)["']?-(?:passin|passout|password|passcerts|pass|k|kfile|K)(?:=|\s)/.test(match[1]!))return true;
+  if(/\bopenssl[ \t]+passwd\b(?![ \t]+-(?:help|h)\b)/.test(text))return true;
+  const credentialCommands:[RegExp,RegExp][]=[
+    [/\bsecurity[ \t]+(?:add|find)-(?:generic|internet)-password\b/,/(?:^|\s)["']?-w(?:\S*|\s)/],
+    [/\bsecurity[ \t]+(?:unlock-keychain|create-keychain|set-keychain-password)\b/,/(?:^|\s)["']?-[po](?:\S*|\s)/],
+    [/\bssh-keygen\b/,/(?:^|\s)["']?-[NP](?:\S*|\s)/],
+    [/\bkeytool\b/,/(?:^|\s)["']?-(?:storepass|keypass|new|srcstorepass|srckeypass|deststorepass|destkeypass)(?::(?:env|file))?(?:=|\s)/],
+    [/\baz[ \t]+login\b/,/(?:^|\s)["']?(?:-p\S*|--password(?:=|\s))/],
+  ];
+  for(const [tool,option] of credentialCommands)if(tool.test(text)&&option.test(text))return true;
   const tools:[RegExp,string,Set<string>,string][]=[
     [/\bcurl\b/,"uUHbEx",new Set(["user","proxy-user","oauth2-bearer","header","proxy-header","cookie","cert","pass","proxy","preproxy","proxy1.0","proxy-cert","proxy-pass","tlspassword","proxy-tlspassword","tlsuser","proxy-tlsuser","socks4","socks4a","socks5","socks5-hostname"]),"sSfvkLIOiNgq#012346"],
     [/\b(?:mysql|mariadb|mysqldump|mysqladmin)\b/,"p",new Set(["password","password1","password2","password3"]),"vVqfBCNnstW"],
     [/\bredis-cli\b/,"a",new Set(["pass"]),"cvr"],
+    [/\b(?:mongosh|mongo)\b/,"p",new Set(["password"]),""],
+    [/\bsqlcmd\b/,"P",new Set(["password"]),""],
+    [/\bgpg(?:2)?\b/,"",new Set(["passphrase","passphrase-file","passphrase-fd"]),""],
     [/\bsshpass\b/,"p",new Set([]),"vV"],
   ];
   for(const [tool,sensitive,longFlags,noValue] of tools){
@@ -86,8 +100,17 @@ function hasCredentialFileFormat(value:string):boolean {
   const text=value.replace(/\\+\r?\n/g,"").replace(/\\+[nrt]/g,"\n");
   if(/(?:^|[\n"'])[ \t]*(?:requirepass|masterauth)[ \t]+\S/i.test(text))return true;
   // .pgpass: host:port:database:user:password。port数値/ワイルドカードと5fieldを要求する。
-  for(const match of text.matchAll(/(?:^|[\n"'])[ \t]*([A-Za-z0-9_.*-]+):(\*|[0-9]{1,5}):((?:\\+.|[^:\s"'\\])+):((?:\\+.|[^:\s"'\\])+):((?:\\+.|[^:\r\n"'\\])+)(?=$|[\n"'])/g)){
-    if(match[2]==="*"||(Number(match[2])>0&&Number(match[2])<=65535))return true;
+  for(const raw of [...text.split("\n"),...text.split(/[\n"']/)]){
+    const fields=[""];let escaped=false;
+    for(const char of raw.trim().replace(/\\+:/g,"\\:")){
+      if(escaped){fields[fields.length-1]+=char;escaped=false;}
+      else if(char==="\\")escaped=true;
+      else if(char===":")fields.push("");
+      else fields[fields.length-1]+=char;
+    }
+    if(escaped||fields.length!==5)continue;
+    const port=fields[1];
+    if(port==="*"||(/^[0-9]{1,5}$/.test(port!)&&Number(port)>0&&Number(port)<=65535))return true;
   }
   // htpasswdの明示的hash scheme。任意user:valueや一般colon区切りをcredentialと断定しない。
   return /(?:^|[\n"'])[ \t]*[^:\s"']+:(?:\$(?:apr1|1|2[aby]|5|6)\$[^\s"']+|\{SHA\}[A-Za-z0-9+/]{27}=)(?=$|[\n"'])/.test(text);
@@ -135,8 +158,14 @@ export function sanitizeConversationItem(value:unknown):ConversationItem|undefin
   const v=record(value),id=identifier(v.id),turn=identifier(v.turn_id);if(!id||!turn||!["user_message","assistant_message","tool_progress"].includes(String(v.kind)))return;
   const out:ConversationItem={id,turn_id:turn,kind:v.kind as ConversationItem["kind"]};
   const metadataOnly=["imageGeneration","sleep","contextCompaction","enteredReviewMode","exitedReviewMode","subAgentActivity","functionCallOutput"].includes(String(v.tool_type));
-  for(const field of ["text","tool_name","command","input","output","error"] as const)if((field==="text"?out.kind!=="tool_progress":out.kind==="tool_progress")&&(!metadataOnly||(field==="tool_name"&&v.tool_type==="functionCallOutput"))&&typeof v[field]==="string"){
+  for(const field of ["text","tool_name","command","input","output","error"] as const)if((field==="text"?out.kind!=="tool_progress":out.kind==="tool_progress")&&(!metadataOnly||(["tool_name","output"].includes(field)&&v.tool_type==="functionCallOutput"))&&typeof v[field]==="string"){
     const limit=field==="tool_name"?200:field==="input"?4096:8192;out[field]=sanitizeObservationText(v[field],limit);if(v[field].length>limit)out.truncated=true;
+  }
+  // 既知credentialを含むcommandのstdout/errorは裸credentialになり得る。再読でも抑制を維持する。
+  const credentialCommandMarker="[認証optionを含む内容を省略]";
+  const credentialMarkers=[credentialCommandMarker,"[機密情報を含む内容を省略]","[機密情報を含む行を省略]","[netrc認証情報を含む内容を省略]","[認証ファイル形式の内容を省略]","[保護された内容を省略]"];
+  if(out.kind==="tool_progress"&&[out.command,out.input].some(text=>text!==undefined&&credentialMarkers.some(marker=>text.includes(marker)))){
+    for(const field of ["command","input","output","error"] as const)if(typeof out[field]==="string")out[field]=credentialCommandMarker;
   }
   if(out.kind==="tool_progress"&&(!metadataOnly||v.tool_type==="imageGeneration")&&["inProgress","completed","failed","declined","interrupted"].includes(String(v.status)))out.status=String(v.status);
   if(out.kind==="tool_progress"&&["commandExecution","fileChange","mcpToolCall","dynamicToolCall","collabAgentToolCall","webSearch","imageView","imageGeneration","sleep","contextCompaction","enteredReviewMode","exitedReviewMode","subAgentActivity","functionCallOutput"].includes(String(v.tool_type)))out.tool_type=String(v.tool_type);
@@ -167,7 +196,19 @@ export function projectItem(value:unknown,turnId:string):ConversationItem|undefi
       if(item.failure!==null&&typeof item.failure==="object")out.status="failed";
       else if(item.status==="")out.status="inProgress";
     }
-    if(item.type==="functionCallOutput"&&typeof item.name==="string")out.tool_name=item.name;
+    if(item.type==="functionCallOutput"){
+      if(typeof item.name==="string")out.tool_name=item.name;
+      if(typeof item.output==="string")out.output=item.output;
+      else if(Array.isArray(item.output)){
+        if(item.output.length>20)out.truncated=true;
+        const chunks:string[]=[];let size=0;
+        for(const raw of item.output.slice(0,20)){
+          const part=record(raw);if(part.type!=="input_text"||typeof part.text!=="string")continue;
+          size+=part.text.length;if(size>131072){out.truncated=true;chunks.push("[上限を超える内容を省略]");break;}chunks.push(part.text);
+        }
+        out.output=chunks.join("\n");
+      }
+    }
     if(item.type==="commandExecution"){if(typeof item.command==="string")out.command=item.command;if(typeof item.aggregatedOutput==="string")out.output=item.aggregatedOutput;if(typeof item.exitCode==="number")out.exit_code=item.exitCode;}
     if(item.type==="fileChange"&&Array.isArray(item.changes)){
       out.files=item.changes.slice(0,20).flatMap(raw=>{

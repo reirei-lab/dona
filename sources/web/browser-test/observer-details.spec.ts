@@ -61,7 +61,7 @@ test('制御項目は種類と許可されたmetadataだけを表示し状態を
  const secret='private-control-payload';
  const items=types.map(([type])=>({id:type,turn_id:'turn',kind:'tool_progress',tool_type:type,
   ...(type==='sleep'?{duration_ms:1250}:{}),...(type==='functionCallOutput'?{tool_name:'functions.exec'}:{}),
-  text:secret,input:secret,output:secret,command:secret,error:secret,files:[{path:secret,change:'add'}],review:secret,thread_id:secret}));
+  text:secret,input:secret,output:type==='functionCallOutput'?[{type:'image',data:secret},{type:'audio',data:secret}]:secret,command:secret,error:secret,files:[{path:secret,change:'add'}],review:secret,thread_id:secret}));
  await page.route('https://observer.test/**',async route=>{
   const p=new URL(route.request().url()).pathname;if(p==='/'){await route.fulfill(observerDashboardPage());return;}
   const value=p==='/api/session'?{csrf:'csrf',capabilities:['conversations:main:read']}:p==='/api/conversations/main'?{items:[{name:'main',generation:'g',connected:true,state:'working',observed_at:at}]}:{status:'observed',conversation:{name:'main',generation:'g',connected:true,state:'working',observed_at:at,items,events:[{kind:'item/started',item_id:'sleep',turn_id:'turn',observed_at:at}],gap:false,truncated:false}};
@@ -76,4 +76,21 @@ test('制御項目は種類と許可されたmetadataだけを表示し状態を
  await expect(page.locator('[data-item="sleep"]')).toContainText('開始を観測:');
  await expect(page.locator('[data-item="functionCallOutput"]')).toContainText('functions.exec');
  await expect(page.locator('#detail')).not.toContainText(secret);
+});
+
+test('functionCallOutputの投影済みテキストを折り畳み表示し生のmetadataやmediaを描画しない',async({page})=>{
+ const output='4 tests passed\n<script>literal result</script>\nAuthorization: [REDACTED]',secret='unprojected-private-payload';
+ const item={id:'result',kind:'tool_progress',tool_type:'functionCallOutput',tool_name:'functions.exec',output,truncated:true,
+  text:secret,input:secret,error:secret,command:secret,files:[{path:secret,change:'add'}],metadata:{private:secret},image:'data:image/png;base64,'+secret,audio:secret,result:secret};
+ await page.route('https://observer.test/**',async route=>{
+  const p=new URL(route.request().url()).pathname;if(p==='/'){await route.fulfill(observerDashboardPage());return;}
+  const value=p==='/api/session'?{csrf:'csrf',capabilities:['conversations:main:read']}:p==='/api/conversations/main'?{items:[{name:'main',generation:'g',connected:true,state:'working',observed_at:at}]}:{status:'observed',conversation:{name:'main',generation:'g',connected:true,state:'working',observed_at:at,items:[item],events:[],gap:false,truncated:false}};
+  await route.fulfill({contentType:'application/json',body:JSON.stringify(value)});
+ });
+ await page.goto('https://observer.test/');await page.locator('[data-main="main:g"]').click();
+ const card=page.locator('[data-item="result"]'),fold=card.locator('details');
+ await expect(card.locator('h4')).toHaveText('ツールの応答');await expect(card).toContainText('functions.exec');
+ await expect(fold).not.toHaveAttribute('open','');await fold.locator('summary').click();await expect(fold.locator('pre')).toHaveText(output);await expect(fold.locator('pre')).toBeVisible();
+ await expect(card).toContainText('表示上限のため一部省略');await expect(card.locator('script, img, audio, .state')).toHaveCount(0);await expect(card).not.toContainText(secret);
+ await page.getByRole('button',{name:'更新',exact:true}).click();await expect(fold).toHaveAttribute('open','');
 });

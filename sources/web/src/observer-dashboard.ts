@@ -94,17 +94,23 @@ function appendConversation(content,runtime) {
     for(const item of visible) {
       const entry = node('article');entry.dataset.item=item.id;
       const imageGeneration=item.kind==='tool_progress'&&item.tool_type==='imageGeneration';
-      const metadataOnly=item.kind==='tool_progress'&&['sleep','contextCompaction','enteredReviewMode','exitedReviewMode','subAgentActivity','functionCallOutput'].includes(item.tool_type);
-      entry.append(node('h4',item.kind==='assistant_message'?'Codex':item.kind==='user_message'?'ユーザー・依頼入力':imageGeneration?'画像生成':metadataOnly?toolLabels[item.tool_type]:item.tool_name||toolLabels[item.tool_type]||'ツールの進捗'));
+      const functionOutput=item.kind==='tool_progress'&&item.tool_type==='functionCallOutput';
+      const metadataOnly=item.kind==='tool_progress'&&['sleep','contextCompaction','enteredReviewMode','exitedReviewMode','subAgentActivity'].includes(item.tool_type);
+      entry.append(node('h4',item.kind==='assistant_message'?'Codex':item.kind==='user_message'?'ユーザー・依頼入力':imageGeneration?'画像生成':metadataOnly||functionOutput?toolLabels[item.tool_type]:item.tool_name||toolLabels[item.tool_type]||'ツールの進捗'));
       const fold=(title,text,field)=>{if(typeof text!=='string'||!text)return;const key=[c.name,c.generation,item.id,field].join(':');const box=node('details');box.dataset.itemDetail=key;box.open=open.has(key);box.append(node('summary',title),node('pre',text));entry.append(box);};
       if(item.status) entry.append(node('p',label(item.status),'state'));
       const times=observedTimes.get(JSON.stringify([item.turn_id,item.id]));
       if(times?.started)entry.append(node('p','開始を観測: '+displayTime(times.started),'muted'));
       if(times?.completed)entry.append(node('p','完了を観測: '+displayTime(times.completed),'muted'));
       if(imageGeneration){messages.append(entry);continue;}
+      if(functionOutput){
+        if(typeof item.tool_name==='string')entry.append(node('p',item.tool_name));
+        fold('実行結果を表示',item.output,'output');
+        if(item.truncated)entry.append(node('p','この項目の内容は表示上限のため一部省略されています。','notice'));
+        messages.append(entry);continue;
+      }
       if(metadataOnly){
         if(item.tool_type==='sleep'&&Number.isFinite(item.duration_ms))entry.append(node('p','所要時間 '+(item.duration_ms/1000).toLocaleString('ja-JP',{maximumFractionDigits:2})+' 秒','muted'));
-        if(item.tool_type==='functionCallOutput'&&typeof item.tool_name==='string')entry.append(node('p',item.tool_name));
         messages.append(entry);continue;
       }
       if(item.text) entry.append(node('pre',item.text));

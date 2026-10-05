@@ -176,7 +176,7 @@ test("固定Codex imageGenerationはbegin/terminal/failureの状態だけを表�
 });
 test("既知control itemは実metadataだけを投影しraw本文・image・thread/pathを出さない",()=>{
  for(const type of ["sleep","contextCompaction","enteredReviewMode","exitedReviewMode","subAgentActivity","functionCallOutput"]){
-  const item=projectItem({id:"control",type,status:"completed",durationMs:25,name:"exec_command",output:"private-output",review:"private-review",agentThreadId:"private-thread",agentPath:"private-path",result:"private-image",text:"private-text"},turn)!;
+  const item=projectItem({id:"control",type,status:"completed",durationMs:25,name:"exec_command",output:"password=private-output",review:"private-review",agentThreadId:"private-thread",agentPath:"private-path",result:"private-image",text:"private-text"},turn)!;
   assert.equal(item.tool_type,type);assert.equal(item.kind,"tool_progress");assert.equal(item.status,undefined);assert.ok(!JSON.stringify(item).includes("private"));
   assert.equal(item.duration_ms,type==="sleep"?25:undefined);assert.equal(item.tool_name,type==="functionCallOutput"?"exec_command":undefined);
  }
@@ -208,7 +208,7 @@ test("canonical pgpass/Redis config/htpasswd形式はcredential fileとして省
   assert.equal(sanitizeObservationText(text),"[認証ファイル形式の内容を省略]");
   assert.ok(!JSON.stringify(projectItem({id:"c",type:"commandExecution",aggregatedOutput:text},turn)).includes("sensitive"));
  }
- for(const value of ["src/main.ts:12:4: error: expected value","name:value","https://example.com:5432/path","npm test: 42 passed"])assert.equal(sanitizeObservationText(value),value);
+ for(const value of ["src/main.ts:12:4: error expected value","name:value","https://example.com:5432/path","npm test: 42 passed"])assert.equal(sanitizeObservationText(value),value);
  for(const file of [".pgpass",".htpasswd"])for(const text of [`cat /Users/alice/${file}`,encodeURIComponent(`/Users/alice/${file}`)])assert.ok(!sanitizeObservationText(text).includes(file));
 });
 
@@ -327,5 +327,107 @@ test("registry credentialはJSON・code wrapper・echo引用内も表示しな�
  for(const value of [JSON.stringify({command}),JSON.stringify(JSON.stringify({command})),`command: ${command}`,`code: ${command}`,`example: ${command}`,`echo "${command}"`]){
   assert.ok(!sanitizeObservationText(value).includes("sensitive-placeholder"));
   assert.ok(!JSON.stringify(projectItem({id:"wrapped",type:"mcpToolCall",tool:"exec",arguments:{code:value},result:{content:[{type:"text",text:value}]}},turn)).includes("sensitive-placeholder"));
+ }
+});
+
+test("OpenSSL passphrase source引数は既知optionに限定して省略する",()=>{
+ for(const flag of ["-passin","-passout","-password","-passcerts","-pass","-k","-kfile","-K"]){
+  for(const source of ["pass:sensitive-placeholder","env:SENSITIVE_PLACEHOLDER","file:/tmp/sensitive-placeholder","fd:3","stdin"]){
+   const command=`openssl pkcs12 ${flag} ${source}`;
+   for(const value of [command,JSON.stringify({command}),encodeURIComponent(command)])assert.ok(sanitizeObservationText(value).includes("省略"));
+  }
+ }
+ assert.ok(sanitizeObservationText("openssl passwd -1 sensitive-placeholder").includes("省略"));
+ assert.equal(sanitizeObservationText("openssl passwd -help"),"openssl passwd -help");
+ assert.equal(sanitizeObservationText("openssl version"),"openssl version");
+ assert.equal(sanitizeObservationText("openssl dgst -sha256 src/a.ts"),"openssl dgst -sha256 src/a.ts");
+});
+
+test("pgpassのescaped IPv6 hostとescaped colon/backslashを5fieldとして検出する",()=>{
+ for(const value of [String.raw`\:\:1:5432:db:user:sensitive-placeholder`,String.raw`2001\:db8\:\:1:5432:db:user:sensitive-placeholder`,String.raw`localhost:5432:db\:name:user:sensitive\:placeholder`,String.raw`localhost:5432:db:user:sensitive\\placeholder`]){
+  for(const text of [value,`first\n${value}\nlast`,JSON.stringify(value),encodeURIComponent(value)])assert.ok(sanitizeObservationText(text).includes("認証ファイル"),text);
+ }
+ for(const value of ["src/file.ts:12:3: warning message","https://example.com:443/a","label:port:database:user:value"])assert.equal(sanitizeObservationText(value),value);
+});
+
+test("functionCallOutputはstring/input_textだけをbounded sanitizeしcache再読する",async()=>{
+ const item=projectItem({id:"function",type:"functionCallOutput",name:"exec",namespace:"hidden",output:[{type:"input_text",text:"3 tests passed"},{type:"input_image",image_url:"hidden"},{type:"input_audio",audio_url:"hidden"},{type:"encrypted_content",encrypted_content:"hidden"},{type:"output_text",text:"hidden"}],status:"completed"},turn)!;
+ assert.equal(item.output,"3 tests passed");assert.equal(item.status,undefined);assert.ok(!JSON.stringify(item).includes("hidden"));
+ assert.equal(projectItem({id:"s",type:"functionCallOutput",output:"done"},turn)?.output,"done");
+ assert.ok(!projectItem({id:"s",type:"functionCallOutput",output:[{type:"input_text",text:"TOKEN="},{type:"input_text",text:"sensitive-placeholder"}]},turn)?.output?.includes("sensitive-placeholder"));
+ const huge=projectItem({id:"h",type:"functionCallOutput",output:[{type:"input_text",text:"x".repeat(9000)}]},turn)!;assert.equal(huge.truncated,true);assert.equal(huge.output?.length,8192);
+ const fs=await import("node:fs/promises"),os=await import("node:os"),path=await import("node:path"),{RuntimeStore}=await import("../src/app-server/store.js");const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-function-output-")),store=new RuntimeStore(path.join(root,"r.db"));
+ try{store.cacheItem("a","g",item);assert.deepEqual(store.cachedItems("a","g"),[item]);store.db.prepare("UPDATE observation_items SET item_json=?").run(JSON.stringify({...item,output:"TOKEN=sensitive-placeholder",raw:"hidden"}));assert.ok(!JSON.stringify(store.cachedItems("a","g")).includes("sensitive-placeholder"));assert.ok(!JSON.stringify(store.cachedItems("a","g")).includes("hidden"));}
+ finally{store.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("既知CLIのcredential optionはwrapper/混在commandにも漏らさずport引数は保持する",()=>{
+ for(const command of [
+  "security add-generic-password -s app -a user -w sensitive-placeholder",
+  "security add-internet-password -s app -a user -wsensitive-placeholder",
+  "security unlock-keychain -p sensitive-placeholder login.keychain-db",
+  "security set-keychain-password -o sensitive-placeholder login.keychain-db",
+  "ssh-keygen -t ed25519 -N sensitive-placeholder -f sample-key",
+  "ssh-keygen -p -P sensitive-placeholder -N new-placeholder -f sample-key",
+  "keytool -list -keystore demo.jks -storepass sensitive-placeholder",
+  "keytool -importkeystore -srcstorepass sensitive-placeholder",
+  "mongosh --host localhost -u user -p sensitive-placeholder",
+  "sqlcmd -S localhost -U user -P sensitive-placeholder",
+  "az login --service-principal -u app -p sensitive-placeholder --tenant example",
+  "gpg --batch --passphrase sensitive-placeholder --decrypt sample.gpg",
+ ]){
+  for(const text of [command,JSON.stringify({command}),`npm test && ${command}`,`${command}; npm test`]){
+   assert.ok(!sanitizeObservationText(text).includes("sensitive-placeholder"),command);
+   assert.ok(!JSON.stringify(projectItem({id:"credential",type:"commandExecution",command:text,aggregatedOutput:text},turn)).includes("sensitive-placeholder"),command);
+  }
+ }
+ for(const command of ["ssh -p 2222 host","ssh-keygen -l -f sample-key.pub","docker run -p 8080:80 nginx","gpg --list-keys","security list-keychains","keytool -list","mongosh --port 27017","sqlcmd -S localhost","az account show"])assert.equal(sanitizeObservationText(command),command);
+});
+
+
+test("pgpass field値のbackslash・zone・空白・引用符を過剰制限しない",()=>{
+ for(const value of [String.raw`host\\name:5432:db:user:sensitive-placeholder`,String.raw`fe80\:\:1%en0:5432:db:user:sensitive-placeholder`,String.raw`localhost:5432:db:user:sensitive placeholder`,String.raw`localhost:5432:db:user:"sensitive-placeholder"`,String.raw`localhost:5432:db:user:'sensitive-placeholder'`]){
+  for(const text of [value,JSON.stringify({output:value}),JSON.stringify(JSON.stringify({output:value}))])assert.ok(sanitizeObservationText(text).includes("認証ファイル"),text);
+ }
+ // 5fieldと数値portに一致する診断は認証行と曖昧なので保守的に省略する。
+ assert.ok(sanitizeObservationText("src/file.ts:12:3: warning: message").includes("認証ファイル"));
+ assert.equal(sanitizeObservationText("src/file.ts:12:3: warning message"),"src/file.ts:12:3: warning message");
+});
+
+test("認証CLI itemの裸stdout/errorは保存前とmarker付きcache再読の双方で抑制する",async()=>{
+ const command="security find-generic-password -w -s example";
+ const item=projectItem({id:"secret_cli",type:"commandExecution",command,aggregatedOutput:"sensitive-placeholder",status:"completed"},turn)!;
+ assert.equal(item.command,"[認証optionを含む内容を省略]");assert.equal(item.output,item.command);
+ for(const source of [command,item.command]){
+  const dto=sanitizeConversationItem({...item,command:source,input:"other naked value",output:"sensitive-placeholder",error:"sensitive-placeholder"})!;
+  assert.equal(dto.input,item.command);assert.equal(dto.output,item.command);assert.equal(dto.error,item.command);
+ }
+ const mcp=projectItem({id:"mcp_credential",type:"mcpToolCall",tool:"exec",arguments:{command},result:{content:[{type:"text",text:"sensitive-placeholder"}]},error:{message:"sensitive-placeholder"}},turn)!;
+ assert.ok(!JSON.stringify(mcp).includes("sensitive-placeholder"));assert.equal(mcp.output,item.command);
+ const fs=await import("node:fs/promises"),os=await import("node:os"),path=await import("node:path"),{RuntimeStore}=await import("../src/app-server/store.js");const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-credential-output-")),store=new RuntimeStore(path.join(root,"r.db"));
+ try{store.cacheItem("a","g",item);assert.ok(!JSON.stringify(store.db.prepare("SELECT item_json FROM observation_items").all()).includes("sensitive-placeholder"));store.db.prepare("UPDATE observation_items SET item_json=?").run(JSON.stringify({...item,output:"sensitive-placeholder",error:"sensitive-placeholder"}));const cached=store.cachedItems("a","g")[0]!;assert.ok(!JSON.stringify(cached).includes("sensitive-placeholder"));assert.deepEqual(sanitizeConversationItem(cached),cached);}
+ finally{store.close();await fs.rm(root,{recursive:true,force:true});}
+ const ordinary=projectItem({id:"normal_cli",type:"commandExecution",command:"npm test",aggregatedOutput:"3 passed"},turn)!;assert.equal(ordinary.output,"3 passed");
+});
+
+test("既知config readのcredential名は裸stdoutをitem単位で抑制する",()=>{
+ for(const command of ["aws configure get aws_secret_access_key","aws --profile dev configure get aws_access_key_id","npm config get _authToken","pnpm config get _auth","git config --get credential.password","git config get service.api-key","git config credential.password","redis-cli CONFIG GET requirepass"]){
+  const item=projectItem({id:"config_read",type:"commandExecution",command,aggregatedOutput:"sensitive-placeholder"},turn)!;
+  assert.equal(item.command,"[認証optionを含む内容を省略]",command);assert.equal(item.output,item.command);
+  assert.deepEqual(sanitizeConversationItem(item),item);
+ }
+ for(const command of ["aws configure get region","npm config get registry","git config --get user.name","git config get user.email"]){assert.equal(sanitizeObservationText(command),command);}
+});
+
+test("credential由来markerはCLI以外でもitemの裸出力を抑制しpath置換では抑制しない",()=>{
+ for(const command of ["MY_SECRET=value env","echo glpat-1234567890abcdefghij","machine host login user password value","host:5432:db:user:value","-----BEGIN PRIVATE KEY-----\nvalue"]){
+  for(const source of [command,sanitizeObservationText(command)]){
+   const item=sanitizeConversationItem({id:"credential_marker",turn_id:turn,kind:"tool_progress",tool_type:"commandExecution",command:source,output:"sensitive-placeholder",error:"sensitive-placeholder",input:"bare-input"})!;
+   assert.ok(!JSON.stringify(item).includes("sensitive-placeholder"));assert.equal(item.input,"[認証optionを含む内容を省略]");assert.deepEqual(sanitizeConversationItem(item),item);
+  }
+  const projected=projectItem({id:"raw_credential",type:"commandExecution",command,aggregatedOutput:"sensitive-placeholder"},turn)!;assert.ok(!JSON.stringify(projected).includes("sensitive-placeholder"));
+ }
+ for(const command of ["cat /Users/alice/project/README.md","cat /Users/alice/.codex/auth.json","npm test"]){
+  const item=projectItem({id:"path_only",type:"commandExecution",command,aggregatedOutput:"normal output"},turn)!;assert.equal(item.output,"normal output");
  }
 });
