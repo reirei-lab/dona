@@ -101,7 +101,18 @@ test("main要求はpending受付で解放しterminalを新しい固定threadイ�
  const {DispatcherDatabase}=await import("../src/database.js");
  const f=setup(t),dispatcher=new DispatcherDatabase(f.filename);t.after(()=>dispatcher.close());
  const event=dispatcher.enqueue({schema_version:1,source:"slack",external_event_id:"external_source",type:"app_mention",occurred_at:start,subject:{workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts,actor_id:"U123"},payload:{},reply_target:{kind:"slack_thread",workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts}}).row;
- f.db.prepare("UPDATE events SET status='dispatching' WHERE event_id=?").run(event.event_id);
+ const {DispatcherWorker}=await import("../src/worker.js"),{tempConfig,waitFor}=await import("./helpers.js"),fs=await import("node:fs/promises");
+ const temporary=await tempConfig();t.after(()=>fs.rm(temporary.root,{recursive:true,force:true}));await fs.mkdir(temporary.config.resultsDir,{recursive:true});
+ let prompts=0,sourceResultPath="";const ok=(agentStatus:"idle"|"done"|"working")=>({ok:true,stdout:"",stderr:"",exitCode:0,timedOut:false,aborted:false,agentStatus});
+ const publish=async(resultPath:string,eventId:string)=>fs.writeFile(resultPath,JSON.stringify({schema_version:1,event_id:eventId,status:"completed",summary:"外部承認の状態を確認",actions:[],memory_candidates:[],completed_at:new Date().toISOString()}));
+ const worker=new DispatcherWorker(dispatcher,{get:async()=>ok("idle"),wait:async()=>ok("working"),prompt:async(prompt)=>{
+  prompts++;const resultPath=/^result_path: (.+)$/m.exec(prompt)![1]!,currentId=/^event_id: (.+)$/m.exec(prompt)![1]!;
+  if(currentId===event.event_id){sourceResultPath=resultPath;return ok("working");}
+  assert.ok(prompt.includes('"source":"dona_approval"'));assert.ok(prompt.includes("同じ本文を再投稿しない"));assert.ok(!prompt.includes(intent.text));
+  await publish(resultPath,currentId);return ok("done");
+ }},temporary.config,{debug(){},info(){},warn(){},error(){}});
+ worker.start();t.after(()=>worker.stop());await waitFor(()=>dispatcher.get(event.event_id)?.status==="waiting_agent");
+
  const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_source",agent:"main",generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"main",attempt_id:null,source_event_id:event.event_id,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
  const results:any[]=[];
  const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:"main",generation:"generation",thread_id:"thread"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{results.push(result);row.state="resolved";row.result_json=JSON.stringify(result);row.text="";return {};}};
@@ -109,20 +120,12 @@ test("main要求はpending受付で解放しterminalを新しい固定threadイ�
  await ingress.tick();assert.equal(results[0]?.state,"pending");assert.equal(f.counts().sends,0);assert.equal(row.state,"resolved");
  const requestId=results[0].request_id,presentation=await f.service.present(actor,requestId);
  await f.service.decide(actor,{...actor,receipt_id:"external_decision",request_id:requestId,decision:"approve",presentation_digest:presentation.presentation_digest,expires_at:"2026-09-19T00:01:00.000Z"});
- f.db.prepare("UPDATE events SET status='completed' WHERE event_id=?").run(event.event_id);
+ await publish(sourceResultPath,event.event_id);await waitFor(()=>dispatcher.get(event.event_id)?.status==="completed");
  await ingress.tick();assert.equal(f.counts().sends,1);
  const notification=dispatcher.getByExternalId("dona_approval",`external:${requestId}:terminal`);assert.ok(notification);assert.deepEqual(JSON.parse(notification.reply_target_json!),{kind:"slack_thread",workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts});assert.equal(JSON.parse(notification.payload_json).state,"succeeded");
  await ingress.tick();assert.equal(f.counts().sends,1);assert.equal(results.length,1);
- // 実DispatcherWorkerを通してmain promptとEvent Resultまで処理する。
- const {DispatcherWorker}=await import("../src/worker.js"),{tempConfig,waitFor}=await import("./helpers.js"),fs=await import("node:fs/promises");
- const temporary=await tempConfig();t.after(()=>fs.rm(temporary.root,{recursive:true,force:true}));await fs.mkdir(temporary.config.resultsDir,{recursive:true});
- let prompts=0;const ok=(agentStatus:"idle"|"done")=>({ok:true,stdout:"",stderr:"",exitCode:0,timedOut:false,aborted:false,agentStatus});
- const worker=new DispatcherWorker(dispatcher,{get:async()=>ok("idle"),wait:async()=>ok("done"),prompt:async(prompt)=>{
-  prompts++;assert.ok(prompt.includes('"source":"dona_approval"'));assert.ok(prompt.includes(requestId));assert.ok(prompt.includes("同じ本文を再投稿しない"));assert.ok(!prompt.includes(intent.text));
-  const resultPath=/^result_path: (.+)$/m.exec(prompt)![1]!;
-  await fs.writeFile(resultPath,JSON.stringify({schema_version:1,event_id:notification.event_id,status:"completed",summary:"外部承認の結果を確認",actions:[],memory_candidates:[],completed_at:new Date().toISOString()}));return ok("done");
- }},temporary.config,{debug(){},info(){},warn(){},error(){}});
- worker.start();try{await waitFor(()=>dispatcher.get(notification.event_id)?.status==="completed");assert.equal(prompts,1);}finally{await worker.stop();}
+ // 同じ実DispatcherWorkerがterminal通知も処理し、draftをmainへ渡さない。
+ await waitFor(()=>dispatcher.get(notification.event_id)?.status==="completed");assert.equal(prompts,2);await worker.stop();
 
  f.setSourceAuthorizer(()=>false);
  assert.equal(f.service.status(actor,requestId).execution?.state,"succeeded");

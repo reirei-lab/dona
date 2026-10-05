@@ -23,7 +23,7 @@ export class LocalExternalApprovalIngress {
    const job=this.dispatcher.getJob(source.source_job_id),task=this.dispatcher.tasks.forAttempt(source.source_job_id);
    if(!job||!task||task.current_attempt_id!==job.job_id||task.desired_state!=="running"||task.stop_state!=="none"||!["running","blocked"].includes(job.status)||job.source_event_id!==event.event_id||job.actor_id!==source.requester_id||job.workspace_id!==source.workspace_id||job.channel_id!==source.channel_id||job.thread_ts!==source.thread_ts||job.agent_name!==source.agent)return false;
    const binding=this.dispatcher.getJobRuntimeBinding(job.job_id,source.generation);if(!binding||binding.thread_id!==source.thread_id||binding.agent_name!==source.agent)return false;
-  }else if(source.agent!==this.config.main_agent||!["dispatching","completed"].includes(event.status))return false;
+  }else if(source.agent!==this.config.main_agent||!["dispatching","waiting_agent","completed"].includes(event.status))return false;
   return true;
  }
  authorizeSource(source:ExternalApprovalSource){const current=this.live.get(source.runtime_request_id);return !!current&&current.until>Date.now()&&stableStringify(current.source)===stableStringify(source)&&this.durable(source);}
