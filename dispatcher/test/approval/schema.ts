@@ -897,3 +897,9 @@ test("execution marker migrationはv4以前・部分schema・payload履歴欠落
     assert.throws(() => verifyApprovalPayloadSchema(f.db), ApprovalSchemaError);
   }
 });
+
+test("既知Dispatcher triggerも定義を改変したら承認schemaを許可しない", t => {
+  const { db } = setup(t, true);
+  db.exec("DROP TRIGGER event_job_binding_immutable; CREATE TRIGGER event_job_binding_immutable BEFORE UPDATE ON event_job_bindings BEGIN SELECT 1; END");
+  assert.throws(() => installApprovalSchema(db), ApprovalSchemaError);
+});
