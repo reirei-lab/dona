@@ -10,7 +10,7 @@ const workspace = z.discriminatedUnion("kind", [z.strictObject({ kind: z.literal
     base_ref: z.string().min(1).max(255).refine(value => !value.startsWith("-") && !value.includes("..") && !/[\u0000-\u001f\u007f ~^:?*\[\\]/.test(value)).optional() })]);
 const submit = z.strictObject({ request_id: requestId, objective: z.string().trim().min(1).max(100000)
   .refine(value => Buffer.byteLength(value) <= 400000), workspace });
-const cancel = z.strictObject({ request_id: requestId });
+const cancel = z.strictObject({ request_id: requestId, task_id: z.string().regex(/^task_[0-9a-hjkmnp-tv-z]{26}$/).optional(), revision: z.number().int().positive().optional() });
 export type BrowserCommand = z.infer<typeof submit> | z.infer<typeof cancel>;
 export function parseBrowserCommand(routeId: string, bytes: Uint8Array): BrowserCommand {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength < 2 || bytes.byteLength > 65536) throw new Error("web_command_invalid");

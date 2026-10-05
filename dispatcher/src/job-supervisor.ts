@@ -713,6 +713,7 @@ export class JobSupervisor {
   }
 
   cancelWeb(jobId: string, identity: WebCommandIdentity, reason = "Cancelled by verified web owner"): Promise<JobControlResult> {
+    if(this.database.tasks.forAttempt(jobId))return Promise.reject(new Error("task_control_required"));
     return this.serialized(jobId, async () => {
       await this.active.get(jobId)?.startup;
       const before = this.database.assertWebJobOwner(jobId, identity);
@@ -1112,6 +1113,10 @@ export class JobSupervisor {
     try {
       prepared = await this.runtime.prepare(preparing, this.abortController.signal);
     } catch (error) {
+      if(row.source==="web"&&error instanceof Error&&error.message==="runtime_profile_unavailable") {
+        this.database.markJobBlocked(row.job_id,"Web analysis runtime is not configured",["preparing"],"runtime_profile_unavailable");
+        return;
+      }
       if(error instanceof PreparedWorkspaceCleanupError) {
         this.database.setJobRuntime(row.job_id,error.herdrWorkspaceId,error.herdrPaneId,error.herdrAgentSessionId);
         this.database.markJobNeedsReview(row.job_id,error.errorCode,error.message);

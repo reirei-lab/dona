@@ -396,6 +396,20 @@ function ensureWebJobProjectionSchema(db: Database.Database): void {
     `);
   };
   if (db.inTransaction) upgrade(); else db.transaction(upgrade).immediate();
+  // Task-visible controls share the durable Job event cursor even when no Job status changes.
+  if(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").get()) db.exec(`
+    CREATE TRIGGER IF NOT EXISTS web_task_projection_update AFTER UPDATE ON tasks
+    WHEN (old.revision IS NOT new.revision OR old.current_attempt_id IS NOT new.current_attempt_id
+      OR old.desired_state IS NOT new.desired_state)
+      AND EXISTS(SELECT 1 FROM jobs WHERE job_id=new.current_attempt_id AND source='web')
+    BEGIN
+      INSERT INTO web_job_projection_events(job_id,event_kind,created_at)
+        VALUES(new.current_attempt_id,'updated',strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+      INSERT INTO web_job_projection_events(job_id,event_kind,created_at)
+        SELECT old.current_attempt_id,'updated',strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE old.current_attempt_id IS NOT new.current_attempt_id;
+    END;
+  `);
   const initialize = () => {
     const claimed = db.prepare(`INSERT OR IGNORE INTO web_job_projection_state(singleton,initialized_at)
       VALUES(1,strftime('%Y-%m-%dT%H:%M:%fZ','now'))`).run().changes;
@@ -1641,6 +1655,34 @@ export class DispatcherDatabase {
           canonical, created.row.job_id, source.row.event_id, timestamp, timestamp);
       const receipt = this.db.prepare("SELECT * FROM web_command_receipts WHERE receipt_id=?").get(receiptId) as WebCommandReceipt;
       return { outcome: "created" as const, row: created.row, receipt };
+    }).immediate();
+  }
+
+  createWebTask(input: WebCommandIdentity & { idempotency_key: string; objective: string; workspace: CreateJobRequest["workspace"] },
+    workspaceRoot:string,resultDir:string) {
+    return this.db.transaction(()=>{
+      const created=this.createWebJob(input,workspaceRoot,resultDir);
+      const task=created.outcome==="created"?this.tasks.attachWebAttempt(created.row,input.idempotency_key):this.tasks.forAttempt(created.row.job_id);
+      // A legacy receipt is historical evidence, not permission to adopt its worker.
+      return {...created,row:this.getJobRequired(created.row.job_id),task};
+    }).immediate();
+  }
+
+  cancelWebTask(input:WebCommandIdentity & {task_id:string;attempt_id:string;revision:number;idempotency_key:string}) {
+    return this.db.transaction(()=>{
+      this.assertWebJobOwner(input.attempt_id,input);
+      const task=this.tasks.forAttempt(input.attempt_id);
+      if(!task||task.task_id!==input.task_id)throw new Error("web_task_migration_required");
+      const receiptId=`web_cancel_${input.idempotency_key}`;
+      const digest=createHash("sha256").update(JSON.stringify({task_id:input.task_id,attempt_id:input.attempt_id,revision:input.revision})).digest("hex");
+      const prior=this.getWebCommandReceipt(receiptId,input);
+      if(prior){
+        if(prior.operation!=="cancel"||prior.canonical_sha256!==digest||prior.job_id!==input.attempt_id)throw new Error("web_command_conflict");
+        return {task,receipt:prior,duplicate:true};
+      }
+      const updated=this.tasks.cancelWeb(task.task_id,input.attempt_id,input.revision);
+      const receipt=this.recordWebCancelReceipt(receiptId,digest,input,input.attempt_id);
+      return {task:updated,receipt,duplicate:false};
     }).immediate();
   }
 

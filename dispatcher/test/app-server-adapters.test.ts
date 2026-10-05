@@ -189,3 +189,18 @@ test("launchdの最小PATHでもnpm版CodexのMCP inventoryを取得する",asyn
   await runtime.prepare(job);assert.equal(starts,1);assert.equal(process.env.PATH,"/usr/bin:/bin:/usr/sbin:/sbin");
  }finally{if(saved===undefined)delete process.env.PATH;else process.env.PATH=saved;db.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+test("旧Web Jobを通常Codex runtimeへ渡してもworkspace・agentを作らずprofile待ちにする",async t=>{
+ const {root,config}=await tempConfig();t.after(()=>fs.rm(root,{recursive:true,force:true}));
+ const db=new DispatcherDatabase(config.databasePath);t.after(()=>db.close());
+ const runtime=new AppServerJobRuntime(config);
+ const job=db.createWebJob({instance_id:"instance",tenant_id:"tenant",principal_id:"principal",idempotency_key:"a".repeat(64),objective:"analysis",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+ let calls=0;runtime.client.status=async()=>{calls++;throw Error("unexpected runtime call");};
+ await assert.rejects(runtime.prepare(job),/runtime_profile_unavailable/);
+ await assert.rejects(fs.stat(job.workspace_path),{code:"ENOENT"});assert.equal(calls,0);
+ const supervisor=new JobSupervisor(db,runtime,config,{debug(){},info(){},warn(){},error(){}},()=>{});
+ // Exercise the supervisor admission boundary without starting long-lived loops.
+ await (supervisor as unknown as {startJob(row:JobRow):Promise<void>}).startJob(job);
+ assert.equal(db.getJob(job.job_id)?.status,"blocked");assert.equal(db.getJob(job.job_id)?.last_error_code,"runtime_profile_unavailable");
+ await assert.rejects(fs.stat(job.workspace_path),{code:"ENOENT"});assert.equal(calls,0);
+});
