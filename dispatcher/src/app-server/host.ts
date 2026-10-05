@@ -51,6 +51,7 @@ export async function serveRuntime(config:HostConfig):Promise<http.Server> {
       let result:unknown;
       switch(p.action) {
         case "conversations":if(p.after!==undefined&&typeof p.after!=="string")throw Error("runtime_conversation_cursor_invalid");result=manager.conversations(p.after as string|undefined);break;
+        case "conversationHistory":if(p.afterGeneration!==undefined&&typeof p.afterGeneration!=="string")throw Error("runtime_conversation_cursor_invalid");result=manager.conversationHistory(name,p.afterGeneration as string|undefined);break;
         case "conversation":if(typeof p.generation!=="string"||(p.afterSequence!==undefined&&typeof p.afterSequence!=="number"))throw Error("runtime_conversation_request_invalid");result=await manager.conversation(name,p.generation,p.afterSequence as number|undefined);break;
         case "list":result=store.agents().map(r=>manager.status(r.name));break;
         case "status":result=manager.status(name)??null;break;

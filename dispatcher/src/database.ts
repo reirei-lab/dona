@@ -1,3 +1,4 @@
+import {archiveRuntimeBinding, installRuntimeBindingArchive, type JobRuntimeBinding} from "./runtime-binding-archive.js";
 import { TaskRepository, taskMayAcceptLateResult } from "./task-execution.js";
 import { jobSnapshot, workspaceJobId, handoffKey, type HandoffRecord, type WorkerObservation } from "./job-handoff.js";
 import { createHash, randomUUID, randomBytes } from "node:crypto";
@@ -1182,6 +1183,7 @@ export class DispatcherDatabase {
       } catch(error) { return (error as NodeJS.ErrnoException).code==="ENOENT"; }
     });
     this.tasks = new TaskRepository(this.db, this);
+    installRuntimeBindingArchive(this.db);
   }
 
   close(): void {
@@ -2032,6 +2034,7 @@ export class DispatcherDatabase {
         updated_at=? WHERE job_id=? AND herdr_workspace_id IS NOT NULL
         AND (status IN ('completed','failed','cancelled') OR (status='needs_review' AND last_error_code='workspace_cleanup_failed'))`).run(nowUtc(),jobId).changes;
       if(changed===1) {
+        archiveRuntimeBinding(this.db,this.getJobLiveSessionIdentity(jobId));
         this.db.prepare("UPDATE legacy_job_agents_to_stop SET stopped_at=COALESCE(stopped_at,?) WHERE job_id=?")
           .run(nowUtc(),jobId);
         this.db.prepare("DELETE FROM job_live_session_identities WHERE job_id=?").run(jobId);
@@ -2300,11 +2303,13 @@ export class DispatcherDatabase {
       const existing=this.getJobLiveSessionIdentity(jobId);
       const sameIdentity=agentSessionId!==undefined&&existing?.herdr_agent_session_id===agentSessionId
         &&existing.herdr_workspace_id===herdrWorkspaceId&&existing.herdr_pane_id===herdrPaneId&&existing.agent_name===agentName;
+      archiveRuntimeBinding(this.db,existing);
       if(!sameIdentity)this.db.prepare("DELETE FROM job_live_session_identities WHERE job_id=?").run(jobId);
       if (agentSessionId !== undefined&&!sameIdentity) this.db.prepare(`INSERT INTO job_live_session_identities(
         job_id,identity_version,herdr_agent_session_id,herdr_workspace_id,herdr_pane_id,agent_name,recorded_at,generation_nonce)
         SELECT job_id,1,?,?,?,?,?,? FROM jobs WHERE job_id=?`)
         .run(agentSessionId,herdrWorkspaceId,herdrPaneId,agentName,at.toISOString(),randomUUID(),jobId);
+      archiveRuntimeBinding(this.db,this.getJobLiveSessionIdentity(jobId));
     }).immediate();
   }
 
@@ -2314,7 +2319,17 @@ export class DispatcherDatabase {
       if(!row||row.status!=="needs_review"||row.last_error_code!=="runtime_preparation_unknown"||this.getJobLiveSessionIdentity(jobId)||workspaceId!==row.herdr_workspace_id||paneId!==row.herdr_pane_id||sessionId.length>512)throw Error("runtime_preparation_identity_changed");
       this.db.prepare(`INSERT INTO job_live_session_identities(job_id,identity_version,herdr_agent_session_id,herdr_workspace_id,herdr_pane_id,agent_name,recorded_at,generation_nonce) VALUES(?,1,?,?,?,?,?,?)`)
         .run(jobId,sessionId,workspaceId,paneId,row.agent_name,new Date().toISOString(),randomUUID());
+      archiveRuntimeBinding(this.db,this.getJobLiveSessionIdentity(jobId));
     }).immediate();
+  }
+
+  getJobRuntimeBinding(jobId:string,generation:string):JobRuntimeBinding|undefined {
+    return this.db.prepare("SELECT * FROM job_runtime_bindings WHERE job_id=? AND generation=?").get(jobId,generation) as JobRuntimeBinding|undefined;
+  }
+
+  listJobRuntimeBindings(jobId:string,afterGeneration=""):{items:JobRuntimeBinding[];next:string|null} {
+    const rows=this.db.prepare("SELECT * FROM job_runtime_bindings WHERE job_id=? AND generation>? ORDER BY generation LIMIT 101").all(jobId,afterGeneration) as JobRuntimeBinding[];
+    return {items:rows.slice(0,100),next:rows.length>100?rows[99]!.generation:null};
   }
 
   getJobLiveSessionIdentity(jobId: string): LiveSessionIdentityRow | undefined {

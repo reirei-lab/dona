@@ -1,6 +1,6 @@
 import type {ConversationIdentity,ConversationSnapshot} from "./observation.js";
 import http from "node:http";
-import type {AgentRecord,QuestionRecord} from "./store.js";
+import type {AgentRecord,QuestionRecord,ArchivedConversation} from "./store.js";
 import type {StartAgent} from "./manager.js";
 
 export class RuntimeResponseError extends Error {
@@ -20,6 +20,7 @@ export class RuntimeClient {
     });
   }
   conversations(after?:string):Promise<{items:ConversationIdentity[];next:string|null}>{return this.call("conversations",{after});}
+  conversationHistory(name:string,afterGeneration?:string):Promise<{items:ArchivedConversation[];next:string|null}>{return this.call("conversationHistory",{name,afterGeneration});}
   conversation(name:string,generation:string,afterSequence?:number):Promise<ConversationSnapshot>{return this.call("conversation",{name,generation,afterSequence});}
   status(name:string):Promise<AgentRecord|null>{return this.call("status",{name});}
   list():Promise<AgentRecord[]>{return this.call("list");}

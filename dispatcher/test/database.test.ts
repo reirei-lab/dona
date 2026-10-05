@@ -1892,6 +1892,30 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("runtime binding survives terminal cleanup and database reopen", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    let database = new DispatcherDatabase(config.databasePath);
+    try {
+      const source = database.enqueue(eventEnvelope("Ev-runtime-archive-cleanup")).row;
+      const job = database.createJob({ source_event_id: source.event_id, objective: "履歴保持",
+        workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+      database.beginJobPreparation(job.job_id);
+      database.setJobRuntime(job.job_id,"workspace","pane",JSON.stringify(["generation","thread"]));
+      const binding=database.getJobRuntimeBinding(job.job_id,"generation");
+      assert.equal(binding?.thread_id,"thread");
+      assert.throws(()=>database.setJobRuntime(job.job_id,"workspace","pane",JSON.stringify(["generation","swapped"])),/runtime_binding_conflict/);
+      assert.equal(database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id,JSON.stringify(["generation","thread"]));
+      const raw = new Database(config.databasePath);
+      raw.prepare("UPDATE jobs SET status='completed' WHERE job_id=?").run(job.job_id);raw.close();
+      database.markJobRuntimeCleaned(job.job_id);
+      assert.equal(database.getJobLiveSessionIdentity(job.job_id),undefined);
+      assert.equal(database.getJob(job.job_id)?.herdr_workspace_id,null);
+      database.close();database=new DispatcherDatabase(config.databasePath);
+      assert.deepEqual(database.getJobRuntimeBinding(job.job_id,"generation"),binding);
+      assert.deepEqual(database.listJobRuntimeBindings(job.job_id).items,[binding]);
+    } finally {database.close();}
+  });
+
   test("workspace cleanup does not clear a prepared worker from the drain gate", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
