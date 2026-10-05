@@ -20,3 +20,31 @@ test('固定bootstrapはESM/CJSのbundle外moduleとdata URLを拒否する',()=
   fs.symlinkSync(path.join(d,'outside.cjs'),path.join(release,'escape.cjs'));r=execute('require("./escape.cjs")');assert.equal(r.status,1);assert.doesNotMatch(r.stdout,/FORBIDDEN/);
  }finally{fs.rmSync(d,{recursive:true,force:true});}
 });
+
+test('release Node majorをhost pinと照合し、欠落/異なるmajorを拒否する',async()=>{
+ const {assertHostNodeMajor,assertNativeDoctor}=await import('../scripts/dispatcher-host-artifact.mjs');
+ assert.doesNotThrow(()=>assertHostNodeMajor('24.4.0','24.21.0'));
+ for(const version of ['22.20.0','25.0.0',undefined,'24','24.4.0-extra'])assert.throws(()=>assertHostNodeMajor(version,'24.21.0'));
+ assert.doesNotThrow(()=>assertNativeDoctor({native:'verified',sqlite:'loaded',keytar:'loaded'}));
+ for(const result of [{signature:'verified'},null,{native:'verified',sqlite:'loaded'},{native:'verified',sqlite:'loaded',keytar:'failed'}])assert.throws(()=>assertNativeDoctor(result));
+});
+
+test('固定native smokeはmemory DBとkeytarロードだけを行い、nativeロード失敗を拒否する',async()=>{
+ const {stripTypeScriptTypes}=await import('node:module');
+ const source=stripTypeScriptTypes(fs.readFileSync(new URL('../dispatcher/src/host-native-doctor.ts',import.meta.url),'utf8'));
+ const d=fs.mkdtempSync(path.join(os.tmpdir(),'dona-host-native-smoke-'));
+ try{
+  const entry=path.join(d,'dispatcher/dist/host-native-doctor.mjs');fs.mkdirSync(path.dirname(entry),{recursive:true});fs.writeFileSync(entry,source);
+  const sqlite=path.join(d,'dispatcher/node_modules/better-sqlite3');fs.mkdirSync(sqlite,{recursive:true});
+  fs.writeFileSync(path.join(sqlite,'package.json'),JSON.stringify({main:'index.cjs'}));
+  fs.writeFileSync(path.join(sqlite,'index.cjs'),`module.exports=class {constructor(p){if(p!==':memory:')throw Error('file_access');} prepare(q){if(q!=='SELECT 1')throw Error('mutation');return {pluck:()=>({get:()=>1})};}close(){}};`);
+  const keytar=path.join(d,'sources/slack/node_modules/@github/keytar');fs.mkdirSync(keytar,{recursive:true});
+  fs.writeFileSync(path.join(keytar,'package.json'),JSON.stringify({main:'index.cjs'}));
+  fs.writeFileSync(path.join(keytar,'index.cjs'),`module.exports={getPassword(){throw Error('keychain_access_forbidden')}};`);
+  const run=(args=[])=>spawnSync(process.execPath,[entry,...args],{encoding:'utf8'});
+  let r=run();assert.equal(r.status,0,r.stderr);assert.deepEqual(JSON.parse(r.stdout),{native:'verified',sqlite:'loaded',keytar:'loaded'});
+  r=run(['arbitrary.js']);assert.equal(r.status,1);assert.equal(r.stdout,'');
+  fs.writeFileSync(path.join(keytar,'index.cjs'),`throw Error('native_load_failure')`);r=run();assert.equal(r.status,1);assert.equal(r.stdout,'');
+  fs.writeFileSync(path.join(sqlite,'index.cjs'),`throw Error('NODE_MODULE_VERSION mismatch')`);r=run();assert.equal(r.status,1);assert.equal(r.stdout,'');
+ }finally{fs.rmSync(d,{recursive:true,force:true});}
+});

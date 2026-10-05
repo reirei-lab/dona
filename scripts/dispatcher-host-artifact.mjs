@@ -31,3 +31,13 @@ export function plist(value) {
   const v=x=>Array.isArray(x)?'<array>'+x.map(v).join('')+'</array>':typeof x==='boolean'?`<${x?'true':'false'}/>`:typeof x==='object'?'<dict>'+Object.entries(x).map(([k,w])=>'<key>'+esc(k)+'</key>'+v(w)).join('')+'</dict>':'<string>'+esc(x)+'</string>';
   return '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0">'+v(value)+'</plist>\n';
 }
+
+/** native ABI smokeの前にも、異なるmajorで作ったreleaseをstageしない。 */
+export function assertHostNodeMajor(releaseVersion, hostVersion) {
+  const major = value => typeof value === 'string' && /^(0|[1-9][0-9]*)\.[0-9]+\.[0-9]+$/.test(value) ? Number(value.split('.')[0]) : null;
+  const release = major(releaseVersion), host = major(hostVersion);
+  if (release === null || host === null || release !== host) throw Error('dispatcher_host_node_major_mismatch');
+}
+export function assertNativeDoctor(value) {
+  if (value?.native !== 'verified' || value.sqlite !== 'loaded' || value.keytar !== 'loaded') throw Error('dispatcher_host_native_unverified');
+}

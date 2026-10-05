@@ -23,6 +23,8 @@ node scripts/package-dispatcher-host.mjs /absolute/new-build-dir /absolute/built
 
 Node sourceのURL/SHA256は `native/dispatcher-host/node-source.json`。2026-10-05に公式dist indexとrelease notesを照合した24系LTS最新patchの24.21.0を使用する。更新時も公式indexとSHASUMS256を照合し、pin変更と同じcommitでhost/API/loader試験を行う。ビルドは新規directoryだけを使用し、取得済みarchiveのSHA256不一致は展開前に拒否する。build directoryの途中成果を次のbuildで自動再利用しない。
 
+release manifestのNode majorがhostのpinと一致しない場合はstage前に拒否する。署名後の固定native smokeでも、埋め込みNodeからbetter-sqlite3のメモリDBとkeytar native moduleをロードし、ABI・library validationを確認する。Keychain APIやDB fileへのアクセスは行わない。
+
 stageはDispatcherのdist/native source/node_modulesとSlack adapterのdist/node_modules、package/release metadataだけをコピーする。DB、credential、設定、git checkout全体は含めない。npmの`.bin`は不要なため除外し、その他symlink/hardlink/special fileは拒否する。
 
 ## 署名順序と検証
@@ -34,11 +36,11 @@ stageはDispatcherのdist/native source/node_modulesとSlack adapterのdist/node
 3. `DonaDispatcher.app` を同identity、Hardened Runtime、stageの `host.entitlements.plist`、trusted timestamp付きで署名する。署名後はresourcesを変更しない。
 4. `node scripts/doctor-dispatcher-host.mjs /absolute/new-stage/DonaDispatcher.app TEAM_ID PREFIX.dev.dona.approval` でexpected identity/profile/entitlement/全resource/実host起動を確認する。
 
-公開配布のnotarization/Gatekeeper検証は別途Appleの配布手順に従う。doctorの `activation_allowed` はartifact起動のgateであり、DB/runtime/Keychain/Slackの業務readyを表さない。`protected_state:not_checked` をreadyへ読み替えない。
+公開配布のnotarization/Gatekeeper検証は別途Appleの配布手順に従う。doctorの `activation_allowed` は署名とnative smokeの両方が成功したartifact起動のgateであり、DB/runtime/Keychain/Slackの業務readyを表さない。`protected_state:not_checked` をreadyへ読み替えない。
 
 ## 固定entryと注入境界
 
-hostは `serve`、`host-doctor`、`validate-job-result <candidate> <job_id>`、`approval-doctor|approval-provision|approval-rotate|approval-recover --config <path> --database <path>` のみを認める。rotateだけ末尾 `--next-version <version>` を要求する。approval entryが配備されていないreleaseではそのmodeは失敗する。
+hostは `serve`、`host-doctor`、`host-native-doctor`、`validate-job-result <candidate> <job_id>`、`approval-doctor|approval-provision|approval-rotate|approval-recover --config <path> --database <path>` のみを認める。rotateだけ末尾 `--next-version <version>` を要求する。approval entryが配備されていないreleaseではそのmodeは失敗する。
 
 NodeのCLI option parsing、NODE_OPTIONS、global module paths、Inspector/SIGUSR1を無効にし、NODE_/DYLD_ hook、OpenSSL/ICU overrideを除去する。任意JS引数、`-e`、loader指定はない。JSロード前にbundleの署名/封印resources/Hardened Runtimeを検証する。worker Result validatorは固定modeを使い、汎用Node CLIへ戻さない。
 

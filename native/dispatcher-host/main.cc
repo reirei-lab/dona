@@ -47,10 +47,11 @@ static bool signedBundle(const std::string& bundle) {
 int main(int argc, char** argv) {
   // No option is passed to Node's generic CLI parser.
   const std::string mode = argc > 1 ? argv[1] : "";
+  const bool native_doctor = mode == "host-native-doctor";
   const bool validator = mode == "validate-job-result";
   const bool approval = mode == "approval-doctor" || mode == "approval-provision" ||
     mode == "approval-rotate" || mode == "approval-recover";
-  if ((!approval && !validator && (argc != 2 || (mode != "serve" && mode != "host-doctor"))) ||
+  if ((!approval && !validator && (argc != 2 || (mode != "serve" && mode != "host-doctor" && !native_doctor))) ||
       (validator && argc != 4) ||
       (approval && (argc != (mode == "approval-rotate" ? 8 : 6) ||
         std::string(argv[2]) != "--config" || !std::filesystem::path(argv[3]).is_absolute() ||
@@ -83,9 +84,10 @@ int main(int argc, char** argv) {
   for (const auto& key : hooks) unsetenv(key.c_str());
   for (const auto* key : {"NODE_OPTIONS", "NODE_PATH", "NODE_REPL_EXTERNAL_MODULE", "NODE_EXTRA_CA_CERTS",
                          "ICU_DATA", "OPENSSL_CONF", "OPENSSL_MODULES", "SSLKEYLOGFILE"}) unsetenv(key);
-  const std::string entry = (contents / (validator ? "Resources/release/dispatcher/dist/job-result-validate.bundle.mjs" : approval ? "Resources/release/dispatcher/dist/approval/local-native-cli.js" :
+  const std::string entry = (contents / (native_doctor ? "Resources/release/dispatcher/dist/host-native-doctor.js" : validator ? "Resources/release/dispatcher/dist/job-result-validate.bundle.mjs" : approval ? "Resources/release/dispatcher/dist/approval/local-native-cli.js" :
     "Resources/release/dispatcher/dist/cli.js")).string();
   std::vector<std::string> args{binary.string(), entry, approval ? mode.substr(9) : "serve"};
+  if (native_doctor) args.resize(2);
   if (validator) { args.resize(2); args.emplace_back(argv[2]); args.emplace_back(argv[3]); }
   if (approval) for (int i = 2; i < argc; ++i) args.emplace_back(argv[i]);
   auto init = node::InitializeOncePerProcess(args, {

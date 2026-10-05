@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // unsigned stagingのみ。署名はMac operatorが別途実行する。
 import fs from 'node:fs';import path from 'node:path';import {spawnSync} from 'node:child_process';import {fileURLToPath} from 'node:url';
-import {bundleId,sha256,profileContract,copyTree,plist} from './dispatcher-host-artifact.mjs';
+import {bundleId,sha256,profileContract,copyTree,plist,assertHostNodeMajor} from './dispatcher-host-artifact.mjs';
 const [build,release,destination,profilePath,team,group]=process.argv.slice(2);
 const root=fileURLToPath(new URL('../',import.meta.url));
 try{
@@ -15,6 +15,7 @@ try{
  const json=spawnSync('/usr/bin/plutil',['-convert','json','-o','-','-'],{input:cms.stdout,encoding:'utf8',maxBuffer:1024*1024});if(json.status!==0)throw Error();
  const ent=profileContract(JSON.parse(json.stdout),team,group);
  const releaseManifest=JSON.parse(fs.readFileSync(path.join(release,'release-manifest.json'),'utf8'));if(!/^[a-f0-9]{40}$/.test(releaseManifest.sha))throw Error();
+ assertHostNodeMajor(releaseManifest.node_version,pin.version);
  fs.mkdirSync(destination,{mode:0o700});const app=path.join(destination,'DonaDispatcher.app'),contents=path.join(app,'Contents');
  fs.mkdirSync(path.join(contents,'MacOS'),{recursive:true,mode:0o700});fs.mkdirSync(path.join(contents,'Resources/release'),{recursive:true,mode:0o700});
  fs.writeFileSync(path.join(contents,'MacOS/DonaDispatcher'),binary,{flag:'wx',mode:0o700});
