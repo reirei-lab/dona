@@ -368,3 +368,22 @@ test("ownとgrantedの両scopeは両方のjobをunionしcursorへbindする",t=>
   const after=broker.execute({codec_version:1,operation:"list",method:"GET",target:"/api/jobs",context:"context"});
   assert.equal(after.status,"succeeded");if(after.status==="succeeded"&&after.kind==="list")assert.deepEqual(after.items.map(item=>item.job_id),[ownJob]);
 });
+
+ test("Taskだけの取消更新も接続中Web readerのcursorへ同じtransactionで記録する",t=>{
+  const f=fixture(t),job=f.seed(owner,"running");
+  const task=f.jobs.tasks.attachWebAttempt(f.jobs.getJob(job)!,job);
+  f.raw.prepare("UPDATE jobs SET status='running',dispatch_started_at=? WHERE job_id=?").run("2026-09-21T00:00:00.000Z",job);
+  const broker=new WebJobReadBroker(readAuth(owner,["job:read:own","job:cancel:own"]) as never,f.jobs);
+  const before=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"});
+  assert.equal(before.status,"succeeded");if(before.status!=="succeeded"||before.kind!=="detail")return;
+  const command={...owner,task_id:task.task_id,attempt_id:job,revision:task.revision,idempotency_key:"1".repeat(64)};
+  assert.throws(()=>f.jobs.cancelWebTask({...command,idempotency_key:"invalid"}),/web_command_invalid/);
+  const unchanged=broker.execute({codec_version:1,operation:"events",method:"GET",target:`/api/jobs/${job}/events`,context:"context",cursor:before.event_cursor});
+  assert.equal(unchanged.status,"succeeded");if(unchanged.status!=="succeeded"||unchanged.kind!=="events")return;
+  assert.equal(unchanged.changed,false);
+  f.jobs.cancelWebTask(command);
+  const after=broker.execute({codec_version:1,operation:"events",method:"GET",target:`/api/jobs/${job}/events`,context:"context",cursor:before.event_cursor});
+  assert.equal(after.status,"succeeded");if(after.status!=="succeeded"||after.kind!=="events")return;
+  assert.equal(after.changed,true);assert.equal(after.job.status,"running");assert.equal(after.job.control.can_cancel,false);
+  assert.equal(after.job.control.revision,task.revision+1);assert.notEqual(after.event_cursor,before.event_cursor);
+ });

@@ -396,6 +396,20 @@ function ensureWebJobProjectionSchema(db: Database.Database): void {
     `);
   };
   if (db.inTransaction) upgrade(); else db.transaction(upgrade).immediate();
+  // Task-visible controls share the durable Job event cursor even when no Job status changes.
+  if(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").get()) db.exec(`
+    CREATE TRIGGER IF NOT EXISTS web_task_projection_update AFTER UPDATE ON tasks
+    WHEN (old.revision IS NOT new.revision OR old.current_attempt_id IS NOT new.current_attempt_id
+      OR old.desired_state IS NOT new.desired_state)
+      AND EXISTS(SELECT 1 FROM jobs WHERE job_id=new.current_attempt_id AND source='web')
+    BEGIN
+      INSERT INTO web_job_projection_events(job_id,event_kind,created_at)
+        VALUES(new.current_attempt_id,'updated',strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+      INSERT INTO web_job_projection_events(job_id,event_kind,created_at)
+        SELECT old.current_attempt_id,'updated',strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE old.current_attempt_id IS NOT new.current_attempt_id;
+    END;
+  `);
   const initialize = () => {
     const claimed = db.prepare(`INSERT OR IGNORE INTO web_job_projection_state(singleton,initialized_at)
       VALUES(1,strftime('%Y-%m-%dT%H:%M:%fZ','now'))`).run().changes;
