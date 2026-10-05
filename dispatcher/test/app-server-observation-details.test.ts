@@ -45,3 +45,14 @@ test("複数行credentialの値とencoded保護pathを表示へ漏らさない",
  }
  assert.equal(sanitizeObservationText('file src/module.ts\n3 passed'),'file src/module.ts\n3 passed');
 });
+
+test("provider prefixとsuffixを持つcredential識別子を単行・JSON・複数行で共通拒否する",()=>{
+ for(const key of ["AWS_SECRET_ACCESS_KEY","OPENAI_API_KEY","MY_API_KEY_V2","AZURE_CLIENT_SECRET_VALUE","GOOGLE_ACCESS_TOKEN_2","DB_PASSWORD_PROD","api-key-secondary","serviceAuthorizationHeader"]){
+  const secret="sensitive-placeholder";
+  for(const text of [`${key}=${secret}`,JSON.stringify({[key]:secret}),`{\n "${key}":\n "${secret}"\n}`,`${key}=\n${secret}`]){
+   assert.ok(!sanitizeObservationText(text).includes(secret),key);
+   const projected=projectItem({id:"cmd",type:"commandExecution",command:"env",aggregatedOutput:text},turn)!;assert.ok(!JSON.stringify(projected).includes(secret),key);
+  }
+ }
+ assert.equal(sanitizeObservationText("NODE_ENV=production\nEXIT_CODE=0"),"NODE_ENV=production\nEXIT_CODE=0");
+});

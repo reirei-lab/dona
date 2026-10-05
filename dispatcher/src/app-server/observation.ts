@@ -13,7 +13,11 @@ export interface ConversationSnapshot extends ConversationIdentity {
 }
 export const record=(x:unknown):Record<string,unknown>=>x!==null&&typeof x==="object"&&!Array.isArray(x)?x as Record<string,unknown>:{};
 const identifier=(x:unknown):string|undefined=>typeof x==="string"&&/^[a-zA-Z0-9_-]{1,160}$/.test(x)?x:undefined;
-const credentialField=/\b(?:[A-Za-z_]*(?:token|password|secret)|api[_ -]?key|authorization|cookie|credential)\b["']?\s*[:=]/gi;
+/** 識別子全体を採り、provider prefix/version suffixを含む既知credential名を共通判定する。 */
+function credentialFields(text:string):RegExpMatchArray[] {
+  return [...text.matchAll(/\b([A-Za-z_][A-Za-z0-9_-]*(?:[ ]+key)?)\b["']?\s*[:=]/gi)]
+    .filter(match=>/(?:token|password|secret|apikey|authorization|cookie|credential|accesskey|privatekey)/i.test(match[1]!.replace(/[_ -]/g,"")));
+}
 function decodedObservationText(value:string):string {
   let text=value;for(let i=0;i<2;i++){try{text=decodeURIComponent(text);}catch{text=text.replace(/%([0-9a-f]{2})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16)));}text=text.replace(/\\u([0-9a-f]{4})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16))).replace(/\\\//g,"/");}return text;
 }
@@ -22,12 +26,12 @@ export function sanitizeObservationText(value:string,limit=8192):string {
   if(value.length>131072)return "[上限を超える内容を省略]";
   let text=value.replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|$))/g,"").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g,"");
   const decodedText=decodedObservationText(text);
-  for(const match of decodedText.matchAll(credentialField)){const rest=decodedText.slice(match.index!+match[0].length);if(/^[ \t]*(?:\r?\n|[\[{])/.test(rest))return "[機密情報を含む内容を省略]";}
+  for(const match of credentialFields(decodedText)){const rest=decodedText.slice(match.index!+match[0].length);if(/^[ \t]*(?:\r?\n|[\[{])/.test(rest))return "[機密情報を含む内容を省略]";}
   if(/-----BEGIN [^-]*PRIVATE KEY|DONA_(?:JOB|EVENT)_(?:BEGIN|END)/i.test(decodedText))return "[保護された内容を省略]";
   text=text.split("\n").map(line=>{
     const decoded=decodedObservationText(line);
     if(decoded!==line&&/(?:^|[\s"']|\/)(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains|\.env(?:\.[\w-]+)?|auth\.json|credentials(?:\.json)?)(?:\/|$|[\s"'])/i.test(decoded))return "[保護されたパスを含む行を省略]";
-    if(/(?:xox[a-z]-|xapp-|gh[pousr]_|github_pat_|sk-(?:proj-)?[A-Za-z0-9_-]{8}|\b(?:AKIA|ASIA)[A-Z0-9]{16}|\b(?:[A-Za-z_]*(?:token|password|secret)|api[_ -]?key|authorization|cookie|credential)\b\s*["']?\s*[:=]|--(?:token|password|secret|api-key|header)\s+\S+|\b(?:Bearer|Basic)\s+\S+|https?:\/\/[^\s/]+@|(?:files|hooks)\.slack\.com|[?&](?:signature|sig|token|key|x-amz-[\w-]+)=|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/i.test(decoded))return "[機密情報を含む行を省略]";
+    if(credentialFields(decoded).length>0||/(?:xox[a-z]-|xapp-|gh[pousr]_|github_pat_|sk-(?:proj-)?[A-Za-z0-9_-]{8}|\b(?:AKIA|ASIA)[A-Z0-9]{16}|--(?:token|password|secret|api-key|header)\s+\S+|\b(?:Bearer|Basic)\s+\S+|https?:\/\/[^\s/]+@|(?:files|hooks)\.slack\.com|[?&](?:signature|sig|token|key|x-amz-[\w-]+)=|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/i.test(decoded))return "[機密情報を含む行を省略]";
     return line.replace(/(?:~|\/[^\s"'<>]*)\/(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains)(?:\/[^\s"'<>]*)?/g,"[保護されたパス]").replace(/(^|[\s"'<>])(?:[^\s"'<>]*\/)?(?:\.env(?:\.[\w-]+)?|auth\.json|credentials(?:\.json)?)(?=\s|$|["'<>])/g,"$1[保護されたパス]").replace(/\/(?:Users|home)\/[^/\s]+/g,"~");
   }).join("\n");
   return text.slice(0,limit);
