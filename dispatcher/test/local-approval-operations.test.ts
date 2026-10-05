@@ -50,3 +50,20 @@ test("retentionは期限到達済みterminal本文だけを消しmetadataとcons
  // 旧運用のterminalだが本文収集前という正規監査済みfixture。retention自体は実production classを通す。
  new ApprovalHistoryTransaction(f.db,f.providers,scope).runPrepared("fixture_terminal_before_retention",(mark,state)=>{const current=records.readInState(state,"execution",a.row.attempt_id)!;const plan=mutations.prepare(mark,state,[{previous:current,next:{...current,row:{...current.row,state:"failed",fence:current.row.fence+1,receipt_ref:"fixture_rejection",failure_code:"invalid_input"}}}]);return {event:{scope:{instance_id:scope.instance_id,tenant_id:scope.workspace_id},actor:{kind:"system",id:"fixture"},action:"approval_execution",operation:"slack.post_thread_reply.v1",resource_id:request,outcome:"failed",reason:"invalid_input",session_ref:null,receipt_id:"fixture_rejection",attempt_id:a.row.attempt_id,policy_revision:1,binding_revision:1,authz_revision:1},resource_commitments:plan.resource_commitments,mutation:plan.mutation};});
  assert.equal(f.ops.previewRetention("attempt",a.row.attempt_id).eligible,false);f.setNow("2026-09-20T01:00:00.000Z");const preview=f.ops.previewRetention("attempt",a.row.attempt_id);assert.equal(preview.eligible,true);assert.equal(f.ops.retain("attempt",a.row.attempt_id,preview.confirmation).status,"deleted");assert.equal(f.db.prepare("SELECT COUNT(*) FROM approval_payload_secrets").pluck().get(),0);assert.equal(f.db.prepare("SELECT COUNT(*) FROM approval_consumes").pluck().get(),1);assert.equal(f.db.prepare("SELECT COUNT(*) FROM approval_payload_metadata").pluck().get(),2);assert.throws(()=>f.ops.retain("attempt",a.row.attempt_id,preview.confirmation));});
+
+for(const outcome of ["accepted","rejected"] as const)test(`${outcome}後の本文はcoreで削除済みとなり常駐retentionはconsume/fenceを維持する`,async t=>{
+ const f=setup(t),request=await create(f,true);await f.service.executePending();
+ assert.deepEqual(f.db.prepare("SELECT owner_kind,state FROM approval_payload_metadata ORDER BY owner_kind").all(),[{owner_kind:"attempt",state:"active"},{owner_kind:"request",state:"deleted"}]);
+ assert.equal(f.db.prepare("SELECT COUNT(*) FROM approval_payload_secrets").pluck().get(),1);
+ f.setReceipt(outcome==="accepted"?{outcome,receipt_ref:"slack_exact"}:{outcome,receipt_ref:"slack_rejected",reason:"scope_denied"});
+ const proof=await f.ops.previewReconcile(request,"operator verified exact terminal evidence");
+ assert.equal(f.ops.applyReconcile(proof.confirmation).state,outcome==="accepted"?"succeeded":"failed");
+ assert.equal(f.service.status(actor,request).state,"consumed");
+ const before=f.db.prepare("SELECT attempt_id,fence,state FROM approval_execution_attempts").get();
+ assert.equal(f.ops.previewRetention("request",request).eligible,false);
+ const payloads=f.db.prepare("SELECT COUNT(*) FROM approval_payload_secrets").pluck().get();assert.equal(payloads,0);
+ assert.equal(f.ops.sweep(performance.now()+5000).changed,0);assert.equal(f.db.prepare("SELECT COUNT(*) FROM approval_payload_secrets").pluck().get(),payloads);
+ f.setNow("2026-09-20T01:00:00.000Z");assert.equal(f.ops.previewRetention("request",request).eligible,false);
+ assert.equal(f.ops.sweep(performance.now()+5000).changed,0);assert.equal(f.db.prepare("SELECT COUNT(*) FROM approval_payload_secrets").pluck().get(),0);
+ assert.deepEqual(f.db.prepare("SELECT attempt_id,fence,state FROM approval_execution_attempts").get(),before);assert.equal(f.db.prepare("SELECT COUNT(*) FROM approval_consumes").pluck().get(),1);assert.equal(f.sends(),1);assert.equal(f.ops.sweep().changed,0);
+});
