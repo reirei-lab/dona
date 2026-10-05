@@ -116,3 +116,24 @@ export function readApprovalListHead(plan: ApprovalMetadataPlan, list: ApprovalI
     return Object.freeze({ count: current.count, ids: Object.freeze(ids), truncated: ids.length < current.count });
   });
 }
+
+/** 現在の監査rootのlinked listを最大100件だけ進める内部走査。
+ * cursor所持は認可ではない。SQL全件countやcaller提供rootを使わない。 */
+export function readApprovalListPage(plan: ApprovalMetadataPlan, list: ApprovalIndexList, after: string | null, limit: number) {
+  return guarded(plan, () => {
+    z.number().int().min(1).max(100).parse(limit);
+    z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).nullable().parse(after);
+    const current = manifest(plan, list); ends(plan, current);
+    if (after !== null) verifyApprovalListMembership(plan, list, after, true);
+    const ids: string[] = [], seen = new Set<string>();
+    let previous = after, next = after === null ? current.head : link(plan, list, after).next;
+    while (next !== null && ids.length < limit) {
+      if (seen.has(next) || next === after || ids.length >= current.count) throw new ApprovalMetadataPlanError();
+      const entry = link(plan, list, next);
+      if (entry.previous !== previous || (entry.next === null) !== (current.tail === next)) throw new ApprovalMetadataPlanError();
+      seen.add(next); ids.push(next); previous = next; next = entry.next;
+    }
+    if (after === null && next === null && ids.length !== current.count) throw new ApprovalMetadataPlanError();
+    return { count: current.count, ids, next_after: ids.at(-1) ?? null, has_more: next !== null };
+  });
+}

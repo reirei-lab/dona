@@ -1,0 +1,208 @@
+import {stableStringify} from "../validation.js";
+import {createHash,randomUUID} from "node:crypto";
+import type Database from "better-sqlite3";
+import {AuditRepository} from "../audit/repository.js";
+import type {ApprovalTransactionProviders} from "./transaction.js";
+import {ApprovalCreateBroker,type ApprovalCreateKeyLookup} from "./create-broker.js";
+import {ApprovalDecisionBroker} from "./decision-broker.js";
+import {ApprovalNotificationBroker} from "./notification-broker.js";
+import {ApprovalConsumeBroker} from "./consume-broker.js";
+import {ApprovalExecutionBroker} from "./execution-broker.js";
+import {ApprovalExecutionMarkerStore} from "./execution-marker-store.js";
+import type {ApprovalExecutionMarkerKey} from "./execution-marker.js";
+import {ApprovalRecordRepository} from "./record-repository.js";
+import {ApprovalRecordMutation} from "./record-mutation.js";
+import {ApprovalHistoryTransaction} from "./history-transaction.js";
+import {ApprovalPayloadRepository} from "./payload-repository.js";
+import {openApprovalPayload,type ApprovalPayloadKey} from "./payload-protection.js";
+import type {ApprovalNotificationKey} from "./notification-marker.js";
+import type {ApprovalRecord,ApprovalRecordScope} from "./record-codec.js";
+import type {ApprovalSnapshot} from "./snapshot.js";
+import {advanceClockMark,type ClockMark} from "./clock.js";
+import {externalAuthoritySchema,externalIntentSchema,externalStepUpSchema,type ExternalApprovalAuthority,type ExternalApprovalIntent,type ExternalApprovalStepUp,
+ type ExternalApprovalAuthPort,type ExternalSlackPort,type SlackTargetObservation,type ExternalSendResult} from "./local-external-types.js";
+import {externalRichText} from "./local-slack-provider.js";
+export type {ExternalApprovalAuthority,ExternalApprovalIntent,ExternalApprovalStepUp,ExternalApprovalAuthPort} from "./local-external-types.js";
+type Request=Extract<ApprovalRecord,{kind:"request"}>;
+const hash=(value:unknown)=>createHash("sha256").update(stableStringify(value)).digest("hex");
+const tx=()=>"local_"+randomUUID().replaceAll("-","");
+const denied={status:"denied",reason:"unauthorized"} as const;
+export interface ExternalApprovalKeys extends ApprovalCreateKeyLookup {
+ wrappingVersion(version:number|null):ApprovalPayloadKey;
+ notificationVersion(version:number):ApprovalNotificationKey;
+ execution(version:number|null):ApprovalExecutionMarkerKey;
+}
+export interface ExternalApprovalPresentation {request_id:string;operation:"slack.post_thread_reply.v1";workspace_id:string;channel_id:string;thread_ts:string;
+ exact_draft:string;notified_user_ids:string[];expires_at:string;request_revision:number;presentation_revision:number;presentation_digest:string}
+/** Mac grantの追加transport。既存coreの暗号化payload、監査root、clock、decision、
+ * consume、execution markerをそのまま使い、別の承認ledgerを作らない。 */
+export class LocalExternalApprovalService {
+ private readonly records:ApprovalRecordRepository;
+ private readonly payloads:ApprovalPayloadRepository;
+ private readonly markers:ApprovalExecutionMarkerStore;
+ private readonly audit:AuditRepository;
+ constructor(private readonly db:Database.Database,private readonly providers:ApprovalTransactionProviders,private readonly scope:ApprovalRecordScope,
+  private readonly keys:ExternalApprovalKeys,private readonly auth:ExternalApprovalAuthPort,private readonly slack:ExternalSlackPort){
+  this.records=new ApprovalRecordRepository(db,providers.auditAnchors,providers.auditKeys,scope);
+  this.payloads=new ApprovalPayloadRepository(db,providers.auditAnchors,providers.auditKeys,scope);
+  this.markers=new ApprovalExecutionMarkerStore(db,providers,scope);this.audit=new AuditRepository(db,providers.auditAnchors,providers.auditKeys);
+  // これは検索用contextだけ。正本のbinding_idが全fieldのdigestを認証する。
+  db.exec("CREATE TABLE IF NOT EXISTS local_external_contexts(request_id TEXT PRIMARY KEY,authority_json TEXT NOT NULL)");
+ }
+ private checked(authority:ExternalApprovalAuthority){const value=externalAuthoritySchema.parse(authority);
+  if(value.instance_id!==this.scope.instance_id||this.auth.authorize(value)!==true)throw Error("external_approval_unauthorized");return value;}
+ private binding(a:ExternalApprovalAuthority){return "local_"+hash([a.instance_id,a.owner_id,a.device_id,a.grant_revision]);}
+ private context(request:Request){const row=this.db.prepare("SELECT authority_json FROM local_external_contexts WHERE request_id=?").get(request.row.request_id) as {authority_json:string}|undefined;
+  if(!row)throw Error("external_approval_context_unavailable");const a=externalAuthoritySchema.parse(JSON.parse(row.authority_json));
+  if(this.binding(a)!==request.row.binding_id||a.owner_id!==this.snapshot(request).request_source.owner_id)throw Error("external_approval_context_unverified");return a;}
+ private permitted(request:Request,actor:ExternalApprovalAuthority){const source=this.context(request);return source.instance_id===actor.instance_id&&source.owner_id===actor.owner_id&&this.auth.authorize(source)===true&&this.auth.authorize(actor)===true;}
+ private snapshot(request:Request){return JSON.parse(request.row.snapshot_json) as ApprovalSnapshot;}
+ private now(){return advanceClockMark(this.providers.clockMarks.read(),this.providers.clock.observe(),tx(),this.providers.maximumClockDriftMs);}
+ private observationValid(o:SlackTargetObservation,mark:Readonly<ClockMark>){const age=Date.parse(mark.effective_utc)-Date.parse(o.observed_at);return Number.isFinite(age)&&age>=0&&age<=15000;}
+ private grant(request:Request,observation:SlackTargetObservation,mark:Readonly<ClockMark>){const source=this.context(request),snapshot=this.snapshot(request);
+  if(this.auth.authorize(source)!==true||!this.observationValid(observation,mark))return null;
+  if(stableStringify(observation.target)!==stableStringify({workspace_id:this.scope.workspace_id,...snapshot.target}))return null;
+  return {binding_id:request.row.binding_id,binding_revision:request.row.binding_revision,policy_revision:request.row.policy_revision,semantic_hash:request.row.semantic_hash,
+   requester_authorization_revision:snapshot.preconditions.requester_authorization_revision,
+   stale_reason:stableStringify(observation.revision)===stableStringify(snapshot.preconditions.ordered_thread_revision)?null:"snapshot_mismatch" as const};
+ }
+ private requestRecord(id:string){const request=this.records.read("request",id);if(!request||request.row.model_version!=="local_operator_v1")throw Error("external_approval_not_found");return request;}
+ async request(authority:ExternalApprovalAuthority,input:ExternalApprovalIntent){
+  const actor=this.checked(authority),intent=externalIntentSchema.parse(input);if(intent.workspace_id!==this.scope.workspace_id)throw Error("external_approval_scope_mismatch");
+  const rich=externalRichText(intent.text),target={workspace_id:intent.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts},observation=await this.slack.observe(target);
+  this.checked(actor);const sourceId="loe_"+hash([actor,intent.idempotency_key]),binding=this.binding(actor);
+  const broker=new ApprovalCreateBroker(this.db,this.providers,this.scope,(_input,mark)=>{
+   if(this.auth.authorize(actor)!==true||!this.observationValid(observation,mark))return denied;
+   return {status:"authorized",binding_id:binding,model_version:"local_operator_v1",snapshot:{codec_version:1,operation_kind:"slack.post_thread_reply.v1",...this.scope,
+    request_source:{source_event_id:sourceId,source_job_id:null,owner_kind:"authenticated_event_actor",owner_id:actor.owner_id,operation_slot:intent.idempotency_key},
+    target:{channel_id:intent.channel_id,thread_ts:intent.thread_ts},policy_revision:1,
+    policy:{reply_broadcast:false,special_mentions:"deny_all",allowed_user_mentions:rich.users,max_user_mentions:3,shared_channel:"deny",reconcile_marker:"block_id_attempt_id_mac_v1"},
+    preconditions:{thread_exists:true,channel_is_shared:false,root_message_revision:{edited_ts:observation.revision.items[0]!.edited_ts,content_hmac_sha256:observation.revision.items[0]!.content_hmac_sha256},ordered_thread_revision:observation.revision,workspace_binding_revision:actor.grant_revision,requester_authorization_revision:actor.grant_revision}},
+    display:{workspace_name:observation.workspace_name,channel_name:observation.channel_name,supervisor_name:"Local operator",mentioned_users:rich.users.map(id=>({id,display_name:id}))}};
+  },{content:v=>this.keys.content(v),wrapping:()=>this.keys.wrapping(),notification:()=>this.keys.notification()});
+  const result=broker.create(tx(),{source_ref:sourceId,operation_slot:intent.idempotency_key,target:{channel_id:intent.channel_id,thread_ts:intent.thread_ts},text:intent.text});
+  if(result.status!=="denied"){
+   this.db.prepare("INSERT OR IGNORE INTO local_external_contexts VALUES(?,?)").run(result.request_handle,stableStringify(actor));
+   if(this.binding(this.context(this.requestRecord(result.request_handle)))!==binding)throw Error("external_approval_context_unverified");
+  }
+  return result;
+ }
+ private text(request:Request,owner:"request"|"attempt"="request",ownerId=request.row.request_id){
+  const found=this.payloads.inspect(owner,ownerId);if(!found||found.metadata.state!=="active"||found.secret.status!=="present")throw Error("external_approval_payload_unavailable");
+  if(found.metadata.binding.request_id!==request.row.request_id||found.metadata.binding.semantic_hash!==request.row.semantic_hash)throw Error("external_approval_payload_unverified");
+  return openApprovalPayload(found.secret.envelope,found.metadata.binding,this.keys.wrappingVersion(found.secret.envelope.key_version),this.keys.content(found.metadata.binding.content.key_version),this.now());
+ }
+ private card(request:Request){const card=this.records.readAlias({name:"notification_request_kind",request_id:request.row.request_id,notification_kind:"approval_card"});
+  if(card?.kind!=="notification")throw Error("external_approval_presentation_unavailable");return card;}
+ async present(authority:ExternalApprovalAuthority,requestId:string):Promise<ExternalApprovalPresentation>{
+  const actor=this.checked(authority),request=this.requestRecord(requestId);if(!this.permitted(request,actor))throw Error("external_approval_unauthorized");
+  const snapshot=this.snapshot(request),observation=await this.slack.observe({workspace_id:this.scope.workspace_id,...snapshot.target});
+  if(!this.permitted(request,actor)||this.grant(request,observation,this.now())?.stale_reason!==null)throw Error("external_approval_snapshot_changed");
+  const exact=this.text(request),card=this.card(request),base={request_id:requestId,operation:"slack.post_thread_reply.v1" as const,workspace_id:this.scope.workspace_id,...snapshot.target,
+   exact_draft:exact,notified_user_ids:[...snapshot.policy.allowed_user_mentions],expires_at:request.row.expires_at,request_revision:card.row.request_revision,presentation_revision:card.row.presentation_revision};
+  if(Date.parse(base.expires_at)<=Date.parse(this.now().effective_utc))throw Error("external_approval_expired");
+  const presentation={...base,presentation_digest:hash(base)},reference="web_"+presentation.presentation_digest;
+  // Webへの配送証拠は、同じcanonical表示を再構成できるdurable opaque ref。
+  // HTTP応答成功を承認として扱わず、decisionには別のWebAuthn receiptを要求する。
+  const notification=new ApprovalNotificationBroker(this.db,this.providers,this.scope,(_cmd,r,n,mark)=>{
+   const g=this.grant(r,observation,mark);return g&&this.permitted(r,actor)?{status:"verified",scope:this.scope,notification_id:n.row.notification_attempt_id,consumer_id:"local_web",...g}:denied;
+  },(_cmd,r,n)=>this.permitted(r,actor)?{status:"verified",scope:this.scope,notification_id:n.row.notification_attempt_id,consumer_id:"local_web"}:denied,
+  (_cmd,r,n)=>this.permitted(r,actor)?{status:"verified",scope:this.scope,notification_id:n.row.notification_attempt_id,consumer_id:"local_web",delivery_fence:n.row.fence,
+   proof_kind:n.row.state==="acceptance_unknown"?"reconcile":"callback",receipt:{outcome:"sent",presentation_ref:reference}}:denied,
+  v=>this.keys.content(v),v=>this.keys.wrappingVersion(v),v=>this.keys.notificationVersion(v));
+  const command=()=>({notification_handle:card.row.notification_attempt_id,authority_ref:reference,expected_fence:this.card(request).row.fence});
+  if(card.row.state==="pending")notification.claim(tx(),command());
+  const current=this.card(request);
+  if(current.row.state==="dispatching"||current.row.state==="acceptance_unknown")notification.resolve(tx(),command());
+  const confirmed=this.card(request);if(confirmed.row.state!=="sent"||confirmed.row.message_ref!==reference||!this.permitted(request,actor))throw Error("external_approval_presentation_unavailable");
+  return presentation;
+ }
+ async decide(authority:ExternalApprovalAuthority,input:ExternalApprovalStepUp){
+  const actor=this.checked(authority),receipt=externalStepUpSchema.parse(input);
+  if(stableStringify({instance_id:receipt.instance_id,owner_id:receipt.owner_id,device_id:receipt.device_id,grant_revision:receipt.grant_revision})!==stableStringify(actor))throw Error("external_approval_step_up_invalid");
+  const request=this.requestRecord(receipt.request_id),snapshot=this.snapshot(request);
+  const observation=await this.slack.observe({workspace_id:this.scope.workspace_id,...snapshot.target});
+  const card=this.card(request),now=this.now();
+  if(receipt.expires_at>request.row.expires_at||Date.parse(receipt.expires_at)>Date.parse(now.effective_utc)+120000||Date.parse(receipt.expires_at)<=Date.parse(now.effective_utc)
+   ||card.row.message_ref!=="web_"+receipt.presentation_digest||this.auth.verifyStepUp(receipt)!==true)throw Error("external_approval_step_up_invalid");
+  const broker=new ApprovalDecisionBroker(this.db,this.providers,this.scope,(_command,r,mark)=>{
+   const g=this.grant(r,observation,mark);return g&&this.permitted(r,actor)&&this.auth.verifyStepUp(receipt)===true&&receipt.expires_at>mark.effective_utc?{status:"verified",scope:this.scope,request_id:r.row.request_id,
+    actor_kind:"supervisor",actor_id:actor.owner_id,presentation_ref:card.row.message_ref,presentation_revision:card.row.presentation_revision,...g}:denied;
+  },v=>this.keys.content(v),v=>this.keys.wrappingVersion(v),v=>this.keys.notificationVersion(v));
+  return broker.decide(tx(),{request_handle:receipt.request_id,authority_ref:receipt.receipt_id,action:receipt.decision,expected_revision:card.row.request_revision,presentation_revision:card.row.presentation_revision});
+ }
+ list(authority:ExternalApprovalAuthority,after:string|null=null){
+  const actor=this.checked(authority);
+  return this.audit.readVerifiedState(state=>{
+   const page=this.records.readListPageInState(state,{record_kind:"request",membership:"all"},after,50);
+   const items=page.records.filter((r):r is Request=>r.kind==="request"&&r.row.model_version==="local_operator_v1").filter(r=>this.permitted(r,actor))
+    .map(r=>({request_id:r.row.request_id,operation:"slack.post_thread_reply.v1" as const,state:r.row.state,created_at:r.row.created_at,expires_at:r.row.expires_at,
+     execution:(()=>{const e=this.records.readAliasInState(state,{name:"execution_request",request_id:r.row.request_id});return e?.kind==="execution"?{attempt_id:e.row.attempt_id,state:e.row.state,receipt_ref:e.row.receipt_ref}:null;})()}));
+   this.checked(actor);return {items,next:page.next_after};
+  });
+ }
+ private executionSummary(requestId:string){const execution=this.records.readAlias({name:"execution_request",request_id:requestId});
+  return execution?.kind==="execution"?{attempt_id:execution.row.attempt_id,state:execution.row.state,receipt_ref:execution.row.receipt_ref}:null;}
+ private settleEvent(eventId:string){
+  const mutations=new ApprovalRecordMutation(this.db,this.scope),transaction=new ApprovalHistoryTransaction(this.db,this.providers,this.scope);
+  transaction.runPrepared(tx(),(mark,state)=>{
+   const event=this.records.readInState(state,"event",eventId);if(!event)throw Error("external_approval_event_missing");
+   const decision=this.records.readAliasInState(state,{name:"decision_id",decision_id:event.row.decision_id});
+   if(decision?.kind!=="decision")throw Error("external_approval_event_missing");
+   const request=this.records.readInState(state,"request",decision.row.request_id);if(!request||request.row.model_version!=="local_operator_v1")throw Error("external_approval_event_scope");
+   const plan=event.row.state==="delivered"?null:mutations.prepare(mark,state,[{previous:event,next:{...event,row:{...event.row,state:"delivered",delivered_at:mark.effective_utc}}}]);
+   return {event:{scope:{instance_id:this.scope.instance_id,tenant_id:this.scope.workspace_id},actor:{kind:"system",id:"local_external_executor"},action:"approval_execution",operation:"slack.post_thread_reply.v1",
+    resource_id:request.row.request_id,outcome:"succeeded",reason:"none",session_ref:null,receipt_id:null,attempt_id:null,policy_revision:request.row.policy_revision,binding_revision:request.row.binding_revision,
+    authz_revision:this.snapshot(request).preconditions.requester_authorization_revision},...(plan?{resource_commitments:plan.resource_commitments}:{resource_digest:null}),mutation:()=>{plan?.mutation();return null;}};
+  });
+ }
+ /** 保存済みdecision eventだけをconsume。開始fence後の復旧はread-only照合に限定する。 */
+ async executePending(){
+  const pending=this.audit.readVerifiedState(state=>this.records.readListPageInState(state,{record_kind:"event",membership:"active"},null,20));
+  const results:Array<{request_id:string;state:string}>=[];
+  for(const event of pending.records){
+   if(event.kind!=="event")continue;
+   const decision=this.records.readAlias({name:"decision_id",decision_id:event.row.decision_id});if(decision?.kind!=="decision")continue;
+   let request:Request;try{request=this.requestRecord(decision.row.request_id);}catch{continue;}
+   if(decision.row.kind!=="approve"){this.settleEvent(event.row.event_id);results.push({request_id:request.row.request_id,state:request.row.state});continue;}
+   const snapshot=this.snapshot(request),target={workspace_id:this.scope.workspace_id,...snapshot.target};
+   let observation:SlackTargetObservation;try{observation=await this.slack.observe(target);}catch{results.push({request_id:request.row.request_id,state:"unavailable"});continue;}
+   const consume=new ApprovalConsumeBroker(this.db,this.providers,this.scope,(_command,r,mark)=>{
+    const g=this.grant(r,observation,mark);return g?{status:"verified",scope:this.scope,request_id:r.row.request_id,decision_id:decision.row.decision_id,event_id:event.row.event_id,consumer_id:"local_external_executor",...g}:denied;
+   },v=>this.keys.content(v),v=>this.keys.wrappingVersion(v),v=>this.keys.notificationVersion(v));
+   const prior=this.records.readAlias({name:"execution_request",request_id:request.row.request_id});
+   const claimed=prior?.kind==="execution"?{status:"reused" as const,attempt_handle:prior.row.attempt_id}:consume.consume(tx(),{request_handle:request.row.request_id,authority_ref:event.row.event_id,expected_revision:request.row.revision});
+   if(claimed.status!=="claimed"&&claimed.status!=="reused"){results.push({request_id:request.row.request_id,state:claimed.status});continue;}
+   const execution=this.records.read("execution",claimed.attempt_handle);if(!execution)throw Error("external_approval_execution_missing");
+   let receipt:ExternalSendResult={outcome:"unknown"},proofKind:"callback"|"reconcile"="callback";
+   const broker=new ApprovalExecutionBroker(this.db,this.providers,this.scope,(_command,r,a,mark)=>{
+    const g=this.grant(r,observation,mark);return g?{status:"verified",scope:this.scope,attempt_id:a.row.attempt_id,consumer_id:"local_external_executor",...g}:denied;
+   },(_command,_r,a)=>({status:"verified",scope:this.scope,attempt_id:a.row.attempt_id,consumer_id:"local_external_executor"}),
+   (_command,_r,a,_marker)=>({status:"verified",scope:this.scope,attempt_id:a.row.attempt_id,consumer_id:"local_external_executor",execution_fence:a.row.fence,proof_kind:proofKind,receipt}),
+   v=>this.keys.content(v),v=>this.keys.wrappingVersion(v),v=>this.keys.execution(v));
+   const command=()=>({attempt_handle:execution.row.attempt_id,authority_ref:event.row.event_id,expected_fence:this.records.read("execution",execution.row.attempt_id)!.row.fence});
+   if(execution.row.state==="claimed"){
+    // 復号はstart前。送信権限はstartが新しく成功したこのcallだけにある。
+    const text=this.text(request,"attempt",execution.row.attempt_id),started=broker.start(tx(),command());
+    if(started.status==="started"){
+     const marker=this.markers.read(execution.row.attempt_id);if(!marker)throw Error("external_approval_marker_missing");
+     try{receipt=await this.slack.send(target,text,marker,observation,()=>{
+      const mark=this.now(),current=this.requestRecord(request.row.request_id),g=this.grant(current,observation,mark);
+      if(!g||g.stale_reason!==null||Date.parse(mark.effective_utc)>=Date.parse(execution.row.execution_expires_at))throw Error("external_approval_authority_changed");
+     });}catch{receipt={outcome:"unknown"};}
+     broker.resolve(tx(),command());
+    }
+   }else if(execution.row.state==="executing"||execution.row.state==="acceptance_unknown"){
+    if(execution.row.state==="executing")broker.recover(tx(),command());
+    if(this.records.read("execution",execution.row.attempt_id)?.row.state==="acceptance_unknown"){
+     const marker=this.markers.read(execution.row.attempt_id);if(marker){proofKind="reconcile";receipt=await this.slack.reconcile(target,marker);broker.resolve(tx(),command());}
+    }
+   }
+   const final=this.records.read("execution",execution.row.attempt_id)!;
+   if(["succeeded","failed","needs_review"].includes(final.row.state))this.settleEvent(event.row.event_id);
+   results.push({request_id:request.row.request_id,state:final.row.state});
+  }
+  return {items:results,truncated:pending.has_more};
+ }
+
+}
