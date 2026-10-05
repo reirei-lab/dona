@@ -11,7 +11,7 @@ import {ApprovalNotificationBroker} from "./notification-broker.js";
 import {ApprovalConsumeBroker} from "./consume-broker.js";
 import {ApprovalExecutionBroker} from "./execution-broker.js";
 import {ApprovalExecutionMarkerStore} from "./execution-marker-store.js";
-import type {ApprovalExecutionMarkerKey} from "./execution-marker.js";
+import {verifyApprovalExecutionMarker,type ApprovalExecutionMarkerKey} from "./execution-marker.js";
 import {ApprovalRecordRepository} from "./record-repository.js";
 import {ApprovalRecordMutation} from "./record-mutation.js";
 import {ApprovalHistoryTransaction} from "./history-transaction.js";
@@ -36,6 +36,9 @@ export interface ExternalApprovalKeys extends ApprovalCreateKeyLookup {
  wrappingVersion(version:number|null):ApprovalPayloadKey;
  notificationVersion(version:number):ApprovalNotificationKey;
  execution(version:number|null):ApprovalExecutionMarkerKey;
+}
+export interface ExternalApprovalRecoveryEvidence {
+ effect:"not_sent"|"accepted"|"unknown";request_id:string;attempt_id:string|null;receipt_ref:string|null;
 }
 export interface ExternalApprovalPresentation {request_id:string;operation:"slack.post_thread_reply.v1";workspace_id:string;channel_id:string;thread_ts:string;workspace_name:string;channel_name:string;
  requester:{kind:"slack"|"local_operator";label:string};risk:"external_message";operation_summary:string;display_fingerprint:string;created_at:string;exact_draft:string;notified_user_ids:string[];expires_at:string;request_revision:number;presentation_revision:number;presentation_digest:string}
@@ -168,6 +171,26 @@ export class LocalExternalApprovalService {
   const r=this.requestRecord(requestId);if(this.binding(source)!==r.row.binding_id||this.binding(this.context(r))!==r.row.binding_id)throw Error("external_approval_scope_mismatch");
   invalidateLocalApprovals(this.db,this.providers,this.scope,source.owner_id,requestId);
   return {state:this.requestRecord(requestId).row.state,execution:this.executionSummary(requestId)};
+ }
+ /** sourceUnavailableで旧要求をfenceした後の内部照合。live runtime認可には依存せず、
+  * 同じ監査snapshot内で保存source・consume・execution・不可逆markerを検証する。
+  * active要求や検証不能はunknownであり、後継Attemptの許可証にはならない。 */
+ recoveryEvidence(source:ExternalApprovalSource,requestId:string):ExternalApprovalRecoveryEvidence{
+  const unknown:ExternalApprovalRecoveryEvidence={effect:"unknown",request_id:requestId,attempt_id:null,receipt_ref:null};
+  try{return this.audit.readVerifiedState((state):ExternalApprovalRecoveryEvidence=>{
+   const r=this.records.readInState(state,"request",requestId);
+   if(!r||r.row.model_version!=="local_operator_v1"||this.binding(externalSourceSchema.parse(source))!==r.row.binding_id||this.binding(this.context(r))!==r.row.binding_id)return unknown;
+   const consume=this.records.readInState(state,"consume",requestId),execution=this.records.readAliasInState(state,{name:"execution_request",request_id:requestId});
+   if(!execution)return !consume&&["needs_review","rejected","cancelled","expired","delivery_failed","consume_expired","execution_cancelled"].includes(r.row.state)?{...unknown,effect:"not_sent"}:unknown;
+   if(execution.kind!=="execution"||!consume||consume.row.consume_id!==execution.row.consume_id||consume.row.attempt_id!==execution.row.attempt_id||execution.row.request_id!==requestId)return unknown;
+   const evidence={...unknown,attempt_id:execution.row.attempt_id};
+   const marker=this.markers.readInState(state,execution.row.attempt_id);
+   if(!marker)return execution.row.state==="needs_review"?{...evidence,effect:"not_sent"}:evidence;
+   verifyApprovalExecutionMarker(marker,this.keys.execution(marker.marker.key_version));
+   if(execution.row.receipt_ref&&["succeeded","failed"].includes(execution.row.state))return {...evidence,effect:execution.row.state==="succeeded"?"accepted":"not_sent",receipt_ref:execution.row.receipt_ref};
+   // needs_review上の手動照合proofだけではledger終端を推測しない。
+   return evidence;
+  });}catch{return unknown;}
  }
  sourceStatus(source:ExternalApprovalSource,requestId:string){
   if(!this.sourceAllowed(source))throw Error("external_approval_unauthorized");
