@@ -20,7 +20,7 @@ test("credentialとcontrol pathはsource別の全表示fieldで永続投影前�
  for(const text of ['token="private"','Authorization: Bearer private','xoxb-private','ghp_private','-----BEGIN PRIVATE KEY-----\nprivate','https://files.slack.com/private','password%3Dprivate','password\\u003dprivate'])assert.ok(!sanitizeObservationText(text).includes("private"));
  assert.ok(!sanitizeObservationText('cat /Users/alice/.dona/config/dispatcher.env').includes("dispatcher.env"));
  assert.equal(sanitizeObservationText('/Users/alice/project/src/app.ts'),'~/project/src/app.ts');
- const item=projectItem({id:"c",type:"commandExecution",command:'TOKEN="private" npm test',aggregatedOutput:'ok\npassword=private\nend'},turn)!;assert.ok(!JSON.stringify(item).includes("private"));assert.equal(item.output,"[機密情報を含む内容を省略]");
+ const item=projectItem({id:"c",type:"commandExecution",command:'TOKEN="private" npm test',aggregatedOutput:'ok\npassword=private\nend'},turn)!;assert.ok(!JSON.stringify(item).includes("private"));assert.equal(item.command,"[認証optionを含む内容を省略]");assert.equal(item.output,item.command);assert.equal(sanitizeConversationItem({...item,error:"private"})?.error,item.command);
  assert.deepEqual(projectNotification("item/agentMessage/delta",{turnId:turn,itemId:"a",delta:"xoxb-"}),{kind:"item/agentMessage/delta",turn_id:turn,item_id:"a"});
 });
 test("projected DTO再読はkind別allowlist、bounded text/files、改変差分は行数だけ",()=>{
