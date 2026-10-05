@@ -89,6 +89,16 @@ test("known credential assignmentのfield全体をYAML comment/tag/anchorやscal
  }
  assert.equal(sanitizeObservationText("normal output\n3 tests passed"),"normal output\n3 tests passed");
 });
+test("schemeに依存せず接続URIのuserinfoを保存前に伏せる",()=>{
+ for(const scheme of ["postgres","postgresql","mysql","mongodb","mongodb+srv","redis","rediss","amqp","amqps","ftp","ssh","custom-v1.2"]){
+  for(const uri of [`${scheme}://alice:sensitive-placeholder@db.internal/app`,`${scheme}://alice%3Asensitive-placeholder%40db.internal/app`]){
+   const text=`接続先\nDATABASE_URL=${uri}\n正常な出力`;
+   assert.equal(sanitizeObservationText(text),"接続先\n[機密情報を含む行を省略]\n正常な出力");
+   for(const item of [projectItem({id:"command",type:"commandExecution",aggregatedOutput:text},turn),projectItem({id:"request",type:"userMessage",content:[{type:"text",text}]},turn)])assert.ok(!JSON.stringify(item).includes("sensitive-placeholder"));
+  }
+ }
+ assert.equal(sanitizeObservationText("postgres://db.internal/app"),"postgres://db.internal/app");
+});
 test("Codex Add/Deleteのraw contentはprefixによらずファイル行数を数える",()=>{
  // rust-v0.160.0 thread_history.rs: FileChange::Add(content="hello\\n") → FileUpdateChange(diff="hello\\n")。
  for(const kind of ["add","delete"]){for(const [diff,lines] of [["hello\n",1],["hello\nworld",2],["+++counter\n---counter\n",2],["\n",1],["",0],["hello\r\nworld\r\n",2]] as const){
