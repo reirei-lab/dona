@@ -278,8 +278,10 @@ test("別principalと未知jobを同じnot_found projectionにする",t=>{const 
 test("can_cancelはowner・scope・現行cancel受付状態を満たす場合だけ公開する",t=>{const f=fixture(t);
   const broker=new WebJobReadBroker(readAuth(owner,["job:read:own","job:cancel:own"]) as never,f.jobs);
   for(const [status,expected] of [["queued",true],["preparing",true],["dispatching",true],["retryable_failed",true],["running",true],["blocked",true],["needs_review",true],["cancelling",false],["completed",false]] as const){
-    const job=f.seed(owner,status);const detail=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"});
-    assert.equal(detail.status,"succeeded");if(detail.status==="succeeded"&&detail.kind==="detail")assert.equal(detail.job.control.can_cancel,expected,status);
+    const job=f.seed(owner,status);const task=f.jobs.tasks.attachWebAttempt(f.jobs.getJob(job)!,job);
+    f.raw.prepare("UPDATE jobs SET status=? WHERE job_id=?").run(status,job);
+    const detail=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"});
+    assert.equal(detail.status,"succeeded");if(detail.status==="succeeded"&&detail.kind==="detail"){assert.equal(detail.job.control.can_cancel,expected,status);assert.equal(detail.job.control.task_id,task.task_id);assert.equal(detail.job.control.revision,f.jobs.tasks.get(task.task_id)!.revision);}
   }
   const unknown=f.seed(owner,"needs_review");f.raw.prepare("UPDATE jobs SET last_error_code='web_cancel_acceptance_unknown' WHERE job_id=?").run(unknown);
   const unknownDetail=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${unknown}`,context:"context"});

@@ -62,12 +62,12 @@ export class WebJobReadBroker {
     if(authority)return finish(result,result.reason==="internal_error"?"failed":"denied",result.reason==="not_found"?"resource_not_visible":result.reason==="internal_error"?"unavailable":"invalid_input");
     return result.reason==="internal_error"?result:{status:"denied",reason:result.reason};}}
   private syncProgress(row:JobRow,receivedAt:Date):void{const progress=this.progress?.get(row.job_id);if(progress)this.database.recordWebJobProgress(row.job_id,progress.sequence,progress.updated_at,receivedAt);}
-  private project(row:JobRow,principalId:string,scopes:Set<string>):WebJobProjection {const progress=this.progress?.get(row.job_id);let result:WebJobProjection["result"]=null;
+  private project(row:JobRow,principalId:string,scopes:Set<string>):WebJobProjection {const task=this.database.tasks.forAttempt(row.job_id);const progress=this.progress?.get(row.job_id);let result:WebJobProjection["result"]=null;
     if(row.result_json)try{const parsed=JSON.parse(row.result_json) as Record<string,unknown>,completed=safe(parsed.completed_at,64);
       if((parsed.status==="completed"||parsed.status==="failed")&&completed)result={status:parsed.status,summary:parsed.status==="completed"?"完了":"失敗",completed_at:completed,
         artifacts:Array.isArray(parsed.artifacts)?parsed.artifacts.slice(0,32).map(artifact).filter((value):value is NonNullable<typeof value>=>value!==null):[]};}catch{}
     const candidate=safe(row.last_error_code,64),error=candidate&&/^[a-z0-9_]+$/u.test(candidate)?candidate:null;return webJobProjectionSchema.parse({job_id:row.job_id,status:row.status,created_at:row.created_at,updated_at:row.updated_at,
       completed_at:row.completed_at,progress:progress?{sequence:progress.sequence,phase:progress.phase,updated_at:progress.updated_at}:null,result,error_code:error,
-      control:{can_cancel:row.actor_id===principalId&&scopes.has("job:cancel:own")&&["queued","preparing","dispatching","retryable_failed","running","blocked","needs_review"].includes(row.status)
+      control:{...(task?{task_id:task.task_id,revision:task.revision}:{}),can_cancel:!!task&&task.current_attempt_id===row.job_id&&task.desired_state==="running"&&row.actor_id===principalId&&scopes.has("job:cancel:own")&&["queued","preparing","dispatching","retryable_failed","running","blocked","needs_review"].includes(row.status)
         &&!(row.status==="needs_review"&&error==="web_cancel_acceptance_unknown")}});}
 }

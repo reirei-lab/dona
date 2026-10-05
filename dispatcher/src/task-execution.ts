@@ -244,7 +244,7 @@ export class TaskRepository {
     const now=new Date().toISOString();
     this.sql.prepare("UPDATE tasks SET state='waiting',desired_state='cancelled',wait_reason='cancel_requested',next_check_at=?,revision=revision+1,updated_at=? WHERE task_id=?").run(now,now,id);
     if(["queued","blocked"].includes(job.status)&&!job.dispatch_started_at&&!job.herdr_pane_id&&!job.herdr_workspace_id)
-      this.sql.prepare("UPDATE jobs SET status='cancelled',completed_at=?,updated_at=? WHERE job_id=?").run(now,now,attemptId);
+      this.sql.prepare("UPDATE jobs SET status='cancelled',completed_at=?,updated_at=?,last_error_code=NULL,last_error_message=NULL WHERE job_id=?").run(now,now,attemptId);
     return this.get(id)!;
   }
   private stampAttempt(job:JobRow,taskId:string,number:number):void {
@@ -396,7 +396,7 @@ export class TaskRepository {
   candidates(at=new Date()):TaskRow[] {
     return this.sql.prepare(`SELECT t.* FROM tasks t JOIN jobs j ON j.job_id=t.current_attempt_id
       WHERE t.state IN ('active','waiting','paused') AND NOT (t.state='paused' AND t.wait_reason='paused') AND (t.next_check_at IS NULL OR t.next_check_at<=?)
-      AND NOT (t.desired_state='running' AND t.wait_reason='runtime_profile_unavailable')
+      AND NOT (t.desired_state='running' AND COALESCE(t.wait_reason,'')='runtime_profile_unavailable')
       AND (j.status IN ('needs_review','blocked') OR t.desired_state<>'running' OR t.wait_reason IN ('cancel_requested','pause_requested','resume_requested','worker_stop_pending','steer_acceptance_unknown'))
       ORDER BY COALESCE(t.next_check_at,t.created_at),t.task_id LIMIT 8`).all(at.toISOString()) as TaskRow[];
   }

@@ -4,7 +4,7 @@ import test from "node:test";
 import Database from "better-sqlite3";
 import { DispatcherDatabase, JobCreationError, migrateDispatcherDatabase } from "../../src/database.js";
 import { assertTaskGenerationFile } from "../../src/task-execution.js";
-import { tempConfig } from "../helpers.js";
+import { tempConfig, eventEnvelope } from "../helpers.js";
 
 const owner = { instance_id: "instance", tenant_id: "tenant", principal_id: "principal" };
 const input = (key: string, objective = "web command") => ({ ...owner, idempotency_key: key, objective, workspace: { kind: "scratch" as const } });
@@ -149,7 +149,7 @@ test("Web Task取消はowner・Attempt・revisionとreceiptを同じtransaction�
   assert.throws(()=>db.cancelWebTask({...command,principal_id:"foreign"}),/owner_mismatch/);
   assert.throws(()=>db.cancelWebTask({...command,revision:task.revision+1}),/revision_conflict/);
   assert.equal(db.getWebCommandReceipt("web_cancel_"+command.idempotency_key,owner),undefined);
-  const cancelled=db.cancelWebTask(command);assert.equal(cancelled.task.state,"cancelled");
+  const cancelled=db.cancelWebTask(command);assert.equal(cancelled.task.state,"cancelled");assert.equal(db.getJob(command.attempt_id)?.last_error_code,null);assert.equal(db.getJob(command.attempt_id)?.last_error_message,null);
   const peer=new DispatcherDatabase(config.databasePath);t.after(()=>peer.close());
   assert.equal(peer.cancelWebTask(command).duplicate,true);
   assert.throws(()=>peer.cancelWebTask({...command,revision:task.revision+1}),/conflict/);
@@ -183,3 +183,14 @@ test("実行中Web Taskの取消receiptは停止完了と区別し、応答喪�
   assert.equal(db.tasks.candidates()[0]?.task_id,task.task_id);
   assert.throws(()=>db.cancelWebTask({...command,idempotency_key:"6".repeat(64)}),/revision_conflict/);
 });
+
+ test("Web profile待機の除外はwait_reason未設定の通常Task回復を妨げない", async t => {
+  const {root,config}=await tempConfig();t.after(()=>fs.rm(root,{recursive:true,force:true}));
+  const db=new DispatcherDatabase(config.databasePath);t.after(()=>db.close());
+  db.createWebTask(input("4".repeat(64)),config.jobsWorkspaceRoot,config.jobResultsDir);
+  const event=db.enqueue(eventEnvelope("web-profile-regression")).row;
+  const ordinary=db.tasks.create({source_event_id:event.event_id,task_key:"ordinary",objective:"test",workspace:{kind:"scratch"},policy:{max_attempts:3,retry_delay_ms:60000}},config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  const raw=new Database(config.databasePath);raw.prepare("UPDATE jobs SET status='blocked' WHERE job_id=?").run(ordinary.current_attempt_id);raw.close();
+  assert.equal(db.tasks.get(ordinary.task_id)?.wait_reason,null);
+  assert.deepEqual(db.tasks.candidates().map(task=>task.task_id),[ordinary.task_id]);
+ });

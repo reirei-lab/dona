@@ -6,7 +6,7 @@ const policy = fixturePolicy(), csrf = Buffer.alloc(32, 7).toString("base64url")
 const at = "2026-09-21T00:00:00.000Z";
 const job = (patch: Record<string, unknown> = {}) => ({ job_id: "job_alpha", status: "running", created_at: at, updated_at: at,
   completed_at: null, progress: { sequence: 3, phase: "implementing", updated_at: at }, result: null, error_code: null,
-  control: { can_cancel: true }, ...patch });
+  control: { can_cancel: true, task_id:"task_00000000000000000000000000", revision:7 }, ...patch });
 const headers = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "referrer-policy": "no-referrer" };
 
 async function fulfill(route: Route, body: unknown, status = 200) {
@@ -513,3 +513,11 @@ for (const viewport of [{ width: 375, height: 812 }, { width: 812, height: 375 }
     expect(f.errors).toEqual([]);
   });
 }
+
+test("取消は表示済みTask identityを送りcancel_requestedを受付済みとして扱う",async({page})=>{
+ const f=await fixture(page,{cancelReceiptOutcome:"cancel_requested"});await page.goto(policy.origin+"/");
+ await page.getByRole("button",{name:/job_alpha/}).click();await page.getByRole("button",{name:"このジョブを取り消す"}).click();await page.getByRole("button",{name:"取消を送信"}).click();
+ await expect(page.getByRole("status")).toContainText("取消受付を確認しました");
+ expect(f.calls.find(call=>call.path.endsWith("/cancel"))?.body).toMatchObject({task_id:"task_00000000000000000000000000",revision:7});
+ expect(f.cancelWrites).toBe(1);expect(f.errors).toEqual([]);
+});
