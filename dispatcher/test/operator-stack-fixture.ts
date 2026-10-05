@@ -1,3 +1,5 @@
+import Database from 'better-sqlite3';
+import {OperatorWebAuthn} from '../src/dashboard/operator-webauthn.js';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -43,6 +45,8 @@ export async function operatorStackFixture(options:{origin?:string;page?:{status
  const session=await request('/api/session',{cookie});assert.equal(session.status,200);const csrf=session.body.csrf as string;
  function startQuestion(taskId:string,kind:'question'|'approval',questionId:string){const task=db.tasks.get(taskId)!,job=db.getJob(task.current_attempt_id)!;db.beginJobPreparation(job.job_id);db.setJobRuntime(job.job_id,'w','p',JSON.stringify(['g','t']));db.beginJobDispatch(job.job_id);db.markJobRunning(job.job_id);
   const q:QuestionRecord={question_id:questionId,agent:job.agent_name,generation:'g',thread_id:'t',turn_id:'turn',rpc_id_json:'1',kind,payload_json:JSON.stringify(kind==='approval'?{command:'echo fixture'}:{questions:[{id:'scope',question:'何を調べますか？'}]}),state:'pending',answer_hash:null,created_at:new Date().toISOString()};questions.set(job.agent_name,[q]);db.enqueueWorkerQuestion(job.job_id,q);return{task:db.tasks.get(taskId)!,job,q};}
- return {db,config,port,request,cookie,csrf,session,supervisor,writes,startQuestion,setReadGate:(gate?:()=>Promise<void>)=>{readGate=gate;},async close(){await bff.close();await api.stop();runtime.closeAllConnections();await new Promise<void>(r=>runtime.close(()=>r()));reader.close();db.close();await fs.rm(root,{recursive:true,force:true});}};
+ return {db,config,port,request,setExternalApproval:api.setExternalApproval.bind(api),cookie,csrf,session,supervisor,writes,startQuestion,setReadGate:(gate?:()=>Promise<void>)=>{readGate=gate;},async close(){await bff.close();await api.stop();runtime.closeAllConnections();await new Promise<void>(r=>runtime.close(()=>r()));reader.close();db.close();await fs.rm(root,{recursive:true,force:true});}};
 }
 
+
+export function fixtureWebAuthnClock(db:DispatcherDatabase,filename:string,origin:string,wall:()=>number){const sql=new Database(filename);db.operatorWebAuthn=new OperatorWebAuthn(sql,db.operatorAuth,origin,()=>performance.now(),wall);return ()=>sql.close();}
