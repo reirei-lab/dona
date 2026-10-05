@@ -189,7 +189,7 @@ cleanup_temp() {
 }
 trap cleanup_temp EXIT
 
-$NODE_PATH "$SCRIPT_DIR/render-self-update-templates.mjs" "$INSTALL_TMP/rendered" "$INSTALL_SHA" "$BASE_DIR" "${TARGET_ROOT:+generation}" "${DONA_SIGNED_HOST_CONFIG:-}" "${DONA_TASK_GENERATION_UPDATE:-}"
+$NODE_PATH "$SCRIPT_DIR/render-self-update-templates.mjs" "$INSTALL_TMP/rendered" "$INSTALL_SHA" "$BASE_DIR" "${TARGET_ROOT:+generation}" "${DONA_SIGNED_HOST_CONFIG:-}" "${DONA_TASK_GENERATION_UPDATE:-}" "${DONA_LOCAL_APPROVAL_CONFIG:-}" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
 if [[ -n "$TARGET_ROOT" ]]; then
   EXPECTED_OLD_UPDATER_SHA=$(/usr/bin/python3 "$SCRIPT_DIR/validate-generation-install-target.py" "$BASE_DIR" "$INSTALL_TMP/rendered" "$LAUNCH_AGENTS_DIR" "$MODE")
 fi

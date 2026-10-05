@@ -77,3 +77,5 @@ Mac の `pair` コマンドには `--capability` を複数指定できます。�
 `node dispatcher/dist/dashboard/cli.js doctor /absolute/path/dashboard.json` は設定の検証後、private Dispatcher socketを通してDB・Runtime接続・operator・外部承認の保護状態を個別に照会する。`external.configured: false` は外部承認未設定であり、利用可能を意味しない。設定済みの機能が不健全な場合は終了code 1となる。これはHTTPSの別端末到達や実Slack操作の成功とは別の確認である。
 
 外部承認を有効にするDispatcherは `DONA_LOCAL_APPROVAL_CONFIG` にMacで管理する0600の設定ファイルを指定する。設定・署名・Keychain整合性の検査に失敗したときは外部承認を利用不可として診断に示す。他のTask閲覧やDispatcher受付を、初期設定の不足だけで停止しない。provisionは常駐serviceから自動実行しない。
+
+通常installerで外部承認設定を導入するには、`DONA_LOCAL_APPROVAL_CONFIG=/absolute/private/approval.json` を `scripts/install-self-update.sh` へ渡す。private設定を検証してDispatcher plistへ保存し、次回は未指定でも同じgenerationの設定を保持する。既存の `config/dispatcher.env` に同変数を設定する経路も有効で、plistの明示値が優先する。設定導入はKeychain provisionや外部承認readyの証明ではない。署名、対話provision、現在scopeとhealthの照合は[署名host手順](dispatcher-signed-host.md)と[承認運用手順](local-external-approval.md)に従う。

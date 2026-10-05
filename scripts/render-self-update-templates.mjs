@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {resolveLocalApprovalInstallConfig} from "./local-approval-install-config.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repository = path.dirname(scriptDir);
@@ -76,6 +77,7 @@ if(fs.existsSync(existingPolicy)){
 const expectedTaskMode={mode:"forward_only",schema:4,task_execution_version:1};
 if(taskInput)taskGenerationUpdate=expectedTaskMode;
 if(taskGenerationUpdate && (Object.keys(taskGenerationUpdate).sort().join(',')!=="mode,schema,task_execution_version"||Object.entries(expectedTaskMode).some(([k,v])=>taskGenerationUpdate[k]!==v)))throw Error("task_generation_update_mode_invalid");
+const localApprovalConfig=resolveLocalApprovalInstallConfig(process.argv[8],process.argv[9],values.CONFIG_ROOT);
 const xml = (value) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
 fs.mkdirSync(destination, { recursive: true, mode: 0o700 });
 for (const name of ["dev.dona.updater", "dev.dona.dispatcher", "dev.dona.slack-adapter"]) {
@@ -84,6 +86,9 @@ for (const name of ["dev.dona.updater", "dev.dona.dispatcher", "dev.dona.slack-a
   if(name==="dev.dona.dispatcher" && signedHost && (!fs.existsSync(path.join(values.RUNTIME_ROOT,"current")) || fs.existsSync(path.join(values.RUNTIME_ROOT,"current/signed-host/DonaDispatcher.app")))) body=body.replace(
     `<string>${xml(values.NODE)}</string>\n    <string>${xml(values.RUNTIME_ROOT)}/current/dispatcher/dist/cli.js</string>`,
     `<string>${xml(values.RUNTIME_ROOT)}/current/signed-host/DonaDispatcher.app/Contents/MacOS/DonaDispatcher</string>`);
+  if(name==="dev.dona.dispatcher" && localApprovalConfig) body=body.replace(
+    "<key>EnvironmentVariables</key>\n  <dict>",
+    `<key>EnvironmentVariables</key>\n  <dict>\n    <key>DONA_LOCAL_APPROVAL_CONFIG</key><string>${xml(localApprovalConfig)}</string>`);
   if (/__[A-Z_]+__/.test(body)) throw new Error(`Unresolved template token in ${name}`);
   fs.writeFileSync(path.join(destination, `${name}.plist`), body, { mode: 0o600 });
 }
