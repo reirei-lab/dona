@@ -14,9 +14,26 @@ export interface ConversationSnapshot extends ConversationIdentity {
 export const record=(x:unknown):Record<string,unknown>=>x!==null&&typeof x==="object"&&!Array.isArray(x)?x as Record<string,unknown>:{};
 const identifier=(x:unknown):string|undefined=>typeof x==="string"&&/^[a-zA-Z0-9_-]{1,160}$/.test(x)?x:undefined;
 /** 識別子全体を採り、provider prefix/version suffixを含む既知credential名を共通判定する。 */
+function credentialName(value:string):boolean {
+  const key=value.replace(/[_ -]/g,"").toLowerCase();
+  return /(?:token|password|passwd|passphrase|secret|apikey|authorization|cookie|credential|accesskey|privatekey)/.test(key)||["accountkey","sharedaccesssignature","auth","rediscliauth","npmconfigauth","clientkeydata","clientkey","sshpass","requirepass","masterauth"].includes(key)||key.endsWith("pwd");
+}
 function credentialFields(text:string):RegExpMatchArray[] {
-  return [...text.matchAll(/\b([A-Za-z_][A-Za-z0-9_-]*(?:[ ]+key)?)\b["']?\s*[:=]/gi)]
-    .filter(match=>{const key=match[1]!.replace(/[_ -]/g,"").toLowerCase();return /(?:token|password|passwd|passphrase|secret|apikey|authorization|cookie|credential|accesskey|privatekey)/.test(key)||key==="accountkey"||key==="sharedaccesssignature"||key==="auth"||key==="rediscliauth"||key==="npmconfigauth"||key==="clientkeydata"||key==="clientkey"||key==="sshpass"||key.endsWith("pwd");});
+  return [...text.matchAll(/\b([A-Za-z_][A-Za-z0-9_-]*(?:[ ]+key)?)\b["']?\s*[:=]/gi)].filter(match=>credentialName(match[1]!));
+}
+/** 設定CLIの既知文脈に限り、name value形式をassignmentと同じcredential名で検査する。 */
+function hasCredentialSetting(value:string):boolean {
+  const text=value.replace(/\\+\r?\n/g," ").replace(/\\+[nrt]/g," ");
+  const contexts=/\b(?:aws\b[^\r\n;|&]*?\bconfigure[ \t]+set|(?:npm|pnpm|yarn|gcloud)\b[^\r\n;|&]*?\bconfig[ \t]+set|git\b[^\r\n;|&]*?\bconfig(?:[ \t]+set)?|redis-cli\b[^\r\n;|&]*?\bconfig[ \t]+set)[ \t]+([^\r\n;|&]+)/gi;
+  for(const match of text.matchAll(contexts)){
+    const tokens=match[1]!.split(/\s+/).map(token=>token.replace(/^["']+|["',}]+$/g,""));
+    for(let i=0;i+1<tokens.length;i++){
+      const key=tokens[i]!;if(key.startsWith("-")||!tokens[i+1])continue;
+      // profile.foo.aws_secret_access_keyやregistryの:_authTokenも同じ既知名へ束縛する。
+      if(key.split(/[./:]/).some(credentialName))return true;
+    }
+  }
+  return false;
 }
 /** 既知CLIの認証optionを検出する表示用検査。shellとして評価せず、該当fieldを保守的に省略する。 */
 function hasCredentialCli(text:string):boolean {
@@ -79,7 +96,7 @@ export function sanitizeObservationText(value:string,limit=8192):string {
   if(value.length>131072)return "[上限を超える内容を省略]";
   let text=value.replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|$))/g,"").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g,"");
   let credentialCli=false,netrc=false,credentialFile=false;
-  const decodedText=decodedObservationText(text,stage=>{if(hasCredentialCli(stage))credentialCli=true;if(hasNetrcCredentials(stage))netrc=true;if(hasCredentialFileFormat(stage))credentialFile=true;});
+  const decodedText=decodedObservationText(text,stage=>{if(hasCredentialCli(stage)||hasCredentialSetting(stage))credentialCli=true;if(hasNetrcCredentials(stage))netrc=true;if(hasCredentialFileFormat(stage))credentialFile=true;});
   if(credentialFile)return "[認証ファイル形式の内容を省略]";
   if(netrc)return "[netrc認証情報を含む内容を省略]";
   if(credentialCli)return "[認証optionを含む内容を省略]";

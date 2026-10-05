@@ -224,3 +224,26 @@ test("Azure接続文字列のAccountKeyと標準SASは既知credentialとして�
  }
  for(const ordinary of ["Key=display-name;AccountName=foo","KeyVaultKey=public-key-name","DefaultEndpointsProtocol=https;AccountName=foo;EndpointSuffix=core.windows.net"])assert.equal(sanitizeObservationText(ordinary),ordinary);
 });
+
+test("既知設定CLIのcredential name whitespace valueは共通名判定で省略する",()=>{
+ const commands=[
+  "aws configure set aws_secret_access_key sensitive-placeholder",
+  "aws --profile dev configure set profile.dev.aws_secret_access_key sensitive-placeholder",
+  "aws configure set aws_session_token 'sensitive-placeholder'",
+  "git config --global service.password sensitive-placeholder",
+  "git -C ./repo config set service.token sensitive-placeholder",
+  "git config --file ./config http.auth sensitive-placeholder",
+  "npm config set _auth sensitive-placeholder",
+  "npm config set //registry.example/:_authToken sensitive-placeholder",
+  "pnpm config set _auth sensitive-placeholder",
+  "yarn config set npmAuthToken sensitive-placeholder",
+  "redis-cli CONFIG SET requirepass sensitive-placeholder",
+  "redis-cli CONFIG SET masterauth sensitive-placeholder",
+  "aws configure set \\\n aws_secret_access_key sensitive-placeholder",
+ ];
+ for(const command of commands)for(const text of [command,JSON.stringify({command}),encodeURIComponent(command)]){
+  assert.ok(!sanitizeObservationText(text).includes("sensitive-placeholder"),command);
+  assert.ok(!JSON.stringify(projectItem({id:"command",type:"commandExecution",command:text,aggregatedOutput:text},turn)).includes("sensitive-placeholder"),command);
+ }
+ for(const ordinary of ["aws configure set region us-east-1","git config --global user.name alice","git config set core.editor vim","npm config set registry https://registry.example","We should document aws configure set and the login screen","The token name is explained here","echo secret documentation"])assert.equal(sanitizeObservationText(ordinary),ordinary);
+});
