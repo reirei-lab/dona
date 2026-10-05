@@ -1,10 +1,15 @@
+import { assertTaskGenerationFile } from "./task-execution.js";
 import type { DispatcherConfig } from "./config.js";
 import { DispatcherApi } from "./api.js";
 import { DispatcherDatabase } from "./database.js";
-import { HerdrProcessClient } from "./herdr.js";
-import { HerdrJobAgentRuntime } from "./job-runtime.js";
+import { AppServerAgentClient,AppServerJobRuntime,runtimeSocket } from "./app-server/adapters.js";
+
 import { JobSupervisor } from "./job-supervisor.js";
+import { SlackAdapterJobNotificationVerifier } from "./job-notification-verifier.js";
 import { createLogger } from "./logger.js";
+import { SystemClock } from "./scheduler/clock.js";
+import { SchedulerService } from "./scheduler/service.js";
+import { ReminderPublisher, SlackAdapterReminderClient } from "./scheduler/reminder-publisher.js";
 import { DispatcherWorker } from "./worker.js";
 import { UpdaterClient } from "./updater-client.js";
 import {
@@ -18,10 +23,12 @@ import { startWebJobProjectionMaintenance } from "./web/job-read-maintenance.js"
 export async function runService(config: DispatcherConfig): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
   const workerLogger = createLogger("dispatcher_worker");
+  assertTaskGenerationFile(config.databasePath);
   const database = new DispatcherDatabase(config.databasePath, {
     jobsPerEventMax: config.jobsPerEventMax,
     jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,
   });
+  database.tasks.assertFreshExecutionModel();
   const updateNotificationDatabase = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
   let jobProgressStore: JobProgressStore | undefined;
   try {
@@ -32,20 +39,24 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       error_message: error instanceof Error ? error.message : String(error),
     });
   }
-  const herdr = new HerdrProcessClient({
-    executable: config.herdrPath,
-    session: config.herdrSession,
-    agentName: config.agentName,
-    waitTimeoutMs: config.agentWaitTimeoutMs,
-  });
+  const herdr = new AppServerAgentClient(runtimeSocket(config),config.agentName,config.agentWaitTimeoutMs);
   let jobSupervisor!: JobSupervisor;
   let jobProgress = jobProgressStore
     ? new JobProgressCoordinator(database, jobProgressStore, config, createLogger("dispatcher_job_progress"))
     : undefined;
-  const worker = new DispatcherWorker(database, herdr, config, workerLogger, () => jobSupervisor.wake());
+  const worker = new DispatcherWorker(database, herdr, config, workerLogger,new SlackAdapterJobNotificationVerifier(config), () => jobSupervisor.wake());
+  const scheduler = new SchedulerService(
+    database.scheduler,
+    new SystemClock(),
+    () => worker.wake(),
+    createLogger("dispatcher_scheduler"),
+    { pollMilliseconds: Math.min(config.queuePollMs, 60_000) },
+  );
+  const reminderPublisher = new ReminderPublisher(database.scheduler, new SlackAdapterReminderClient(config),
+    new SystemClock(), createLogger("dispatcher_slack_reminders"), Math.min(config.queuePollMs, 60_000));
   jobSupervisor = new JobSupervisor(
     database,
-    new HerdrJobAgentRuntime(config, jobProgress !== undefined),
+    new AppServerJobRuntime(config, jobProgress !== undefined,id=>database.getJobLiveSessionIdentity(id)?.herdr_agent_session_id??undefined,id=>!!database.tasks.forAttempt(id)),
     config,
     createLogger("dispatcher_jobs"),
     () => worker.wake(),
@@ -68,6 +79,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     new UpdaterClient(config.updaterSocketPath, config.jobCommandTimeoutMs),
     {
       async quiesce() {
+        await scheduler.stop();
+        await reminderPublisher.stop();
         worker.quiesceAfterCurrent();
         await updateNotificationWorker.stop();
         await jobSupervisor.stop();
@@ -75,11 +88,16 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     },
     updateNotificationWorker,
     jobProgress,
+    undefined,
+    () => scheduler.wake(),
+    scheduler,
   );
   let stopWebJobProjectionMaintenance:(()=>void)|undefined;
 
   try {
     await api.start();
+    // Clear stale/expired outbox fences before due materialization decides overlap for a newer occurrence.
+    database.scheduler.recover(new SystemClock().now(), true);
     jobSupervisor.recoverStaleJobs();
     try { await jobProgress?.recover(); }
     catch (error) {
@@ -102,6 +120,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       }
     }
     worker.start();
+    scheduler.start();
+    reminderPublisher.start();
     jobSupervisor.start();
     updateNotificationWorker.start();
     stopWebJobProjectionMaintenance=startWebJobProjectionMaintenance(database,error=>apiLogger.warn("Web job projection maintenance failed",{
@@ -111,7 +131,10 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     stopWebJobProjectionMaintenance?.();
     if (updateNotificationWorker.isRunning()) await updateNotificationWorker.stop();
     if (jobSupervisor.isRunning()) await jobSupervisor.stop();
+    if (scheduler.isRunning()) await scheduler.stop();
+    if (reminderPublisher.isRunning()) await reminderPublisher.stop();
     if (worker.isRunning()) await worker.stop();
+    await api.stop();
     database.close();
     updateNotificationDatabase.close();
     jobProgressStore?.close();
@@ -128,6 +151,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
         stopWebJobProjectionMaintenance?.();
         api.beginShutdown();
         await api.stop();
+        await scheduler.stop();
+        await reminderPublisher.stop();
         await updateNotificationWorker.stop();
         await jobSupervisor.stop();
         await worker.stop();

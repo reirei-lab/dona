@@ -71,6 +71,14 @@ function assertContract(source, label, patterns) {
   }
 }
 
+test("scheduled Slack確認のMCP timeoutはadapter scan期限を上回る", async () => {
+  const config=await read(".codex/config.toml");
+  const section=config.match(/\[mcp_servers\.dona_dispatcher\]([\s\S]*?)(?=\n\[|$)/)?.[1];
+  assert.ok(section,"dona_dispatcher MCP設定が必要です");
+  const timeout=Number(section.match(/tool_timeout_sec\s*=\s*(\d+)/)?.[1]);
+  assert.ok(timeout>95,"dona_dispatcher tool timeoutは95秒のlive access照合より長くします");
+});
+
 test("implicit invocation metadataとrouting boundaryが整合する", async () => {
   const [skill, openaiYaml] = await Promise.all([
     read(".agents/skills/code-submission-review-cycle/SKILL.md"),
@@ -189,6 +197,24 @@ test("stalled roundはduplicate triggerなしで停止する", async () => {
     /title\/body hash.*merge-target contract hash.*closing relationship hash.*closing issue scope hash.*変わった.*current template.*current Issue内容の完了条件.*reconcile/,
     /findings.*`eyes`消失.*terminal review\/completion.*feedback処理やhead変更を始めない/,
     /terminal後.*reviews.*inline comments.*pagination.*全finding集合を固定/,
+  ]);
+});
+
+test("security reviewのusage limitは通常code reviewと分離する", async () => {
+  const reviewRound = await read(".agents/skills/code-submission-review-cycle/references/review-round.md");
+  const polling = section(reviewRound, "30〜60秒間隔で全sourceをpollする");
+  const decision = section(reviewRound, "round結果を判定する");
+
+  assertContract(polling, "security review usage limit boundary", [
+    /security review.*通常のcode review.*別のsignal/,
+    /security reviewだけ.*usage limit.*未実行.*通常reviewのfailure.*finding.*pending.*clean signal.*数えず/,
+    /security review由来.*usage limitによる未実行.*一意に確認/,
+    /通常reviewの`\+1`.*no-major-issues\/no-findings.*代替しない/,
+    /通常review自身のusage limit.*無視せず.*clean evidence不足.*停止/,
+  ]);
+  assertContract(decision, "security review does not weaken completion", [
+    /security reviewだけ.*usage limit.*未実行.*通常roundの結果から除外/,
+    /通常reviewのclean signal.*current identity.*CI.*未解決finding.*省略しない/,
   ]);
 });
 

@@ -177,6 +177,9 @@ export const runtimeOperationKinds = [
   "start_target_slack",
   "restart_current_dispatcher",
   "restart_current_slack",
+  "restart_target_dispatcher_after_drain",
+  "restart_target_slack_after_drain",
+  "restart_target_main_agent_after_drain",
   "stop_target_slack",
   "stop_target_dispatcher",
   "stop_target_main_agent",
@@ -219,6 +222,7 @@ export type CompletionLookupResult =
 export interface HealthSnapshot {
   service: "dispatcher" | "slack_adapter";
   live: boolean;
+  observed?: boolean;
   ready: boolean;
   build_sha: string | null;
   protocol: number | null;
@@ -273,6 +277,42 @@ export interface CommandResult {
   timed_out: boolean;
   output_truncated: boolean;
   output_checkpoint?: string;
+  exit_signal?: NodeJS.Signals;
+  cleanup_status?: string;
+  spawn_error?: string;
+  diagnostic_log?: DiagnosticLogCapture;
+}
+
+export type DiagnosticLogStoredState = "capturing" | "complete" | "truncated" | "write_failed" | "purged";
+export type DiagnosticLogState = DiagnosticLogStoredState | "missing" | "read_error" | "size_mismatch";
+
+export interface DiagnosticLogIdentity {
+  request_id: string;
+  attempt: number;
+  step: string;
+}
+
+export interface DiagnosticLogCapture extends DiagnosticLogIdentity {
+  log_id: string;
+  relative_ref: string | null;
+  byte_size: number;
+  content_sha256: string | null;
+  capture_state: Exclude<DiagnosticLogStoredState, "capturing" | "purged">;
+  error_code: string | null;
+  created_at: string;
+  finalized_at: string;
+}
+
+export interface DiagnosticLogRow extends DiagnosticLogIdentity {
+  log_id: string;
+  relative_ref: string | null;
+  byte_size: number;
+  content_sha256: string | null;
+  capture_state: DiagnosticLogStoredState;
+  error_code: string | null;
+  created_at: string;
+  finalized_at: string | null;
+  purged_at: string | null;
 }
 
 export interface ActivationReceipt {

@@ -10,12 +10,35 @@ export class DispatcherClientError extends Error {
 export class DispatcherApiClient {
   constructor(private readonly socketPath: string, private readonly timeoutMs = 10_000) {}
 
+  createTask(input:unknown):Promise<Record<string,unknown>> {return this.request("POST","/v1/tasks",input);}
+  inspectTaskRecovery(id:string,eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/${encodeURIComponent(id)}/recovery?${new URLSearchParams({source_event_id:eventId})}`);}
+  getTaskQuestions(id:string,eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/${encodeURIComponent(id)}/questions?${new URLSearchParams({source_event_id:eventId})}`);}
+  getTask(id:string,eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/${encodeURIComponent(id)}?${new URLSearchParams({source_event_id:eventId})}`);}
+  findIssueTask(eventId:string,repository:string,issueNumber:number):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/issue?${new URLSearchParams({source_event_id:eventId,repository,issue_number:String(issueNumber)})}`);}
+  listTasks(eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks?${new URLSearchParams({source_event_id:eventId})}`);}
+  controlTask(id:string,action:string,input:unknown):Promise<Record<string,unknown>> {return this.request("POST",`/v1/tasks/${encodeURIComponent(id)}/${encodeURIComponent(action)}`,input);}
+
+  inspectWorker(jobId: string, sourceEventId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/v1/jobs/${encodeURIComponent(jobId)}/worker?${new URLSearchParams({source_event_id:sourceEventId})}`);
+  }
+  resumeJob(jobId: string, input: unknown): Promise<Record<string, unknown>> {
+    return this.request("POST", `/v1/jobs/${encodeURIComponent(jobId)}/resume`, input);
+  }
+
   createJob(input: unknown): Promise<Record<string, unknown>> {
     return this.request("POST", "/v1/jobs", input);
   }
 
-  getJob(jobId: string, sourceEventId?: string): Promise<Record<string, unknown>> {
-    const query = sourceEventId === undefined ? "" : `?${new URLSearchParams({ source_event_id: sourceEventId })}`;
+  delegateScheduledWork(eventId: string): Promise<Record<string, unknown>> {
+    return this.request("POST", `/v1/scheduled-jobs/${encodeURIComponent(eventId)}/delegate`, {});
+  }
+
+  getJob(jobId: string, sourceEventId?: string, options?:{includeLiveSession?:boolean;liveSessionReceiptId?:string}): Promise<Record<string, unknown>> {
+    const params=new URLSearchParams();
+    if(sourceEventId!==undefined)params.set("source_event_id",sourceEventId);
+    if(options?.includeLiveSession)params.set("include_live_session","true");
+    const query=params.size===0?"":`?${params}`;
+    if(options?.liveSessionReceiptId)return this.request("GET",`/v1/jobs/${encodeURIComponent(jobId)}/live-session-receipts/${encodeURIComponent(options.liveSessionReceiptId)}${query}`);
     return this.request("GET", `/v1/jobs/${encodeURIComponent(jobId)}${query}`);
   }
 
@@ -31,6 +54,13 @@ export class DispatcherApiClient {
     return this.request("GET", `/v1/events/${encodeURIComponent(sourceEventId)}/jobs${suffix}`);
   }
 
+  authorizeJobNotification(eventId:string,receipt?:string):Promise<Record<string,unknown>> {
+    return this.request("POST",`/v1/job-notifications/${encodeURIComponent(eventId)}/authorize`,receipt?{receipt}:{});
+  }
+  recordScheduleJobAccess(eventId:string,receipt:string):Promise<Record<string,unknown>> {
+    return this.request("POST",`/v1/scheduled-jobs/${encodeURIComponent(eventId)}/access`,{receipt});
+  }
+
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>> {
     const query = new URLSearchParams({
       workspace_id: workspaceId,
@@ -40,6 +70,10 @@ export class DispatcherApiClient {
     return this.request("GET", `/v1/jobs?${query}`);
   }
 
+  listOwnerJobs(sourceEventId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/v1/jobs?${new URLSearchParams({ source_event_id: sourceEventId })}`);
+  }
+
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>> {
     return this.request("POST", `/v1/jobs/${encodeURIComponent(jobId)}/steer`, input);
   }
@@ -47,6 +81,13 @@ export class DispatcherApiClient {
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>> {
     return this.request("POST", `/v1/jobs/${encodeURIComponent(jobId)}/cancel`, input);
   }
+  previewSchedule(input: unknown) { return this.request("POST", "/v1/schedules/preview", input); }
+  createSchedule(input: unknown) { return this.request("POST", "/v1/schedules", input); }
+  getSchedule(scheduleId: string, sourceEventId: string) { return this.request("GET", `/v1/schedules/${encodeURIComponent(scheduleId)}?source_event_id=${encodeURIComponent(sourceEventId)}`); }
+  listSchedules(sourceEventId: string, limit: number, cursor?: string) { const q = new URLSearchParams({ source_event_id: sourceEventId, limit: String(limit), ...(cursor ? { cursor } : {}) }); return this.request("GET", `/v1/schedules?${q}`); }
+  updateSchedule(scheduleId: string, input: unknown) { return this.request("PATCH", `/v1/schedules/${encodeURIComponent(scheduleId)}`, input); }
+  transitionSchedule(scheduleId: string, action: "pause"|"resume"|"cancel", input: unknown) { return this.request("POST", `/v1/schedules/${encodeURIComponent(scheduleId)}/${action}`, input); }
+  getScheduleHistory(scheduleId: string, sourceEventId: string, limit: number, cursor?: string) { const q = new URLSearchParams({ source_event_id: sourceEventId, limit: String(limit), ...(cursor ? { cursor } : {}) }); return this.request("GET", `/v1/schedules/${encodeURIComponent(scheduleId)}/runs?${q}`); }
 
   planSelfUpdate(input: unknown): Promise<Record<string, unknown>> {
     return this.request("POST", "/v1/self-update/plan", input);

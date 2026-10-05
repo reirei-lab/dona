@@ -17,7 +17,7 @@ export interface HerdrCommandResult {
 
 export interface HerdrClient {
   get(signal?: AbortSignal): Promise<HerdrCommandResult>;
-  prompt(text: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  prompt(text: string, signal?: AbortSignal, operationKey?: string): Promise<HerdrCommandResult>;
   wait(signal?: AbortSignal): Promise<HerdrCommandResult>;
 }
 

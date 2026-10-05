@@ -41,6 +41,7 @@ Herdr連携の初期値は次のとおりです。
 HERDR_SESSION=dona
 DONA_AGENT_NAME=dona-main
 DONA_HERDR_PATH=herdr
+DONA_CODEX_PATH=codex
 DONA_AGENT_MISSING_GRACE_MS=5000
 DONA_JOBS_WORKSPACE_ROOT=~/.dona/workspaces
 DONA_JOB_RESULTS_DIR=~/Library/Application Support/Dona/job-results
@@ -76,7 +77,13 @@ herdr --session dona agent wait dona-main --until idle --until done --until bloc
 
 最初のbackground job promptだけは`DONA_JOB_PROMPT_TIMEOUT_MS`（既定30秒）をstatus待機へ使い、汎用`DONA_JOB_COMMAND_TIMEOUT_MS`は変更しません。受理不明時はさらに`DONA_JOB_PROMPT_RECONCILE_MS`（既定30秒）のmonotonic absolute deadline内で、`DONA_JOB_PROMPT_RECONCILE_POLL_MS`（既定5秒）ごとに同一agent identity、`state_change_seq`、Result Envelopeをread-onlyで照合します。各status readはpoll間隔と残り時間の小さい方を上限にし、最終deadlineでもResultを再確認します。準備やprocess cleanupを除く既定の最大待機は概ねprompt 30秒 + reconcile 30秒です。運用判断は[background job prompt reconcile runbook](../docs/operations/background-job-prompt-reconcile.md)を参照してください。
 
+通常・schedule両方のworkerに`--model gpt-6.1-sol -c 'model_reasoning_effort="low"'`を明示します。新規起動時に適用し、実行中sessionの設定は変更しません。詳細は[モデル設定と検証](../docs/operations/codex-model-settings.md)を参照してください。
+
 バックグラウンドジョブでは、専用workspaceまたはworktreeを`--no-focus`で作り、30文字の`job_id`をそのままHerdr agent名としてCodexを起動します。新規`job_id`はULID互換の26文字の末尾4文字を固定slugにし、たとえば改善作業は`job_01m1ne631mt99zdpwfmrwsenhc`になります。slugは外部入力を転写せず、`enhc`（改善）、`mend`（修正）、`feat`（実装）、`test`（テスト）、`read`（文書）、`rvwx`（レビュー）、`rsch`（調査）、`sync`（更新）、`send`（デプロイ）、`tags`（リリース）、`task`（その他）の固定語彙から選びます。ULIDの時刻部と60bitのランダム値を保持し、既存のjob ID形式、DB schema v2、`agent_name = job_id`も維持するため、旧リリースへ戻した場合も新規ジョブを同じ名前で制御できます。`job_id`は従来どおりDB主キー、API、workspace/worktree path、branch、Result Envelopeに使い、永続済みのagent名も再起動時にそのまま使います。
+
+`delegate_job`へ表示専用の`display_name`を明示すると、新規workspaceの`--label`だけに使用します。構造化した`issue_repository`と`issue_number`も指定し、workspaceのrepositoryと一致する場合は`#<number> <display_name>`、Issue参照がない場合は短い作業名だけを表示します。objective全文やIssue titleから表示名を推測しません。NFC正規化、制御・ANSI・双方向制御文字の除去、空白の正規化を行い、URL、private path、secret相当、空文字、repository不一致は安全側で`agent_name`へfallbackします。最終ラベルはIssue prefixを含む48 Unicode code point以下で、UTF-16 surrogateを途中分割しません。画面幅によるHerdr側の省略はこの保存上限とは別です。
+
+正規化済みラベルはworkspace生成前に既存の`workspace_json`拡張metadataへ保存され、Dispatcher再起動や生成再開でも外部titleを再取得せず同じ値を再利用します。旧job、metadata欠落・破損、未知metadataを持つjobは従来の`agent_name`へfallbackし、独立schema migrationを必要としません。ラベルはlookup、認可、owner、routing、idempotency、Herdrのstart/get/prompt/wait/steer/cancelには使わず、argvの単一要素としてのみ渡します。fake Herdrでは3生成経路、identity維持、再起動・応答喪失を検証していますが、production processを操作する実画面・幅狭時の省略・Herdr cold restoreの確認はこの変更では未実施です。
 
 Codex 0.152.0でも有効な`projects = { "<path>" = { trust_level = "trusted" } }`inline tableを起動時overrideに使い、scratch jobではDispatcherが生成した`<jobsWorkspaceRoot>/scratch/<job_id>`との完全一致を検証した当該workspace 1件だけ、GitHub jobでは従来どおり検証・選択したrepositoryとworktreeだけをtrustします。scratch root、job-results、global Codex configはtrust対象にしません。これはsandbox、command approval、network policyを変更する設定ではありません。稼働中agentへの`agent prompt`はCodexのsteerとして扱われます。Dispatcher以外はジョブagentを直接操作しません。
 
@@ -84,16 +91,26 @@ Codex 0.152.0でも有効な`projects = { "<path>" = { trust_level = "trusted" }
 
 Dispatcher packageには、常駐Dispatcherとは別プロセスのstdio MCPも含まれます。MCP自身はSQLiteやHerdrへ直接触らず、常駐DispatcherのUDS APIだけを呼びます。
 
+schedule操作は、呼出し元が指定したworkspace・actor・返信先を信用しません。`source_event_id`で保存済みSlack eventを引き、actor、workspace、固定thread、30日以内のauthorization snapshotをserver-sideで組み立てます。`preview_schedule`で有限horizonのoccurrence・policy・固定target・失効時刻を確認してから、`create_schedule`を呼びます。writeのtimeoutや切断時はblind retryせず、同じidempotency keyの状態を`get_schedule`または`list_schedules`で照合してください。updateとpause/resume/cancelは必ず取得済みの`expected_revision`を渡します。利用例、security model、release/rollback gateは[Scheduler 利用・release gateガイド](../docs/scheduler-guide.md)を参照してください。
+
 - `delegate_job`: 長い調査・開発をscratchまたはGitHub worktreeへ委任。同じsource eventでは安定した`job_key`ごとにcreate/reuseを判定
 - `list_event_jobs`: create応答喪失時に`source_event_id`と任意の`job_key`から、writeを再送せずjobを照合。元の`objective`とworkspaceも渡すとcanonical payloadの`matched` / `conflict`を判定
 - `list_thread_jobs`: Slack threadに紐づくジョブを列挙
-- `get_job_status`: 現在の`source_event_id`と明示`job_id`でthreadを照合。 状態と結果を取得
+- `get_job_status`: 現在の`source_event_id`と明示`job_id`でthreadを照合。状態と結果を取得。`include_live_session: true`で保存済みexact identityだけをboundedに観測し、`live_session_receipt_id`で既存receiptを再読
 - `steer_job`: 同じthreadの後続イベントを稼働中Codex turnへsteer
 - `cancel_job`: ジョブを中止
 - `plan_self_update`: fixed mainのexact SHA update planを作る（read-only）
 - `apply_self_update`: exact plan hashと明示承認receiptを投入（destructive）
 - `get_self_update_status`: state、fence、SHA、health、outboxを取得（read-only）
 - `cancel_self_update`: activation前にcancel。外部mutation後はneeds_review（destructive）
+- `preview_schedule` / `create_schedule`: scheduleの安全なpreviewと冪等作成
+- `get_schedule` / `list_schedules` / `update_schedule`: owner-scoped CRUDとoptimistic revision更新
+- `pause_schedule` / `resume_schedule` / `cancel_schedule`: 冪等な状態遷移
+- `get_schedule_history`: bounded paginationのrun履歴（本文・secretは非投影）
+
+対応UDS routeは`POST /v1/schedules/preview`、`POST|GET /v1/schedules`、`GET|PATCH /v1/schedules/:id`、`POST /v1/schedules/:id/{pause,resume,cancel}`、`GET /v1/schedules/:id/runs`です。due scan、Slack投稿、background job実行、自然言語日時解析はこのsurfaceの責務外です。
+
+live session観測は既定offです。`GET /v1/jobs/:job_id?source_event_id=...&include_live_session=true`は保存済みworkspace、pane、agent名、Herdr agent session IDの完全一致だけを照合し、実行するHerdr操作は`agent get`に限定します。prompt、Enter、start、wait、steer、cancel、job state更新、Result生成、自動復活は行いません。結果はraw identity、stdout/stderr、objective、pathを除いたsnapshotとopaque receiptです。`GET /v1/jobs/:job_id/live-session-receipts/:receipt_id?source_event_id=...`は新しいHerdr queryを行わず、再起動後も同じreceiptを再読します。状態行列、retention、migration/rollback、運用判断は[live session照合runbook](../docs/operations/live-session-reconciliation.md)を参照してください。
 
 `apply_self_update`のacceptedはupdater DB commit後だけ返ります。元のSlack受付eventが`completed`になる前にupdaterはactivationをclaimしません。timeoutや接続切断でapply/cancelのacceptanceが不明な場合は、同じwriteを再送せずstatusを確認します。
 
@@ -105,7 +122,13 @@ terminal updateは`source: dona_update`としてDispatcherへ戻ります。外�
 
 ジョブが`completed`、`failed`、`blocked`、`cancelled`、`needs_review`になると、Dispatcherは同じSQLiteへ`source: dona_job`の内部イベントを冪等に追加します。`dona-main`がそのイベントを通常の直列キューで受け、必要なSlack応答とAgent Sessionの状態変更を行います。ジョブworkerはSlackへ直接書き込みません。セルフアップデート通知は前述の専用workerだけが、固定文面・固定宛先でSlack Adapterへ依頼します。
 
-明示的な`job_key`を持つ複数jobでは、元のsource eventが`dispatching` / `waiting_agent`から離れるtransaction内でgroupをsealし、それまではjob通知をメインキューへ流しません。各通知にはResult全文とは別の最大32件のboundedなgroup snapshotと`progress` / `attention` / `all_terminal` transitionを付けます。`progress`はAgent Sessionを変更せず、最初の`attention`だけが`suspended`、attention対象がなく全jobが`completed`または`cancelled`になった最初の`all_terminal`だけが`active`を所有します。`all_terminal`を処理する`dona-main`は`list_event_jobs`で全jobのdurable summaryを列挙し、snapshot内の各IDへread-onlyな`get_job_status`を使って先行jobのResultも集約するため、owner 1件の`payload.result`だけを全体結果として誤用しません。transition claim、event enqueue、jobの`completion_event_id`更新は1 transactionなので、再起動後は未通知jobだけを再照合できます。v2移行由来の単一jobと`job_key`省略callerはgroup fieldのない従来通知を維持します。
+明示的な`job_key`を持つ複数jobでは、元のsource eventが`dispatching` / `waiting_agent`から離れるtransaction内でgroupをsealし、それまではjob通知をメインキューへ流しません。各通知にはResult全文とは別の最大32件のboundedなgroup snapshotと`progress` / `attention` / `all_terminal` transitionを付けます。`progress`はAgent Sessionを変更せず、最初の`attention`だけが`suspended`を所有します。`blocked` / `needs_review`は状態が解消するまで、`failed`は検証済みlate Resultまたは監査付きoperator reconcileまで、永続resolution fenceが`all_terminal`を拒否します。attention配送やSession変更の結果が曖昧な場合も、確認receiptを得るまでfenceを保持します。`all_terminal`のsnapshotには`attention_resolution_state`を付け、`dona-main`は`not_required`か`resolved`を確認した後だけ最終報告と`active`遷移を行います。最終報告には`list_event_jobs`で全jobのdurable summaryを列挙し、snapshot内の各IDへread-onlyな`get_job_status`を使って先行jobのResultも集約します。transition claim、event enqueue、jobの`completion_event_id`更新は1 transactionなので、再起動後は未通知jobだけを再照合できます。v2移行由来の単一jobと`job_key`省略callerはgroup fieldのない従来通知を維持します。
+
+operatorが`failed`のattention原因を最終状態として確定する場合は、先にattention通知とSession `suspended`の記録を確認し、`job resolve-failed-attention <source_event_id> <job_id> <attention_event_id> <expected_updated_at> --notification-reviewed --side-effects-reviewed`を使います。`needs_review`でResultがない場合は、最新のlive session receipt、worker停止、side effectを確認し、`job resolve-review-attention <source_event_id> <job_id> <attention_event_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed`を使います。通知の受理が曖昧な場合は、Slack上の対象message timestampと本文SHA-256を確認したうえで`job reconcile-attention-delivery <source_event_id> <attention_event_id> <expected_event_updated_at> <message_ts> <body_sha256> --notification-reviewed`を使います。後者はSlack write前に永続claimを取得し、Slack Adapterでevent identity block、本文、thread、投稿者、Session `suspended`を検証してからreceiptを保存します。timeout時は出力済みclaim tokenと同じ引数に`--resume <claim_token>`を付けて、operatorが既存receiptと状態を確認してから再開します。claimが残る間は`all_terminal`をclaimできません。AdapterがSession write前に確定的に拒否したことをoperatorが確認した場合に限り、`job release-rejected-attention-claim <source_event_id> <attention_event_id> <expected_event_updated_at> <claim_token> --definitive-rejection-reviewed --no-session-write-reviewed`で監査記録を残してclaimを解除し、訂正した値で新規照合できます。timeoutや受理不明では解除せず、同じ投稿を再送しません。
+
+原因jobのattentionをlate Result、operator reconcile、明示取消で解消した時点で別の未解決jobが残る場合は、配送済みattentionのownerを解除し、次の通知候補へ引き継ぎます。配送確認receiptまたは通常のattention Resultが解消後に保存された場合も同じ引継ぎを行います。配送reconcileのclaim中はownerを維持し、receipt保存後に再評価します。operator解消とinvalid Resultのresolutionはattention payloadの原因jobに限ります。原因jobの解消後に別jobが失敗した場合は、その通知生成時にも引継ぎを再評価します。Slack actionに`error`または`ok: false`があるResultや、最後の確定Session状態が`suspended`でないResultは配送成功の証拠に使いません。
+
+旧版で`all_terminal`をclaimしたDBを再起動した場合、attentionの有無や現在のjob statusにかかわらずresolution fieldを欠く旧claimを検出します。未配送が確定した`queued` / `retryable_failed` eventだけをtransaction内でsupersedeし、job linkとgroup ownerを解除します。全jobが`completed` / `cancelled`なら旧attention ownerも解除し、新しい最終通知を生成できます。再生成通知の外部IDには旧claimのevent IDを含め、旧attention通知と衝突させません。投稿受理が不明な状態は`job_attention_legacy_claims`に`needs_review`として記録し、自動的に再投稿・`active`遷移しません。`job attention-recovery <source_event_id>`でその監査状態を確認します。既送信通知の判別や自動再実行は行いません。
 
 ### background jobのAgent Status進捗
 
@@ -119,7 +142,7 @@ live smokeはrelease適用後に、専用test threadで`implementing`から`test
 
 Dispatcher DB schema v3は、v2の`jobs.source_event_id UNIQUE`を`UNIQUE(source_event_id, job_key)`へtransactionalにrebuildします。既存jobは`job_key = legacy-default`へbackfillされ、全job列、Result、runtime identity、completion eventを保持します。source eventごとの`job_groups`も同じtransactionで作成し、通知済みjobは`notification_mode = legacy`、未通知jobは`grouped`として区別します。migration失敗時は旧tableと`PRAGMA user_version = 2`がそのままrollbackされます。production backup/restoreとactivationはこの自動migrationとは別のrelease手順で、WAL稼働中DBの単体file copyをbackup扱いしません。
 
-新規jobは作成時canonical payloadのSHA-256を`workspace_json`内のDispatcher予約metadataへ保存し、後続steerで`objective`が変わってもcreate/reuse判定を固定します。v2から移行した`legacy-default` rowには作成時payloadが存在しないためhashを推測せず、payload付き照合では`unverified_legacy`を返して従来の単一job reuseを維持します。予約metadataはworker promptと`dona_job` payloadのworkspace projectionから除外されます。
+新規jobは作成時canonical payloadのSHA-256を`workspace_json`内のDispatcher予約metadataへ保存し、後続steerで`objective`が変わってもcreate/reuse判定を固定します。表示専用metadataはrollback時にも旧版と同じcreate/reuse照合を維持するため、この実行payload hashから分離します。v2から移行した`legacy-default` rowには作成時payloadが存在しないためhashを推測せず、payload付き照合では`unverified_legacy`を返して従来の単一job reuseを維持します。予約metadataはworker promptと`dona_job` payloadのworkspace projectionから除外されます。
 
 Codexで`/clear`するとagent sessionが置き換わり、Herdr上の`dona-main`という名前が解除される場合があります。`waiting_agent`の処理中は`/clear`を避けてください。解除された場合は`herdr --session dona agent list`で対象の`pane_id`を確認し、次のように名前を戻します。
 
@@ -183,6 +206,10 @@ npm exec -- tsx src/cli.ts event retry evt_... --force
 npm exec -- tsx src/cli.ts job list
 npm exec -- tsx src/cli.ts job list --status running
 npm exec -- tsx src/cli.ts job show job_...
+npm exec -- tsx src/cli.ts job show job_... --live-session
+npm exec -- tsx src/cli.ts job show job_... --live-session-receipt lsr_...
+npm exec -- tsx src/cli.ts job live-session-retention
+npm exec -- tsx src/cli.ts job live-session-retention --apply --force
 ```
 
 `blocked`または`needs_review`のretryには`--force`が必要です。Herdr画面、結果ファイル、構造化ログを確認し、二重実行の可能性を理解した場合だけ実行してください。
@@ -222,3 +249,9 @@ create/steer/cancel/promptのtimeout・切断はblind retryせず、read-only re
 MCPのcreate/steer/cancel応答とthread候補はDB rowのallowlist projectionで、objective・workspace/result path・runtime identityを除外します。thread候補は最大100件で、`truncated: true`なら省略の可能性があるため最新1件を選びません。詳細Resultは明示status取得時だけ返します。HTTPのsource_event_id省略status取得は既存ローカルCLI互換用であり、MCPはevent IDを必須にします。
 
 詳細statusの`last_error_message`は最大2,000文字に制限し、既知のobjective/path/runtime値と典型的なcredential・URL・絶対pathを秘匿して返します。`blocked`/`needs_review`でResultがなくても理由を確認できます。自由文の完全な秘密検出を保証するものではなく、未信頼の説明データとして扱い、外部投稿前にも確認します。候補・create/control応答には含めません。
+
+Herdrの`agent start`応答にsession IDがない場合、Dispatcherはprompt送信前に同じagent名を`agent get`で一度読み、workspace・pane・agent名が一致するsession IDだけを保存します。readに失敗した場合は既に起動したworkerを再作成せず、live queryは`not_addressable`のまま安全側に倒します。既存jobの欠落したsession IDをagent名やpaneから後付け推定しません。Herdrの公開statusには待機中の承認・入力の内容を安全に分類したfieldがないため、`blocked`は待機中という型付き状態まで表示し、prompt本文やpane内容は取得・転送しません。
+
+## Task世代の通常実行
+
+通常の長時間作業は`delegate_task`、状態確認は`get_task` / `list_tasks`を使う。Task IDはworker交代後も維持され、Attempt（内部job）は履歴として残る。ProjectはDispatcherの投影であり、workerは担当fieldを書かない。旧job操作の記述は旧世代の保守用で、新Taskの制御にはTask IDとrevisionを使う。詳細はリポジトリの`docs/operations/task-execution.md`とADR 0004を参照する。

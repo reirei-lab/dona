@@ -1,6 +1,7 @@
 import type {
   ActivationReceipt,
   CommandResult,
+  DiagnosticLogIdentity,
   Compatibility,
   DrainSnapshot,
   HealthSnapshot,
@@ -34,7 +35,7 @@ export interface GitPort {
 
 export interface BuildPort {
   toolchain(): Promise<{ node_version: string; npm_version: string }>;
-  buildRelease(checkoutPath: string): Promise<{
+  buildRelease(checkoutPath: string, diagnostic?: Omit<DiagnosticLogIdentity, "step">): Promise<{
     lock_hashes: Record<string, string>;
     node_version: string;
     npm_version: string;
@@ -57,10 +58,15 @@ export interface ReleaseStorePort {
 }
 
 export interface RuntimePort {
+  workerSafety(): Promise<{ safe: boolean; active_worker_count: number; error_code?: string }>;
   quiesceSlack(requestId: string, targetSha: string): Promise<DrainSnapshot>;
   quiesceDispatcher(requestId: string, targetSha: string): Promise<DrainSnapshot>;
+  slackDrainStatus(): Promise<DrainSnapshot>;
+  dispatcherDrainStatus(): Promise<DrainSnapshot>;
   stopSlack(): Promise<CommandResult>;
+  slackRegistered(): Promise<boolean>;
   stopDispatcher(): Promise<CommandResult>;
+  dispatcherRegistered(): Promise<boolean>;
   migrateAppSchema(requestId: string, targetSha: string, previous: Compatibility, target: Compatibility): Promise<CommandResult>;
   appSchemaState(): Promise<{ user_version: number; integrity_ok: boolean; foreign_key_violations: number }>;
   schemaMigrationCapability(capability: string): Promise<{ ready: boolean; build_sha: string | null }>;

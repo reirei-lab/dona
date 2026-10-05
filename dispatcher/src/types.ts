@@ -35,7 +35,7 @@ export type JobGroupTransition = "progress" | "attention" | "all_terminal";
 
 export interface EventEnvelope {
   schema_version: 1;
-  source: "slack" | "web" | "dona_job" | "dona_update";
+  source: "slack" | "web" | "dona_job" | "dona_update" | "dona_schedule";
   external_event_id: string;
   type: string;
   occurred_at: string;
@@ -49,17 +49,24 @@ export type JobWorkspace =
   | { kind: "scratch" }
   | { kind: "github"; repository: string; base_ref?: string };
 
+export interface JobDisplay {
+  short_name: string;
+  issue?: { repository: string; number: number };
+}
+
 export interface CreateJobRequest {
   source_event_id: string;
   job_key?: string;
   objective: string;
   workspace: JobWorkspace;
+  display?: JobDisplay;
 }
 
 export interface CanonicalJobPayload {
   objective: string;
   workspace: JobWorkspace;
 }
+
 
 export interface SteerJobRequest {
   source_event_id: string;
@@ -121,6 +128,8 @@ export interface EventRow {
   last_error_message: string | null;
   created_at: string;
   updated_at: string;
+  schedule_access_checked_at: string | null;
+  schedule_access_consumed_at: string | null;
 }
 
 export interface EnqueueResult {
@@ -173,6 +182,7 @@ export interface JobGroupRow {
 
 export interface JobGroupSnapshot {
   source_event_id: string;
+  attention_resolution_state: "not_required" | "unresolved" | "resolved";
   total: number;
   pending: number;
   status_counts: Partial<Record<JobStatus, number>>;

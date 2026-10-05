@@ -8,7 +8,8 @@ import { promisify } from "node:util";
 
 import { DispatcherDatabase } from "../src/database.js";
 import { buildJobPrompt } from "../src/job-prompt.js";
-import { codexAgentArguments, HerdrJobAgentRuntime } from "../src/job-runtime.js";
+import { codexAgentArguments, HerdrJobAgentRuntime, parseScheduledMcpInventory, PreparedWorkspaceCleanupError } from "../src/job-runtime.js";
+import { scheduledPermissionArguments } from "../src/scheduled-sandbox.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
@@ -37,6 +38,12 @@ process.stdout.write(JSON.stringify({
     assert.equal(JSON.parse(result.stdout).input, "");
   });
 
+  test("rejects missing or malformed scheduled MCP identities", () => {
+    assert.deepEqual(parseScheduledMcpInventory([{name:"slack"},{name:"github_1"}]),["slack","github_1"]);
+    for(const inventory of [[{}],[{name:undefined}],[{name:""}],[{name:"bad.name"}],null])
+      assert.throws(()=>parseScheduledMcpInventory(inventory),/MCP (?:inventory|identity) was invalid/);
+  });
+
   test("promptだけに専用status timeoutを渡し汎用command timeoutを維持する", async () => {
     const { root, config: baseConfig } = await tempConfig(); roots.push(root);
     const capturePath = path.join(root, "prompt-argv.json");
@@ -59,16 +66,46 @@ process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
     assert.equal(args.includes("77"), false);
   });
 
+  test("steer submission omits the worker state wait while the initial prompt retains it", async () => {
+    const { root, config: baseConfig } = await tempConfig(); roots.push(root);
+    const capturePath = path.join(root, "argv.json");
+    const fakeHerdrPath = path.join(root, "herdr.mjs");
+    await fs.writeFile(fakeHerdrPath, `#!/usr/bin/env node
+import fs from "node:fs";
+const args = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(args));
+if (args.includes("--wait")) process.exit(2);
+process.stdout.write(JSON.stringify({result:{agent_status:"idle"}}));
+`, { mode: 0o700 });
+    const runtime = new HerdrJobAgentRuntime({ ...baseConfig, herdrPath: fakeHerdrPath });
+    const submitted = await runtime.prompt("job_123", "追加条件", undefined, undefined, true);
+    assert.equal(submitted.ok, true);
+    assert.equal(submitted.agentStatus, "idle");
+    const args = JSON.parse(await fs.readFile(capturePath, "utf8")) as string[];
+    assert.deepEqual(args.slice(0, 6), ["--session", baseConfig.herdrSession, "agent", "prompt", "job_123", "追加条件"]);
+    assert.equal(args.includes("--wait"), false);
+    assert.equal((await runtime.prompt("job_123", "初回")).ok, false);
+    assert.equal((JSON.parse(await fs.readFile(capturePath, "utf8")) as string[]).includes("--wait"), true);
+  });
+
   test("omits the progress directory and prompt contract when progress is disabled", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
     const source = database.enqueue(eventEnvelope("Ev-runtime-no-progress")).row;
     const job = database.createJob({ source_event_id:source.event_id, objective:"調査する", workspace:{ kind:"scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
-    const args = codexAgentArguments(job, config, false);
+    const args = codexAgentArguments(job, config, [], false);
     assert.equal(args.includes(path.dirname(job.workspace_path)), false);
+    assert.equal(args[args.indexOf("--model") + 1], "gpt-6.1-sol");
+    assert.ok(args.includes('model_reasoning_effort="low"'));
     const prompt = buildJobPrompt(job, false);
     assert.equal(prompt.includes("progress_path"), false);
     assert.equal(prompt.includes("工程が変わるたび"), false);
+    assert.match(prompt, /new Date\(\)\.toISOString\(\)/);
+    assert.match(prompt, /isoformat\(\)\.replace/);
+    assert.match(prompt, /末尾Zが必須/);
+    assert.match(prompt, /job-result-validate\.ts/);
+    assert.match(prompt, /exit code 0の場合だけrename/);
+    assert.match(prompt, /既存final Resultがある場合も新規公開を停止/);
     database.close();
   });
 
@@ -89,9 +126,10 @@ process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
     const repositoryPath = `${config.jobsWorkspaceRoot}/github/reirei-lab/boatrace/repository`;
     assert.deepEqual(codexAgentArguments(job, config), [
       "--add-dir",
-      config.jobResultsDir,
+      path.dirname(job.result_path),
       "--add-dir",
       path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)),
+      "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"', "-c", "check_for_update_on_startup=false",
       "-c",
       `projects = { ${JSON.stringify(repositoryPath)} = { trust_level = "trusted" }, ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`,
     ]);
@@ -110,10 +148,19 @@ process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
     ).row;
     const expectedOverride = `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`;
     const args = codexAgentArguments(job, config);
-    assert.deepEqual(args, ["--add-dir", config.jobResultsDir, "--add-dir", path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)), "-c", expectedOverride]);
-    assert.equal(args[5]!.match(/trust_level/g)?.length, 1);
-    assert.equal(args[5]!.includes(`${JSON.stringify(config.jobsWorkspaceRoot)} =`), false);
-    assert.equal(args[5]!.includes(`${JSON.stringify(config.jobResultsDir)} =`), false);
+    assert.deepEqual(args, ["--add-dir", path.dirname(job.result_path), "--add-dir", path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)), "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"', "-c", "check_for_update_on_startup=false", "-c", expectedOverride]);
+    assert.equal(args[11]!.match(/trust_level/g)?.length, 1);
+    assert.equal(args[11]!.includes(`${JSON.stringify(config.jobsWorkspaceRoot)} =`), false);
+    assert.equal(args[11]!.includes(`${JSON.stringify(config.jobResultsDir)} =`), false);
+    assert.doesNotMatch(buildJobPrompt({...job,source:"dona_schedule"}), /progress_path|工程が変わるたび/);
+    const scheduledOverride=`projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" }, ${JSON.stringify(path.dirname(job.result_path))} = { trust_level = "trusted" } }`;
+    assert.deepEqual(codexAgentArguments({...job,source:"dona_schedule"},config,[],true,["/usr/bin/codex"]),[
+      "--strict-config","-C",path.dirname(job.result_path),...scheduledPermissionArguments(path.dirname(job.result_path),["/usr/bin/codex"],job.workspace_path),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser","--model","gpt-6.1-sol","-c",'model_reasoning_effort="low"',"-c","check_for_update_on_startup=false","-c",scheduledOverride,
+    ]);
+    assert.deepEqual(codexAgentArguments({...job,source:"dona_schedule"},config,["slack","github"],true,["/usr/bin/codex"]),[
+      "--strict-config","-C",path.dirname(job.result_path),...scheduledPermissionArguments(path.dirname(job.result_path),["/usr/bin/codex"],job.workspace_path),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
+      "-c","mcp_servers.slack.enabled=false","-c","mcp_servers.github.enabled=false","--model","gpt-6.1-sol","-c",'model_reasoning_effort="low"',"-c","check_for_update_on_startup=false","-c",scheduledOverride,
+    ]);
     database.close();
   });
 
@@ -159,9 +206,10 @@ process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
 
     assert.deepEqual(codexAgentArguments(job, config), [
       "--add-dir",
-      config.jobResultsDir,
+      path.dirname(job.result_path),
       "--add-dir",
       path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)),
+      "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"', "-c", "check_for_update_on_startup=false",
       "-c",
       `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`,
     ]);
@@ -184,9 +232,14 @@ if (args.includes("workspace") && args.includes("create")) {
   process.stdout.write(JSON.stringify({ result: { workspace_id: "w1", pane_id: "w1:p1" } }));
   process.exit(0);
 }
+if (args.includes("pane") && args.includes("run")) {
+  process.stdout.write(JSON.stringify({ result: { ok: true } }));
+  process.exit(0);
+}
 if (args.includes("agent") && args.includes("start")) {
   fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(args));
-  process.stdout.write(JSON.stringify({ result: { agent: { agent_status: "idle" } } }));
+  const agentName=args[args.indexOf("start")+1];
+  process.stdout.write(JSON.stringify({ result: { agent: { agent_name:agentName,workspace_id:"w1",pane_id:"w1:p1",agent_session:{kind:"id",value:"session-1"},agent_status: "idle" } } }));
   process.exit(0);
 }
 process.stderr.write(JSON.stringify({ error: { code: "unexpected", message: args.join(" ") } }));
@@ -202,7 +255,7 @@ process.exit(1);
     ).row;
 
     const prepared = await new HerdrJobAgentRuntime(config).prepare(job);
-    assert.deepEqual(prepared, { herdrWorkspaceId: "w1", herdrPaneId: "w1:p1" });
+    assert.deepEqual(prepared, { herdrWorkspaceId: "w1", herdrPaneId: "w1:p1",herdrAgentSessionId:"session-1" });
     const captured = JSON.parse(await fs.readFile(capturePath, "utf8")) as string[];
     assert.deepEqual(captured, [
       "--session", config.herdrSession,
@@ -211,15 +264,44 @@ process.exit(1);
       "--pane", "w1:p1",
       "--timeout", String(config.jobAgentStartTimeoutMs),
       "--",
-      "--add-dir", config.jobResultsDir,
+      "--add-dir", path.dirname(job.result_path),
       "--add-dir", path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)),
+      "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"', "-c", "check_for_update_on_startup=false",
       "-c", `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`,
     ]);
     assert.equal((await fs.stat(job.workspace_path)).mode & 0o777, 0o700);
     database.close();
   });
 
-  test("passes the rollback-compatible display name through the Herdr workspace and agent-start boundary", async () => {
+  test("start応答にsession IDがなくてもexact agentのread-only照合から保存する", async () => {
+    const { root, config: baseConfig } = await tempConfig(); roots.push(root);
+    const executable=path.join(root,"herdr-session-read.mjs");
+    const marker=path.join(root,"started");
+    const calls=path.join(root,"calls.jsonl");
+    await fs.writeFile(executable,`#!/usr/bin/env node
+import fs from "node:fs";
+const args=process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+"\\n");
+if(args[2]==="agent"&&args[3]==="get") {
+  if(!fs.existsSync(${JSON.stringify(marker)})){console.error(JSON.stringify({error:{code:"agent_not_found"}}));process.exit(1);}
+  console.log(JSON.stringify({result:{agent:{agent_name:args[4],workspace_id:"w1",pane_id:"w1:p1",agent_session:{kind:"id",value:"session-2"},agent_status:"idle",state_change_seq:1}}}));process.exit(0);
+}
+if(args[2]==="workspace"&&args[3]==="create"){console.log(JSON.stringify({result:{workspace_id:"w1",pane_id:"w1:p1"}}));process.exit(0);}
+if(args[2]==="agent"&&args[3]==="start"){fs.writeFileSync(${JSON.stringify(marker)},"1");console.log(JSON.stringify({result:{agent:{agent_status:"idle"}}}));process.exit(0);}
+process.exit(2);
+`,{mode:0o700});
+    const config={...baseConfig,herdrPath:executable};
+    const database=new DispatcherDatabase(config.databasePath);
+    const source=database.enqueue(eventEnvelope("Ev-session-read")).row;
+    const job=database.createJob({source_event_id:source.event_id,objective:"調査",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    const prepared=await new HerdrJobAgentRuntime(config).prepare(job);
+    assert.deepEqual(prepared,{herdrWorkspaceId:"w1",herdrPaneId:"w1:p1",herdrAgentSessionId:"session-2"});
+    const argv=(await fs.readFile(calls,"utf8")).trim().split("\n").map(line=>JSON.parse(line) as string[]);
+    assert.deepEqual(argv.filter(args=>args[2]==="agent").map(args=>args[3]).slice(-2),["start","get"]);
+    database.close();
+  });
+
+  test("表示ラベルをscratch workspaceだけへ単一argvで渡しagent identityを維持する", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const logPath = `${root}/herdr-argv.jsonl`;
@@ -247,7 +329,7 @@ process.exit(2);
     const database = new DispatcherDatabase(config.databasePath);
     const source = database.enqueue(eventEnvelope("Ev-herdr-display-boundary")).row;
     const job = database.createJob(
-      { source_event_id: source.event_id, objective: "一覧を改善する", workspace: { kind: "scratch" } },
+      { source_event_id: source.event_id, objective: "一覧を改善する", workspace: { kind: "scratch" }, display: { short_name: '一覧 "改善" $(safe)' } },
       config.jobsWorkspaceRoot,
       config.jobResultsDir,
     ).row;
@@ -263,11 +345,74 @@ process.exit(2);
     assert.deepEqual(prepared, { herdrWorkspaceId: "w1", herdrPaneId: "w1:p1" });
     assert.ok(workspace, JSON.stringify(calls));
     assert.ok(start, JSON.stringify(calls));
-    assert.equal(workspace[workspace.indexOf("--label") + 1], job.agent_name);
+    assert.equal(workspace[workspace.indexOf("--label") + 1], '一覧 "改善" $(safe)');
+    assert.equal(workspace.filter((value) => value === '一覧 "改善" $(safe)').length, 1);
     assert.equal(start[4], job.agent_name);
     assert.equal(job.agent_name, job.job_id);
     assert.match(job.agent_name, /enhc$/);
     database.close();
+  });
+
+  test("terminal scheduled scratch workspaceをHerdr close後に削除する", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const capturePath=path.join(root,"cleanup-argv.json");
+    const executable=path.join(root,"fake-herdr-cleanup.mjs");
+    await fs.writeFile(executable,`#!/usr/bin/env node
+import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(capturePath)},JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({status:"ok"}));
+`,{mode:0o700});
+    const database=new DispatcherDatabase(config.databasePath);
+    const source=database.enqueue(eventEnvelope("Ev-scheduled-cleanup")).row;
+    const job=database.createJob({source_event_id:source.event_id,objective:"調査",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    await fs.mkdir(job.workspace_path,{recursive:true});
+    await fs.writeFile(path.join(job.workspace_path,"artifact"),"temporary");
+    const runtime=new HerdrJobAgentRuntime({...config,herdrPath:executable});
+    const cleaned=await runtime.cleanup!({...job,source:"dona_schedule",herdr_workspace_id:"w7"});
+    assert.equal(cleaned.ok,true,JSON.stringify(cleaned));
+    assert.deepEqual(JSON.parse(await fs.readFile(capturePath,"utf8")),["--session",config.herdrSession,"workspace","close","w7"]);
+    await assert.rejects(fs.access(job.workspace_path),{code:"ENOENT"});
+    database.close();
+  });
+
+  test("agent start失敗後のworkspace close失敗はIDとscratch workspaceを保持する", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const executable=path.join(root,"fake-herdr-start-cleanup-failure.mjs");
+    await fs.writeFile(executable,`#!/usr/bin/env node
+const args=process.argv.slice(2);
+if(args[2]==="agent"&&args[3]==="get")process.exit(1);
+if(args[2]==="workspace"&&args[3]==="create"){
+  console.log(JSON.stringify({status:"ok",result:{workspace:{workspace_id:"w9"},root_pane:{pane_id:"w9:p1"}}}));
+  process.exit(0);
+}
+if(args[2]==="agent"&&args[3]==="start")process.exit(1);
+if(args[2]==="workspace"&&args[3]==="close")process.exit(1);
+process.exit(2);
+`,{mode:0o700});
+    const database=new DispatcherDatabase(config.databasePath);
+    const source=database.enqueue(eventEnvelope("Ev-start-cleanup-failure")).row;
+    const job=database.createJob({source_event_id:source.event_id,objective:"調査",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    await assert.rejects(
+      new HerdrJobAgentRuntime({...config,herdrPath:executable}).prepare(job),
+      (error:unknown)=>error instanceof PreparedWorkspaceCleanupError&&error.herdrWorkspaceId==="w9"&&error.herdrPaneId==="w9:p1",
+    );
+    assert.equal((await fs.stat(job.workspace_path)).isDirectory(),true);
+    database.close();
+  });
+
+  test("legacy agent closeをagent identityへ固定する",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const capturePath=path.join(root,"agent-close-argv.json"),executable=path.join(root,"fake-herdr-agent-close.mjs");
+    await fs.writeFile(executable,`#!/usr/bin/env node
+import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(capturePath)},JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({status:"ok"}));
+`,{mode:0o700});
+    const result=await new HerdrJobAgentRuntime({...config,herdrPath:executable}).closeAgent("job_01m1legacyagent000000enhc");
+    assert.equal(result.ok,true);
+    assert.deepEqual(JSON.parse(await fs.readFile(capturePath,"utf8")),["--session",config.herdrSession,"agent","close","job_01m1legacyagent000000enhc"]);
   });
 });
 
@@ -403,6 +548,7 @@ describe("GitHub workspace provisioning", () => {
       source_event_id: source.event_id,
       objective: "確認する",
       workspace: { kind: "github", repository: "owner/repo", base_ref: "feature/test" },
+      display: { short_name: "表示ラベル", issue: { repository: "owner/repo", number: 87 } },
     }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
     const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
     await git(fixture.seedPath, "push", "origin", "main:refs/heads/foo");
@@ -417,6 +563,8 @@ describe("GitHub workspace provisioning", () => {
     assert.ok(createIndex >= 0 && startIndex > createIndex, JSON.stringify(calls));
     const create = calls[createIndex]!;
     assert.equal(create[create.indexOf("--base") + 1], fixture.featureSha);
+    assert.equal(create[create.indexOf("--label") + 1], "#87 表示ラベル");
+    assert.equal(calls[startIndex]![4], job.agent_name);
     assert.equal(await git(fixture.root, "--git-dir", path.join(fixture.root, "origin.git"), "rev-parse", "refs/heads/feature/test"), fixture.raceSha);
     assert.ok(calls.slice(0, startIndex).some((args) => args[2] === "worktree" && args[3] === "create"));
     fixture.database.close();
@@ -757,6 +905,7 @@ process.exit(2);
       source_event_id: source.event_id,
       objective: "確認する",
       workspace: { kind: "github", repository: "owner/repo", base_ref: "feature/test" },
+      display: { short_name: "再利用ラベル", issue: { repository: "owner/repo", number: 87 } },
     }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
     const runtime = new HerdrJobAgentRuntime(fixture.config);
     await runtime.prepare(job);
@@ -768,6 +917,8 @@ process.exit(2);
     const calls = (await fs.readFile(fixture.logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]);
     assert.equal(calls.filter((args) => args[2] === "worktree" && args[3] === "create").length, 1);
     assert.equal(calls.filter((args) => args[2] === "workspace" && args[3] === "create").length, 1);
+    const restored = calls.find((args) => args[2] === "workspace" && args[3] === "create")!;
+    assert.equal(restored[restored.indexOf("--label") + 1], "#87 再利用ラベル");
     fixture.database.close();
   });
 
@@ -804,4 +955,38 @@ process.exit(2);
     assert.equal(calls.some((args) => args[2] === "agent" && args[3] === "start"), false);
     fixture.database.close();
   });
+});
+
+test("引継ぎworkerは変更したbranchの追加commit・index・未trackedファイルを保持して新しいResultだけを使う",async()=>{
+  const f=await githubFixture();
+  try {
+    const event=f.database.enqueue(eventEnvelope("handoff-github")).row;
+    const old=f.database.createJob({source_event_id:event.event_id,objective:"実装",workspace:{kind:"github",repository:"owner/repo"}},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).row;
+    const runtime=new HerdrJobAgentRuntime(f.config);
+    await runtime.prepare(old);
+    await git(old.workspace_path,"switch","-c",`dona/${old.job_id}-approval-operations`);
+    await git(old.workspace_path,"config","user.email","test@example.com");
+    await git(old.workspace_path,"config","user.name","Test");
+    await fs.writeFile(path.join(old.workspace_path,"committed.txt"),"commit");
+    await git(old.workspace_path,"add","committed.txt");await git(old.workspace_path,"commit","-m","checkpoint");
+    await fs.writeFile(path.join(old.workspace_path,"committed.txt"),"staged");await git(old.workspace_path,"add","committed.txt");
+    await fs.writeFile(path.join(old.workspace_path,"committed.txt"),"unstaged");
+    await fs.writeFile(path.join(old.workspace_path,"untracked.txt"),"untracked");
+    const before=await git(old.workspace_path,"status","--porcelain");const head=await git(old.workspace_path,"rev-parse","HEAD");
+    const follow=f.database.enqueue(eventEnvelope("handoff-github-follow")).row;
+    const raw=f.database.createJob({source_event_id:follow.event_id,objective:"続ける",workspace:{kind:"github",repository:"owner/repo"}},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).row;
+    const next={...raw,workspace_path:old.workspace_path,workspace_json:JSON.stringify({...JSON.parse(raw.workspace_json),_dona_handoff:{predecessor_job_id:old.job_id,workspace_job_id:old.job_id}})};
+    await runtime.prepare(next);
+    assert.equal(await git(old.workspace_path,"status","--porcelain"),before);assert.equal(await git(old.workspace_path,"rev-parse","HEAD"),head);
+    const calls=(await fs.readFile(f.logPath,"utf8")).trim().split("\n").map(line=>JSON.parse(line) as string[]);
+    assert.equal(calls.filter(args=>args[2]==="worktree"&&args[3]==="create").length,1);
+    const start=calls.filter(args=>args[2]==="agent"&&args[3]==="start").at(-1)!;
+    assert.equal(start[4],next.job_id);assert.ok(start.includes(path.dirname(next.result_path)));assert.ok(!start.includes(path.dirname(old.result_path)));
+    const repository=path.join(f.config.jobsWorkspaceRoot,"github","owner","repo","repository"),other=path.join(f.root,"other-worktree");
+    await git(repository,"worktree","add","--detach",other,"HEAD");await fs.copyFile(path.join(other,".git"),path.join(old.workspace_path,".git"));
+    await assert.rejects(runtime.prepare(next),/handoff_worktree_registration_mismatch/);
+    const afterCalls=(await fs.readFile(f.logPath,"utf8")).trim().split("\n").map(line=>JSON.parse(line) as string[]);
+    assert.equal(afterCalls.filter(args=>args[2]==="agent"&&args[3]==="start").length,calls.filter(args=>args[2]==="agent"&&args[3]==="start").length);
+
+  } finally {f.database.close();}
 });

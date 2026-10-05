@@ -12,12 +12,22 @@ import type {
   ResultEnvelope,
   SteerJobRequest,
 } from "./types.js";
+import { jobDisplayMetadataKey } from "./job-display-label.js";
 
 const jsonObject = z.record(z.string(), z.unknown());
-const utcRfc3339 = z
-  .string()
-  .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/, "must be UTC RFC 3339")
-  .refine((value) => !Number.isNaN(Date.parse(value)), "must be a valid timestamp");
+// Date.parse normalizes invalid calendar dates; validate components without rounding fractions.
+const utcTimestampPattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/;
+const utcRfc3339 = z.string()
+  .refine((value) => utcTimestampPattern.exec(value)?.[0] === value, "must be UTC RFC 3339 with trailing Z")
+  .refine((value) => {
+    const match = utcTimestampPattern.exec(value);
+    if (!match) return true; // The format validator supplies the bounded reason.
+    const [year, month, day, hour, minute, second] = match.slice(1).map(Number);
+    const leap = year! % 4 === 0 && (year! % 100 !== 0 || year! % 400 === 0);
+    const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    return month! >= 1 && month! <= 12 && day! >= 1 && day! <= days[month! - 1]!
+      && hour! <= 23 && minute! <= 59 && second! <= 59;
+  }, "must be a valid calendar date and time");
 
 export const jobKeyPattern = /^[a-z0-9](?:[a-z0-9._-]{0,63})$/;
 export const legacyJobKey = "legacy-default";
@@ -90,6 +100,27 @@ const updateEventEnvelopeSchema = z
     }
   });
 
+const scheduleEventEnvelopeSchema = z.object({
+  schema_version: z.literal(1),
+  source: z.literal("dona_schedule"),
+  external_event_id: z.string().regex(/^schedule:v1:[A-Za-z0-9_-]+:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/),
+  type: z.literal("schedule_due"),
+  occurred_at: utcRfc3339,
+  subject: z.object({
+    tenant_id: z.string().min(1).max(160), owner_id: z.string().min(1).max(160), schedule_id: z.string().min(1).max(160),
+  }).strict(),
+  payload: z.object({
+    run_id: z.string().min(1).max(160), revision: z.number().int().positive(), occurrence_key: z.string().min(1).max(512),
+    work: z.object({ objective: z.string().min(1).max(4_000), scope: z.literal("read_only"),
+      allowed_external_writes: z.tuple([]), result_destination: z.unknown(),
+      authorization_target: z.object({workspace_id:z.string().min(1).max(160),channel_id:z.string().min(1).max(160)}).strict().optional() }).strict().optional(),
+  }).strict(),
+  reply_target: z.null(),
+  trace: z.object({ schedule_id: z.string().min(1).max(160), run_id: z.string().min(1).max(160) }).strict(),
+}).strict()
+  .refine((value) => value.external_event_id === `schedule:v1:${value.subject.schedule_id}:${value.occurred_at}`, "external_event_id mismatch")
+  .refine((value) => value.subject.schedule_id === value.trace.schedule_id && value.payload.run_id === value.trace.run_id, "trace mismatch");
+
 const resultEnvelopeSchema = z
   .object({
     schema_version: z.literal(1),
@@ -117,6 +148,10 @@ const jobWorkspaceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("scratch") }).strip(),
   z.object({ kind: z.literal("github"), repository, base_ref: gitRef.optional() }).strip(),
 ]);
+export const jobDisplaySchema = z.object({
+  short_name: z.string().min(1).max(512),
+  issue: z.object({ repository, number: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict().optional(),
+}).strict();
 const jobCreationMetadataSchema = z.object({
   canonical_payload_sha256: z.string().regex(/^[0-9a-f]{64}$/),
 }).strict();
@@ -137,6 +172,7 @@ const createJobSchema = z.object({
     `must be at most ${jobObjectiveCharacterMax} characters`,
   ),
   workspace: jobWorkspaceSchema,
+  display: jobDisplaySchema.optional(),
 }).strip();
 
 const steerJobSchema = z.object({
@@ -187,6 +223,16 @@ export function parseInternalUpdateEventEnvelope(input: unknown): EventEnvelope 
   return parsed.data as EventEnvelope;
 }
 
+export function parseInternalScheduleEventEnvelope(input: unknown): EventEnvelope {
+  const parsed = scheduleEventEnvelopeSchema.safeParse(input);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const location = issue?.path.length ? `${issue.path.join(".")} ` : "";
+    throw new RequestValidationError(`${location}${issue?.message ?? "is invalid"}`);
+  }
+  return parsed.data as EventEnvelope;
+}
+
 export function parseResultEnvelope(input: unknown, eventId: string): ResultEnvelope {
   const parsed = resultEnvelopeSchema.safeParse(input);
   if (!parsed.success) {
@@ -210,12 +256,17 @@ function parseWithSchema<T>(schema: z.ZodType, input: unknown): T {
   return parsed.data as T;
 }
 
-export function parseCreateJobRequest(input: unknown): CreateJobRequest {
-  return parseWithSchema<CreateJobRequest>(createJobSchema, input);
+export function parseCreateJobRequest(input: unknown, preserveObjective = false): CreateJobRequest {
+  const parsed = parseWithSchema<CreateJobRequest>(createJobSchema, input);
+  if (preserveObjective) parsed.objective = (input as {objective:string}).objective;
+  return parsed;
 }
 
 export function canonicalJobPayload(request: CreateJobRequest): CanonicalJobPayload {
-  return { objective: request.objective, workspace: request.workspace };
+  return {
+    objective: request.objective,
+    workspace: request.workspace,
+  };
 }
 
 export function canonicalJobPayloadSha256(request: CreateJobRequest): string {
@@ -228,6 +279,7 @@ export function serializeJobWorkspace(
   workspace: JobWorkspace,
   canonicalPayloadSha256: string,
   objectiveUtf8Bytes?: number,
+  displayLabel?: string,
 ): string {
   return stableStringify({
     ...workspace,
@@ -235,6 +287,7 @@ export function serializeJobWorkspace(
     ...(objectiveUtf8Bytes === undefined
       ? {}
       : { [jobResourceMetadataKey]: { objective_utf8_bytes: objectiveUtf8Bytes } }),
+    ...(displayLabel === undefined ? {} : { [jobDisplayMetadataKey]: { label: displayLabel } }),
   });
 }
 

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import Database from "better-sqlite3";
@@ -21,6 +22,28 @@ class RecordingRunner {
   }
 }
 
+test("Dispatcher registration read distinguishes bootout from an ambiguous launchctl failure", async () => {
+  const { root, policy } = await tempPolicy();
+  try {
+    const recording = new RecordingRunner();
+    const runtime = new RealRuntime(policy, recording as unknown as ProcessRunner);
+    assert.equal(await runtime.dispatcherRegistered(), true);
+    recording.result = { ...ok, exit_code: 113, stderr: "Could not find service" };
+    assert.equal(await runtime.dispatcherRegistered(), false);
+    await runtime.startDispatcher();
+    recording.result = { ...ok, exit_code: 1, stderr: "permission denied" };
+    await assert.rejects(runtime.dispatcherRegistered(), /dispatcher_registration_unverified/);
+    const uid = process.getuid!();
+    assert.deepEqual(recording.calls.map(call => call.args), [
+      ["print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      ["print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      ["print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      ["bootstrap", `gui/${uid}`, path.join(os.homedir(), "Library/LaunchAgents/dev.dona.dispatcher.plist")],
+      ["print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+    ]);
+  } finally { await removeTree(root); }
+});
+
 function agentResponse(cwd: string, sessionId: string | null, interactiveReady = true): string {
   return JSON.stringify({
     result: {
@@ -30,7 +53,7 @@ function agentResponse(cwd: string, sessionId: string | null, interactiveReady =
         agent_status: "idle",
         workspace_id: "w1",
         tab_id: "w1:t1",
-        pane_id: "w1:p1",
+        pane_id: "wBR:p1",
         focused: false,
         revision: 1,
         agent: "codex",
@@ -54,7 +77,7 @@ function paneResponse(cwd: string): string {
         agent_status: "unknown",
         workspace_id: "w1",
         tab_id: "w1:t1",
-        pane_id: "w1:p1",
+        pane_id: "wBR:p1",
         cwd,
         foreground_cwd: cwd,
       },
@@ -117,6 +140,7 @@ async function listen(
   service: "dispatcher" | "slack_adapter",
   requests: unknown[],
   pendingDrainResponses = 0,
+  healthStatus: "ready" | "not_ready" = "ready",
 ): Promise<http.Server> {
   await fs.mkdir(path.dirname(socketPath), { recursive: true });
   let remainingPending = pendingDrainResponses;
@@ -124,7 +148,7 @@ async function listen(
     if (request.url === "/health/version") {
       const body = JSON.stringify({
         schema_version: 1,
-        status: "ready",
+        status: healthStatus,
         service,
         build_sha: targetSha,
         protocol: 1,
@@ -135,7 +159,8 @@ async function listen(
         config: 1,
         ...(service === "slack_adapter" ? { workspaces_ready: true } : {}),
       });
-      response.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+      response.writeHead(healthStatus === "ready" ? 200 : 503,
+        { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
       response.end(body);
       return;
     }
@@ -165,8 +190,33 @@ async function listen(
   return server;
 }
 
+test("RealRuntime observes a versioned 503 not_ready service as live during quiesce", async () => {
+  const { root, policy } = await tempPolicy();
+  const requests: unknown[] = [];
+  const dispatcher = await listen(policy.dispatcher_socket, "dispatcher", requests, 0, "not_ready");
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    const health = await runtime.dispatcherHealth();
+    assert.equal(health.observed, true);
+    assert.equal(health.live, true);
+    assert.equal(health.ready, false);
+    assert.equal(health.build_sha, targetSha);
+  } finally {
+    await new Promise<void>((resolve) => dispatcher.close(() => resolve()));
+    await removeTree(root);
+  }
+});
+
 test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without live process access", async () => {
   const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const dispatcherDatabasePath = path.join(root, "Dona", "dona.sqlite3");
+  const dispatcherDatabase = new Database(dispatcherDatabasePath);
+  dispatcherDatabase.exec("CREATE TABLE jobs (job_id TEXT, status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  dispatcherDatabase.exec("CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT)");
+  dispatcherDatabase.close();
+  await fs.chmod(dispatcherDatabasePath, 0o600);
   const requests: unknown[] = [];
   const dispatcher = await listen(policy.dispatcher_socket, "dispatcher", requests, 1);
   const slack = await listen(policy.slack_socket, "slack_adapter", requests);
@@ -189,14 +239,204 @@ test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without liv
     ]);
     const uid = process.getuid!();
     assert.deepEqual(recording.calls.map(({ executable, args }) => [executable, ...args]), [
-      [policy.executables.launchctl, "kill", "SIGTERM", `gui/${uid}/${policy.launchd.slack_label}`],
-      [policy.executables.launchctl, "kill", "SIGTERM", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      [policy.executables.launchctl, "bootout", `gui/${uid}/${policy.launchd.slack_label}`],
+      [policy.executables.launchctl, "bootout", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      [policy.executables.launchctl, "print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
       [policy.executables.launchctl, "kickstart", "-k", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      [policy.executables.launchctl, "print", `gui/${uid}/${policy.launchd.slack_label}`],
       [policy.executables.launchctl, "kickstart", "-k", `gui/${uid}/${policy.launchd.slack_label}`],
     ]);
     assert.equal(Object.values(recording.calls[0]!.options.env ?? {}).some((value) => /token|secret/i.test(value)), false);
   } finally {
     await Promise.all([new Promise<void>((resolve) => dispatcher.close(() => resolve())), new Promise<void>((resolve) => slack.close(() => resolve()))]);
+    await removeTree(root);
+  }
+});
+
+test("RealRuntime refuses a legacy drained response while a durable worker remains active", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec("CREATE TABLE jobs (status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  database.prepare("INSERT INTO jobs (status,herdr_workspace_id) VALUES ('running','private-agent')").run();
+  database.prepare("INSERT INTO jobs (status,last_error_code) VALUES ('retryable_failed','stale_preparing')").run();
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const requests: unknown[] = [];
+  const dispatcher = await listen(policy.dispatcher_socket, "dispatcher", requests);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    const snapshot = await runtime.quiesceDispatcher("upd_01m1es03xy5cf8d9pm5cwx4srv", targetSha);
+    assert.equal(snapshot.drained, false);
+    assert.deepEqual(snapshot.unsafe_states, ["jobs.handoff_unavailable:2"]);
+    assert.equal(JSON.stringify(snapshot).includes("private-agent"), false);
+  } finally {
+    await new Promise<void>((resolve) => dispatcher.close(() => resolve()));
+    await removeTree(root);
+  }
+});
+
+test("RealRuntime keeps legacy name-based stop markers unsafe", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec("CREATE TABLE jobs (job_id TEXT, status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  database.exec("CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT)");
+  database.prepare("INSERT INTO jobs (job_id,status) VALUES ('legacy-terminal','failed')").run();
+  database.prepare("INSERT INTO legacy_job_agents_to_stop VALUES ('legacy-terminal',NULL)").run();
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const stopped = new Database(databasePath);
+    stopped.prepare("UPDATE legacy_job_agents_to_stop SET stopped_at='2026-09-25T00:00:00Z'").run();
+    stopped.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+  } finally { await removeTree(root); }
+});
+
+test("RealRuntime keeps an operator assertion outside machine stop proof", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec(`CREATE TABLE jobs (job_id TEXT, status TEXT NOT NULL, updated_at TEXT,
+    steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT,
+    last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT);
+    CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT);
+    CREATE TABLE job_operator_assertion_recoveries (job_id TEXT, final_status TEXT, final_updated_at TEXT)`);
+  database.prepare("INSERT INTO jobs (job_id,status,updated_at,herdr_workspace_id) VALUES ('legacy','failed','t1','agent')").run();
+  database.prepare("INSERT INTO legacy_job_agents_to_stop VALUES ('legacy',NULL)").run();
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    assert.equal((await runtime.workerSafety()).safe, false);
+    const recorded = new Database(databasePath);
+    recorded.prepare("INSERT INTO job_operator_assertion_recoveries VALUES ('legacy','failed','t1')").run();
+    recorded.close();
+    assert.equal((await runtime.workerSafety()).safe, false);
+    const changed = new Database(databasePath);
+    changed.prepare("UPDATE jobs SET updated_at='t2' WHERE job_id='legacy'").run();
+    changed.close();
+    assert.equal((await runtime.workerSafety()).safe, false);
+  } finally { await removeTree(root); }
+});
+
+test("RealRuntime counts a reconciled terminal schedule worker without stop proof", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec("CREATE TABLE jobs (status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  for (const code of ["schedule_reconcile_worker_unverified", "terminal_steer_worker_unverified",
+    "cancel_worker_unverified"]) {
+    database.prepare("INSERT INTO jobs (status,last_error_code) VALUES ('failed',?)").run(code);
+  }
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    assert.equal((await runtime.workerSafety()).active_worker_count, 3);
+  } finally { await removeTree(root); }
+});
+
+test("RealRuntime distinguishes unresolved steer from definite retryable agent absence", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec("CREATE TABLE jobs (status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  database.prepare("INSERT INTO jobs (status,steer_state) VALUES ('completed','dispatching')").run();
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const settled = new Database(databasePath);
+    settled.prepare("UPDATE jobs SET steer_state='accepted'").run();
+    settled.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const retryable = new Database(databasePath);
+    retryable.prepare("UPDATE jobs SET status='retryable_failed',herdr_workspace_id='recorded',last_error_code='agent_not_found'").run();
+    retryable.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const uncertain = new Database(databasePath);
+    uncertain.prepare("UPDATE jobs SET last_error_code='stale_preparing'").run();
+    uncertain.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const terminalCancel = new Database(databasePath);
+    terminalCancel.prepare("UPDATE jobs SET status='completed',steer_state=NULL,last_error_code=NULL,herdr_workspace_id='recorded'").run();
+    terminalCancel.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const proof = new Database(databasePath);
+    proof.exec("ALTER TABLE jobs ADD COLUMN job_id TEXT");
+    proof.prepare("UPDATE jobs SET job_id='terminal-job'").run();
+    proof.exec("CREATE TABLE job_terminal_worker_stop_proofs(job_id TEXT PRIMARY KEY,stopped_at TEXT NOT NULL)");
+    proof.prepare("INSERT INTO job_terminal_worker_stop_proofs VALUES('terminal-job',?)").run(new Date().toISOString());
+    proof.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const stopped = new Database(databasePath);
+    stopped.prepare("UPDATE jobs SET last_error_code='agent_not_found'").run();
+    stopped.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+  } finally { await removeTree(root); }
+});
+
+test("RealRuntime excludes only a proven pre-prepare result collision", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec("CREATE TABLE jobs (job_id TEXT, status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  database.exec("CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT)");
+  database.prepare("INSERT INTO jobs (job_id,status,last_error_code) VALUES ('collision-job','needs_review','result_path_exists')").run();
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    assert.equal((await runtime.workerSafety()).safe, true);
+    const retried = new Database(databasePath);
+    retried.prepare("UPDATE jobs SET attempt_count=1").run();
+    retried.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const firstAttempt = new Database(databasePath);
+    firstAttempt.prepare("UPDATE jobs SET attempt_count=0").run();
+    firstAttempt.close();
+    const guarded = new Database(databasePath);
+    guarded.prepare("UPDATE jobs SET herdr_workspace_id='possible-worker'").run();
+    guarded.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const stopped = new Database(databasePath);
+    stopped.prepare("UPDATE jobs SET last_error_code='invalid_result_agent_stopped'").run();
+    stopped.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    for (const code of ["agent_not_found", "agent_not_running", "steer_acceptance_unknown"]) {
+      const state = new Database(databasePath);
+      state.prepare("UPDATE jobs SET last_error_code=?").run(code);
+      state.close();
+      assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    }
+    const legacy = new Database(databasePath);
+    legacy.prepare("UPDATE jobs SET last_error_code='legacy_agent_sandbox_unknown'").run();
+    legacy.prepare("INSERT INTO legacy_job_agents_to_stop VALUES ('collision-job',?)")
+      .run(new Date().toISOString());
+    legacy.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const invalid = new Database(databasePath);
+    invalid.prepare("UPDATE jobs SET last_error_code='invalid_result'").run();
+    invalid.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+  } finally {
     await removeTree(root);
   }
 });
@@ -257,8 +497,8 @@ test("RealRuntime restarts the exact idle dona-main pane from the immutable targ
   await fs.writeFile(path.join(policy.config_root, "slack.env"), "SLACK_WORKSPACES=test\n", { mode: 0o600 });
   const canonicalTargetRelease = await fs.realpath(targetRelease);
   const canonicalConfigRoot = await fs.realpath(policy.config_root);
-  const dispatcherMcpEnvironment = `mcp_servers.dona_dispatcher.env = { "DOTENV_CONFIG_PATH" = ${JSON.stringify(path.join(canonicalConfigRoot, "dispatcher.env"))}, "DONA_RELEASE_MANIFEST_PATH" = ${JSON.stringify(path.join(policy.current_pointer, "release-manifest.json"))}, "DONA_UPDATER_SOCKET_PATH" = ${JSON.stringify(path.join(policy.control_root, "updater.sock"))}, "DONA_UPDATE_INTERNAL_TOKEN_PATH" = ${JSON.stringify(policy.dispatcher_internal_token_file)}, "DONA_HERDR_PATH" = ${JSON.stringify(policy.executables.herdr)}, "DONA_GH_PATH" = ${JSON.stringify(policy.executables.gh)}, "DONA_GIT_PATH" = ${JSON.stringify(policy.executables.git)} }`;
-  const slackMcpEnvironment = `mcp_servers.dona_slack.env = { "DOTENV_CONFIG_PATH" = ${JSON.stringify(path.join(canonicalConfigRoot, "slack.env"))} }`;
+  const dispatcherMcpEnvironment = `mcp_servers.dona_dispatcher.env = { "DOTENV_CONFIG_PATH" = ${JSON.stringify(path.join(canonicalConfigRoot, "dispatcher.env"))}, "DONA_RELEASE_MANIFEST_PATH" = ${JSON.stringify(path.join(policy.current_pointer, "release-manifest.json"))}, "DONA_UPDATER_SOCKET_PATH" = ${JSON.stringify(path.join(policy.control_root, "updater.sock"))}, "DONA_UPDATE_INTERNAL_TOKEN_PATH" = ${JSON.stringify(policy.dispatcher_internal_token_file)}, "DONA_HERDR_PATH" = ${JSON.stringify(policy.executables.herdr)}, "DONA_CODEX_PATH" = ${JSON.stringify(policy.executables.codex)}, "DONA_GH_PATH" = ${JSON.stringify(policy.executables.gh)}, "DONA_GIT_PATH" = ${JSON.stringify(policy.executables.git)} }`;
+  const slackMcpEnvironment = `mcp_servers.dona_slack.env = { "DOTENV_CONFIG_PATH" = ${JSON.stringify(path.join(canonicalConfigRoot, "slack.env"))}, "DONA_UPDATE_INTERNAL_TOKEN_PATH" = ${JSON.stringify(policy.dispatcher_internal_token_file)} }`;
   const runner = new AgentRunner(currentRelease);
   const runtime = new RealRuntime(policy, runner as unknown as ProcessRunner);
   try {
@@ -270,9 +510,9 @@ test("RealRuntime restarts the exact idle dona-main pane from the immutable targ
     runner.sessionId = "session-replaced";
     assert.equal((await runtime.stopMainAgent(idle)).outcome, "rejected");
     runner.sessionId = "session-old";
-    assert.deepEqual(await runtime.stopMainAgent(idle), { outcome: "stopped", pane_id: "w1:p1", error_code: null });
+    assert.deepEqual(await runtime.stopMainAgent(idle), { outcome: "stopped", pane_id: "wBR:p1", error_code: null });
     runner.interactiveReady = true;
-    const started = await runtime.startMainAgent("w1:p1", targetRelease);
+    const started = await runtime.startMainAgent("wBR:p1", targetRelease);
     assert.equal(started.outcome, "started");
     assert.equal(started.observation.matches_release, true);
     assert.equal(started.observation.session_id, "session-new");
@@ -281,16 +521,17 @@ test("RealRuntime restarts the exact idle dona-main pane from the immutable targ
       [policy.executables.herdr, "--session", "dona", "agent", "wait", "dona-main", "--until", "idle", "--until", "done", "--until", "blocked", "--timeout", "100"],
       [policy.executables.herdr, "--session", "dona", "agent", "get", "dona-main"],
       [policy.executables.herdr, "--session", "dona", "agent", "get", "dona-main"],
-      [policy.executables.herdr, "--session", "dona", "agent", "send-keys", "w1:p1", "ctrl+c"],
-      [policy.executables.herdr, "--session", "dona", "agent", "get", "w1:p1"],
-      [policy.executables.herdr, "--session", "dona", "agent", "get", "w1:p1"],
-      [policy.executables.herdr, "--session", "dona", "pane", "run", "w1:p1", `cd -- '${canonicalTargetRelease}'`],
-      [policy.executables.herdr, "--session", "dona", "pane", "get", "w1:p1"],
+      [policy.executables.herdr, "--session", "dona", "agent", "send-keys", "wBR:p1", "ctrl+c"],
+      [policy.executables.herdr, "--session", "dona", "agent", "get", "wBR:p1"],
+      [policy.executables.herdr, "--session", "dona", "agent", "get", "wBR:p1"],
+      [policy.executables.herdr, "--session", "dona", "pane", "run", "wBR:p1", `cd -- '${canonicalTargetRelease}'`],
+      [policy.executables.herdr, "--session", "dona", "pane", "get", "wBR:p1"],
       [
         policy.executables.herdr, "--session", "dona", "agent", "start", "dona-main", "--kind", "codex",
-        "--pane", "w1:p1", "--timeout", "100", "--", "-C", canonicalTargetRelease, "-c",
+        "--pane", "wBR:p1", "--timeout", "100", "--", "-C", canonicalTargetRelease, "-c",
         `projects = { ${JSON.stringify(canonicalTargetRelease)} = { trust_level = "trusted" } }`,
         "-c", dispatcherMcpEnvironment, "-c", slackMcpEnvironment,
+        "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"',
         "-c", "check_for_update_on_startup=false",
         "起動確認です。外部操作、ファイル変更、プロセス操作は行わず、READYとだけ返してください。",
       ],
@@ -300,34 +541,64 @@ test("RealRuntime restarts the exact idle dona-main pane from the immutable targ
     runner.sessionId = "session-old";
     runner.interactiveReady = false;
     runner.becomeReadyOnNextGet = true;
-    const delayedReady = await runtime.startMainAgent("w1:p1", targetRelease, "session-old");
+    const delayedReady = await runtime.startMainAgent("wBR:p1", targetRelease, "session-old");
     assert.equal(delayedReady.outcome, "started");
     assert.equal(delayedReady.observation.interactive_ready, true);
     runner.running = false;
     runner.cwd = currentRelease;
     runner.omitSessionOnStart = true;
-    assert.equal((await runtime.startMainAgent("w1:p1", targetRelease)).outcome, "accepted_unknown");
+    assert.equal((await runtime.startMainAgent("wBR:p1", targetRelease)).outcome, "accepted_unknown");
     const busyCallCount = runner.calls.length;
-    const busy = await runtime.startMainAgent("w1:p1", targetRelease);
+    const busy = await runtime.startMainAgent("wBR:p1", targetRelease);
     assert.equal(busy.outcome, "rejected");
     assert.equal(busy.error_code, "agent_pane_busy");
     assert.equal(runner.calls.length, busyCallCount + 1);
-    assert.deepEqual(runner.calls.at(-1)!.args, ["--session", "dona", "agent", "get", "w1:p1"]);
+    assert.deepEqual(runner.calls.at(-1)!.args, ["--session", "dona", "agent", "get", "wBR:p1"]);
     runner.running = false;
     runner.cwd = currentRelease;
     runner.ignoreCwdChange = true;
     const unchangedCwdCallCount = runner.calls.length;
-    const unchangedCwd = await runtime.startMainAgent("w1:p1", targetRelease);
+    const unchangedCwd = await runtime.startMainAgent("wBR:p1", targetRelease);
     assert.equal(unchangedCwd.outcome, "accepted_unknown");
     assert.equal(unchangedCwd.error_code, "main_agent_pane_cwd_change_unknown");
     assert.equal(runner.calls.slice(unchangedCwdCallCount).some(({ args }) => args.includes("start")), false);
     runner.ignoreCwdChange = false;
     const callCount = runner.calls.length;
     await fs.chmod(path.join(policy.config_root, "slack.env"), 0o644);
-    assert.equal((await runtime.startMainAgent("w1:p1", targetRelease)).outcome, "rejected");
+    assert.equal((await runtime.startMainAgent("wBR:p1", targetRelease)).outcome, "rejected");
     assert.equal(runner.calls.length, callCount);
     assert.equal(Object.values(runner.calls.at(-1)!.options.env ?? {}).some((value) => /token|secret/i.test(value)), false);
   } finally {
     await removeTree(root);
   }
+});
+
+test("保守bridgeは通常main adapterを通して世代固有MCPを必須接続で起動する", async () => {
+  const bridgeUrl = new URL('../../scripts/maintenance/main_bridge.mjs', import.meta.url).href;
+  const {operate} = await import(bridgeUrl);
+  const {root,policy} = await tempPolicy();
+  try {
+    const release = path.join(policy.release_root,targetSha);
+    await fs.mkdir(path.join(release,'.codex'),{recursive:true});
+    await fs.writeFile(path.join(release,'.codex/config.toml'),'');
+    await fs.mkdir(policy.config_root,{recursive:true,mode:0o700});
+    for (const name of ['dispatcher','slack']) await fs.writeFile(path.join(policy.config_root,`${name}.env`),'',{mode:0o600});
+    const oldRelease=path.join(policy.release_root,'1'.repeat(40));
+    const recorder=new AgentRunner(oldRelease);
+    class BridgeProcess { run(executable:string,args:readonly string[],options:RunOptions) { return recorder.run(executable,args,options); } }
+    const old=await operate({action:'status',release:oldRelease},policy,RealRuntime,BridgeProcess);
+    assert.equal(old.session_id,'session-old');
+    assert.equal((await operate({action:'stop',expected:old},policy,RealRuntime,BridgeProcess)).outcome,'stopped');
+    const started=await operate({action:'start',release,pane:old.pane_id,previous_session:old.session_id},policy,RealRuntime,BridgeProcess);
+    assert.equal(started.outcome,'started');
+    assert.equal(started.observation.session_id,'session-new');
+    const call=recorder.calls.find(c=>c.args[2]==='agent'&&c.args[3]==='start')!;
+    for (const [server,name] of [['dona_dispatcher','dispatcher'],['dona_slack','slack']]) {
+      assert.ok(call.args.includes(`mcp_servers.${server}.required=true`));
+      assert.ok(call.args.includes(`mcp_servers.${server}.args=${JSON.stringify([path.join(policy.config_root,`mcp-${name}.mjs`)])}`));
+      assert.ok(call.args.includes(`mcp_servers.${server}.command=${JSON.stringify(policy.executables.node)}`));
+    }
+    assert.equal(recorder.calls.filter(c=>c.args[3]==='start').length,1);
+    assert.equal(recorder.calls.some(c=>c.args.includes('session')&&c.args.includes('kill')),false);
+  } finally { await removeTree(root); }
 });

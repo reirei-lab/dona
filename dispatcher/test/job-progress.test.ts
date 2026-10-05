@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import { test } from "node:test";
 import Database from "better-sqlite3";
 
 import { JobProgressCoordinator, JobProgressStore, parseJobProgress, safeProgressText } from "../src/job-progress.js";
@@ -35,7 +35,7 @@ test("worker summary is never sent and phase is rendered as a fixed label", () =
 test("scratch progress path stays fixed when the worker creates git metadata", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-git-"));
   try {
-    const row = { workspace_path: root, workspace_json: JSON.stringify({ kind:"scratch" }) } as never;
+    const row = { job_id: path.basename(root), workspace_path: root, workspace_json: JSON.stringify({ kind:"scratch" }) } as never;
     const expected=path.join(path.dirname(root),".dona-progress",path.basename(root),"progress.json");
     assert.equal(jobProgressPath(row), expected);
     await fs.mkdir(path.join(root, ".git"));
@@ -329,4 +329,23 @@ test("migrates progress schema 1 with a terminal reconciliation marker", async (
   const store=new JobProgressStore(file);
   try { const check=new Database(file,{readonly:true}); try { assert.equal(check.pragma("user_version",{simple:true}),2); const row=check.prepare("SELECT safe_summary,updated_at FROM job_progress WHERE job_id='job_legacy'").get() as {safe_summary:string;updated_at:string}; assert.equal(row.safe_summary,"テスト中"); assert.equal(row.updated_at,"1970-01-01T00:00:00.000Z"); assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='job_progress_terminal_idx'").get()); } finally { check.close(); } }
   finally { store.close(); await fs.rm(root,{recursive:true}); }
+});
+
+
+test("scheduled ownerは通常progress storeの既存行とworkerファイルからSlackへ送信されない", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(),"dona-scheduled-progress-"));
+  const store = new JobProgressStore(path.join(root,"progress.sqlite3"));
+  const row = {job_id:valid.job_id,source:"dona_schedule",status:"running",workspace_id:"T1",channel_id:"C1",thread_ts:"1.1",workspace_path:path.join(root,"work")};
+  let ordinaryLookups=0;
+  const jobs = {getJob:()=>row,listEventJobs(){ordinaryLookups++;throw new Error("scheduled progress must not use normal group");}};
+  const coordinator = new JobProgressCoordinator(jobs as never,store,{updateInternalTokenPath:path.join(root,"missing")} as never,{warn(){}} as never);
+  try {
+    store.ingest(valid);
+    await coordinator.report();
+    assert.equal(store.pending(),undefined);
+    assert.equal(store.get(row.job_id)?.delivered_at,null);
+    await coordinator.ingest(row as never);
+    assert.equal(ordinaryLookups,0);
+    assert.equal(coordinator.resolveDelivery(`${row.job_id}:1`,"untrusted"),undefined);
+  } finally { await coordinator.stop();store.close();await fs.rm(root,{recursive:true,force:true}); }
 });

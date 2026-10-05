@@ -8,17 +8,17 @@ import { parseApplyRequest, parseCompatibilityMetadata, parsePlanRequest } from 
 import { tempPolicy } from "./helpers.js";
 
 describe("fixed self-update surface", () => {
-  test("publishes the dispatcher v2/v3 read range and schema-v3 write target", async () => {
+  test("Task世代のschema 4と旧世代rollback不可を公開する", async () => {
     const metadata = parseCompatibilityMetadata(JSON.parse(
       await fs.readFile(new URL("../../config/release-compatibility.json", import.meta.url), "utf8"),
     ));
     assert.deepEqual(metadata, {
       protocol: 1,
       config: 1,
-      app_schema_read_min: 2,
-      app_schema_read_max: 3,
-      app_schema_write: 3,
-      rollback_safe: true,
+      app_schema_read_min: 4,
+      app_schema_read_max: 4,
+      app_schema_write: 4,
+      rollback_safe: false,
     });
     const examplePolicy = JSON.parse(
       await fs.readFile(new URL("../../config/update-policy.example.json", import.meta.url), "utf8"),
@@ -52,6 +52,9 @@ describe("fixed self-update surface", () => {
     const { root, policy } = await tempPolicy();
     try {
       assert.throws(() => parsePolicy({ ...policy, canonical_remote: "https://example.invalid/other.git" }), /canonical_remote/);
+      assert.throws(() => parsePolicy({ ...policy,
+        diagnostic_aggregate_limit_bytes: policy.diagnostic_log_limit_bytes,
+      }), /both command and observation logs/);
       assert.throws(() => parsePolicy({ ...policy, control_root: `${policy.release_root}/control` }), /outside/);
       assert.throws(() => parsePolicy({ ...policy, config_root: "/tmp/unrelated-config" }), /fixed base/);
       assert.throws(() => parsePolicy({ ...policy, main_agent: { ...policy.main_agent, session: "other" } }), /main_agent/);
@@ -62,7 +65,7 @@ describe("fixed self-update surface", () => {
         from: policy.compatibility,
         to: { ...policy.compatibility, app_schema_read_max: 3, app_schema_write: 3 },
         previous_release_contract: "release-compatibility.v2-v3-bridge.json",
-        required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+        required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1",
       };
       assert.deepEqual(parsePolicy({ ...policy, compatibility_transitions: [transition] }).compatibility_transitions, [transition]);
       assert.throws(() => parsePolicy({ ...policy, compatibility_transitions: [transition, transition] }), /duplicates/);

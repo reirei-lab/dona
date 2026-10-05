@@ -22,6 +22,7 @@ export interface UpdatePolicy {
     session: "dona";
     name: "dona-main";
     minimum_herdr_version: string;
+    runtime?: "app_server";
   };
   launchd: {
     dispatcher_label: string;
@@ -34,6 +35,7 @@ export interface UpdatePolicy {
     launchctl: string;
     gh: string;
     herdr: string;
+    codex: string;
   };
   timeouts: {
     command_ms: number;
@@ -46,6 +48,9 @@ export interface UpdatePolicy {
     lease_ms: number;
   };
   output_limit_bytes: number;
+  diagnostic_log_limit_bytes: number;
+  diagnostic_aggregate_limit_bytes: number;
+  diagnostic_retention_days: number;
   disk_floor_bytes: number;
   retain_successful: number;
   required_checks: string[];
@@ -101,7 +106,8 @@ export function parsePolicy(input: unknown): UpdatePolicy {
     "schema_version", "policy_version", "repository", "canonical_remote", "default_branch",
     "control_root", "config_root", "release_root", "current_pointer", "previous_pointer", "dispatcher_socket",
     "slack_socket", "dispatcher_internal_token_file", "main_agent", "launchd", "executables", "timeouts",
-    "output_limit_bytes", "disk_floor_bytes", "retain_successful", "required_checks", "require_verified_signature", "compatibility",
+    "output_limit_bytes", "diagnostic_log_limit_bytes", "diagnostic_aggregate_limit_bytes", "diagnostic_retention_days",
+    "disk_floor_bytes", "retain_successful", "required_checks", "require_verified_signature", "compatibility",
   ];
   const extras = Object.keys(value).filter((key) => ![...policyKeys, "compatibility_transitions"].includes(key));
   const missing = policyKeys.filter((key) => !(key in value));
@@ -114,7 +120,8 @@ export function parsePolicy(input: unknown): UpdatePolicy {
     throw new ValidationError("policy_version is invalid");
   }
   const mainAgent = record(value.main_agent, "main_agent");
-  exact(mainAgent, ["session", "name", "minimum_herdr_version"], "main_agent");
+  exact(mainAgent, ["session", "name", "minimum_herdr_version",...(Object.hasOwn(mainAgent,"runtime")?["runtime"]:[])], "main_agent");
+  if(mainAgent.runtime!==undefined&&mainAgent.runtime!=="app_server")throw new ValidationError("main_agent runtime is invalid");
   if (mainAgent.session !== "dona" || mainAgent.name !== "dona-main" ||
     typeof mainAgent.minimum_herdr_version !== "string" || !/^\d+\.\d+\.\d+$/.test(mainAgent.minimum_herdr_version)) {
     throw new ValidationError("main_agent configuration is not allowed");
@@ -125,7 +132,7 @@ export function parsePolicy(input: unknown): UpdatePolicy {
     throw new ValidationError("launchd labels are not allowed");
   }
   const executables = record(value.executables, "executables");
-  exact(executables, ["git", "npm", "node", "launchctl", "gh", "herdr"], "executables");
+  exact(executables, ["git", "npm", "node", "launchctl", "gh", "herdr", "codex"], "executables");
   const timeouts = record(value.timeouts, "timeouts");
   exact(timeouts, ["command_ms", "health_ms", "drain_ms", "agent_drain_ms", "agent_exit_ms", "agent_start_ms", "reconcile_ms", "lease_ms"], "timeouts");
   const controlRoot = absolute(value.control_root, "control_root");
@@ -150,8 +157,9 @@ export function parsePolicy(input: unknown): UpdatePolicy {
     launchctl: absolute(executables.launchctl, "executables.launchctl"),
     gh: absolute(executables.gh, "executables.gh"),
     herdr: absolute(executables.herdr, "executables.herdr"),
+    codex: absolute(executables.codex, "executables.codex"),
   };
-  const fixedChecks = ["Verify dispatcher", "Verify sources/slack", "Verify updater"];
+  const fixedChecks = ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS"];
   const requiredChecks = value.required_checks;
   if (!Array.isArray(requiredChecks) || requiredChecks.length !== fixedChecks.length ||
     !fixedChecks.every((check) => requiredChecks.includes(check))) {
@@ -183,7 +191,7 @@ export function parsePolicy(input: unknown): UpdatePolicy {
       parsed.from.app_schema_read_min > 2 || parsed.from.app_schema_read_max < 2 ||
       parsed.to.app_schema_read_min > 2 || parsed.to.app_schema_read_max < 3 ||
       !parsed.from.rollback_safe || !parsed.to.rollback_safe ||
-      parsed.required_control_plane_capability !== "dispatcher_v2_to_v3_online_backup_v1") {
+      parsed.required_control_plane_capability !== "dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1") {
       throw new ValidationError(`compatibility_transitions[${index}] is not a supported v2 to v3 migration`);
     }
     return parsed;
@@ -191,6 +199,11 @@ export function parsePolicy(input: unknown): UpdatePolicy {
   const transitionKeys = compatibilityTransitions.map(({ from_sha, from, to }) =>
     JSON.stringify({ from_sha, from, to }));
   if (new Set(transitionKeys).size !== transitionKeys.length) throw new ValidationError("compatibility_transitions contains duplicates");
+  const diagnosticLogLimitBytes = integer(value.diagnostic_log_limit_bytes, "diagnostic_log_limit_bytes", 4_096);
+  const diagnosticAggregateLimitBytes = integer(value.diagnostic_aggregate_limit_bytes, "diagnostic_aggregate_limit_bytes", 4_096);
+  if (diagnosticAggregateLimitBytes < diagnosticLogLimitBytes * 2) {
+    throw new ValidationError("diagnostic_aggregate_limit_bytes must cover both command and observation logs");
+  }
   return {
     schema_version: 1,
     policy_version: value.policy_version,
@@ -209,6 +222,7 @@ export function parsePolicy(input: unknown): UpdatePolicy {
       session: "dona",
       name: "dona-main",
       minimum_herdr_version: mainAgent.minimum_herdr_version,
+      ...(mainAgent.runtime==="app_server"?{runtime:"app_server" as const}:{}),
     },
     launchd: {
       dispatcher_label: typeof launchd.dispatcher_label === "string" ? launchd.dispatcher_label : "",
@@ -226,6 +240,9 @@ export function parsePolicy(input: unknown): UpdatePolicy {
       lease_ms: integer(timeouts.lease_ms, "timeouts.lease_ms"),
     },
     output_limit_bytes: integer(value.output_limit_bytes, "output_limit_bytes", 1_024),
+    diagnostic_log_limit_bytes: diagnosticLogLimitBytes,
+    diagnostic_aggregate_limit_bytes: diagnosticAggregateLimitBytes,
+    diagnostic_retention_days: integer(value.diagnostic_retention_days, "diagnostic_retention_days"),
     disk_floor_bytes: integer(value.disk_floor_bytes, "disk_floor_bytes", 0),
     retain_successful: integer(value.retain_successful, "retain_successful"),
     required_checks: [...requiredChecks] as string[],

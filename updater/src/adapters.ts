@@ -5,13 +5,16 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseDotenv } from "dotenv";
+import Database from "better-sqlite3";
 
 import type { UpdatePolicy } from "./policy.js";
 import type { BuildPort, DispatcherPort, GitPort, RuntimePort } from "./ports.js";
 import { ProcessRunner, minimalEnvironment } from "./process.js";
+import { DiagnosticLogStore } from "./diagnostic-log.js";
 import { redactText } from "./redaction.js";
 import type {
   CommandResult,
+  DiagnosticLogIdentity,
   Compatibility,
   DrainSnapshot,
   HealthSnapshot,
@@ -22,16 +25,27 @@ import type {
   OutboxRow,
   SchemaRollout,
 } from "./types.js";
+import {AppServerMain} from "./app-server-main.js";
 import { fullSha, parseCompatibilityMetadata, sha256 } from "./validation.js";
 
 const mainAgentStartupPrompt =
   "起動確認です。外部操作、ファイル変更、プロセス操作は行わず、READYとだけ返してください。";
 
+export class CommandFailureError extends Error {
+  constructor(message: string, readonly result: CommandResult) { super(message); }
+}
+
 function commandError(name: string, result: CommandResult): Error {
   const suffix = result.timed_out ? "timed out" : `exited ${result.exit_code}`;
-  const head = redactText((result.stderr || result.stdout).slice(0, 700), 700);
-  const checkpoint = result.output_checkpoint ? `; checkpoint: ${result.output_checkpoint}` : "";
-  return new Error(redactText(`${name} ${suffix}: ${head}${checkpoint}`, 1_000));
+  const checkpoint = result.output_checkpoint ? `; checkpoint=${result.output_checkpoint}` : "";
+  const runner = `; runner=exit:${result.exit_code},signal:${result.exit_signal ?? "none"},cleanup:${result.cleanup_status ?? "unknown"}`;
+  const stderr = redactText(result.stderr.slice(0, 250), 250);
+  const stdout = redactText(result.stdout.slice(0, 250), 250);
+  const spawn = result.spawn_error ? `; spawn=${redactText(result.spawn_error, 100)}` : "";
+  const diagnostic = result.diagnostic_log
+    ? `; diagnostic=${result.diagnostic_log.log_id}:${result.diagnostic_log.capture_state}:${result.diagnostic_log.byte_size}`
+    : "";
+  return new CommandFailureError(redactText(`${name} ${suffix}${spawn}${checkpoint}${runner}${diagnostic}; stderr=${stderr}; stdout=${stdout}`, 1_000), result);
 }
 
 function requireSuccess(name: string, result: CommandResult): string {
@@ -130,17 +144,30 @@ export class RealGit implements GitPort {
         env: minimalEnvironment({ HOME: os.homedir(), GH_PROMPT_DISABLED: "1" }),
       });
       if (result.exit_code !== 0 || result.timed_out || result.output_truncated) return false;
-      let checkRuns: Array<{ name?: unknown; status?: unknown; conclusion?: unknown; app?: { slug?: unknown } }>;
+      let checks: unknown;
       try {
-        const parsed = JSON.parse(result.stdout) as { check_runs?: unknown };
-        checkRuns = Array.isArray(parsed.check_runs) ? parsed.check_runs : [];
+        checks = JSON.parse(result.stdout);
       } catch {
         return false;
       }
-      const trusted = this.policy.required_checks.every((name) => checkRuns.some((run) =>
-        run.name === name && run.status === "completed" && run.conclusion === "success" && run.app?.slug === "github-actions",
-      ));
-      if (!trusted) return false;
+      const runId = trustedMainPushRunId(checks, targetSha, this.policy.required_checks);
+      if (runId === null) return false;
+      const workflow = await this.runner.run(this.policy.executables.gh, [
+        "api", "--method", "GET", `repos/${this.policy.repository}/actions/runs/${runId}`,
+      ], {
+        timeoutMs: this.policy.timeouts.command_ms,
+        outputLimitBytes: this.policy.output_limit_bytes,
+        env: minimalEnvironment({ HOME: os.homedir(), GH_PROMPT_DISABLED: "1" }),
+      });
+      if (workflow.exit_code !== 0 || workflow.timed_out || workflow.output_truncated) return false;
+      try {
+        const run = JSON.parse(workflow.stdout) as Record<string, unknown>;
+        if (run.id !== runId || run.event !== "push" || run.head_branch !== this.policy.default_branch ||
+          run.head_sha !== targetSha || run.status !== "completed" || run.conclusion !== "success" ||
+          run.name !== "CI") return false;
+      } catch {
+        return false;
+      }
     }
     if (this.policy.require_verified_signature) {
       const result = await this.runner.run(this.policy.executables.gh, [
@@ -192,6 +219,29 @@ export class RealGit implements GitPort {
   }
 }
 
+export function trustedMainPushRunId(checks: unknown, targetSha: string, names: readonly string[]): number | null {
+  if (!checks || typeof checks !== "object") return null;
+  const response = checks as { total_count?: unknown; check_runs?: unknown };
+  if (!Array.isArray(response.check_runs) || response.total_count !== response.check_runs.length ||
+    response.check_runs.length > 100) return null;
+  const runs = response.check_runs as Array<Record<string, unknown>>;
+  const matched = names.map(name => runs.filter(run => run.name === name));
+  if (matched.some(group => group.length !== 1)) return null;
+  let runId: number | null = null;
+  for (const group of matched) {
+    const run = group[0];
+    if (!run) return null;
+    const url = typeof run.details_url === "string" ? run.details_url.match(/^https:\/\/github\.com\/[^/]+\/[^/]+\/actions\/runs\/([1-9]\d*)\/job\/([1-9]\d*)$/) : null;
+    const id = url ? Number(url[1]) : null;
+    if (!id || !Number.isSafeInteger(id) || run.head_sha !== targetSha ||
+      run.status !== "completed" || run.conclusion !== "success" ||
+      (run.app as { slug?: unknown } | null)?.slug !== "github-actions") return null;
+    if (runId !== null && runId !== id) return null;
+    runId = id;
+  }
+  return runId;
+}
+
 function versionAtLeast(actual: string, minimum: string): boolean {
   const actualParts = actual.split(".").map(Number);
   const minimumParts = minimum.split(".").map(Number);
@@ -235,7 +285,11 @@ async function isolatedNpmEnvironment(
 }
 
 export class CanonicalBuild implements BuildPort {
-  constructor(private readonly policy: UpdatePolicy, private readonly runner = new ProcessRunner()) {}
+  constructor(
+    private readonly policy: UpdatePolicy,
+    private readonly runner = new ProcessRunner(),
+    private readonly diagnostics?: DiagnosticLogStore,
+  ) {}
 
   async toolchain(): Promise<{ node_version: string; npm_version: string }> {
     const npmVersion = requireSuccess("npm --version", await this.runner.run(this.policy.executables.npm, ["--version"], {
@@ -246,7 +300,7 @@ export class CanonicalBuild implements BuildPort {
     return { node_version: process.versions.node, npm_version: npmVersion };
   }
 
-  async buildRelease(checkoutPath: string): Promise<{
+  async buildRelease(checkoutPath: string, diagnostic?: Omit<DiagnosticLogIdentity, "step">): Promise<{
     lock_hashes: Record<string, string>;
     node_version: string;
     npm_version: string;
@@ -273,12 +327,16 @@ export class CanonicalBuild implements BuildPort {
       const lockPath = path.join(directory, "package-lock.json");
       const before = sha256(await fs.readFile(lockPath));
       lockHashes[component] = before;
-      for (const args of [["ci"], ["test"], ["run", "typecheck"], ["run", "build"]] as const) {
+      for (const args of [["ci"], ["run", "typecheck"], ["run", "build"]] as const) {
         const result = await this.runner.run(this.policy.executables.npm, args, {
           cwd: directory,
           timeoutMs: this.policy.timeouts.command_ms,
           outputLimitBytes: this.policy.output_limit_bytes,
           env: npmEnvironment,
+          ...(diagnostic && this.diagnostics ? { diagnostic: {
+            store: this.diagnostics,
+            identity: { ...diagnostic, step: canonicalDiagnosticStep(component, args) },
+          } } : {}),
         });
         requireSuccess(`npm ${args.join(" ")} (${component})`, result);
       }
@@ -291,6 +349,13 @@ export class CanonicalBuild implements BuildPort {
     ));
     return { lock_hashes: lockHashes, node_version: process.versions.node, npm_version: npmVersion, compatibility };
   }
+}
+
+export function canonicalDiagnosticStep(
+  component: "dispatcher" | "sources/slack" | "updater",
+  args: readonly string[],
+): string {
+  return `${component.replaceAll("/", ".")}:npm-${args.join("-")}`;
 }
 
 interface HttpResponse {
@@ -472,11 +537,58 @@ function shellSingleQuote(value: string): string {
 export class RealRuntime implements RuntimePort {
   constructor(private readonly policy: UpdatePolicy, private readonly runner = new ProcessRunner()) {}
 
+  async workerSafety(): Promise<{ safe: boolean; active_worker_count: number; error_code?: string }> {
+    try {
+      const database = new Database(this.dispatcherDatabasePath(), { readonly: true, fileMustExist: true });
+      try {
+        const legacyTable = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_job_agents_to_stop'").get();
+        const legacyWorkerClause = legacyTable ? `OR EXISTS
+          (SELECT 1 FROM legacy_job_agents_to_stop l WHERE l.job_id=jobs.job_id)` : "";
+        const active = (database.prepare(`SELECT COUNT(*) AS count FROM jobs
+          WHERE (status IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
+            AND NOT (status='needs_review' AND COALESCE(last_error_code,'')='result_path_exists'
+              AND attempt_count=0 AND herdr_workspace_id IS NULL AND dispatch_started_at IS NULL AND prompt_accepted_at IS NULL)
+            AND NOT (status='needs_review' AND COALESCE(last_error_code,'') IN
+              ('invalid_result_agent_stopped','agent_not_found','agent_not_running','workspace_cleanup_agent_stopped')))
+            OR (status='retryable_failed' AND (last_error_code='stale_preparing' OR
+              (herdr_workspace_id IS NOT NULL AND COALESCE(last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))
+            OR steer_state='dispatching'
+            OR (status IN ('completed','failed','cancelled') AND steer_state='accepted')
+            OR herdr_workspace_id IS NOT NULL
+            OR attempt_count > 0
+            ${legacyWorkerClause}
+            OR (status IN ('completed','failed','cancelled') AND last_error_code IN
+              ('schedule_reconcile_worker_unverified','terminal_steer_worker_unverified','cancel_worker_unverified'))`)
+          .get() as { count: number }).count;
+        return { safe: active === 0, active_worker_count: active };
+      } finally { database.close(); }
+    } catch {
+      return { safe: false, active_worker_count: 0, error_code: "worker_state_unverified" };
+    }
+  }
+
   async quiesceSlack(requestId: string, targetSha: string): Promise<DrainSnapshot> {
-    const response = await udsRequest(this.policy.slack_socket, "POST", "/v1/admin/quiesce", {
+    let snapshot = drainSnapshot(await udsRequest(this.policy.slack_socket, "POST", "/v1/admin/quiesce", {
       schema_version: 1, protocol: 1, operation_id: requestId, target_sha: targetSha,
-    }, this.policy.timeouts.drain_ms);
-    return drainSnapshot(response, "slack_adapter");
+    }, this.policy.timeouts.drain_ms), "slack_adapter");
+    const deadline = Date.now() + this.policy.timeouts.agent_drain_ms;
+    while (!snapshot.drained && Date.now() < deadline) {
+      await delay(100);
+      snapshot = drainSnapshot(await udsRequest(
+        this.policy.slack_socket, "GET", "/v1/admin/drain-status", undefined, this.policy.timeouts.health_ms,
+      ), "slack_adapter");
+    }
+    return snapshot;
+  }
+
+  async slackDrainStatus(): Promise<DrainSnapshot> {
+    return drainSnapshot(await udsRequest(this.policy.slack_socket, "GET", "/v1/admin/drain-status",
+      undefined, this.policy.timeouts.health_ms), "slack_adapter");
+  }
+
+  async dispatcherDrainStatus(): Promise<DrainSnapshot> {
+    return drainSnapshot(await udsRequest(this.policy.dispatcher_socket, "GET", "/v1/admin/drain-status",
+      undefined, this.policy.timeouts.health_ms), "dispatcher");
   }
 
   async quiesceDispatcher(requestId: string, targetSha: string): Promise<DrainSnapshot> {
@@ -489,6 +601,15 @@ export class RealRuntime implements RuntimePort {
       snapshot = drainSnapshot(await udsRequest(
         this.policy.dispatcher_socket, "GET", "/v1/admin/drain-status", undefined, this.policy.timeouts.health_ms,
       ), "dispatcher");
+    }
+    if (snapshot.drained) {
+      // A pre-handoff Dispatcher can report a drained supervisor while Herdr
+      // workers still run. Independently inspect durable job state before any
+      // service stop, schema migration or pointer switch. No worker is stopped.
+      const worker = await this.workerSafety();
+      if (!worker.safe) snapshot = { ...snapshot, drained: false, in_flight: Math.max(snapshot.in_flight, 1),
+        unsafe_states: [...snapshot.unsafe_states, worker.error_code
+          ? "jobs.handoff_observation_unknown" : `jobs.handoff_unavailable:${worker.active_worker_count}`] };
     }
     return snapshot;
   }
@@ -516,11 +637,31 @@ export class RealRuntime implements RuntimePort {
   }
 
   stopSlack(): Promise<CommandResult> {
-    return this.launchctl(["kill", "SIGTERM", this.domainTarget(this.policy.launchd.slack_label)]);
+    return this.launchctl(["bootout", this.domainTarget(this.policy.launchd.slack_label)]);
+  }
+
+  slackRegistered(): Promise<boolean> {
+    return this.serviceRegistered(this.policy.launchd.slack_label);
   }
 
   stopDispatcher(): Promise<CommandResult> {
-    return this.launchctl(["kill", "SIGTERM", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+    return this.launchctl(["bootout", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+  }
+
+  async dispatcherRegistered(): Promise<boolean> {
+    return this.serviceRegistered(this.policy.launchd.dispatcher_label);
+  }
+
+  private async serviceRegistered(label: string): Promise<boolean> {
+    const errorCode = label === this.policy.launchd.dispatcher_label
+      ? "dispatcher_registration_unverified" : "slack_registration_unverified";
+    const result = await this.launchctl(["print", this.domainTarget(label)]);
+    if (result.timed_out || result.output_truncated || result.exit_code === null) {
+      throw new Error(errorCode);
+    }
+    if (result.exit_code === 0) return true;
+    if (/Could not find (?:specified )?service/i.test(result.stderr)) return false;
+    throw new Error(errorCode);
   }
 
   migrateAppSchema(_requestId: string, targetSha: string, previous: Compatibility, target: Compatibility): Promise<CommandResult> {
@@ -592,15 +733,28 @@ export class RealRuntime implements RuntimePort {
     return resolved;
   }
 
-  startDispatcher(): Promise<CommandResult> {
-    return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+  async startDispatcher(): Promise<CommandResult> {
+    if (await this.dispatcherRegistered()) {
+      return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+    }
+    const uid = process.getuid?.();
+    if (uid === undefined) throw new Error("launchctl_requires_unix_uid");
+    return this.launchctl(["bootstrap", `gui/${uid}`,
+      path.join(os.homedir(), "Library/LaunchAgents/dev.dona.dispatcher.plist")]);
   }
 
-  startSlack(): Promise<CommandResult> {
-    return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.slack_label)]);
+  async startSlack(): Promise<CommandResult> {
+    if (await this.slackRegistered()) {
+      return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.slack_label)]);
+    }
+    const uid = process.getuid?.();
+    if (uid === undefined) throw new Error("launchctl_requires_unix_uid");
+    return this.launchctl(["bootstrap", `gui/${uid}`,
+      path.join(os.homedir(), "Library/LaunchAgents/dev.dona.slack-adapter.plist")]);
   }
 
   async waitForMainAgentIdle(): Promise<MainAgentObservation> {
+    if(this.policy.main_agent.runtime==="app_server")return new AppServerMain(this.policy).waitIdle();
     if (!(await this.herdrVersionSupported())) return missingMainAgent("unsupported_herdr_version");
     const result = await this.herdr([
       "--session", this.policy.main_agent.session,
@@ -612,6 +766,7 @@ export class RealRuntime implements RuntimePort {
   }
 
   async stopMainAgent(expected: MainAgentObservation): Promise<MainAgentStopResult> {
+    if(this.policy.main_agent.runtime==="app_server")return new AppServerMain(this.policy).stop(expected);
     if (!expected.exists || !expected.pane_id || !expected.session_id || !["idle", "done"].includes(expected.status ?? "") ||
       expected.name !== this.policy.main_agent.name || expected.kind !== "codex") {
       return { outcome: "rejected", pane_id: expected.pane_id, error_code: "main_agent_not_idle" };
@@ -645,7 +800,8 @@ export class RealRuntime implements RuntimePort {
   }
 
   async startMainAgent(paneId: string, releasePath: string, previousSessionId?: string): Promise<MainAgentStartResult> {
-    if (!/^[a-z0-9][a-z0-9:_-]{0,63}$/.test(paneId)) {
+    if(this.policy.main_agent.runtime==="app_server")return new AppServerMain(this.policy).start(paneId,releasePath,previousSessionId);
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,63}$/.test(paneId)) {
       return { outcome: "rejected", observation: missingMainAgent("invalid_main_agent_pane"), error_code: "invalid_main_agent_pane" };
     }
     let canonicalRelease: string;
@@ -710,11 +866,13 @@ export class RealRuntime implements RuntimePort {
       DONA_UPDATER_SOCKET_PATH: path.join(this.policy.control_root, "updater.sock"),
       DONA_UPDATE_INTERNAL_TOKEN_PATH: this.policy.dispatcher_internal_token_file,
       DONA_HERDR_PATH: this.policy.executables.herdr,
+      DONA_CODEX_PATH: this.policy.executables.codex,
       DONA_GH_PATH: this.policy.executables.gh,
       DONA_GIT_PATH: this.policy.executables.git,
     })}`;
     const slackMcpEnvironment = `mcp_servers.dona_slack.env = ${tomlInlineTable({
       DOTENV_CONFIG_PATH: path.join(canonicalConfigRoot, "slack.env"),
+      DONA_UPDATE_INTERNAL_TOKEN_PATH: this.policy.dispatcher_internal_token_file,
     })}`;
     const deadline = Date.now() + this.policy.timeouts.agent_exit_ms;
     let result: CommandResult;
@@ -726,6 +884,7 @@ export class RealRuntime implements RuntimePort {
         "--timeout", String(this.policy.timeouts.agent_start_ms),
         "--", "-C", canonicalRelease, "-c", projectTrust,
         "-c", dispatcherMcpEnvironment, "-c", slackMcpEnvironment,
+        "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"',
         "-c", "check_for_update_on_startup=false", mainAgentStartupPrompt,
       ], this.policy.timeouts.agent_start_ms + 5_000);
       if (result.exit_code === 0 && !result.timed_out && !result.output_truncated) break;
@@ -753,6 +912,7 @@ export class RealRuntime implements RuntimePort {
   }
 
   async mainAgentStatus(releasePath: string): Promise<MainAgentObservation> {
+    if(this.policy.main_agent.runtime==="app_server")return new AppServerMain(this.policy).status(releasePath);
     if (!(await this.herdrVersionSupported())) return missingMainAgent("unsupported_herdr_version");
     return this.readMainAgent(releasePath);
   }
@@ -809,10 +969,22 @@ export class RealRuntime implements RuntimePort {
 
   private async health(socketPath: string, service: HealthSnapshot["service"]): Promise<HealthSnapshot> {
     try {
-      const response = parsedObject(await udsRequest(socketPath, "GET", "/health/version", undefined, this.policy.timeouts.health_ms));
+      const healthResponse = await udsRequest(socketPath, "GET", "/health/version", undefined, this.policy.timeouts.health_ms);
+      // A quiescing service answers 503 with a versioned not_ready body. It is
+      // still live, so its stop must not be inferred from the HTTP status.
+      const response = healthResponse.statusCode === 503
+        ? JSON.parse(healthResponse.body) as Record<string, unknown>
+        : parsedObject(healthResponse);
+      if (healthResponse.statusCode === 503 &&
+        (response.schema_version !== 1 || response.status !== "not_ready" || response.service !== service ||
+          typeof response.build_sha !== "string" || response.protocol !== 1)) {
+        throw new Error("Unverified service health response");
+      }
       return {
         service,
-        live: response.status === "live" || response.status === "ready",
+        observed: true,
+        live: response.status === "live" || response.status === "ready" ||
+          (healthResponse.statusCode === 503 && response.status === "not_ready"),
         ready: response.status === "ready",
         build_sha: typeof response.build_sha === "string" ? response.build_sha : null,
         protocol: typeof response.protocol === "number" ? response.protocol : null,
@@ -833,7 +1005,7 @@ export class RealRuntime implements RuntimePort {
         ...(service === "slack_adapter" ? { workspaces_ready: response.workspaces_ready === true } : {}),
       };
     } catch {
-      return { service, live: false, ready: false, build_sha: null, protocol: null, app_schema: null, config: null };
+      return { service, observed: false, live: false, ready: false, build_sha: null, protocol: null, app_schema: null, config: null };
     }
   }
 }
