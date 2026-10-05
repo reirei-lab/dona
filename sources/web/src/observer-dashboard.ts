@@ -230,12 +230,15 @@ async function nativeApproval(input,buttons) {
     decideStarted=true;const value=await credentialPost('/api/native/decide',{ceremony_id:ceremony.ceremony_id,response});if(epoch===authEpoch)accepted(value);
   }catch(error){
     if(epoch!==authEpoch)return;
-    if(!decideStarted&&error.name==='NotAllowedError'){savePending(null);byId('command-status').textContent='パスキー確認が取り消されたため、判断は送信していません。';}
+    if(!decideStarted)byId('command-status').textContent='承認操作が中断されたため、判断は送信していません。';
     else await reconcile();
-  }finally{for(const button of buttons.querySelectorAll('button'))button.disabled=!!pending;}
+  }finally{
+    if(!decideStarted&&pending?.request_id===request_id){savePending(null);if(epoch===authEpoch&&!stopped)void detailRead();}
+    for(const button of buttons.querySelectorAll('button'))button.disabled=!!pending;
+  }
 }
 function externalSavePending(id) {externalPending=id;try{if(id)sessionStorage.setItem('dona.pending-external',id);else sessionStorage.removeItem('dona.pending-external');}catch{}byId('external-reconcile').hidden=!id;}
-const externalState=value=>({pending:'判断待ち',awaiting_decision:'判断待ち',draft:'確認準備中',decided:'判断受付済み',authorized:'許可済み',consumed:'判断受付済み',approved:'許可済み',rejected:'拒否済み',expired:'期限切れ',cancelled:'取消済み',ready:'実行待ち',queued:'実行待ち',running:'実行中',executing:'実行中',succeeded:'実行成功',completed:'完了',failed:'失敗',unknown:'結果未確認',execution_unknown:'実行結果未確認'})[value]||'状態未確認';
+const externalState=value=>({requested:'承認要求を受付済み',delivery_pending:'承認内容の提示待ち',delivery_unknown:'承認内容の提示結果未確認',sent:'承認内容を提示済み',delivery_failed:'承認内容の提示失敗',execution_cancelled:'実行取消済み',consume_expired:'実行受付期限切れ',needs_review:'要確認',claimed:'実行準備中',acceptance_unknown:'送信結果未確認',pending:'判断待ち',awaiting_decision:'判断待ち',draft:'確認準備中',decided:'判断受付済み',authorized:'許可済み',consumed:'判断受付済み',approved:'許可済み',rejected:'拒否済み',expired:'期限切れ',cancelled:'取消済み',ready:'実行待ち',queued:'実行待ち',running:'実行中',executing:'実行中',succeeded:'実行成功',completed:'完了',failed:'失敗',unknown:'結果未確認',execution_unknown:'実行結果未確認'})[value]||'状態未確認';
 async function externalRefresh() {
   const allowed=capabilities.includes('approvals:external');byId('external-panel').hidden=!allowed;
   if(!allowed){externalView=null;byId('external-items').replaceChildren();byId('external-detail').replaceChildren();return;}
@@ -299,7 +302,8 @@ async function externalDecide(decision) {
     sent=true;const result=await credentialPost('/api/approvals/decide',{ceremony_id:ceremony.ceremony_id,response});if(epoch!==authEpoch)return;
     if(['decided','reused'].includes(result.status))externalTracked=id;
     byId('external-status').textContent=['decided','reused'].includes(result.status)?'判断を受け付けました。外部操作の実行成功はまだ確認していません。':'判断の受理を確認できません。';await externalStatus();
-  }catch(error){if(epoch!==authEpoch)return;if(!sent&&error.name==='NotAllowedError'){externalSavePending(null);byId('external-status').textContent='パスキー確認が取り消されたため、判断は送信していません。';}else await externalStatus();}
+  }catch(error){if(epoch!==authEpoch)return;if(!sent)byId('external-status').textContent='承認操作が中断されたため、判断は送信していません。';else await externalStatus();}
+  finally{if(!sent&&externalPending===id){externalSavePending(null);if(epoch===authEpoch&&!stopped)void externalRead(true);}}
 }
 byId('external-reconcile').addEventListener('click',()=>void externalStatus());
 byId('external-next').addEventListener('click',()=>{if(!externalNext)return;externalAfter=externalNext;externalEpoch++;void refresh();});
