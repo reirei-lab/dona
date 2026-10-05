@@ -24,4 +24,4 @@ manifest readerは旧3component manifestを旧release照合のために受け入
 
 既存 `WebLoopbackStartup` は実HTTPS listener、OIDC、signed UDS clientを持つが、通常Dona serviceのproduction compositionは未接続である。既存multiuser Web認証を起動するにはOS credential storeと、監査anchor/clock markのprotected CAS provider、初期principal登録、固定originに対応するIdP/TLS設定が必要になる。テスト用providerは本番providerの代用にしない。
 
-#374の完了には独立Web serviceの起動・停止・version/readiness、Webだけのrestartでworkerが継続する証拠、preserve upgradeと障害rollbackのharnessが残る。未接続のcommand/approvalは `safe_off` として扱い、Web packageの配置だけで有効化済みと表示しない。実環境での起動・アクセスURL確認・本番activationはこのbuild対応の成果に含めない。
+private networkの閲覧専用serviceについては[観測service手順](dashboard-observer.md)で独立した設定・pairing・起動とpointer追随を扱う。既存OIDCの認証方式やcommand/approval有効化を変更するものではない。#374の完了には実serviceとprivate HTTPS proxyを接続したinstall・preserve update・障害rollbackの通し検証が残る。未接続のcommand/approvalは `safe_off` として扱い、Web packageの配置だけで有効化済みと表示しない。実環境での起動・アクセスURL確認・本番activationはこのbuild対応の成果に含めない。

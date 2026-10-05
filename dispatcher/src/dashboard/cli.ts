@@ -6,6 +6,7 @@ import { RuntimeClient } from "../app-server/client.js";
 import { readDashboardConfig } from "./config.js";
 import { DashboardTaskReader } from "./task-reader.js";
 import { DashboardObserver, type ConversationContent, type ObservedConversation } from "./observer.js";
+import { readDashboardRelease, watchDashboardRelease } from "./release-pointer.js";
 import { DashboardServer } from "./server.js";
 
 async function main():Promise<void>{
@@ -17,7 +18,8 @@ async function main():Promise<void>{
     const moduleUrl=new URL('../../../sources/web/dist/observer-dashboard.js',import.meta.url);
     const web=await import(moduleUrl.href) as {observerDashboardPage:()=>{status:200;headers:Record<string,string>;body:string}};
     const manifest=JSON.parse(fs.readFileSync(new URL('../../../release-manifest.json',import.meta.url),'utf8')) as {sha?:unknown;lock_hashes?:Record<string,unknown>};
-    if(typeof manifest.sha!=='string'||!/^[a-f0-9]{40}$/.test(manifest.sha)||typeof manifest.lock_hashes?.['sources/web']!=='string')throw Error('dashboard_release_unverified');
+    if(typeof manifest.sha!=='string'||!/^[a-f0-9]{40}$/.test(manifest.sha)||typeof manifest.lock_hashes?.['sources/web']!=='string'||!/^[a-f0-9]{64}$/.test(manifest.lock_hashes['sources/web'] as string))throw Error('dashboard_release_unverified');
+    if(config.active_release_pointer&&readDashboardRelease(config.active_release_pointer).sha!==manifest.sha)throw Error('dashboard_release_changed');
     const reader=new DashboardTaskReader(config.dispatcher_database),client=new RuntimeClient(config.runtime_socket,5000);
     const observer=new DashboardObserver(reader,{
       conversations:after=>client.call<{items:ObservedConversation[];next:string|null}>('conversations',after?{after}:{}),
@@ -26,7 +28,9 @@ async function main():Promise<void>{
     const server=new DashboardServer({origin:config.origin,port:config.port,controlSocket:config.control_socket,reader,observer,page:web.observerDashboardPage(),version:manifest.sha});
     try{await server.start();}catch(error){reader.close();throw error;}
     let closing=false;
-    for(const signal of ['SIGINT','SIGTERM'] as const)process.on(signal,()=>{if(closing)return;closing=true;void server.close().finally(()=>{reader.close();process.exit(0);});setTimeout(()=>process.exit(1),5000).unref();});
+    const shutdown=async(code:number)=>{if(closing)return;closing=true;cancelWatch();const deadline=setTimeout(()=>process.exit(1),5000);deadline.unref();try{await server.close();}finally{reader.close();process.exit(code);}};
+    const cancelWatch=config.active_release_pointer?watchDashboardRelease(config.active_release_pointer,manifest.sha,()=>shutdown(1)):()=>{};
+    for(const signal of ['SIGINT','SIGTERM'] as const)process.on(signal,()=>{void shutdown(0);});
     return;
   }
   if(command==='pair'&&!process.stdout.isTTY)throw Error('dashboard_pair_requires_terminal');
