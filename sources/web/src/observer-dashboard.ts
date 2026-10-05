@@ -28,7 +28,7 @@ function renderDetail(value) {
   const task = value?.snapshot?.task;
   if(!task || task.task_id!==selected || !Array.isArray(value.snapshot.attempts)) throw Error();
   const content = document.createDocumentFragment();
-  content.append(node('h2',task.task_id),node('p','Task: '+label(task.state)+(task.wait_reason?' · '+label(task.wait_reason):''),'state'));
+  content.append(node('h2',task.task_key || task.task_id),node('p',task.task_id,'muted'),node('p','Task: '+label(task.state)+(task.wait_reason?' · '+label(task.wait_reason):''),'state'));
   content.append(node('p','ワーカー: '+label(task.worker_status)+' · 更新 '+task.updated_at,'muted'));
   content.append(node('h3','実行履歴'));
   const attempts = node('ol');
@@ -64,7 +64,7 @@ function renderList(value) {
   const content=document.createDocumentFragment();
   for(const task of value.items) {
     if(!validId(task.task_id)) throw Error();
-    const button=node('button',task.task_id+' · '+label(task.state)); button.type='button'; button.dataset.task=task.task_id;
+    const button=node('button',(task.task_key || task.task_id)+' · '+label(task.state)); button.type='button'; button.dataset.task=task.task_id;
     button.setAttribute('aria-pressed',String(task.task_id===selected));
     button.addEventListener('click',()=> {selected=task.task_id; generation++; detail.replaceChildren(node('p','会話を取得しています…'));
       for(const b of list.querySelectorAll('button')) b.setAttribute('aria-pressed',String(b.dataset.task===selected)); void detailRead(); });
