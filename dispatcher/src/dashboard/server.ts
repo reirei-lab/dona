@@ -1,4 +1,5 @@
 import http from "node:http";
+import {OperatorStream} from "./operator-stream.js";
 import fs from "node:fs";
 import path from "node:path";
 import net from "node:net";
@@ -18,6 +19,7 @@ const headers = {"cache-control":"no-store", "referrer-policy":"no-referrer", "x
   "content-security-policy":"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"};
 const equal = (a: string, b: string) => { const x=Buffer.from(a),y=Buffer.from(b);return x.length===y.length&&timingSafeEqual(x,y); };
 export class DashboardServer {
+  private readonly stream=new OperatorStream();
   private readonly server: http.Server;
   private readonly control: http.Server;
   private readonly origin: URL;
@@ -67,7 +69,7 @@ export class DashboardServer {
     this.active++;
     try {
       const counts=new Map<string,number>();for(let i=0;i<req.rawHeaders.length;i+=2){const key=req.rawHeaders[i]!.toLowerCase();counts.set(key,(counts.get(key)??0)+1);}
-      if(["host","origin","cookie","content-length","content-type","x-csrf-token"].some(name=>(counts.get(name)??0)>1))throw Error("headers_invalid");
+      if(["host","origin","cookie","content-length","content-type","x-csrf-token","last-event-id"].some(name=>(counts.get(name)??0)>1))throw Error("headers_invalid");
       if(req.socket.remoteAddress!=="127.0.0.1" || req.headers.host!==this.origin.host
         || (req.headers.origin!==undefined&&req.headers.origin!==this.origin.origin)
         || ![undefined,"same-origin","none"].includes(req.headers["sec-fetch-site"] as string|undefined)
@@ -91,6 +93,13 @@ export class DashboardServer {
         this.reply(res,403,{error:"csrf_invalid"});return;
       }
       if(req.method==="GET"&&target==="/api/session"){this.reply(res,200,session);return;}
+      if(req.method==='GET'&&target==='/api/readiness'){
+        const health=await this.options.backend.call<{database:unknown;runtime:unknown;operator:unknown;external:{configured:unknown;ready:unknown}}>('admin/health',{});
+        if((health.database!=='ready'&&health.database!=='unavailable')||(health.runtime!=='ready'&&health.runtime!=='unavailable')||health.operator!=='ready'
+          ||typeof health.external?.configured!=='boolean'||typeof health.external.ready!=='boolean')throw Error('health_invalid');
+        if(JSON.stringify(await this.session(token))!==JSON.stringify(session)){this.reply(res,401,{error:'session_invalid'});return;}
+        this.reply(res,200,{ready:health.database==='ready'&&health.runtime==='ready'&&(!health.external.configured||health.external.ready),database:health.database,runtime:health.runtime,operator:'ready',external:{configured:health.external.configured,ready:health.external.ready}});return;
+      }
       if(req.method==="POST"&&target==="/api/logout"){
         if(typeof req.headers["x-csrf-token"]!=="string"||!equal(req.headers["x-csrf-token"],session.csrf)){this.reply(res,403,{error:"csrf_invalid"});return;}
         await this.options.backend.call('logout',{token});this.reply(res,200,{ok:true},undefined,{"set-cookie":this.cookie("",0)});return;
@@ -169,17 +178,23 @@ export class DashboardServer {
       if(req.method==="GET"&&match){
         const keys=[...url.searchParams.keys()];if(keys.some(k=>k!=="attempt")||keys.length>1)throw Error("query_invalid");
         if(!has('tasks:read')){this.reply(res,403,{error:'scope_denied'});return;}
-        const detail=await this.options.observer.detail(match[1]!,authority,undefined,url.searchParams.get('attempt')??undefined);
+        const attempt=url.searchParams.get('attempt')??undefined,scope=this.stream.scope(authority().revision,['task',match[1],attempt??null]);
+        const previous=match[2]?this.stream.read(req.headers['last-event-id'],scope):null;
+        const detail=await this.options.observer.detail(match[1]!,authority,previous?.sequence,attempt);
         if(!await recheck())return;
         if(!detail){this.reply(res,404,{error:"not_found"});return;}
-        if(match[2])this.reply(res,200,`event: task\ndata: ${JSON.stringify(detail)}\n\n`,"text/event-stream; charset=utf-8");
-        else this.reply(res,200,detail);return;
+        if(match[2])this.reply(res,200,this.stream.frame(scope,detail,previous),"text/event-stream; charset=utf-8");
+        else this.reply(res,200,this.stream.snapshot(scope,detail));return;
       }
-      const main=/^\/api\/conversations\/main(?:\/([A-Za-z0-9_-]{1,160})\/([A-Za-z0-9_-]{1,160}))?$/.exec(url.pathname);
+      const main=/^\/api\/conversations\/main(?:\/([A-Za-z0-9_-]{1,160})\/([A-Za-z0-9_-]{1,160})(\/events)?)?$/.exec(url.pathname);
       if(req.method==='GET'&&main){
         if(url.search)throw Error('query_invalid');if(!has('conversations:main:read')){this.reply(res,403,{error:'scope_denied'});return;}
-        const result=main[1]?await this.options.observer.mainDetail(main[1],main[2]!,authority):await this.options.observer.mainList(authority);
-        if(!await recheck())return;this.reply(res,result?200:404,result??{error:'not_found'});return;
+        const scope=this.stream.scope(authority().revision,['main',main[1],main[2]]),previous=main[3]?this.stream.read(req.headers['last-event-id'],scope):null;
+        const result=main[1]?await this.options.observer.mainDetail(main[1],main[2]!,authority,previous?.sequence):await this.options.observer.mainList(authority);
+        if(!await recheck())return;
+        if(!result){this.reply(res,404,{error:'not_found'});return;}
+        if('status'in result){if(main[3])this.reply(res,200,this.stream.frame(scope,result,previous),'text/event-stream; charset=utf-8');else this.reply(res,200,this.stream.snapshot(scope,result));}
+        else this.reply(res,200,result);return;
       }
       this.reply(res,404,{error:"not_found"});
     } catch {this.reply(res,503,{error:"observation_unavailable"});}

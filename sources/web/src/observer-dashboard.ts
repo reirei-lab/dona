@@ -10,13 +10,14 @@ let csrf=null, authEpoch=0, credentialReady=false;
 let externalSelected=null,externalTracked=null,externalView=null,externalEpoch=0,externalAfter=null,externalNext=null;
 let externalPending=(()=>{try{const id=sessionStorage.getItem('dona.pending-external');return typeof id==='string'&&/^[A-Za-z0-9_-]{1,128}$/.test(id)?id:null;}catch{return null;}})();
 let pending=(()=>{try{return JSON.parse(sessionStorage.getItem("dona.pending-command")||"null");}catch{return null;}})();
+let stream=null,streamBusy=false,deferredDetail=null;
 let selected = null, selectedAttempt = null, selectedMain = null, capabilities = [], generation = 0, pageAfter = null, next = null, stopped = false, polling = false;
 const labels = {preparing:'実行準備中',dispatching:'起動処理中',blocked:'入力・承認待ち',needs_review:'確認が必要',cancelling:'取消処理中',inProgress:'進行中',declined:'拒否済み',active:'実行中',capacity_wait:'実行枠の空き待ち',rate_limit_wait:'利用上限の回復待ち',retry_exhausted:'再試行上限',running:'実行中',waiting:'待機中',queued:'実行待ち',paused:'一時停止',completed:'完了',failed:'失敗',cancelled:'取消済み',human_input:'質問への回答待ち',rate_limit:'利用上限の回復待ち',retry_limit:'再試行上限',retry_wait:'再試行待ち',unknown:'状態未確認'};
 const label = value => labels[value] || String(value || '未確認');
 const node = (tag, text, className) => { const n = document.createElement(tag); if(text !== undefined) n.textContent = String(text); if(className) n.className = className; return n; };
 const validId = id => typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id);
 function clearPrivate(message, auth) {
-  generation++; authEpoch++; externalEpoch++; externalTracked=null;externalView=null; byId('external-panel').hidden=true;byId('external-items').replaceChildren();byId('external-detail').replaceChildren();byId('external-status').textContent='';byId('external-reconcile').hidden=true;credentialReady=false; byId("objective").value=""; byId("repository").value=""; byId("base-ref").value=""; csrf=null; capabilities=[]; byId("credential-panel").hidden=true; byId("submit-panel").hidden=true; byId("task-panel").hidden=true; byId("command-status").textContent=""; byId('main-conversations').replaceChildren(); byId('main-panel').hidden=true; list.replaceChildren(); detail.replaceChildren(node('p',message)); next = null; byId('next').disabled = true;
+  generation++; authEpoch++; externalEpoch++; externalTracked=null;externalView=null; byId('external-panel').hidden=true;byId('external-items').replaceChildren();byId('external-detail').replaceChildren();byId('external-status').textContent='';byId('external-reconcile').hidden=true;credentialReady=false; if(auth){byId("objective").value="";byId("repository").value="";byId("base-ref").value="";} csrf=null; capabilities=[];stream=null;deferredDetail=null; byId("credential-panel").hidden=true; byId("submit-panel").hidden=true; byId("task-panel").hidden=true; byId("command-status").textContent=""; byId('main-conversations').replaceChildren(); byId('main-panel').hidden=true; list.replaceChildren(); detail.replaceChildren(node('p',message)); next = null; byId('next').disabled = true;
   connection.textContent = message; connection.dataset.state = 'disconnected';
   if(auth) { stopped = true; byId('pairing').hidden = false;byId('logout').hidden=true; }
 }
@@ -31,7 +32,8 @@ async function read(url) {
 function renderDetail(value) {
   const task = value?.snapshot?.task;
   if(!task || task.task_id!==selected || (selectedAttempt && value.snapshot.selected_attempt_id!==selectedAttempt) || !Array.isArray(value.snapshot.attempts)) throw Error();
-  if(document.activeElement?.closest('[data-question-form]'))return;
+  if(document.activeElement?.closest('[data-question-form]')){deferredDetail=value;return;}
+  deferredDetail=null;
   const content = document.createDocumentFragment();
   content.append(node('h2',task.task_key || task.task_id),node('p',task.task_id,'muted'),node('p','Task: '+label(task.state)+(task.wait_reason?' · '+label(task.wait_reason):''),'state'));
   content.append(node('p','ワーカー: '+label(task.worker_status)+' · 更新 '+task.updated_at,'muted'));
@@ -48,7 +50,7 @@ function renderDetail(value) {
     const item=node('li'),button=node('button','Attempt '+attempt.number+' · '+label(attempt.status)+(attempt.outcome?' · '+label(attempt.outcome):''));button.type='button';button.dataset.attempt=attempt.attempt_id;
     button.setAttribute('aria-pressed',String(attempt.attempt_id===(selectedAttempt || value.snapshot.selected_attempt_id || task.current_attempt_id)));
     button.disabled=!validId(attempt.attempt_id);
-    button.addEventListener('click',()=>{selectedAttempt=attempt.attempt_id;generation++;detail.replaceChildren(node('p','実行履歴を取得しています…'));void detailRead();});item.append(button);attempts.append(item);
+    button.addEventListener('click',()=>{selectedAttempt=attempt.attempt_id;rememberSelection();generation++;detail.replaceChildren(node('p','実行履歴を取得しています…'));void detailRead();});item.append(button);attempts.append(item);
   }
   content.append(attempts,node('h3','ワーカーの会話'));
   if(task.next_check_at)content.append(node('p','次の確認予定: '+task.next_check_at,'muted'));
@@ -81,7 +83,7 @@ function appendConversation(content,runtime) {
 async function detailRead() {
   if(!selected || stopped) return;
   const id=selected, token=++generation;
-  try { const value=await read('/api/tasks/'+encodeURIComponent(id)+(selectedAttempt?'?attempt='+encodeURIComponent(selectedAttempt):'')); if(token!==generation || id!==selected || stopped)return; renderDetail(value); }
+  try { const value=await read('/api/tasks/'+encodeURIComponent(id)+(selectedAttempt?'?attempt='+encodeURIComponent(selectedAttempt):'')); if(token!==generation || id!==selected || stopped)return; renderDetail(value);rememberStream(value,taskPath()); }
   catch(error) { if(token!==generation || id!==selected || stopped)return; clearPrivate(error.auth?'接続の認証が必要です。':'接続が切れています。表示を消去しました。',error.auth); }
 }
 function renderList(value) {
@@ -92,7 +94,7 @@ function renderList(value) {
     if(!validId(task.task_id)) throw Error();
     const button=node('button',(task.task_key || task.task_id)+' · '+label(task.state)); button.type='button'; button.dataset.task=task.task_id;
     button.setAttribute('aria-pressed',String(task.task_id===selected));
-    button.addEventListener('click',()=> {selected=task.task_id; selectedAttempt=null;selectedMain=null; generation++; detail.replaceChildren(node('p','会話を取得しています…'));
+    button.addEventListener('click',()=> {selected=task.task_id; selectedAttempt=null;selectedMain=null;rememberSelection(); generation++; detail.replaceChildren(node('p','会話を取得しています…'));
       for(const b of list.querySelectorAll('button')) b.setAttribute('aria-pressed',String(b.dataset.task===selected)); void detailRead(); });
     content.append(button);
   }
@@ -107,7 +109,7 @@ async function refresh() {
     byId('task-layout').hidden=!capabilities.includes('tasks:read')&&!capabilities.includes('conversations:main:read');byId('submit-task').disabled=!!pending;showPending();await credentialStatus();await mainList();await externalRefresh();
     if(capabilities.includes('tasks:read')) {const value=await read('/api/tasks'+(pageAfter?'?after='+encodeURIComponent(pageAfter):''));if(token!==generation || stopped)return;renderList(value);}
     if(token!==generation || stopped)return; connection.textContent='接続中 · 5秒ごとに更新';connection.dataset.state='connected';
-    if(selectedMain)await mainRead();else if(capabilities.includes('tasks:read'))await detailRead();
+    if(stream)await streamRead();else if(selectedMain)await mainRead();else if(capabilities.includes('tasks:read'))await detailRead();
   } catch(error) {if(token===generation && !stopped)clearPrivate(error.auth?'接続の認証が必要です。':'接続が切れています。表示を消去しました。',error.auth);}
   finally {polling=false;}
 }
@@ -119,7 +121,7 @@ async function mainList() {
   for(const entry of value.items || []) {
     if(typeof entry.name!=='string'||typeof entry.generation!=='string'||!/^[A-Za-z0-9_-]{1,160}$/.test(entry.name)||!/^[A-Za-z0-9_-]{1,160}$/.test(entry.generation))throw Error();
     const button=node('button',entry.name+' · '+entry.generation+(entry.connected?' · 接続中':' · 保存された履歴'));button.type='button';button.dataset.main=entry.name+':'+entry.generation;
-    button.addEventListener('click',()=>{selectedMain={name:entry.name,generation:entry.generation};selected=null;selectedAttempt=null;generation++;detail.replaceChildren(node('p','Dona本体の会話を取得しています…'));void mainRead();});box.append(button);
+    button.addEventListener('click',()=>{selectedMain={name:entry.name,generation:entry.generation};selected=null;selectedAttempt=null;rememberSelection();generation++;detail.replaceChildren(node('p','Dona本体の会話を取得しています…'));void mainRead();});box.append(button);
   }
   const focused=document.activeElement?.dataset?.main;byId('main-conversations').replaceChildren(box);
   if(focused)Array.from(byId('main-conversations').querySelectorAll('button')).find(b=>b.dataset.main===focused)?.focus({preventScroll:true});
@@ -127,9 +129,48 @@ async function mainList() {
 async function mainRead() {
   if(!selectedMain||stopped)return;const target=selectedMain,token=++generation;
   try {const value=await read('/api/conversations/main/'+encodeURIComponent(target.name)+'/'+encodeURIComponent(target.generation));if(token!==generation||selectedMain!==target||stopped)return;
-    const content=document.createDocumentFragment();content.append(node('h2','Dona本体の会話'),node('p','このDona全体にまたがる発言です。特定のTaskの会話ではありません。','notice'));appendConversation(content,value);detail.replaceChildren(content);
+    const content=document.createDocumentFragment();content.append(node('h2','Dona本体の会話'),node('p','このDona全体にまたがる発言です。特定のTaskの会話ではありません。','notice'));appendConversation(content,value);detail.replaceChildren(content);rememberStream(value,mainPath());
   }catch(error){if(token===generation&&!stopped)clearPrivate(error.auth?'接続の認証が必要です。':'接続が切れています。表示を消去しました。',error.auth);}
 }
+function taskPath() {return '/api/tasks/'+encodeURIComponent(selected)+(selectedAttempt?'?attempt='+encodeURIComponent(selectedAttempt):'');}
+function mainPath() {return '/api/conversations/main/'+encodeURIComponent(selectedMain.name)+'/'+encodeURIComponent(selectedMain.generation);}
+function rememberStream(value,path) {stream=typeof value.stream_cursor==='string'?{cursor:value.stream_cursor,path}:null;}
+function rememberSelection() {
+  stream=null;deferredDetail=null;const query=new URLSearchParams();if(selected){query.set('task',selected);if(selectedAttempt)query.set('attempt',selectedAttempt);}else if(selectedMain){query.set('main',selectedMain.name);query.set('generation',selectedMain.generation);}
+  const hash=query.toString();if(location.hash.slice(1)!==hash)history.pushState(null,'',location.pathname+location.search+(hash?'#'+hash:''));
+}
+function restoreSelection() {
+  stream=null;deferredDetail=null;generation++;selected=null;selectedAttempt=null;selectedMain=null;
+  const query=new URLSearchParams(location.hash.slice(1)),keys=[...query.keys()],id=value=>typeof value==='string'&&/^[A-Za-z0-9_-]{1,160}$/.test(value);
+  if(keys.length<=2&&keys.every(k=>['task','attempt'].includes(k))&&validId(query.get('task'))&&(!query.has('attempt')||validId(query.get('attempt')))){selected=query.get('task');selectedAttempt=query.get('attempt');}
+  else if(keys.length===2&&keys.includes('main')&&keys.includes('generation')&&id(query.get('main'))&&id(query.get('generation')))selectedMain={name:query.get('main'),generation:query.get('generation')};
+  detail.replaceChildren(node('p','会話を選択してください。'));
+  if(!stopped){if(selectedMain&&capabilities.includes('conversations:main:read'))void mainRead();else if(selected&&capabilities.includes('tasks:read'))void detailRead();}
+}
+async function streamRead() {
+  if(!stream||streamBusy||stopped)return;const current=stream,token=generation,epoch=authEpoch;streamBusy=true;
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);
+  try{
+    const url=new URL(current.path,location.origin);url.pathname+='/events';
+    const response=await fetch(url.pathname+url.search,{credentials:'same-origin',cache:'no-store',redirect:'error',signal:controller.signal,headers:{accept:'text/event-stream','last-event-id':current.cursor}});
+    if(response.status===401||response.status===403)throw Object.assign(Error(),{auth:true});
+    if(!response.ok||!response.headers.get('content-type')?.includes('text/event-stream'))throw Error();
+    const reader=response.body.getReader(),decoder=new TextDecoder();let raw='',bytes=0;
+    for(;;){const part=await reader.read();if(part.done)break;bytes+=part.value.byteLength;if(bytes>4096){await reader.cancel();throw Error();}raw+=decoder.decode(part.value,{stream:true});}
+    if(epoch!==authEpoch||token!==generation||stream!==current||stopped)return;
+    const events=raw.match(/^event: (snapshot|heartbeat|reset)$/gm),ids=raw.match(/^id: ([-A-Za-z0-9_.]+)$/gm);
+    if(events?.length!==1||ids?.length!==1||!raw.endsWith('\n\n'))throw Error();
+    current.cursor=ids[0].slice(4);
+    if(events[0]!=='event: heartbeat'){
+      stream=null;if(selectedMain)await mainRead();else await detailRead();
+      if(events[0]==='event: reset'&&epoch===authEpoch&&!stopped){connection.textContent='履歴の連続性を再確認しました。最新の状態を取得しました。';}
+    }
+  }catch(error){if(epoch===authEpoch&&token===generation&&stream===current&&!stopped)clearPrivate(error.auth?'接続の認証が必要です。':'更新の接続が切れました。最新状態から再接続します。',error.auth);}
+  finally{clearTimeout(timer);streamBusy=false;}
+}
+detail.addEventListener('focusout',()=>setTimeout(()=>{const value=deferredDetail;if(value&&!stopped&&!document.activeElement?.closest('[data-question-form]')){deferredDetail=null;renderDetail(value);}},0));
+window.addEventListener('popstate',restoreSelection);
+restoreSelection();
 const fromBase64=value=>Uint8Array.from(atob(value.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));
 const toBase64=value=>btoa(String.fromCharCode(...new Uint8Array(value))).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
 async function credentialStatus() {
@@ -156,7 +197,7 @@ function showPending() {byId('reconcile').hidden=!pending;byId('submit-task').di
 function accepted(value) {
   if(!value?.receipt || !pending || value.receipt.request_id!==pending.request_id || value.receipt.operation!==pending.operation)throw Error();
   const receipt=value.receipt;savePending(null);byId('command-status').textContent=(receipt.operation==='cancel'?'取消を受け付けました。停止完了はTaskの状態で確認してください。':receipt.operation==='question_reply'?'回答を受け付けました。Donaがワーカーへ届けます。':receipt.operation==='native_approval'?'承認判断を受け付けました。ワーカーへの反映はTaskの状態で確認してください。':'依頼を受け付けました。')+' Task: '+receipt.task_id;
-  if(capabilities.includes('tasks:read')){selected=receipt.task_id;selectedAttempt=null;selectedMain=null;void detailRead();}
+  if(capabilities.includes('tasks:read')){selected=receipt.task_id;selectedAttempt=null;selectedMain=null;rememberSelection();void detailRead();}
 }
 async function reconcile() {
   if(!pending)return;const expected=pending,epoch=authEpoch;byId('reconcile').disabled=true;
@@ -261,6 +302,9 @@ function targetName(name,id) {return typeof name==='string'&&name.length>0&&name
 function validPresentation(value,id) {
   return value&&value.request_id===id&&value.operation==='slack.post_thread_reply.v1'&&typeof value.exact_draft==='string'&&new TextEncoder().encode(value.exact_draft).length<=65536
     &&['workspace_id','channel_id','thread_ts','expires_at','presentation_digest'].every(key=>typeof value[key]==='string'&&value[key].length<=256)
+    &&['slack','local_operator'].includes(value.requester?.kind)&&typeof value.requester.label==='string'&&value.requester.label.length>0&&value.requester.label.length<=256
+    &&value.risk==='external_message'&&typeof value.operation_summary==='string'&&value.operation_summary.length>0&&value.operation_summary.length<=256
+    &&typeof value.display_fingerprint==='string'&&/^[A-F0-9]{16}$/.test(value.display_fingerprint)&&typeof value.created_at==='string'&&Number.isFinite(Date.parse(value.created_at))
     &&Number.isSafeInteger(value.request_revision)&&Number.isSafeInteger(value.presentation_revision)&&Array.isArray(value.notified_user_ids)&&value.notified_user_ids.length<=100
     &&value.notified_user_ids.every(id=>typeof id==='string'&&id.length<=128)&&Number.isFinite(Date.parse(value.expires_at));
 }
@@ -272,6 +316,7 @@ async function externalRead(render) {
     if(!validPresentation(value,id))throw Error();
     if(!render){if(!externalView||!samePresentation(externalView,value))disableExternal('表示後に承認内容またはrevisionが変わりました。一覧から選び直して確認してください。');else if(Date.parse(value.expires_at)<=Date.now())disableExternal('この承認要求は期限切れです。');return;}
     externalView=value;const box=document.createDocumentFragment();box.append(node('h3','Donaの外部操作: Slackスレッドへの返信'),node('p','承認すると以下の内容を指定先へ送信できます。許可と送信成功は別の状態です。','notice'));
+    box.append(node('p','依頼元: '+(value.requester?.label||'未確認')),node('p','操作: '+(value.operation_summary||'Slackスレッドへの返信')),node('p','リスク: '+(value.risk==='external_message'?'Slackへ外部メッセージを送信':'未確認')),node('p','照合番号: '+(value.display_fingerprint||'未確認')),node('p','作成日時: '+localExpiry(value.created_at)));
     box.append(node('p','ワークスペース: '+targetName(value.workspace_name,value.workspace_id)),node('p','チャンネル: '+targetName(value.channel_name,value.channel_id)),node('p','スレッド: '+value.thread_ts),node('p','通知するユーザー: '+(value.notified_user_ids.join(', ')||'なし')),node('p','有効期限: '+localExpiry(value.expires_at)),node('h4','送信する本文（そのまま）'),node('pre',value.exact_draft));
     for(const [decision,title] of [['approve','この外部操作を許可'],['reject','この外部操作を拒否']]){const button=node('button',title);button.type='button';button.disabled=!!externalPending||!credentialReady||Date.parse(value.expires_at)<=Date.now();button.addEventListener('click',()=>void externalDecide(decision));box.append(button);}
     if(!credentialReady)box.append(node('p','先にこの端末の承認用パスキーを登録してください。','notice'));

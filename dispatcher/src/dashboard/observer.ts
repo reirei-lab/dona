@@ -90,14 +90,14 @@ export class DashboardObserver {
     for(const row of items){const key=JSON.stringify([row.name,row.generation]);if(identities.has(key))throw Error("observation_identity_ambiguous");identities.add(key);}
     return {items,next:null};
   }
-  async mainDetail(name:string,generation:string,authorize:()=>DashboardAuthority|null):Promise<ObservedTask["runtime"]|null> {
+  async mainDetail(name:string,generation:string,authorize:()=>DashboardAuthority|null,afterSequence?:number):Promise<ObservedTask["runtime"]|null> {
     const authority=authorize();if(!authority?.mainConversation?.())return null;
     try {
       const inventory=await this.mainList(authorize);
       if(!inventory||!sameMainAuthority(authorize(),authority))return null;
       const match=inventory.items.find(row=>row.name===name&&row.generation===generation);
       if(!match)return {status:"unavailable"};
-      const content=await withinDeadline(this.runtime.conversation(name,generation),performance.now());
+      const content=await withinDeadline(this.runtime.conversation(name,generation,afterSequence),performance.now());
       if(!sameMainAuthority(authorize(),authority))return null;
       if(content.name!==name||content.generation!==generation||content.role!=="main"||content.attempt_id!==null||content.thread_id!==match.thread_id)throw Error("observation_identity_changed");
       return {status:"observed",conversation:publicConversation(content)};

@@ -19,7 +19,7 @@ for(const kind of ['native','external'] as const)for(const phase of ['options','
   else if(path.endsWith('/options')){arrived=true;if(phase==='options')await gate;value={ceremony_id:'ceremony',options:{challenge:Buffer.alloc(32,1).toString('base64url'),rpId:'operator.test',allowCredentials:[],userVerification:'required'}};}
   else if(path.endsWith('/decide')){decisions++;value={};}
   else if(path.startsWith('/api/commands/')||path.endsWith('/status')){lookups++;value={receipt:null,request_id:'approval_one',state:'requested',decision:null,execution:null};}
-  else value={request_id:path.split('/').at(-1),operation:'slack.post_thread_reply.v1',workspace_id:'T_ONE',channel_id:'C_ONE',thread_ts:'123.456',exact_draft:'表示本文',notified_user_ids:[],expires_at,request_revision:1,presentation_revision:1,presentation_digest:'a'.repeat(64)};
+  else value={request_id:path.split('/').at(-1),operation:'slack.post_thread_reply.v1',workspace_id:'T_ONE',channel_id:'C_ONE',thread_ts:'123.456',requester:{kind:'slack',label:'U_REQUESTER'},risk:'external_message',operation_summary:'確認したSlackスレッドへ返信',display_fingerprint:'A1B2C3D4E5F60718',created_at:'2026-10-05T00:00:00.000Z',exact_draft:'表示本文',notified_user_ids:[],expires_at,request_revision:1,presentation_revision:1,presentation_digest:'a'.repeat(64)};
   await route.fulfill({contentType:'application/json',body:JSON.stringify(value)});
  });
  await page.goto('https://operator.test/');
