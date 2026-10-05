@@ -176,11 +176,11 @@ test("未知のprojection schema versionはDDL前にfail closedする",t=>{const
   assert.equal(after,before);
 });
 
-test("通常job更新はwall clockが同一でもupdated_atを単調増加させる",t=>{const f=fixture(t);
+test("Web jobの状態更新はwall clockが同一でもupdated_atを単調増加させる",t=>{const f=fixture(t);
   const job=f.seed(owner,"queued","2099-01-01T00:00:00.000Z");
   f.jobs.beginJobPreparation(job,new Date("2099-01-01T00:00:00.000Z"));
   const before=(f.raw.prepare("SELECT updated_at FROM jobs WHERE job_id=?").get(job) as {updated_at:string}).updated_at;
-  f.jobs.setJobRuntime(job,"workspace","pane");
+  f.jobs.markJobNeedsReview(job,"fixture","fixture");
   const after=(f.raw.prepare("SELECT updated_at FROM jobs WHERE job_id=?").get(job) as {updated_at:string}).updated_at;
   assert.equal(Date.parse(after),Date.parse(before)+1);
 });

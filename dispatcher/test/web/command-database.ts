@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import test from "node:test";
 import Database from "better-sqlite3";
 import { DispatcherDatabase, JobCreationError, migrateDispatcherDatabase } from "../../src/database.js";
+import { assertTaskGenerationFile } from "../../src/task-execution.js";
 import { tempConfig } from "../helpers.js";
 
 const owner = { instance_id: "instance", tenant_id: "tenant", principal_id: "principal" };
@@ -109,4 +110,18 @@ test("Web Resultはownerを検証して保存しSlack通知を生成しない", 
   assert.equal(receipt.row.source, "web");
   assert.equal(db.enqueueJobNotification(job.job_id).duplicate, true);
   assert.equal((raw.prepare("SELECT count(*) AS n FROM events WHERE source='dona_job'").get() as {n:number}).n, 0);
+});
+
+
+test("Task世代に保存したWeb JobはDispatcher再起動の世代検査を妨げない", async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  let db = new DispatcherDatabase(config.databasePath);
+  db.tasks.assertFreshExecutionModel();
+  const created = db.createWebJob(input("8".repeat(64)), config.jobsWorkspaceRoot, config.jobResultsDir);
+  db.close();
+  assert.doesNotThrow(() => assertTaskGenerationFile(config.databasePath));
+  db = new DispatcherDatabase(config.databasePath); t.after(() => db.close());
+  assert.doesNotThrow(() => db.tasks.assertFreshExecutionModel());
+  assert.equal(db.getWebCommandReceipt(created.receipt.receipt_id, owner)?.job_id, created.row.job_id);
+  assert.equal(db.getJob(created.row.job_id)?.status, "queued");
 });

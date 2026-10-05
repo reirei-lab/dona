@@ -4593,7 +4593,7 @@ export class DispatcherDatabase {
     const current = this.getJobRequired(jobId);
     const wallClock = Date.parse(nowUtc());
     const previous = Date.parse(current.updated_at);
-    const timestamp = new Date(Math.max(wallClock, previous + 1)).toISOString();
+    const timestamp = new Date(current.source === "web" ? Math.max(wallClock, previous + 1) : wallClock).toISOString();
     const binding=readEventJobBinding(this.db,this.getJobRequired(jobId).source_event_id),persisted={...values};
     const job=this.getJobRequired(jobId);
     if(binding?.owner.kind==="schedule"&&typeof persisted.last_error_message==="string") persisted.last_error_message=this.safeNotificationError(persisted.last_error_message,true,job);

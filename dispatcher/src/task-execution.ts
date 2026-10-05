@@ -146,7 +146,7 @@ export class TaskRepository {
     }).immediate();
   }
   assertFreshExecutionModel():void {
-    if(this.sql.prepare("SELECT 1 FROM jobs j WHERE j.source<>'dona_schedule' AND NOT EXISTS(SELECT 1 FROM task_attempts a WHERE a.attempt_id=j.job_id) LIMIT 1").get())
+    if(this.sql.prepare("SELECT 1 FROM jobs j WHERE j.source NOT IN ('dona_schedule','web') AND NOT EXISTS(SELECT 1 FROM task_attempts a WHERE a.attempt_id=j.job_id) LIMIT 1").get())
       throw new Error("task_execution_requires_fresh_generation");
     if(!this.sql.prepare("SELECT 1 FROM task_execution_schema").get()&&this.sql.prepare("SELECT 1 FROM events LIMIT 1").get())throw new Error("task_execution_requires_fresh_generation");
     this.activateSchema();
