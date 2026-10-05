@@ -23,7 +23,8 @@ async function request(port:number,socket:string|null,target:string,options:{pos
 }
 async function until<T>(operation:()=>Promise<T|false>):Promise<T>{const end=Date.now()+10000;while(Date.now()<end){try{const value=await operation();if(value!==false)return value;}catch{}await new Promise(r=>setTimeout(r,25));}throw Error('fixture_wait_timeout');}
 async function port(){const s=net.createServer();await new Promise<void>(r=>s.listen(0,'127.0.0.1',r));const p=(s.address()as net.AddressInfo).port;await new Promise<void>(r=>s.close(()=>r()));return p;}
-async function exit(child:ChildProcess,signal:NodeJS.Signals='SIGTERM'){if(child.exitCode!==null||child.signalCode!==null)return;const done=once(child,'exit');child.kill(signal);await done;}
+async function deadline<T>(value:Promise<T>):Promise<T>{let timer:ReturnType<typeof setTimeout>|undefined;try{return await Promise.race([value,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(Error('fixture_process_timeout')),10000);})]);}finally{clearTimeout(timer);}}
+async function exit(child:ChildProcess,signal:NodeJS.Signals='SIGTERM'){if(child.exitCode!==null||child.signalCode!==null)return;const done=once(child,'exit');child.kill(signal);await deadline(done);}
 
 test('実CLIはpairing・観測・SIGKILL回復・preserve更新・rollbackでworkerとDBを保全する',{timeout:90000},async()=>{
  const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'dobs-cli-'))),runtimeSocket=path.join(root,'r.sock'),control=path.join(root,'c.sock');
@@ -61,7 +62,7 @@ test('実CLIはpairing・観測・SIGKILL回復・preserve更新・rollbackでwo
   // Hard death leaves a stale UDS; the real service proves it is refused before reclaim.
   await exit(process!,'SIGKILL');await start(a);assert.equal((await request(listen,null,'/api/tasks',{cookie})).status,401);
   for(const [sha,target]of [[b,releaseB],[a,releaseA]]as const){
-   cookie=await pair();const ended=once(process!,'exit');await fs.symlink(target,pointer+'.tmp');await fs.rename(pointer+'.tmp',pointer);const [code]=await ended;assert.equal(code,1);
+   cookie=await pair();const ended=once(process!,'exit');await fs.symlink(target,pointer+'.tmp');await fs.rename(pointer+'.tmp',pointer);const [code]=await deadline(ended);assert.equal(code,1);
    assert.equal(worker.exitCode,null);await once(worker.stdout!,'data');await start(sha);assert.equal((await request(listen,null,'/api/tasks',{cookie})).status,401);
   }
   assert.equal(JSON.stringify(db.tasks.get(created.task.task_id)),before);assert.equal(worker.exitCode,null);assert.ok(calls.every(action=>['conversations','conversation'].includes(action)));
