@@ -294,12 +294,22 @@ async function externalRefresh() {
   const box=document.createDocumentFragment(),focused=document.activeElement?.dataset?.external;
   for(const item of value.items){if(!validId(item.request_id)||item.operation!=='slack.post_thread_reply.v1')continue;
     const button=node('button','Slackスレッドへの返信 · '+externalState(item.state));button.type='button';button.dataset.external=item.request_id;
-    button.addEventListener('click',()=>{externalSelected=item.request_id;externalView=null;externalEpoch++;byId('external-detail').replaceChildren(node('p','承認内容を取得しています…'));void externalRead(true);});box.append(button);
+    button.addEventListener('click',()=>{externalSelected=item.request_id;externalView=null;externalEpoch++;byId('external-detail').replaceChildren(node('p','承認内容を取得しています…'));void externalSelect();});box.append(button);
   }
   if(!box.childNodes.length)box.append(node('p','外部操作の承認要求はありません。'));byId('external-items').replaceChildren(box);
   if(focused)Array.from(byId('external-items').querySelectorAll('button')).find(b=>b.dataset.external===focused)?.focus({preventScroll:true});
   externalNext=value.next;byId('external-next').disabled=!externalNext;byId('external-reconcile').hidden=!externalPending;
-  if(externalSelected){if(externalTracked===externalSelected||externalPending===externalSelected)await externalStatus(externalSelected);else await externalRead(false);}
+  if(externalSelected){if(externalTracked===externalSelected||externalPending===externalSelected)await externalStatus(externalSelected);else await externalSelect(false);}
+}
+async function externalSelect(render=true) {
+  const id=externalSelected,epoch=authEpoch,selection=externalEpoch;
+  const value=await externalStatus(id);if(!value||epoch!==authEpoch||selection!==externalEpoch||id!==externalSelected)return;
+  const state=value.request_state??value.state,decision=typeof value.decision==='string'?value.decision:value.decision?.kind;
+  if(decision||!['requested','delivery_pending','delivery_unknown','sent'].includes(state)||!Number.isFinite(Date.parse(value.expires_at))||Date.parse(value.expires_at)<=Date.now()||externalPending===id){
+    externalTracked=id;externalView=null;byId('external-detail').replaceChildren(node('h3','外部操作の履歴'),node('p','判断と実行の状態を表示しています。この画面から再送は行いません。'));return;
+  }
+  externalTracked=null;const failure=await externalRead(render);
+  if(failure==='unavailable'&&epoch===authEpoch&&selection===externalEpoch&&id===externalSelected&&!externalView)renderExternalStatus(value,id);
 }
 function localExpiry(value) {const date=new Date(value);if(!Number.isFinite(date.getTime()))return '日時未確認';try{return new Intl.DateTimeFormat(undefined,{year:'numeric',month:'long',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',timeZoneName:'long'}).format(date);}catch{return '日時を表示できません';}}
 function targetName(name,id) {return typeof name==='string'&&name.length>0&&name.length<=256?name+'（'+id+'）':id;}
@@ -325,15 +335,18 @@ async function externalRead(render) {
     for(const [decision,title] of [['approve','この外部操作を許可'],['reject','この外部操作を拒否']]){const button=node('button',title);button.type='button';button.disabled=!!externalPending||!credentialReady||Date.parse(value.expires_at)<=Date.now();button.addEventListener('click',()=>void externalDecide(decision));box.append(button);}
     if(!credentialReady)box.append(node('p','先にこの端末の承認用パスキーを登録してください。','notice'));
     byId('external-detail').replaceChildren(box);byId('external-status').textContent=externalPending?'判断結果の照合が必要です。自動で再送しません。':'';
-  }catch(error){if(epoch===authEpoch&&selection===externalEpoch){byId('external-detail').replaceChildren();disableExternal(error.auth?'外部操作の閲覧権限がありません。':'外部操作の内容を取得できません。表示を消去しました。');}}
+  }catch(error){if(epoch===authEpoch&&selection===externalEpoch){byId('external-detail').replaceChildren();disableExternal(error.auth?'外部操作の閲覧権限がありません。':'外部操作の内容を取得できません。表示を消去しました。');return error.auth?'auth_failed':'unavailable';}}
+}
+function renderExternalStatus(value,id) {
+    const state=value.request_state??value.state,decision=typeof value.decision==='string'?value.decision:value.decision?.kind;
+    byId('external-status').textContent='承認ID: '+id+' · 要求: '+externalState(state)+' · 判断: '+(({approve:'許可',reject:'拒否',cancel:'取消',expire:'期限切れ'})[decision]||'未確認')+' · 実行: '+(value.execution?externalState(value.execution.state):'実行成功は未確認');
+    if(['approve','reject','cancel','expire'].includes(decision)){externalTracked=id;if(externalPending===id)externalSavePending(null);}else byId('external-status').textContent+='。判断の受理は未確認です。自動再送しません。';
 }
 async function externalStatus(trackedId) {
   const id=trackedId||externalPending,epoch=authEpoch,selection=externalEpoch;if(!id)return;byId('external-reconcile').disabled=true;
-  try{const value=await read('/api/approvals/'+encodeURIComponent(id)+'/status');if(epoch!==authEpoch||selection!==externalEpoch||(id!==externalPending&&id!==externalTracked))return;
+  try{const value=await read('/api/approvals/'+encodeURIComponent(id)+'/status');if(epoch!==authEpoch||selection!==externalEpoch||(id!==externalPending&&id!==externalTracked&&id!==externalSelected))return;
     if(value.request_id!==id||value.operation!==undefined&&value.operation!=='slack.post_thread_reply.v1')throw Error();
-    const state=value.request_state??value.state,decision=typeof value.decision==='string'?value.decision:value.decision?.kind;
-    byId('external-status').textContent='承認ID: '+id+' · 要求: '+externalState(state)+' · 判断: '+(({approve:'許可',reject:'拒否',cancel:'取消',expire:'期限切れ'})[decision]||'未確認')+' · 実行: '+(value.execution?externalState(value.execution.state):'実行成功は未確認');
-    if(['approve','reject','cancel','expire'].includes(decision)){externalTracked=id;externalSavePending(null);}else byId('external-status').textContent+='。判断の受理は未確認です。自動再送しません。';
+    renderExternalStatus(value,id);return value;
   }catch{if(epoch===authEpoch)byId('external-status').textContent='判断結果を照合できません。自動再送せず、接続回復後に状態を確認してください。';}
   finally{byId('external-reconcile').disabled=false;}
 }
@@ -349,11 +362,11 @@ async function externalDecide(decision) {
     const credential=await navigator.credentials.get({publicKey});if(epoch!==authEpoch||selection!==externalEpoch||!credential)return;
     const response=typeof credential.toJSON==='function'?credential.toJSON():{id:credential.id,rawId:toBase64(credential.rawId),type:credential.type,clientExtensionResults:credential.getClientExtensionResults(),response:{clientDataJSON:toBase64(credential.response.clientDataJSON),authenticatorData:toBase64(credential.response.authenticatorData),signature:toBase64(credential.response.signature),userHandle:credential.response.userHandle?toBase64(credential.response.userHandle):null}};
     sent=true;const result=await credentialPost('/api/approvals/decide',{ceremony_id:ceremony.ceremony_id,response});if(epoch!==authEpoch)return;
-    if(rejected(result,id,'external_approval')){if(externalPending===id)externalSavePending(null);byId('external-status').textContent='この判断は受け付けられませんでした。最新の内容を確認して、改めて判断してください。';if(selection===externalEpoch)void externalRead(true);return;}
+    if(rejected(result,id,'external_approval')){if(externalPending===id)externalSavePending(null);byId('external-status').textContent='この判断は受け付けられませんでした。最新の内容を確認して、改めて判断してください。';if(selection===externalEpoch)void externalSelect();return;}
     if(['decided','reused'].includes(result.status))externalTracked=id;
     byId('external-status').textContent=['decided','reused'].includes(result.status)?'判断を受け付けました。外部操作の実行成功はまだ確認していません。':'判断の受理を確認できません。';await externalStatus();
   }catch(error){if(epoch!==authEpoch)return;if(!sent)byId('external-status').textContent='承認操作が中断されたため、判断は送信していません。';else await externalStatus();}
-  finally{if(!sent&&externalPending===id){externalSavePending(null);if(epoch===authEpoch&&!stopped)void externalRead(true);}}
+  finally{if(!sent&&externalPending===id){externalSavePending(null);if(epoch===authEpoch&&!stopped)void externalSelect();}}
 }
 byId('external-reconcile').addEventListener('click',()=>void externalStatus());
 byId('external-next').addEventListener('click',()=>{if(!externalNext)return;externalAfter=externalNext;externalEpoch++;void refresh();});

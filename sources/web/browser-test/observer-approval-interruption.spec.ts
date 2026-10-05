@@ -18,7 +18,7 @@ for(const kind of ['native','external'] as const)for(const phase of ['options','
   else if(path==='/api/approvals')value={available:true,items:['one','two'].map(id=>({request_id:'approval_'+id,operation:'slack.post_thread_reply.v1',state:'requested'})),next:null};
   else if(path.endsWith('/options')){arrived=true;if(phase==='options')await gate;value={ceremony_id:'ceremony',options:{challenge:Buffer.alloc(32,1).toString('base64url'),rpId:'operator.test',allowCredentials:[],userVerification:'required'}};}
   else if(path.endsWith('/decide')){decisions++;value={};}
-  else if(path.startsWith('/api/commands/')||path.endsWith('/status')){lookups++;value={receipt:null,request_id:'approval_one',state:'requested',decision:null,execution:null};}
+  else if(path.startsWith('/api/commands/')||path.endsWith('/status')){lookups++;value={receipt:null,request_id:path.split('/').at(-2),expires_at,state:'requested',decision:null,execution:null};}
   else value={request_id:path.split('/').at(-1),operation:'slack.post_thread_reply.v1',workspace_id:'T_ONE',channel_id:'C_ONE',thread_ts:'123.456',requester:{kind:'slack',label:'U_REQUESTER'},risk:'external_message',operation_summary:'確認したSlackスレッドへ返信',display_fingerprint:'A1B2C3D4E5F60718',created_at:'2026-10-05T00:00:00.000Z',exact_draft:'表示本文',notified_user_ids:[],expires_at,request_revision:1,presentation_revision:1,presentation_digest:'a'.repeat(64)};
   await route.fulfill({contentType:'application/json',body:JSON.stringify(value)});
  });
@@ -31,7 +31,7 @@ for(const kind of ['native','external'] as const)for(const phase of ['options','
  if(phase==='options')release();else await page.evaluate(()=>(window as any).finishPasskey());
  const key=kind==='native'?'dona.pending-command':'dona.pending-external';
  await expect.poll(()=>page.evaluate(key=>sessionStorage.getItem(key),key)).toBeNull();
- await expect(approve()).toBeEnabled();await select('one').click();await expect(approve()).toBeEnabled();expect(decisions).toBe(0);expect(lookups).toBe(0);
+ await expect(approve()).toBeEnabled();await select('one').click();await expect(approve()).toBeEnabled();expect(decisions).toBe(0);if(kind==='external')expect(lookups).toBeGreaterThanOrEqual(3);else expect(lookups).toBe(0);
 });
 
 test('外部承認coreの要求状態と実行状態を区別して表示する',async({page})=>{
@@ -68,7 +68,7 @@ for(const kind of ['native','external'] as const)for(const outcome of ['rejected
   else if(path==='/api/approvals')value={available:true,items:['one','two'].map(id=>({request_id:'approval_'+id,operation:'slack.post_thread_reply.v1',state:'requested'})),next:null};
   else if(path.endsWith('/options')){if(kind==='native')requestId=route.request().postDataJSON().input.request_id;value={ceremony_id:'ceremony',options:{challenge:Buffer.alloc(32,1).toString('base64url'),rpId:'operator.test',allowCredentials:[],userVerification:'required'}};}
   else if(path.endsWith('/decide')){decisions++;await route.fulfill({status:outcome==='rejected'?409:503,contentType:'application/json',body:JSON.stringify(outcome==='rejected'?{rejection:{request_id:kind==='native'?requestId:'approval_one',operation:kind==='native'?'native_approval':'external_approval',code:'conflict',not_committed:true}}:{error:'observation_unavailable'})});return;}
-  else if(path.startsWith('/api/commands/')||path.endsWith('/status')){lookups++;value={receipt:null,request_id:'approval_one',state:'requested',decision:null,execution:null};}
+  else if(path.startsWith('/api/commands/')||path.endsWith('/status')){lookups++;value={receipt:null,request_id:path.split('/').at(-2),expires_at,state:'requested',decision:null,execution:null};}
   else value={request_id:path.split('/').at(-1),operation:'slack.post_thread_reply.v1',workspace_id:'T_ONE',channel_id:'C_ONE',thread_ts:'123.456',requester:{kind:'slack',label:'U_REQUESTER'},risk:'external_message',operation_summary:'確認したSlackスレッドへ返信',display_fingerprint:'A1B2C3D4E5F60718',created_at:'2026-10-05T00:00:00.000Z',exact_draft:'表示本文',notified_user_ids:[],expires_at,request_revision:1,presentation_revision:1,presentation_digest:'a'.repeat(64)};
   await route.fulfill({contentType:'application/json',body:JSON.stringify(value)});
  });
@@ -77,6 +77,6 @@ for(const kind of ['native','external'] as const)for(const outcome of ['rejected
  await page.getByRole('button',{name:kind==='native'?'この要求を許可':'この外部操作を許可'}).click();
  await expect.poll(()=>decisions).toBe(1);
  const key=kind==='native'?'dona.pending-command':'dona.pending-external';
- if(outcome==='rejected'){await expect.poll(()=>page.evaluate(key=>sessionStorage.getItem(key),key)).toBeNull();await expect(page.getByRole('button',{name:kind==='native'?'この要求を許可':'この外部操作を許可'})).toBeEnabled();expect(lookups).toBe(0);}
+ if(outcome==='rejected'){await expect.poll(()=>page.evaluate(key=>sessionStorage.getItem(key),key)).toBeNull();await expect(page.getByRole('button',{name:kind==='native'?'この要求を許可':'この外部操作を許可'})).toBeEnabled();if(kind==='external')expect(lookups).toBeGreaterThanOrEqual(1);else expect(lookups).toBe(0);}
  else{await expect.poll(()=>lookups).toBeGreaterThan(0);expect(await page.evaluate(key=>sessionStorage.getItem(key),key)).not.toBeNull();}
 });
