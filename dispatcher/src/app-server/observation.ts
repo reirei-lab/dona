@@ -37,6 +37,22 @@ function hasCredentialSetting(value:string):boolean {
 }
 /** 既知CLIの認証optionを検出する表示用検査。shellとして評価せず、該当fieldを保守的に省略する。 */
 function hasCredentialCli(text:string):boolean {
+  // registry loginだけの-pを認証情報として扱う。docker run -pのport公開とは区別する。
+  const registryText=text.replace(/\\+\r?\n/g," ").replace(/\\+[nrt]/g," ");
+  const registryCommands:[string,string,string][]=[
+    ["docker","context|config|host|log-level|tlscacert|tlscert|tlskey","debug|tls|tlsverify"],
+    ["podman","connection|url|identity|log-level|root|runroot|storage-driver|storage-opt|namespace|tmpdir|runtime|events-backend","remote|debug|syslog"],
+    ["helm","kube-context|kubeconfig|namespace|kube-apiserver|kube-as-user|kube-as-group|registry-config|repository-config|repository-cache|burst-limit|qps","debug|kube-insecure-skip-tls-verify"],
+  ];
+  for(const [tool,values,flags] of registryCommands){
+    const value=`(?:"[^"\\r\\n;|&]*"|'[^'\\r\\n;|&]*'|[^\\s;|&]+)`;
+    const options=`(?:(?:--(?:${values})(?:=|[ \\t]+)${value}|--(?:${flags})(?:=(?:true|false))?|-D)[ \\t]+)*`;
+    const verb=tool==="helm"?"registry[ \\t]+login":"login";
+    const command=new RegExp(`\\b${tool}[ \\t]+${options}${verb}[ \\t]+([^\\r\\n;|&]+)`,"gi");
+    for(const match of registryText.matchAll(command)){
+      if(/(?:^|\s)["']?-(?:p|[v]+p)\S*|(?:^|\s)["']?--password(?:=|\s)/.test(match[1]!))return true;
+    }
+  }
   const tools:[RegExp,string,Set<string>,string][]=[
     [/\bcurl\b/,"uUHbEx",new Set(["user","proxy-user","oauth2-bearer","header","proxy-header","cookie","cert","pass","proxy","preproxy","proxy1.0","proxy-cert","proxy-pass","tlspassword","proxy-tlspassword","tlsuser","proxy-tlsuser","socks4","socks4a","socks5","socks5-hostname"]),"sSfvkLIOiNgq#012346"],
     [/\b(?:mysql|mariadb|mysqldump|mysqladmin)\b/,"p",new Set(["password","password1","password2","password3"]),"vVqfBCNnstW"],
@@ -126,7 +142,7 @@ export function sanitizeConversationItem(value:unknown):ConversationItem|undefin
   if(out.kind==="tool_progress"&&["commandExecution","fileChange","mcpToolCall","dynamicToolCall","collabAgentToolCall","webSearch","imageView","imageGeneration","sleep","contextCompaction","enteredReviewMode","exitedReviewMode","subAgentActivity","functionCallOutput"].includes(String(v.tool_type)))out.tool_type=String(v.tool_type);
   if(out.kind==="tool_progress"&&(!metadataOnly||v.tool_type==="sleep")&&Number.isFinite(v.duration_ms)&&Number(v.duration_ms)>=0)out.duration_ms=Number(v.duration_ms);
   if(out.kind==="tool_progress"&&!metadataOnly&&Number.isSafeInteger(v.exit_code))out.exit_code=Number(v.exit_code);
-  if(out.kind==="tool_progress"&&!metadataOnly&&Array.isArray(v.files)){out.files=[];if(v.files.length>20)out.truncated=true;for(const raw of v.files.slice(0,20)){const f=record(raw);if(typeof f.path!=="string"||!["add","delete","update"].includes(String(f.change)))continue;const file:ConversationFile={path:sanitizeObservationText(f.path,1024),change:f.change as ConversationFile["change"]};if(file.change==="update"&&typeof f.move_path==="string"){file.move_path=sanitizeObservationText(f.move_path,1024);if(f.move_path.length>1024)out.truncated=true;}for(const k of ["additions","deletions"] as const)if(Number.isSafeInteger(f[k])&&Number(f[k])>=0)file[k]=Number(f[k]);out.files.push(file);}}
+  if(out.kind==="tool_progress"&&!metadataOnly&&Array.isArray(v.files)){out.files=[];if(v.files.length>20)out.truncated=true;for(const raw of v.files.slice(0,20)){const f=record(raw);if(typeof f.path!=="string"||!["add","delete","update"].includes(String(f.change)))continue;const file:ConversationFile={path:sanitizeObservationText(f.path,1024),change:f.change as ConversationFile["change"]};if(f.path.length>1024)out.truncated=true;if(file.change==="update"&&typeof f.move_path==="string"){file.move_path=sanitizeObservationText(f.move_path,1024);if(f.move_path.length>1024)out.truncated=true;}for(const k of ["additions","deletions"] as const)if(Number.isSafeInteger(f[k])&&Number(f[k])>=0)file[k]=Number(f[k]);out.files.push(file);}}
   if(v.truncated===true)out.truncated=true;return out;
 }
 function requestText(text:string):string|undefined {

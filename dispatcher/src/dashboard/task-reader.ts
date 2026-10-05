@@ -66,8 +66,15 @@ export class DashboardTaskReader {
       const selected_attempt_id = attemptId ?? task.current_attempt_id;
       const selected = attempts.find(attempt => attempt.attempt_id === selected_attempt_id);
       if (!selected) return null;
-      const resultRow = this.sql.prepare("SELECT result_json,objective FROM jobs WHERE job_id=?").get(selected_attempt_id) as {result_json:string|null;objective:string};
-      const request=sanitizeObservationText(resultRow.objective)+(resultRow.objective.length>8192?"\n[長い依頼内容の末尾を省略]":"");
+      const resultRow = this.sql.prepare("SELECT result_json,objective,steer_event_id,steer_state FROM jobs WHERE job_id=?").get(selected_attempt_id) as {result_json:string|null;objective:string;steer_event_id:string|null;steer_state:string|null};
+      const effective = this.sql.prepare("SELECT objective,steer_pending_event_id FROM tasks WHERE task_id=?").get(id) as {objective:string;steer_pending_event_id:string|null};
+      const current = selected_attempt_id === task.current_attempt_id;
+      const objective = current ? effective.objective : resultRow.objective;
+      // prepareSteer records the requested change before the worker acknowledges it.
+      // Do not parse delimiters or hide earlier accepted additions while awaiting proof.
+      const pending = current && effective.steer_pending_event_id !== null &&
+        !(resultRow.steer_event_id === effective.steer_pending_event_id && resultRow.steer_state === "accepted");
+      const request=(pending?"追加指示のワーカー受理は未確認です。\n\n":"")+sanitizeObservationText(objective)+(objective.length>8192?"\n[長い依頼内容の末尾を省略]":"");
       let result: DashboardTaskSnapshot["result"] = null;
       if (["completed","failed","cancelled"].includes(selected.status) && resultRow.result_json && resultRow.result_json.length <= 1_048_576) try {
         const value:unknown=JSON.parse(resultRow.result_json);

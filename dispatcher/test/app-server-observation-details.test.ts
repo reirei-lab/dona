@@ -275,3 +275,57 @@ test("fileChange update移動先はbounded DTOとcache再読で保持し保護pa
   const cached=store.cachedItems("a","g")[0]!;assert.ok(cached.files?.[0]?.move_path);assert.ok(!JSON.stringify(cached).includes("alice"));assert.ok(!JSON.stringify(cached).includes("hidden"));
  }finally{store.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+test("file pathは1024文字境界を超えた場合だけtruncatedを保持する",()=>{
+ for(const length of [1023,1024,1025]){
+  const item=projectItem({id:"path",type:"fileChange",changes:[{path:"x".repeat(length),kind:{type:"update"},diff:""}]},turn)!;
+  assert.equal(item.files?.[0]?.path.length,Math.min(length,1024));assert.equal(item.truncated,length>1024?true:undefined);
+  assert.deepEqual(sanitizeConversationItem(item),item);
+ }
+ const cached=sanitizeConversationItem({id:"old",turn_id:turn,kind:"tool_progress",tool_type:"fileChange",files:[{path:"x".repeat(1025),change:"add"}]})!;
+ assert.equal(cached.truncated,true);assert.equal(cached.files?.[0]?.path.length,1024);
+});
+
+test("registry loginのpassword optionを省略しrunのportや通常commandを残す",()=>{
+ for(const cli of ["docker login","podman login","helm registry login"]){
+  for(const option of ["-p sensitive-placeholder","-psensitive-placeholder","--password sensitive-placeholder","--password=sensitive-placeholder"]){
+   const command=`${cli} -u alice ${option} registry.example`;
+   for(const value of [command,JSON.stringify(command),encodeURIComponent(command),command.replaceAll(" ","\\\n ")]){
+    assert.ok(!sanitizeObservationText(value).includes("sensitive-placeholder"));
+    assert.ok(!JSON.stringify(projectItem({id:"login",type:"commandExecution",command:value},turn)).includes("sensitive-placeholder"));
+   }
+  }
+ }
+ for(const command of ["docker run -p 8080:80 nginx","podman run -p8080:80 nginx","helm template app ./chart","docker login -u alice","docker login -u alice && docker run -p8080:80 nginx","npm test"]){assert.equal(sanitizeObservationText(command),command);}
+});
+
+test("registry loginのglobal optionを認識し別commandのlogin文字列と区別する",()=>{
+ for(const command of [
+  "docker --context dev login -p sensitive-placeholder registry.example",
+  "docker --context=dev --debug login -psensitive-placeholder registry.example",
+  "docker --config '/tmp/config dir' login -p sensitive-placeholder",
+  "podman --connection remote login -p sensitive-placeholder",
+  "podman --remote --connection=remote login -p sensitive-placeholder",
+  "helm --kube-context dev registry login -p sensitive-placeholder registry.example",
+  "helm --debug --namespace=dev registry login -psensitive-placeholder",
+  "sudo /usr/local/bin/docker --context dev login -p sensitive-placeholder",
+  "npm test && docker --context dev login -p sensitive-placeholder",
+ ]){
+  for(const value of [command,JSON.stringify(command),encodeURIComponent(command)])assert.ok(!sanitizeObservationText(value).includes("sensitive-placeholder"),command);
+ }
+ for(const command of [
+  "docker --context dev run -p8080:80 nginx",
+  "podman --connection remote run -p 8080:80 nginx",
+  "helm --kube-context dev template app ./chart",
+  "docker --context dev ps && echo login -p example",
+ ])assert.equal(sanitizeObservationText(command),command);
+});
+
+
+test("registry credentialはJSON・code wrapper・echo引用内も表示しない",()=>{
+ const command="docker --context dev login -p sensitive-placeholder registry.example";
+ for(const value of [JSON.stringify({command}),JSON.stringify(JSON.stringify({command})),`command: ${command}`,`code: ${command}`,`example: ${command}`,`echo "${command}"`]){
+  assert.ok(!sanitizeObservationText(value).includes("sensitive-placeholder"));
+  assert.ok(!JSON.stringify(projectItem({id:"wrapped",type:"mcpToolCall",tool:"exec",arguments:{code:value},result:{content:[{type:"text",text:value}]}},turn)).includes("sensitive-placeholder"));
+ }
+});

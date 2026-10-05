@@ -190,7 +190,7 @@ test('依頼本文だけの変更とretention縮小を会話閲覧端末のSSE�
   const durableBefore=db.tasks.get(task.task_id),publicFingerprint=visible.snapshot.fingerprint;
   for(const objective of ['追記された非公開依頼と追加条件','[保持期限を過ぎた依頼]']){
    // follow-upやretentionがobjectiveだけを書き換えた永続状態を再現する。
-   sql.prepare('UPDATE jobs SET objective=? WHERE job_id=?').run(objective,task.current_attempt_id);
+   sql.prepare('UPDATE tasks SET objective=? WHERE task_id=?').run(objective,task.task_id);
    const changed=await request(port,null,target+'/events',{cookie:detailed,cursor:visible.stream_cursor});
    assert.equal(changed.status,200);assert.match(changed.body,/event: snapshot\n/);assert.ok(!changed.body.includes(objective));
    const unchanged=await request(port,null,target+'/events',{cookie:tasksOnly,cursor:limited.stream_cursor});
@@ -209,6 +209,6 @@ test('依頼本文だけの変更とretention縮小を会話閲覧端末のSSE�
    assert.match((await request(port,null,target+'/events',{cookie:detailed,cursor:next.stream_cursor})).body,/event: heartbeat\n/);
    visible=next;limited=nextLimited;
   }
-  assert.deepEqual(db.tasks.get(task.task_id),durableBefore);
+  assert.deepEqual(db.tasks.get(task.task_id),{...durableBefore,objective:'[保持期限を過ぎた依頼]'});
  }finally{await server.close();reader.close();sql.close();db.close();await fs.rm(root,{recursive:true,force:true});}
 });
