@@ -192,6 +192,7 @@ trap cleanup_temp EXIT
 $NODE_PATH "$SCRIPT_DIR/render-self-update-templates.mjs" "$INSTALL_TMP/rendered" "$INSTALL_SHA" "$BASE_DIR" "${TARGET_ROOT:+generation}" "${DONA_SIGNED_HOST_CONFIG:-}" "${DONA_TASK_GENERATION_UPDATE:-}" "${DONA_LOCAL_APPROVAL_CONFIG:-}" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
 if [[ -n "$TARGET_ROOT" ]]; then
   EXPECTED_OLD_UPDATER_SHA=$(/usr/bin/python3 "$SCRIPT_DIR/validate-generation-install-target.py" "$BASE_DIR" "$INSTALL_TMP/rendered" "$LAUNCH_AGENTS_DIR" "$MODE")
+  DISPATCHER_SOCKET=$($NODE_PATH -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).dispatcher_socket)' "$INSTALL_TMP/rendered/policy.json")
 fi
 /usr/bin/plutil -lint "$INSTALL_TMP/rendered/dev.dona.updater.plist" \
   "$INSTALL_TMP/rendered/dev.dona.dispatcher.plist" \

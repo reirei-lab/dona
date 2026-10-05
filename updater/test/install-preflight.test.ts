@@ -545,3 +545,7 @@ test('署名hostのrenderは指定設定と既存policyを保持し固定binary�
   const preserved=JSON.parse(await fs.readFile(path.join(next,'policy.json'),'utf8'));assert.deepEqual(preserved.signed_host,config);assert.deepEqual(preserved.task_generation_update,policy.task_generation_update);
  }finally{await fs.rm(home,{recursive:true,force:true});}
 });
+
+test("offline preserve control upgrade verifies the installed split data identity and retains generated bindings", async () => {
+  await execute("/usr/bin/python3", [fileURLToPath(new URL("./generation-install-fixture.py", import.meta.url))]);
+});
