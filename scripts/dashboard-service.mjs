@@ -24,9 +24,15 @@ try{
    if(!/^[a-f0-9]{40}$/.test(manifest.sha)||!/^[a-f0-9]{64}$/.test(manifest.lock_hashes?.['sources/web']))fail();
    const {readDashboardConfig}=await import(pathToFileURL(path.join(release,'dispatcher/dist/dashboard/config.js')).href);
    const config=readDashboardConfig(configArg);privateDirectory(path.dirname(config.control_socket));privateDirectory(logsArg);
+   let executableRelease=release;
+   if(config.active_release_pointer){
+     const {readDashboardRelease}=await import(pathToFileURL(path.join(release,'dispatcher/dist/dashboard/release-pointer.js')).href);
+     const current=readDashboardRelease(config.active_release_pointer);if(current.root!==release||current.sha!==manifest.sha)fail();
+     executableRelease=config.active_release_pointer;
+   }
    const xml=value=>value.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&apos;');
    let template=fs.readFileSync(new URL('../launchd/dev.dona.dashboard.plist.in',import.meta.url),'utf8');
-   for(const [name,value]of Object.entries({NODE:fs.realpathSync(process.execPath),RELEASE:release,CONFIG:configArg,LOG_ROOT:logsArg}))template=template.replaceAll(`__${name}__`,xml(value));
+   for(const [name,value]of Object.entries({NODE:fs.realpathSync(process.execPath),RELEASE:executableRelease,CONFIG:configArg,LOG_ROOT:logsArg}))template=template.replaceAll(`__${name}__`,xml(value));
    if(/__[A-Z_]+__/.test(template))fail();
    if(operation==='render')process.stdout.write(template);
    else{
