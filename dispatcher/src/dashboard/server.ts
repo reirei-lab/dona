@@ -102,6 +102,23 @@ export class DashboardServer {
         if(!current||JSON.stringify(current)!==JSON.stringify(session)){this.reply(res,401,{error:"session_invalid"});return false;}return true;
       };
       const url=new URL(target,this.origin);
+      if(req.method==='GET'&&url.pathname==='/api/approvals'){
+        const keys=[...url.searchParams.keys()];if(keys.length>1||keys.some(key=>key!=='after'))throw Error('query_invalid');
+        const result=await this.options.backend.call('external/list',{token,...(url.searchParams.has('after')?{after:url.searchParams.get('after')}:{})});
+        if(!await recheck())return;this.reply(res,200,result);return;
+      }
+      if(req.method==='POST'&&url.pathname==='/api/approvals/decide'&&!url.search){
+        const body=await this.body(req);if(Object.keys(body).some(key=>!['ceremony_id','response'].includes(key)))throw Error('body_invalid');
+        const result=await this.options.backend.call('external/decide',{...body,token});
+        if(!await recheck())return;this.reply(res,200,result);return;
+      }
+      const external=/^\/api\/approvals\/([A-Za-z0-9_-]{1,128})(?:\/(options|status))?$/.exec(url.pathname);
+      if(external&&!url.search&&((req.method==='GET'&&external[2]!=='options')||(req.method==='POST'&&external[2]==='options'))){
+        const body=req.method==='POST'?await this.body(req):{};
+        if(Object.keys(body).some(key=>!['decision','presentation_digest'].includes(key)))throw Error('body_invalid');
+        const result=await this.options.backend.call('external/'+(external[2]??'present'),{...body,token,request_id:external[1]});
+        if(!await recheck())return;this.reply(res,200,result);return;
+      }
       const native=/^\/api\/native\/(options|decide)$/.exec(url.pathname);
       if(native&&req.method==='POST'&&!url.search){
         const body=await this.body(req);

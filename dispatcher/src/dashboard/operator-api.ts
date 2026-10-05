@@ -5,10 +5,13 @@ import type { RegistrationResponseJSON } from "@simplewebauthn/server";
 import { operatorCommand, operatorQuestions, type OperatorCommandPaths } from "./operator-commands.js";
 import type { QuestionRecord } from "../app-server/store.js";
 import { operatorNativeRequest } from "./operator-native.js";
+import type { LocalExternalApprovalService } from "../approval/local-external-service.js";
+import { operatorExternalRequest } from "./operator-external.js";
 
 export interface OperatorApiContext extends OperatorCommandPaths {
   readQuestions(agent:string):Promise<QuestionRecord[]>;
   wake():void;
+  external?:LocalExternalApprovalService;
 }
 
 const tokenSchema = z.strictObject({token:z.string().regex(/^[A-Za-z0-9_-]{43}$/)});
@@ -16,6 +19,10 @@ const tokenSchema = z.strictObject({token:z.string().regex(/^[A-Za-z0-9_-]{43}$/
  * forwarded from the browser-facing HTTP server. */
 export async function operatorRequest(database:DispatcherDatabase, route:string, input:unknown,context?:OperatorApiContext):Promise<unknown> {
   const auth=database.operatorAuth;
+  if(route.startsWith('external/')) {
+    if(!context)throw new OperatorAuthError('denied');
+    return operatorExternalRequest(database,context,route.slice('external/'.length),input);
+  }
   if(route.startsWith('native/')) {
     if(!context)throw new OperatorAuthError('denied');
     return operatorNativeRequest(database,context,route.slice('native/'.length),input);

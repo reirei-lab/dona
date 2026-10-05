@@ -23,6 +23,10 @@ test('実ES256/CBOR登録と署名assertionを通し別action・capability・rep
   const ceremony=await f.web.approvalOptions(f.token,'approvals:native',f.intent),response=f.device.assert(ceremony.options.challenge);
   const receipt=await f.web.verify(f.token,ceremony.ceremony_id,response);
   assert.equal(f.web.verifyReceipt(receipt,f.intent,'approvals:native'),true);
+  const reordered=Object.fromEntries(Object.entries(receipt).reverse()) as typeof receipt;
+  assert.equal(f.web.verifyReceipt(reordered,f.intent,'approvals:native'),true);
+  assert.equal(f.web.verifyReceipt(receipt,{...f.intent,expires_at:'invalid'},'approvals:native'),false);
+  assert.equal((f.sql.prepare('SELECT count(*) AS n FROM dashboard_operator_stepup_receipts').get() as {n:number}).n,1);
   assert.equal(f.web.verifyReceipt(receipt,{...f.intent,decision:'reject'},'approvals:native'),false);
   assert.equal(f.web.verifyReceipt(receipt,{...f.intent,request_id:'other'},'approvals:native'),false);
   assert.equal(f.web.verifyReceipt(receipt,{...f.intent,presentation_digest:'b'.repeat(64)},'approvals:native'),false);

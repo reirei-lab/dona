@@ -3,6 +3,7 @@ import { operatorRequest } from "./dashboard/operator-api.js";
 import { OperatorAuthError } from "./dashboard/operator-auth.js";
 import { RuntimeClient } from "./app-server/client.js";
 import { runtimeSocket } from "./app-server/adapters.js";
+import type { LocalExternalApprovalService } from "./approval/local-external-service.js";
 import { githubQuery, verifyTaskIssue } from "./task-github.js";
 import fs from "node:fs/promises";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
@@ -147,6 +148,8 @@ export interface ApiJobProgressResolver {
 }
 
 export class DispatcherApi {
+  private externalApproval:LocalExternalApprovalService|undefined;
+  setExternalApproval(service:LocalExternalApprovalService|undefined):void {this.externalApproval=service;}
   private server: http.Server | undefined;
   private shuttingDown = false;
   private quiesceOperationId: string | undefined;
@@ -247,6 +250,7 @@ export class DispatcherApi {
           jobsWorkspaceRoot:this.config.jobsWorkspaceRoot,jobResultsDir:this.config.jobResultsDir,
           readQuestions:agent=>new RuntimeClient(runtimeSocket(this.config),5000).questions(agent),
           wake:()=>{this.jobs.wake();this.worker.wake();},
+          ...(this.externalApproval?{external:this.externalApproval}:{}),
         });
         sendJson(response,200,result);return;
       }
