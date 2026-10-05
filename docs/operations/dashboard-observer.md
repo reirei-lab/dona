@@ -23,11 +23,15 @@ control socketの親とlog directoryはowner所有・mode `0700`、socket path�
 
 `node scripts/dashboard-service.mjs render <release> <config.json> <log-directory>` で専用plistを確認する。`install` は同じ3引数で `dev.dona.dashboard` のplistだけを配置し、`start` で起動する。`status` はlaunchd状態、`node <release>/dispatcher/dist/dashboard/cli.js status <config.json>` はowner-only control socket上のversionとsession数を返す。serviceは `127.0.0.1:<port>` だけにbindする。
 
+起動前に `node scripts/dashboard-service.mjs doctor <release> <config.json> <log-directory>` を実行する。これは設定・private socket/DB・control/log directory・Tailscaleの導入/接続状態を読むだけで、serviceやServeの設定を変更しない。`ready: true` でもsocketへの認可やHTTPS到達はまだ未検証なので、起動後のCLI `status` と端末からの確認まで行う。Tailscale以外のprivate proxyを使う場合、Tailscale項目は独立した参考情報として、そのproxyのTLS/到達を別途検証する。
+
+`dispatcher_socket` がない旧configはrender/installで拒否される。現在世代のDispatcher設定にある `DONA_SOCKET_PATH` またはupdate policyの `dispatcher_socket` を照合して明示し、runtime socketと混同しない。socketの親directoryはcanonical pathで記述する（macOSの `/var` が `/private/var` へのsymlinkの場合なども実体を使う）。DB/socketがまだ作成されていない場合はDona本体の起動状態を確認し、dashboardのために別DBを新規作成しない。
+
 Tailscale Serve等のreverse proxy側は、設定したexact HTTPS originからこのloopback portだけへ転送する。proxyはHostを設定originへ一致させる必要がある。HTTP直アクセスや任意Hostは利用対象外。forwarded user/headerを認証には使わない。Tailnet ACLで閲覧対象端末を限定し、インターネット公開・Funnelは使わない。proxy設定の変更・実ネットワーク接続は別途その環境で検証する。
 
 ## Tailscaleの設定手順
 
-1. Macと閲覧端末の両方でTailscaleにログインする。未導入なら[Tailscale公式のインストール手順](https://tailscale.com/download)を使う。
+1. doctorが `not_installed` なら、Macと閲覧端末の両方へTailscaleを導入してログインする。`not_connected` はログイン/接続、`unavailable` はCLIの起動結果と既存設定を確認する。未導入なら[Tailscale公式のインストール手順](https://tailscale.com/download)を使う。
 2. Macの `tailscale status` で接続状態と名前を確認し、`tailscale serve status` で既存の公開先を確認する。すでに同じHTTPS port/pathが使われている場合は上書きせず、空いているportを選んで設定の `origin` にもそのportを含める。
 3. observerを起動・status確認後、未使用のHTTPS portに転送を設定する。以下は443が未使用でbackendが4318の場合の例。環境の既存設定を確認してから実行する。
 
