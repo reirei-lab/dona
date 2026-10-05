@@ -55,4 +55,3 @@ export function fixture(t:{after(fn:()=>void):void},initialize=true){
   setGrant:(value:ApprovalCreateGrant)=>{current=value;},rotate:()=>{rotated=true;},revoke:()=>{revoked=true;},counts:()=>({authorityCalls,activeCalls,wrapCalls})};
 }
 export const count=(f:ReturnType<typeof fixture>,table:"approval_requests"|"approval_notifications"|"approval_payload_secrets")=>f.db.prepare(`SELECT count(*) FROM ${table}`).pluck().get();
-

@@ -51,4 +51,3 @@ export function decisionFixture(t: { after(fn: () => void): void }, sent = true)
     authorityState: () => captured, calls: () => calls, read: () => f.records.read("request", requestId)!,
     rows: (table: "approval_decisions" | "approval_event_outbox" | "approval_payload_secrets" | "approval_presentation_updates") => Number(f.db.prepare(`SELECT count(*) FROM ${table}`).pluck().get()) };
 }
-

@@ -27,4 +27,3 @@ test("CAS responseはcanonical JSONと厳密なfieldを要求し内容をerror�
     observed.replace('"status":"observed"', '"extra":1,"status":"observed"'), "x".repeat(16385)])
     assert.throws(() => parseKeychainCasResponse(raw), { name: "KeychainCasError", message: "keychain_cas_unverified" });
 });
-
