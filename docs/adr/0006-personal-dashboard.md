@@ -32,6 +32,10 @@ workerの質問はDona本体へ届ける。browserの回答もexact Task/Attempt
 
 Codexのコマンド・ファイル操作承認と、Dona独自の外部操作承認は、別の権限と台帳として表示する。どちらも現在の対象、期限、状態、decisionを確認する。Dona承認は既存coreのtyped operation `slack.post_thread_reply.v1` に限定し、保存済みexact target/draft、現在のアクセス、one-shot consume、実行結果と曖昧状態の記録まで接続する。UI上の許可ボタンだけを完了とはしない。
 
+承認を必須にする範囲は、2026-10-05の利用者の選択によりworkerの外部投稿とする。MVP対象のSlack投稿は `dona_request_thread_reply` から既存typed executorへ渡し、未承認の要求を送信しない。dona-mainの通常返信・進捗の集約・結果通知は従来の経路を維持し、それらの投稿に追加のDona承認を要求しない。workerの承認待ち本文をmainへ転送して代わりに投稿させることは、通常の結果通知として扱わない。
+
+この境界はDonaが提供するworkerの投稿経路を制御する。Macの開発環境を直接使うworkerを、同一OS利用者から隔離するsandboxへ変更する決定ではない。別途operatorが設定した外部clientや資格情報まで強制隔離したとは主張しない。旧設計の全main/worker client遮断・二者Slack承認を実装済みと読み替えず、今回の個人用運用契約と区別する。
+
 承認には通常cookieとは別に、対象とdecisionへ束縛した一回限りのWebAuthn確認を要求する。RP IDとoriginは設定値、user verificationは必須。Macが承認権限付きの登録コードを発行した端末だけがcredentialを登録できる。自分用の構成では端末のTouch ID・Face ID・PINで保護したplatform credential/passkeyを許可し、旧ADRのhardware attestation・non-backup必須条件を置き換える。これは単独operator向けの判断であり、独立した二人の承認やIdPと独立した企業向け二者統制を保証しない。credential交換はMacの新たな登録操作に戻す。
 
 承認challengeは2分以内かつrequest期限以内。保存済み対象・decision・device/session/grant revisionへ束縛し、replay、別action転用、失効後回答を拒否する。署名検証後にも現在の権限と対象を照合する。未対応の外部操作、self-update、権限変更、支払い、削除をこの承認で解禁しない。
