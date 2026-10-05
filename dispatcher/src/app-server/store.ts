@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
-import type {ObservationEvent,ConversationItem} from "./observation.js";
+import {sanitizeConversationItem,type ObservationEvent,type ConversationItem} from "./observation.js";
 
 export interface AgentRecord {
   name:string; generation:string; role:"main"|"worker"; cwd:string; release:string;
@@ -93,14 +93,14 @@ export class RuntimeStore {
   cacheItem(agent:string,generation:string,item:ConversationItem):void {
     this.db.transaction(()=>{
       const sequence=(this.db.prepare("UPDATE observation_item_sequence SET sequence=sequence+1 WHERE singleton=1 RETURNING sequence").get() as {sequence:number}).sequence;
-      this.db.prepare("INSERT INTO observation_items(agent,generation,item_id,item_json,observed_at,sequence) VALUES(?,?,?,?,?,?) ON CONFLICT(agent,generation,item_id) DO UPDATE SET item_json=excluded.item_json,observed_at=excluded.observed_at,sequence=excluded.sequence").run(agent,generation,`${item.turn_id}:${item.id}`,JSON.stringify(item),new Date().toISOString(),sequence);
+      this.db.prepare("INSERT INTO observation_items(agent,generation,item_id,item_json,observed_at,sequence) VALUES(?,?,?,?,?,?) ON CONFLICT(agent,generation,item_id) DO UPDATE SET item_json=excluded.item_json,observed_at=excluded.observed_at").run(agent,generation,`${item.turn_id}:${item.id}`,JSON.stringify(item),new Date().toISOString(),sequence);
       const rows=this.db.prepare("SELECT item_id,length(CAST(item_json AS BLOB)) AS bytes FROM observation_items WHERE agent=? AND generation=? ORDER BY sequence DESC").all(agent,generation) as {item_id:string;bytes:number}[];
       let bytes=0;for(let i=0;i<rows.length;i++){bytes+=rows[i]!.bytes;if(i>=200||bytes>524288)this.db.prepare("DELETE FROM observation_items WHERE agent=? AND generation=? AND item_id=?").run(agent,generation,rows[i]!.item_id);}
     }).immediate();
   }
   cachedItems(agent:string,generation:string):ConversationItem[] {
     this.db.prepare("DELETE FROM observation_items WHERE observed_at<?").run(new Date(Date.now()-86400_000).toISOString());
-    return (this.db.prepare("SELECT item_json FROM observation_items WHERE agent=? AND generation=? ORDER BY sequence").all(agent,generation) as {item_json:string}[]).map(r=>JSON.parse(r.item_json) as ConversationItem);
+    return (this.db.prepare("SELECT item_json FROM observation_items WHERE agent=? AND generation=? ORDER BY sequence").all(agent,generation) as {item_json:string}[]).flatMap(r=>{const item=sanitizeConversationItem(JSON.parse(r.item_json));return item?[item]:[];});
   }
   observe(agent:string,generation:string,event:Omit<ObservationEvent,"sequence"|"observed_at">):void {
     this.db.transaction(()=>{

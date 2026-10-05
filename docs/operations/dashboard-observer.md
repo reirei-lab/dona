@@ -79,3 +79,11 @@ Mac の `pair` コマンドには `--capability` を複数指定できます。�
 外部承認を有効にするDispatcherは `DONA_LOCAL_APPROVAL_CONFIG` にMacで管理する0600の設定ファイルを指定する。設定・署名・Keychain整合性の検査に失敗したときは外部承認を利用不可として診断に示す。他のTask閲覧やDispatcher受付を、初期設定の不足だけで停止しない。provisionは常駐serviceから自動実行しない。
 
 通常installerで外部承認設定を導入するには、`DONA_LOCAL_APPROVAL_CONFIG=/absolute/private/approval.json` を `scripts/install-self-update.sh` へ渡す。private設定を検証してDispatcher plistへ保存し、次回は未指定でも同じgenerationの設定を保持する。既存の `config/dispatcher.env` に同変数を設定する経路も有効で、plistの明示値が優先する。設定導入はKeychain provisionや外部承認readyの証明ではない。署名、対話provision、現在scopeとhealthの照合は[署名host手順](dispatcher-signed-host.md)と[承認運用手順](local-external-approval.md)に従う。
+
+## 会話・実行内容の表示
+
+会話の詳細には依頼本文、Codexの応答、ツール名、コマンド、テキスト出力・エラー、変更ファイル・移動先と追加/削除行数、終了コード・所要時間を表示する。項目の有無はApp Serverの返す情報に従う。Taskの依頼は現在のAttemptではTaskの最新objective、過去のAttemptでは当時のobjectiveを表示し、会話閲覧権限が必要。追加指示のワーカー受理が未確認の場合は注意を表示する。観測時刻は取得時点で、実行開始時刻の代わりにはしない。長い入力・出力は折りたたみ、表示上限による省略を明示する。
+
+内部のDona処理契約は依頼部分だけを抽出し、reasoning、認証用metadata、ツール引数全体、画像や生の変更差分は公開しない。既知のcredential形式や管理用pathは保存・表示前に除去する。既知のcredential名への代入を含む表示fieldは、複数行の値も漏れないよう内容全体を省略する。コマンド・入力から既知の認証情報を検出した項目は、裸の秘密値が返る可能性を考慮して出力・エラーも省略する。認証ファイルの5field形式と一致する一部の診断文も保守的に省略する。ただし任意の出力に含まれる未知の秘密を完全検出する保証ではないため、会話閲覧権限は自分の信頼する端末にだけ付与する。分割されたtokenを本文として流さないため、本文は完成したitem/historyから反映する。
+
+旧版で内容を省略して保存した履歴は、App Serverから再取得できる場合に限り詳細が増える。取得できない旧履歴には詳細未保存を表示し、更新だけで過去の出力が復元されたとは扱わない。

@@ -10,9 +10,9 @@ import {RuntimeStore} from "../src/app-server/store.js";
 import {AppServerManager} from "../src/app-server/manager.js";
 import {projectHistory} from "../src/app-server/observation.js";
 
-test("観測projectionは機械prompt・tool引数・出力を取り除きassistantだけを返す",()=>{
- const result=projectHistory({thread:{id:"thread",turns:[{id:"turn",items:[{id:"user",type:"userMessage",content:[{text:"[DONA_JOB] secret"}]},{id:"tool",type:"commandExecution",command:"secret",aggregatedOutput:"secret",status:"completed"},{id:"agent",type:"agentMessage",text:"進捗"}]}]}});
- assert.deepEqual(result.items,[{id:"tool",turn_id:"turn",kind:"tool_progress",tool_type:"commandExecution",status:"completed"},{id:"agent",turn_id:"turn",kind:"assistant_message",text:"進捗"}]);
+test("観測projectionは機械promptを除外しcommand結果をtypedに返す",()=>{
+ const result=projectHistory({thread:{id:"thread",turns:[{id:"turn",items:[{id:"user",type:"userMessage",content:[{text:"[DONA_JOB] secret"}]},{id:"tool",type:"commandExecution",command:"npm test",aggregatedOutput:"3 tests passed",status:"completed"},{id:"agent",type:"agentMessage",text:"進捗"}]}]}});
+ assert.deepEqual(result.items,[{id:"tool",turn_id:"turn",kind:"tool_progress",tool_type:"commandExecution",status:"completed",command:"npm test",output:"3 tests passed"},{id:"agent",turn_id:"turn",kind:"assistant_message",text:"進捗"}]);
 });
 
 test("通知は1000件・24時間に制限しretentionと再起動gapを保持する",()=>{
@@ -46,7 +46,7 @@ test("固定Codex 0.160.0でUnix WebSocketのinitialize・履歴・通知を隔�
   await rpc.request("turn/start",{threadId:started.thread.id,input:[{type:"text",text:"隔離smoke"}]});
   for(let i=0;i<100&&!notifications.includes("turn/started");i++)await new Promise(r=>setTimeout(r,20));
   assert.ok(notifications.includes("turn/started"));
-  const turns=await rpc.request("thread/turns/list",{threadId:started.thread.id,limit:10,itemsView:"full"}) as {data:unknown[]};assert.ok(turns.data.length>0);
+  const turns=await rpc.request("thread/turns/list",{threadId:started.thread.id,limit:10,itemsView:"full"}) as {data:unknown[]};assert.ok(turns.data.length>0);assert.ok(projectHistory({thread:{id:started.thread.id,turns:turns.data}}).items.some(item=>item.kind==="user_message"&&item.text==="隔離smoke"));
   assert.equal(history.thread.id,started.thread.id);assert.ok(notifications.includes("thread/started"));
   const peer=new AppServerRpc(codex!,[],root,{...process.env,CODEX_HOME:home},{socketPath:path.join(root,"rpc.sock"),attachPid:rpc.child.pid!});
   try {await peer.initialize();const read=await peer.request("thread/read",{threadId:started.thread.id,includeTurns:false}) as {thread:{id:string}};assert.equal(read.thread.id,started.thread.id);}finally{peer.closeConnection();}
@@ -140,6 +140,11 @@ test("全世代retention・cache受信順・長文と通知byte上限を保持�
   store.db.prepare("UPDATE observation_events SET observed_at='2000-01-01T00:00:00Z'").run();store.db.prepare("UPDATE observation_items SET observed_at='2000-01-01T00:00:00Z'").run();store.close();store=new RuntimeStore(file);
   assert.equal((store.db.prepare("SELECT COUNT(*) AS n FROM observation_events").get() as {n:number}).n,0);assert.equal(store.cachedItems("old","old-generation").length,0);assert.equal(store.observations("old","old-generation",0).gap,true);
   store.cacheItem("current","g",{id:"z",turn_id:"turn",kind:"tool_progress"});store.cacheItem("current","g",{id:"a",turn_id:"turn",kind:"assistant_message",text:"after"});store.db.prepare("UPDATE observation_items SET observed_at=?").run(new Date().toISOString());assert.deepEqual(store.cachedItems("current","g").map(x=>x.id),['z','a']);
+  store.cacheItem("current","g",{id:"a",turn_id:"turn",kind:"assistant_message",text:"after complete"});
+  store.cacheItem("current","g",{id:"z",turn_id:"turn",kind:"tool_progress",status:"completed",command:"npm test"});
+  assert.deepEqual(store.cachedItems("current","g").map(x=>x.id),['z','a']);
+  assert.equal(store.cachedItems("current","g")[0]!.status,'completed');
+
   assert.equal(projectHistory({thread:{id:"t",turns:[{id:"turn",items:[{id:"long",type:"agentMessage",text:"x".repeat(9000)}]}]}}).truncated,true);
   for(let i=0;i<1000;i++)store.observe("current","g",{kind:"item/agentMessage/delta",text:"x".repeat(512)});
   const bounded=store.observations("current","g",0);assert.ok(Buffer.byteLength(JSON.stringify(bounded.events))<265000);assert.equal(bounded.gap,true);assert.ok(bounded.cursor<1001);assert.ok(store.observations("current","g",bounded.cursor).events.length>0);

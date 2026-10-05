@@ -1,3 +1,4 @@
+import { sanitizeConversationItem, type ConversationItem } from "../app-server/observation.js";
 import { DashboardTaskReader, type DashboardTaskSnapshot } from "./task-reader.js";
 
 export interface ObservedConversation {
@@ -6,7 +7,7 @@ export interface ObservedConversation {
   observed_at: string; state: string;
 }
 export interface ConversationContent extends ObservedConversation {
-  items: readonly {id: string; turn_id: string; kind: "assistant_message" | "tool_progress"; text?: string; status?: string}[];
+  items: readonly ConversationItem[];
   events: readonly {sequence: number; kind: string; turn_id?: string; item_id?: string; text?: string; observed_at: string}[]; cursor: number; oldest_sequence: number; gap: boolean; truncated: boolean;
 }
 export interface ObservationRuntime {
@@ -22,7 +23,7 @@ export interface DashboardAuthority {
   mainConversation?(): boolean;
 }
 export interface ObservedTask {
-  snapshot: Pick<DashboardTaskSnapshot,"task"|"attempts"|"fingerprint"|"selected_attempt_id"|"result">;
+  snapshot: Pick<DashboardTaskSnapshot,"task"|"attempts"|"fingerprint"|"selected_attempt_id"|"result"|"request">;
   runtime: {status: "observed"; conversation: ConversationContent} | {status: "unavailable" | "not_started" | "forbidden"};
 }
 /** The authority callback is evaluated again after runtime I/O. A revoked
@@ -54,13 +55,16 @@ export class DashboardObserver {
     if (!current || current.revision !== authority.revision || !current.task(id)) return null;
     const after = this.tasks.snapshot(id, attemptId);
     if (!after) return null;
-    if (after.fingerprint !== before.fingerprint) return {snapshot: publicSnapshot(after, current.conversation(id)), runtime: {status: "unavailable"}};
+    if (after.fingerprint !== before.fingerprint || after.request !== before.request) return {snapshot: publicSnapshot(after, current.conversation(id)), runtime: {status: "unavailable"}};
     if (!current.conversation(id)) observed = {status: "forbidden"};
     return {snapshot: publicSnapshot(after, current.conversation(id)), runtime: observed};
   }
   async mainList(authorize:()=>DashboardAuthority|null):Promise<{items:ObservedConversation[];next:null}|null> {
+    return this.mainListWithinDeadline(authorize,performance.now());
+  }
+  private async mainListWithinDeadline(authorize:()=>DashboardAuthority|null,started:number):Promise<{items:ObservedConversation[];next:null}|null> {
     const authority=authorize(); if(!authority?.mainConversation?.())return null;
-    const started=performance.now(),items:ObservedConversation[]=[];let cursor:string|undefined;const seen=new Set<string>();
+    const items:ObservedConversation[]=[];let cursor:string|undefined;const seen=new Set<string>();
     for(let page=0;page<100;page++) {
       const result=await withinDeadline(this.runtime.conversations(cursor),started);
       if(!sameMainAuthority(authorize(),authority))return null;
@@ -91,13 +95,13 @@ export class DashboardObserver {
     return {items,next:null};
   }
   async mainDetail(name:string,generation:string,authorize:()=>DashboardAuthority|null,afterSequence?:number):Promise<ObservedTask["runtime"]|null> {
-    const authority=authorize();if(!authority?.mainConversation?.())return null;
+    const started=performance.now(),authority=authorize();if(!authority?.mainConversation?.())return null;
     try {
-      const inventory=await this.mainList(authorize);
+      const inventory=await this.mainListWithinDeadline(authorize,started);
       if(!inventory||!sameMainAuthority(authorize(),authority))return null;
       const match=inventory.items.find(row=>row.name===name&&row.generation===generation);
       if(!match)return {status:"unavailable"};
-      const content=await withinDeadline(this.runtime.conversation(name,generation,afterSequence),performance.now());
+      const content=await withinDeadline(this.runtime.conversation(name,generation,afterSequence),started);
       if(!sameMainAuthority(authorize(),authority))return null;
       if(content.name!==name||content.generation!==generation||content.role!=="main"||content.attempt_id!==null||content.thread_id!==match.thread_id)throw Error("observation_identity_changed");
       return {status:"observed",conversation:publicConversation(content)};
@@ -124,19 +128,16 @@ function publicConversation(value: ConversationContent): ConversationContent {
     || typeof value.connected !== "boolean" || typeof value.gap !== "boolean" || typeof value.truncated !== "boolean"
     || !Number.isFinite(Date.parse(value.observed_at))) throw Error("observation_projection_invalid");
   const id = (text: string) => {if(typeof text!=="string"||!/^[A-Za-z0-9_-]{1,160}$/.test(text))throw Error("observation_projection_invalid");return text;};
-  const text = (input: string) => {if(typeof input!=="string")throw Error("observation_projection_invalid");return input.slice(0,8192);};
   const items = value.items.map(item => {
-    if(!["assistant_message","tool_progress"].includes(item.kind))throw Error("observation_projection_invalid");
-    return {id:id(item.id),turn_id:id(item.turn_id),kind:item.kind,
-      ...(item.kind==="assistant_message"&&item.text!==undefined?{text:text(item.text)}:{}),
-      ...(item.kind==="tool_progress"&&["inProgress","completed","failed","declined"].includes(item.status??"")?{status:item.status!}:{})};
+    const projected=sanitizeConversationItem(item);
+    if(!projected)throw Error("observation_projection_invalid");
+    return projected;
   });
   const kinds=new Set(["turn/started","turn/completed","item/started","item/completed","serverRequest/resolved","item/agentMessage/delta"]);
   const events=value.events.filter(event=>kinds.has(event.kind)).map(event=>{
     if(!Number.isSafeInteger(event.sequence)||event.sequence<0||!Number.isFinite(Date.parse(event.observed_at)))throw Error("observation_projection_invalid");
     return {sequence:event.sequence,kind:event.kind,observed_at:event.observed_at,
-      ...(event.turn_id===undefined?{}:{turn_id:id(event.turn_id)}),...(event.item_id===undefined?{}:{item_id:id(event.item_id)}),
-      ...(event.kind==="item/agentMessage/delta"&&event.text!==undefined?{text:text(event.text)}:{})};
+      ...(event.turn_id===undefined?{}:{turn_id:id(event.turn_id)}),...(event.item_id===undefined?{}:{item_id:id(event.item_id)})};
   });
   const result={name:id(value.name),generation:id(value.generation),role:value.role,thread_id:value.thread_id===null?null:id(value.thread_id),
     attempt_id:value.attempt_id===null?null:id(value.attempt_id),connected:value.connected,observed_at:value.observed_at,state:id(value.state),
@@ -145,8 +146,8 @@ function publicConversation(value: ConversationContent): ConversationContent {
   return result;
 }
 
-function publicSnapshot(value:DashboardTaskSnapshot, includeResult=true):Pick<DashboardTaskSnapshot,"task"|"attempts"|"fingerprint"|"selected_attempt_id"|"result"> {
-  return {task:value.task,attempts:value.attempts,fingerprint:value.fingerprint,selected_attempt_id:value.selected_attempt_id,result:includeResult?value.result:null};
+function publicSnapshot(value:DashboardTaskSnapshot, includeResult=true):Pick<DashboardTaskSnapshot,"task"|"attempts"|"fingerprint"|"selected_attempt_id"|"result"|"request"> {
+  return {task:value.task,attempts:value.attempts,fingerprint:value.fingerprint,selected_attempt_id:value.selected_attempt_id,result:includeResult?value.result:null,...(includeResult&&value.request!==undefined?{request:value.request}:{})};
 }
 
 function sameMainAuthority(current:DashboardAuthority|null,before:DashboardAuthority):boolean {

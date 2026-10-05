@@ -156,3 +156,59 @@ test('session照会のtransport障害は503、明示的な失効だけ401にす�
   await backend.call('admin/revoke',{});assert.equal((await request(port,null,'/api/session',{cookie})).status,401);
  }finally{await server.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+test('依頼本文だけの変更とretention縮小を会話閲覧端末のSSEへ通知し、Task閲覧だけの端末には漏らさない',async()=>{
+ const {DispatcherDatabase}=await import('../src/database.js');
+ const {DashboardTaskReader}=await import('../src/dashboard/task-reader.js');
+ const {DashboardObserver}=await import('../src/dashboard/observer.js');
+ const {taskRequestSchema}=await import('../src/task-execution.js');
+ const {tempConfig,eventEnvelope}=await import('./helpers.js');
+ const {default:Database}=await import('better-sqlite3');
+ const {createHash}=await import('node:crypto');
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath),sql=new Database(config.databasePath);
+ const parent=path.join(await fs.realpath(root),'observer');await fs.mkdir(parent,{mode:0o700});
+ const socket=path.join(parent,'c.sock'),port=await freePort(),origin='https://observer.example';
+ const event=db.enqueue(eventEnvelope('stream-request-only')).row;
+ const task=db.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:'request-only',objective:'最初の非公開依頼',workspace:{kind:'scratch'}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+ const reader=new DashboardTaskReader(config.databasePath);
+ const observer=new DashboardObserver(reader,{async conversations(){throw Error('queued runtime must not be read');},async conversation(){throw Error('queued runtime must not be read');}});
+ const server=new DashboardServer({backend:new OperatorFixture(),origin,port,controlSocket:socket,version:'test',page:{status:200,headers:{},body:'observer'},reader,observer});
+ const target=`/api/tasks/${task.task_id}`;
+ const pair=async(capabilities:string[])=>{
+  const issued=JSON.parse((await request(port,socket,'/pair',{method:'POST',body:{capabilities}})).body);
+  const login=await request(port,null,'/api/pair',{method:'POST',origin,body:{code:issued.code}});
+  assert.equal(login.status,200);return login.headers['set-cookie']![0]!.split(';')[0]!;
+ };
+ const snapshot=async(cookie:string)=>{const r=await request(port,null,target,{cookie});assert.equal(r.status,200);return JSON.parse(r.body);};
+ const position=(cursor:string)=>JSON.parse(Buffer.from(cursor.split('.')[0]!,'base64url').toString());
+ try{
+  await server.start();
+  const detailed=await pair(['tasks:read','conversations:worker:read']),tasksOnly=await pair(['tasks:read']);
+  let visible=await snapshot(detailed),limited=await snapshot(tasksOnly);
+  assert.equal(visible.runtime.status,'not_started');assert.equal(visible.snapshot.request,'最初の非公開依頼');
+  assert.equal(limited.snapshot.request,undefined);
+  const durableBefore=db.tasks.get(task.task_id),publicFingerprint=visible.snapshot.fingerprint;
+  for(const objective of ['追記された非公開依頼と追加条件','[保持期限を過ぎた依頼]']){
+   // follow-upやretentionがobjectiveだけを書き換えた永続状態を再現する。
+   sql.prepare('UPDATE tasks SET objective=? WHERE task_id=?').run(objective,task.task_id);
+   const changed=await request(port,null,target+'/events',{cookie:detailed,cursor:visible.stream_cursor});
+   assert.equal(changed.status,200);assert.match(changed.body,/event: snapshot\n/);assert.ok(!changed.body.includes(objective));
+   const unchanged=await request(port,null,target+'/events',{cookie:tasksOnly,cursor:limited.stream_cursor});
+   assert.equal(unchanged.status,200);assert.match(unchanged.body,/event: heartbeat\n/);
+   const next=await snapshot(detailed),nextLimited=await snapshot(tasksOnly);
+   assert.equal(next.snapshot.request,objective);assert.equal(next.snapshot.fingerprint,publicFingerprint);
+   assert.deepEqual(nextLimited.snapshot,limited.snapshot);
+   assert.equal(position(nextLimited.stream_cursor).fingerprint,position(limited.stream_cursor).fingerprint);
+   const p=position(next.stream_cursor);
+   assert.notEqual(p.fingerprint,position(visible.stream_cursor).fingerprint);
+   assert.ok(!JSON.stringify(p).includes(objective));
+   // 公開cursorのscopeが既知でも、本文候補の通常SHAでは一致しない。
+   const candidate=['operator-stream-position-v1',p.scope,[publicFingerprint,objective],'not_started'];
+   assert.notEqual(p.fingerprint,createHash('sha256').update(JSON.stringify(candidate)).digest('hex'));
+   assert.notEqual(p.fingerprint,createHash('sha256').update(objective).digest('hex'));
+   assert.match((await request(port,null,target+'/events',{cookie:detailed,cursor:next.stream_cursor})).body,/event: heartbeat\n/);
+   visible=next;limited=nextLimited;
+  }
+  assert.deepEqual(db.tasks.get(task.task_id),{...durableBefore,objective:'[保持期限を過ぎた依頼]'});
+ }finally{await server.close();reader.close();sql.close();db.close();await fs.rm(root,{recursive:true,force:true});}
+});

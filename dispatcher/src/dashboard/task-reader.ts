@@ -1,3 +1,4 @@
+import { sanitizeObservationText } from "../app-server/observation.js";
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 
@@ -17,6 +18,8 @@ export interface DashboardTaskSnapshot {
   /** Internal read-only identity evidence; never project this field to the browser. */
   runtime_binding: {agent_name:string;generation:string;thread_id:string} | null;
   selected_attempt_id: string;
+  /** Selected Attempt request; public observer requires conversation permission. */
+  request?: string;
   result: {status: string; summary: string; completed_at: string; output?: string; artifacts: {display_name:string;kind:string}[]} | null;
   runtime_binding_state: "missing" | "invalid" | "verified";
 }
@@ -63,7 +66,15 @@ export class DashboardTaskReader {
       const selected_attempt_id = attemptId ?? task.current_attempt_id;
       const selected = attempts.find(attempt => attempt.attempt_id === selected_attempt_id);
       if (!selected) return null;
-      const resultRow = this.sql.prepare("SELECT result_json FROM jobs WHERE job_id=?").get(selected_attempt_id) as {result_json:string|null};
+      const resultRow = this.sql.prepare("SELECT result_json,objective,steer_event_id,steer_state FROM jobs WHERE job_id=?").get(selected_attempt_id) as {result_json:string|null;objective:string;steer_event_id:string|null;steer_state:string|null};
+      const effective = this.sql.prepare("SELECT objective,steer_pending_event_id FROM tasks WHERE task_id=?").get(id) as {objective:string;steer_pending_event_id:string|null};
+      const current = selected_attempt_id === task.current_attempt_id;
+      const objective = current ? effective.objective : resultRow.objective;
+      // prepareSteer records the requested change before the worker acknowledges it.
+      // Do not parse delimiters or hide earlier accepted additions while awaiting proof.
+      const pending = current && effective.steer_pending_event_id !== null &&
+        !(resultRow.steer_event_id === effective.steer_pending_event_id && resultRow.steer_state === "accepted");
+      const request=(pending?"追加指示のワーカー受理は未確認です。\n\n":"")+sanitizeObservationText(objective)+(objective.length>8192?"\n[長い依頼内容の末尾を省略]":"");
       let result: DashboardTaskSnapshot["result"] = null;
       if (["completed","failed","cancelled"].includes(selected.status) && resultRow.result_json && resultRow.result_json.length <= 1_048_576) try {
         const value:unknown=JSON.parse(resultRow.result_json);
@@ -107,9 +118,11 @@ export class DashboardTaskReader {
             runtime_binding={agent_name:row.agent_name,generation:row.generation,thread_id:row.thread_id};
         }
       }
+      // The fingerprint is public even without conversation permission. Do not
+      // make the private request recoverable through candidate hashing.
       const fingerprint = createHash("sha256").update(JSON.stringify({task, attempts, selected_attempt_id, result, archived, identity:identity??null})).digest("hex");
       const runtime_binding_state:DashboardTaskSnapshot["runtime_binding_state"]=runtime_binding?"verified":identity||archived.length?"invalid":"missing";
-      return {task, attempts, selected_attempt_id, result, fingerprint, runtime_binding, runtime_binding_state};
+      return {task, attempts, selected_attempt_id, result, request, fingerprint, runtime_binding, runtime_binding_state};
     })();
   }
 }

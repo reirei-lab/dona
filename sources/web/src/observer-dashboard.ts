@@ -12,7 +12,7 @@ let externalPending=(()=>{try{const id=sessionStorage.getItem('dona.pending-exte
 let pending=(()=>{try{return JSON.parse(sessionStorage.getItem("dona.pending-command")||"null");}catch{return null;}})();
 let stream=null,streamBusy=false,deferredDetail=null;
 let selected = null, selectedAttempt = null, selectedMain = null, capabilities = [], generation = 0, pageAfter = null, next = null, stopped = false, polling = false;
-const labels = {preparing:'実行準備中',dispatching:'起動処理中',blocked:'入力・承認待ち',needs_review:'確認が必要',cancelling:'取消処理中',inProgress:'進行中',declined:'拒否済み',active:'実行中',capacity_wait:'実行枠の空き待ち',rate_limit_wait:'利用上限の回復待ち',retry_exhausted:'再試行上限',running:'実行中',waiting:'待機中',queued:'実行待ち',paused:'一時停止',completed:'完了',failed:'失敗',cancelled:'取消済み',human_input:'質問への回答待ち',external_approval:'外部操作の承認・照合待ち',external_effect_unknown:'外部操作の実行結果を要確認（再実行保留）',rate_limit:'利用上限の回復待ち',retry_limit:'再試行上限',retry_wait:'再試行待ち',unknown:'状態未確認'};
+const labels = {interrupted:'中断',idle:'待機中',working:'実行中',starting:'起動中',stopped:'停止済み',error:'エラー',preparing:'実行準備中',dispatching:'起動処理中',blocked:'入力・承認待ち',needs_review:'確認が必要',cancelling:'取消処理中',inProgress:'進行中',declined:'拒否済み',active:'実行中',capacity_wait:'実行枠の空き待ち',rate_limit_wait:'利用上限の回復待ち',retry_exhausted:'再試行上限',running:'実行中',waiting:'待機中',queued:'実行待ち',paused:'一時停止',completed:'完了',failed:'失敗',cancelled:'取消済み',human_input:'質問への回答待ち',external_approval:'外部操作の承認・照合待ち',external_effect_unknown:'外部操作の実行結果を要確認（再実行保留）',rate_limit:'利用上限の回復待ち',retry_limit:'再試行上限',retry_wait:'再試行待ち',unknown:'状態未確認'};
 const label = value => labels[value] || String(value || '未確認');
 const node = (tag, text, className) => { const n = document.createElement(tag); if(text !== undefined) n.textContent = String(text); if(className) n.className = className; return n; };
 const validId = id => typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id);
@@ -36,7 +36,8 @@ function renderDetail(value) {
   deferredDetail=null;
   const content = document.createDocumentFragment();
   content.append(node('h2',task.task_key || task.task_id),node('p',task.task_id,'muted'),node('p','Task: '+label(task.state)+(task.wait_reason?' · '+label(task.wait_reason):''),'state'));
-  content.append(node('p','ワーカー: '+label(task.worker_status)+' · 更新 '+task.updated_at,'muted'));
+  if(typeof value.snapshot.request==='string'&&value.snapshot.request)content.append(node('h3','依頼内容'),node('pre',value.snapshot.request));
+  content.append(node('p','ワーカー: '+label(task.worker_status)+' · 更新 '+displayTime(task.updated_at),'muted'));
   if(task.local_operator_owned===true && capabilities.includes('tasks:cancel') && task.desired_state==='running' && !['completed','failed','cancelled'].includes(task.state)) {
     const button=node('button','このTaskを取り消す');button.type='button';button.disabled=!!pending;
     button.addEventListener('click',()=>{if(!confirm('このTaskの実行を取り消しますか？ 停止確認が完了するまで取消処理中になります。'))return;void command('/api/tasks/'+encodeURIComponent(task.task_id)+'/cancel','cancel',{attempt_id:task.current_attempt_id,revision:task.revision},button);});content.append(button);
@@ -53,28 +54,75 @@ function renderDetail(value) {
     button.addEventListener('click',()=>{selectedAttempt=attempt.attempt_id;rememberSelection();generation++;detail.replaceChildren(node('p','実行履歴を取得しています…'));void detailRead();});item.append(button);attempts.append(item);
   }
   content.append(attempts,node('h3','ワーカーの会話'));
-  if(task.next_check_at)content.append(node('p','次の確認予定: '+task.next_check_at,'muted'));
+  if(task.next_check_at)content.append(node('p','次の確認予定: '+displayTime(task.next_check_at),'muted'));
   if(value.snapshot.result) {
-    const result=value.snapshot.result;content.append(node('h3','実行結果'),node('p',result.completed_at,'muted'),node('pre',result.summary));
+    const result=value.snapshot.result;content.append(node('h3','実行結果'),node('p',displayTime(result.completed_at),'muted'),node('pre',result.summary));
     if(result.output)content.append(node('pre',result.output));
     for(const artifact of result.artifacts || [])content.append(node('p',artifact.display_name+' · '+artifact.kind));
   }
   appendConversation(content,value.runtime);
   const focus=document.activeElement?.dataset?.attempt;detail.replaceChildren(content);if(focus)Array.from(detail.querySelectorAll('button')).find(b=>b.dataset.attempt===focus)?.focus({preventScroll:true});
 }
+const displayTime = value => {const time=new Date(value);return Number.isFinite(time.getTime())?new Intl.DateTimeFormat('ja-JP',{dateStyle:'medium',timeStyle:'medium'}).format(time):String(value||'時刻未確認');};
+function selectionState() {
+  for(const button of list.querySelectorAll('[data-task]'))button.setAttribute('aria-pressed',String(!selectedMain&&button.dataset.task===selected));
+  for(const button of byId('main-conversations').querySelectorAll('[data-main]'))button.setAttribute('aria-pressed',String(!!selectedMain&&button.dataset.main===selectedMain.name+':'+selectedMain.generation));
+}
+function emptyDetail() {
+  if(selected||selectedMain)return;
+  detail.replaceChildren(node('h2','会話を選んでください'),node('p',capabilities.includes('conversations:main:read')&&capabilities.includes('tasks:read')?'左のDona本体またはTaskを選ぶと、状態・実行履歴・会話を確認できます。':capabilities.includes('conversations:main:read')?'Dona本体を選ぶと、現在の状態と会話を確認できます。':capabilities.includes('tasks:read')?'Taskを選ぶと、状態・実行履歴・ワーカーの会話を確認できます。':'この端末に許可された操作を利用できます。'));
+}
 function appendConversation(content,runtime) {
-
   if(runtime?.status==='observed') {
     const c = runtime.conversation;
     if(!Array.isArray(c.items)) throw Error();
-    content.append(node('p',(c.connected?'Runtime接続中':'Runtime接続なし')+' · 観測 '+c.observed_at,'muted'));
+    content.append(node('p','状態: '+label(c.state)+' · '+(c.connected?'Runtime接続中':'Runtime接続なし')+' · 観測 '+displayTime(c.observed_at),'muted'));
     if(c.gap || c.truncated) content.append(node('p','履歴の一部は保持期間または表示上限のため省略されています。','notice'));
-    if(c.items.length===0) content.append(node('p','表示できる発言はまだありません。','muted'));
+    const visible=c.items.filter(item=>['user_message','assistant_message','tool_progress'].includes(item.kind));
+    if(visible.length===0) content.append(node('p',c.connected?'この会話には表示できる発言やツール実行がまだありません。更新を待つか、別の会話を選んでください。':'この世代には表示できる保存済みの発言やツール実行がありません。','muted'));
+    const observedTimes=new Map();
+    for(const event of (Array.isArray(c.events)?c.events:[]).slice(-1000)) {
+      if(!['item/started','item/completed'].includes(event.kind)||typeof event.item_id!=='string'||typeof event.turn_id!=='string'||typeof event.observed_at!=='string'||!Number.isFinite(Date.parse(event.observed_at)))continue;
+      const key=JSON.stringify([event.turn_id,event.item_id]),times=observedTimes.get(key)||{};
+      const field=event.kind==='item/started'?'started':'completed';
+      if(!times[field]||(field==='started'?Date.parse(event.observed_at)<Date.parse(times[field]):Date.parse(event.observed_at)>Date.parse(times[field])))times[field]=event.observed_at;
+      observedTimes.set(key,times);
+    }
     const messages = node('div',undefined,'messages');
-    for(const item of c.items) {
-      if(!['assistant_message','tool_progress'].includes(item.kind)) continue;
-      const entry = node('article'); entry.append(node('h4',item.kind==='assistant_message'?'Codex':'ツールの進捗'));
-      if(item.text) entry.append(node('pre',item.text)); if(item.status) entry.append(node('p',label(item.status),'muted'));
+    const open=new Set(Array.from(detail.querySelectorAll('details[open][data-item-detail]')).map(n=>n.dataset.itemDetail));
+    const toolLabels={sleep:'待機',contextCompaction:'会話の要約',enteredReviewMode:'レビュー開始',exitedReviewMode:'レビュー終了',subAgentActivity:'サブエージェントの活動',functionCallOutput:'ツールの応答',imageGeneration:'画像生成',collabAgentToolCall:'サブエージェント操作',commandExecution:'コマンド実行',fileChange:'ファイル変更',mcpToolCall:'MCPツール',dynamicToolCall:'ツール実行',webSearch:'Web検索',imageView:'画像の確認'};
+    for(const item of visible) {
+      const entry = node('article');entry.dataset.item=item.id;
+      const imageGeneration=item.kind==='tool_progress'&&item.tool_type==='imageGeneration';
+      const functionOutput=item.kind==='tool_progress'&&item.tool_type==='functionCallOutput';
+      const metadataOnly=item.kind==='tool_progress'&&['sleep','contextCompaction','enteredReviewMode','exitedReviewMode','subAgentActivity'].includes(item.tool_type);
+      entry.append(node('h4',item.kind==='assistant_message'?'Codex':item.kind==='user_message'?'ユーザー・依頼入力':imageGeneration?'画像生成':metadataOnly||functionOutput?toolLabels[item.tool_type]:item.tool_name||toolLabels[item.tool_type]||'ツールの進捗'));
+      const fold=(title,text,field)=>{if(typeof text!=='string'||!text)return;const key=[c.name,c.generation,item.id,field].join(':');const box=node('details');box.dataset.itemDetail=key;box.open=open.has(key);box.append(node('summary',title),node('pre',text));entry.append(box);};
+      if(item.status) entry.append(node('p',label(item.status),'state'));
+      const times=observedTimes.get(JSON.stringify([item.turn_id,item.id]));
+      if(times?.started)entry.append(node('p','開始を観測: '+displayTime(times.started),'muted'));
+      if(times?.completed)entry.append(node('p','完了を観測: '+displayTime(times.completed),'muted'));
+      if(imageGeneration){messages.append(entry);continue;}
+      if(functionOutput){
+        if(typeof item.tool_name==='string')entry.append(node('p',item.tool_name));
+        fold('実行結果を表示',item.output,'output');
+        if(item.truncated)entry.append(node('p','この項目の内容は表示上限のため一部省略されています。','notice'));
+        messages.append(entry);continue;
+      }
+      if(metadataOnly){
+        if(item.tool_type==='sleep'&&Number.isFinite(item.duration_ms))entry.append(node('p','所要時間 '+(item.duration_ms/1000).toLocaleString('ja-JP',{maximumFractionDigits:2})+' 秒','muted'));
+        messages.append(entry);continue;
+      }
+      if(item.text) entry.append(node('pre',item.text));
+      if(item.command) entry.append(node('h5','コマンド'),node('pre',item.command,'command'));
+      const facts=[];if(Number.isFinite(item.exit_code))facts.push('終了コード '+item.exit_code);if(Number.isFinite(item.duration_ms))facts.push('所要時間 '+(item.duration_ms/1000).toLocaleString('ja-JP',{maximumFractionDigits:2})+' 秒');
+      if(facts.length)entry.append(node('p',facts.join(' · '),'muted'));
+      if(item.error)entry.append(node('h5','エラー'),node('pre',item.error,'notice'));
+      if(Array.isArray(item.files)&&item.files.length){const files=node('ul');for(const file of item.files){const counts=[];if(Number.isFinite(file.additions))counts.push('+'+file.additions);if(Number.isFinite(file.deletions))counts.push('−'+file.deletions);const moved=file.change==='update'&&typeof file.move_path==='string'&&file.move_path.length>0;files.append(node('li',(moved?'移動':({add:'追加',delete:'削除',update:'更新'})[file.change])+' · '+file.path+(moved?' → '+file.move_path:'')+(counts.length?' ('+counts.join(' / ')+')':'')));}entry.append(node('h5','変更ファイル'),files);}
+      fold('入力を表示',item.input,'input');
+      fold('実行結果を表示',item.output,'output');
+      if(item.truncated)entry.append(node('p','この項目の内容は表示上限のため一部省略されています。','notice'));
+      if(item.kind==='tool_progress'&&!item.text&&!item.command&&!item.input&&!item.output&&!item.error&&!item.files?.length)entry.append(node('p','この履歴には実行内容・結果の詳細が記録されていません。','muted'));
       messages.append(entry);
     }
     content.append(messages);
@@ -92,10 +140,10 @@ function renderList(value) {
   const content=document.createDocumentFragment();
   for(const task of value.items) {
     if(!validId(task.task_id)) throw Error();
-    const button=node('button',(task.task_key || task.task_id)+' · '+label(task.state)); button.type='button'; button.dataset.task=task.task_id;
+    const button=node('button',(task.task_key || task.task_id)+' · '+label(task.state)); button.type='button'; button.dataset.task=task.task_id;button.setAttribute('aria-label',(task.task_key || task.task_id)+' · '+label(task.state));if(task.updated_at)button.append(node('span','更新 '+displayTime(task.updated_at),'list-time'));
     button.setAttribute('aria-pressed',String(task.task_id===selected));
     button.addEventListener('click',()=> {selected=task.task_id; selectedAttempt=null;selectedMain=null;rememberSelection(); generation++; detail.replaceChildren(node('p','会話を取得しています…'));
-      for(const b of list.querySelectorAll('button')) b.setAttribute('aria-pressed',String(b.dataset.task===selected)); void detailRead(); });
+      selectionState(); void detailRead(); });
     content.append(button);
   }
   if(value.items.length===0)content.append(node('p','表示できるTaskはありません。','muted'));
@@ -105,11 +153,21 @@ function renderList(value) {
 async function refresh() {
   if(polling || stopped)return; polling=true; const token=generation;
   try {const session=await read('/api/session');if(token!==generation || stopped)return;capabilities=Array.isArray(session.capabilities)?session.capabilities:[];csrf=typeof session.csrf==='string'?session.csrf:null;
+    if(selected&&!capabilities.includes('tasks:read')){selected=null;selectedAttempt=null;rememberSelection();}
+    if(selectedMain&&!capabilities.includes('conversations:main:read')){selectedMain=null;rememberSelection();}
     byId('submit-panel').hidden=!capabilities.includes('tasks:submit');byId('task-panel').hidden=!capabilities.includes('tasks:read');byId('control-hint').hidden=capabilities.includes('tasks:read')||!capabilities.includes('tasks:cancel');
-    byId('task-layout').hidden=!capabilities.includes('tasks:read')&&!capabilities.includes('conversations:main:read');byId('submit-task').disabled=!!pending;showPending();await credentialStatus();await mainList();await externalRefresh();
+    byId('task-layout').hidden=!capabilities.includes('tasks:read')&&!capabilities.includes('conversations:main:read');byId('submit-task').disabled=!!pending;showPending();await credentialStatus();
+    let mainAvailable=true;
+    try {await mainList();}catch(error){
+      if(token!==generation||stopped)return;
+      if(error.auth)throw error;
+      mainAvailable=false;byId('main-conversations').replaceChildren(node('p','Dona本体の会話一覧を現在取得できません。','notice'));
+      if(selectedMain){stream=null;deferredDetail=null;detail.replaceChildren(node('p','Dona本体の会話を現在取得できません。','notice'));}
+    }
+    if(token!==generation||stopped)return;await externalRefresh();
     if(capabilities.includes('tasks:read')) {const value=await read('/api/tasks'+(pageAfter?'?after='+encodeURIComponent(pageAfter):''));if(token!==generation || stopped)return;renderList(value);}
-    if(token!==generation || stopped)return; connection.textContent='接続中 · 5秒ごとに更新';connection.dataset.state='connected';
-    if(stream)await streamRead();else if(selectedMain)await mainRead();else if(capabilities.includes('tasks:read'))await detailRead();
+    if(token!==generation || stopped)return; connection.textContent='接続中 · 5秒ごとに更新';connection.dataset.state='connected';emptyDetail();selectionState();
+    if(stream)await streamRead();else if(selectedMain){if(mainAvailable)await mainRead();}else if(capabilities.includes('tasks:read'))await detailRead();
   } catch(error) {if(token===generation && !stopped)clearPrivate(error.auth?'接続の認証が必要です。':'接続が切れています。表示を消去しました。',error.auth);}
   finally {polling=false;}
 }
@@ -120,17 +178,17 @@ async function mainList() {
   const box=document.createDocumentFragment();
   for(const entry of value.items || []) {
     if(typeof entry.name!=='string'||typeof entry.generation!=='string'||!/^[A-Za-z0-9_-]{1,160}$/.test(entry.name)||!/^[A-Za-z0-9_-]{1,160}$/.test(entry.generation))throw Error();
-    const button=node('button',entry.name+' · '+entry.generation+(entry.connected?' · 接続中':' · 保存された履歴'));button.type='button';button.dataset.main=entry.name+':'+entry.generation;
-    button.addEventListener('click',()=>{selectedMain={name:entry.name,generation:entry.generation};selected=null;selectedAttempt=null;rememberSelection();generation++;detail.replaceChildren(node('p','Dona本体の会話を取得しています…'));void mainRead();});box.append(button);
+    const button=node('button',entry.name+' · '+label(entry.state)+(entry.connected?' · 接続中':' · 保存された履歴'));if(entry.observed_at)button.append(node('span','観測 '+displayTime(entry.observed_at),'list-time'));button.append(node('span',entry.generation,'list-time'));button.type='button';button.dataset.main=entry.name+':'+entry.generation;
+    button.addEventListener('click',()=>{selectedMain={name:entry.name,generation:entry.generation};selected=null;selectedAttempt=null;rememberSelection();generation++;detail.replaceChildren(node('p','Dona本体の会話を取得しています…'));selectionState();void mainRead();});box.append(button);
   }
-  const focused=document.activeElement?.dataset?.main;byId('main-conversations').replaceChildren(box);
+  const focused=document.activeElement?.dataset?.main;if(!box.childNodes.length)box.append(node('p','表示できるDona本体の会話はありません。','muted'));byId('main-conversations').replaceChildren(box);selectionState();
   if(focused)Array.from(byId('main-conversations').querySelectorAll('button')).find(b=>b.dataset.main===focused)?.focus({preventScroll:true});
 }
 async function mainRead() {
   if(!selectedMain||stopped)return;const target=selectedMain,token=++generation;
   try {const value=await read('/api/conversations/main/'+encodeURIComponent(target.name)+'/'+encodeURIComponent(target.generation));if(token!==generation||selectedMain!==target||stopped)return;
     const content=document.createDocumentFragment();content.append(node('h2','Dona本体の会話'),node('p','このDona全体にまたがる発言です。特定のTaskの会話ではありません。','notice'));appendConversation(content,value);detail.replaceChildren(content);rememberStream(value,mainPath());
-  }catch(error){if(token===generation&&!stopped)clearPrivate(error.auth?'接続の認証が必要です。':'接続が切れています。表示を消去しました。',error.auth);}
+  }catch(error){if(token===generation&&!stopped){if(error.auth)clearPrivate('接続の認証が必要です。',true);else {stream=null;deferredDetail=null;detail.replaceChildren(node('p','Dona本体の会話を現在取得できません。','notice'));}}}
 }
 function taskPath() {return '/api/tasks/'+encodeURIComponent(selected)+(selectedAttempt?'?attempt='+encodeURIComponent(selectedAttempt):'');}
 function mainPath() {return '/api/conversations/main/'+encodeURIComponent(selectedMain.name)+'/'+encodeURIComponent(selectedMain.generation);}
@@ -165,7 +223,7 @@ async function streamRead() {
       stream=null;if(selectedMain)await mainRead();else await detailRead();
       if(events[0]==='event: reset'&&epoch===authEpoch&&!stopped){connection.textContent='履歴の連続性を再確認しました。最新の状態を取得しました。';}
     }
-  }catch(error){if(epoch===authEpoch&&token===generation&&stream===current&&!stopped)clearPrivate(error.auth?'接続の認証が必要です。':'更新の接続が切れました。最新状態から再接続します。',error.auth);}
+  }catch(error){if(epoch===authEpoch&&token===generation&&stream===current&&!stopped){if(!error.auth&&selectedMain&&current.path===mainPath()){stream=null;deferredDetail=null;detail.replaceChildren(node('p','Dona本体の会話を現在取得できません。','notice'));}else clearPrivate(error.auth?'接続の認証が必要です。':'更新の接続が切れました。最新状態から再接続します。',error.auth);}}
   finally{clearTimeout(timer);streamBusy=false;}
 }
 detail.addEventListener('focusout',()=>setTimeout(()=>{const value=deferredDetail;if(value&&!stopped&&!document.activeElement?.closest('[data-question-form]')){deferredDetail=null;renderDetail(value);}},0));
@@ -375,7 +433,7 @@ byId('submit-form').addEventListener('submit',event=>{event.preventDefault();con
 byId('reconcile').addEventListener('click',()=>{void reconcile();});
 byId('pair-form').addEventListener('submit',async event=>{event.preventDefault();const code=byId('code').value;byId('code').value='';const button=byId('pair-submit');button.disabled=true;
   try {const r=await fetch('/api/pair',{method:'POST',credentials:'same-origin',redirect:'error',headers:{'content-type':'application/json'},body:JSON.stringify({code})});
-    if(!r.ok)throw Error();stopped=false;byId('pairing').hidden=true;byId('logout').hidden=false;void refresh();
+    if(!r.ok)throw Error();generation++;authEpoch++;stream=null;deferredDetail=null;detail.replaceChildren(node('p','接続を確認しています…'));byId('pair-status').textContent='';stopped=false;byId('pairing').hidden=true;byId('logout').hidden=false;void refresh();
   }catch{byId('pair-status').textContent='接続を確認できません。Macで状態を確認し、新しいコードを発行してください。';}finally{button.disabled=false;}
 });
 byId('logout').addEventListener('click',async()=>{const button=byId('logout');button.disabled=true;
@@ -391,7 +449,7 @@ window.addEventListener('pagehide',()=>{stopped=true;clearPrivate('接続を終�
 window.addEventListener('pageshow',event=>{if(event.persisted){stopped=false;clearPrivate('接続を再確認しています…',false);void refresh();}});
 void refresh();setInterval(()=>{if(!document.hidden)void refresh();},5000);
 })();`;
-const style = `[hidden]{display:none!important}p{overflow-wrap:anywhere}body>section.panel{max-width:1152px;margin:16px auto}#external-items{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}#external-detail>button{margin-right:8px;margin-bottom:8px}@media(max-width:720px){body>section.panel{margin:16px}}:root{color-scheme:light dark;font-family:system-ui,sans-serif;background:#101923;color:#eaf0f4}*{box-sizing:border-box}body{margin:0}header,main{max-width:1200px;margin:auto;padding:24px}header{border-bottom:1px solid #405060}h1{font-size:26px;margin:0 0 8px}h2{overflow-wrap:anywhere}h3{margin-top:28px}h4{margin:0 0 12px}.muted{color:#adbfce;font-size:14px}.layout{display:grid;grid-template-columns:minmax(220px,1fr) minmax(0,2fr);gap:24px}nav,.panel{background:#182531;border:1px solid #405060;border-radius:12px;padding:20px}button,a{font:inherit}button{cursor:pointer;background:#253747;color:#eaf0f4;border:1px solid #6d8699;border-radius:6px;padding:10px 12px}button:disabled{opacity:.45;cursor:default}button:focus-visible,a:focus-visible{outline:3px solid #8fd8eb;outline-offset:3px}#tasks{display:grid;gap:10px;margin-bottom:20px}#tasks button{text-align:left;overflow-wrap:anywhere}#tasks button[aria-pressed=true]{border-color:#8fd8eb;background:#304c5c}label{display:block;margin:12px 0 6px}input,textarea,select{font:inherit;width:100%;padding:10px;background:#101923;color:#eaf0f4;border:1px solid #6d8699;border-radius:6px}textarea{min-height:100px}fieldset{margin:16px 0;border:1px solid #405060}#submit-panel{margin-top:20px}.controls{display:flex;gap:8px;flex-wrap:wrap}.notice{border-left:3px solid #e2b66f;padding:12px}.messages article{padding:16px;background:#101923;border-radius:8px;margin:12px 0}pre{font:inherit;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}a{color:#8fd8eb}.skip{position:absolute;top:-100px}.skip:focus{top:10px}#connection[data-state=disconnected]{color:#edbd87}@media(max-width:720px){header,main{padding:16px}.layout{grid-template-columns:1fr}.panel,nav{padding:16px}}`;
+const style = `[hidden]{display:none!important}p{overflow-wrap:anywhere}body>section.panel{max-width:1152px;margin:16px auto}#external-items{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}#external-detail>button{margin-right:8px;margin-bottom:8px}@media(max-width:720px){body>section.panel{margin:16px}}:root{color-scheme:light dark;font-family:system-ui,sans-serif;background:#101923;color:#eaf0f4}*{box-sizing:border-box}body{margin:0}header,main{max-width:1200px;margin:auto;padding:24px}header{border-bottom:1px solid #405060}h1{font-size:26px;margin:0 0 8px}h2{overflow-wrap:anywhere}h3{margin-top:28px}h4{margin:0 0 12px}.muted{color:#adbfce;font-size:14px}.layout{display:grid;grid-template-columns:minmax(220px,1fr) minmax(0,2fr);gap:24px}nav,.panel{background:#182531;border:1px solid #405060;border-radius:12px;padding:20px}button,a{font:inherit}button{cursor:pointer;background:#253747;color:#eaf0f4;border:1px solid #6d8699;border-radius:6px;padding:10px 12px}button:disabled{opacity:.45;cursor:default}button:focus-visible,a:focus-visible{outline:3px solid #8fd8eb;outline-offset:3px}#tasks{display:grid;gap:10px;margin-bottom:20px}#tasks button{text-align:left;overflow-wrap:anywhere}.list-time{display:block;font-size:12px;color:#adbfce;margin-top:6px}#main-conversations{display:grid;gap:10px}#main-conversations button{text-align:left;overflow-wrap:anywhere}summary{cursor:pointer;color:#8fd8eb}h5{margin:14px 0 4px}#main-conversations button[aria-pressed=true],#tasks button[aria-pressed=true]{border-color:#8fd8eb;background:#304c5c}label{display:block;margin:12px 0 6px}input,textarea,select{font:inherit;width:100%;padding:10px;background:#101923;color:#eaf0f4;border:1px solid #6d8699;border-radius:6px}textarea{min-height:100px}fieldset{margin:16px 0;border:1px solid #405060}#submit-panel{margin-top:20px}.controls{display:flex;gap:8px;flex-wrap:wrap}.notice{border-left:3px solid #e2b66f;padding:12px}.messages article{padding:16px;background:#101923;border-radius:8px;margin:12px 0}pre{font:inherit;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}a{color:#8fd8eb}.skip{position:absolute;top:-100px}.skip:focus{top:10px}#connection[data-state=disconnected]{color:#edbd87}@media(max-width:720px){header,main{padding:16px}.layout{grid-template-columns:1fr}.panel,nav{padding:16px}}`;
 const digest = (value: string) => createHash("sha256").update(value).digest("base64");
 export function observerDashboardPage(): {status: 200; headers: Record<string,string>; body: string} {
   return {status:200,headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store","referrer-policy":"no-referrer",
