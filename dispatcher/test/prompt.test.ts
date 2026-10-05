@@ -56,3 +56,9 @@ test('外部承認terminalだけを保存sourceと固定宛先でmainへ渡し�
  assert.equal(envelopeFromRow(row).source,'dona_approval');
  for(const change of [{schema_version:2},{event_type:'post_message'},{external_event_id:'external:other:terminal'},{payload_json:JSON.stringify({...payload,state:'pending'})},{payload_json:JSON.stringify({...payload,text:'draft'})},{payload_json:JSON.stringify({...payload,source_event_id:'unbound'})},{reply_target_json:JSON.stringify({kind:'slack_thread',workspace_id:'T_OTHER',channel_id:'C_TEST',thread_ts:'1.0'})},{trace_json:JSON.stringify({text:'untrusted draft'})}])assert.throws(()=>envelopeFromRow({...row,...change}));
 });
+
+
+test('外部承認通知は現在通知IDと保存宛先への非broadcast投稿を指示する',()=>{
+ const prompt=buildEventPrompt('evt_current','/tmp/result.json',{...envelope,source:'dona_approval'});
+ for(const instruction of ['保存reply_targetのworkspace/channel/thread','今回の通知event_id','payload.source_event_idで代用しない','reply_broadcast:false','mrkdwn:true','parse:none','schedule専用authorize_job_notificationは呼ばない','同じ本文を再投稿しない'])assert.ok(prompt.includes(instruction));
+});
