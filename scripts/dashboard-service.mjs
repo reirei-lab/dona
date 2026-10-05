@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import {spawnSync} from 'node:child_process';
 import {pathToFileURL} from 'node:url';
+import {writeDashboardPlist} from './dashboard-plist.mjs';
 const label='dev.dona.dashboard';
 const [operation,releaseArg,configArg,logsArg,...extra]=process.argv.slice(2);
 const fail=()=>{throw Error('dashboard_service_invalid');};
@@ -43,7 +44,7 @@ try{
      const info=fs.lstatSync(directory);if(!info.isDirectory()||info.isSymbolicLink()||info.uid!==process.getuid()||(info.mode&0o022))fail();
      const file=path.join(directory,label+'.plist');
      if(fs.existsSync(file)){const s=fs.lstatSync(file);if(!s.isFile()||s.isSymbolicLink()||s.uid!==process.getuid()||s.nlink!==1)fail();}
-     const temporary=file+'.tmp';const fd=fs.openSync(temporary,'wx',0o600);try{fs.writeFileSync(fd,template);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}fs.renameSync(temporary,file);
+     writeDashboardPlist(file,template);
      process.stdout.write('Web serviceを登録用に配置しました。startで起動してください。\n');
    }
  }
