@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { z } from "zod";
-import { assertSecurityDurability } from "../audit/durability.js";
+import { assertSecurityReadAdmission } from "../audit/durability.js";
 import { verifyOpenDatabaseFile } from "../audit/file-identity.js";
 import { assertSynchronousCallback, assertSynchronousResult, type SynchronousCallback } from "../audit/synchronous.js";
 import { verifyApprovalIndexSchema } from "./schema.js";
@@ -33,7 +33,7 @@ export class ApprovalIndexBlobs {
     this.scope = guard(() => {
       assertSynchronousResult(scope);
       if (db.inTransaction) throw new ApprovalIndexStoreError();
-      assertSecurityDurability(db); verifyOpenDatabaseFile(db); verifyApprovalIndexSchema(db);
+      assertSecurityReadAdmission(db); verifyOpenDatabaseFile(db); verifyApprovalIndexSchema(db);
       return Object.freeze(scopeSchema.parse(scope));
     });
   }
@@ -61,7 +61,7 @@ export class ApprovalIndexBlobs {
   stage(input: readonly ApprovalIndexBlob[]): undefined {
     return guard(() => {
       if (!this.db.inTransaction) throw new ApprovalIndexStoreError();
-      verifyOpenDatabaseFile(this.db); verifyApprovalIndexSchema(this.db); assertSynchronousResult(input);
+      if (this.db.readonly) throw new Error("security_write_unavailable"); verifyOpenDatabaseFile(this.db); verifyApprovalIndexSchema(this.db); assertSynchronousResult(input);
       if (!Array.isArray(input) || input.length < 1 || input.length > 32) throw new ApprovalIndexStoreError();
       const blobs = input.map(value => {
         const blob = blobSchema.parse(value); decodeApprovalIndex(blob.wire, blob.digest, this.scope); return blob;

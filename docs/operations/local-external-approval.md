@@ -76,3 +76,31 @@ Runtimeの要求queueは本文をprocess memoryだけに置き、SQLiteの既存
 `doctor()` がreadyの場合、全active keyの最短期限を `key_expires_at`、残り14日以内を `rotation_due` として返す。hostの署名やprovisioning profileの期限とは別に確認する。
 
 保護payloadを導入したDBは、通常の保守reset/offline updateによる全DB snapshotの対象にできない。schema名と永続application IDを同じSQLite snapshotで検査し、payload tableをrename/drop済みでもfreelistを含む複製を拒否する。保管・照合には承認metadata専用の手順を使い、この拒否をraw file copyで回避しない。
+## 個人用の運用CLI
+
+固定署名hostの `approval-operations` modeは `operations --operation ...` を固定entryへ渡す。共通引数は `--config` / `--database`。実行中のDispatcherをquiesceしてから保守writeを行い、Mac TTYで表示された対象・結果候補・exact digestを確認する。mode/flagの入口だけを呼べるhostへ、任意JSやprovider outcomeを渡さない。
+
+| operation | 追加引数 | 動作 |
+| --- | --- | --- |
+| `health` | なし | liveness、保護状態の検証可否、expiry lag、stale claim、unknown、needs_review、retention overdueの固定numeric field |
+| `list` | 任意 `--cursor` / `--limit 1..100` | request ID/state/revision/expiryだけの有界page |
+| `sweep` | 任意 `--apply yes` | provider不通でもrequest expiry、attempt期限、terminal本文収集を継続 |
+| `retention` | `--owner-kind request\|attempt --handle` | exact metadata digestとTTL/terminal条件を再確認して本文だけ削除 |
+| `reconcile` | `--handle --reason` | 保存markerを実Slack providerでread-only照合し、operator reasonのdigestと証拠を監査保存 |
+| `backup` | `--destination` | 新規private metadata artifactを作成 |
+| `restore-check` | `--candidate` | 候補をread-onlyで現在の保護状態へ照合 |
+| `restore` | `--candidate --destination` | 一致したmetadataを新しいDBへ再構成。live DBを置換しない |
+
+write operationは既定dry-runで、適用には `--apply yes` とそのprocessのTTY確認が必要である。reasonには秘密や本文を含めない。認可は現在のOS本人性、Mac owner、private config、保護maintenance phaseを毎回確認する。端末の自己申告や古いCLI確認値を権限にしない。healthの `live` / `verified` と `safe_ready` は別であり、この運用componentはexecutor・署名・provider配備全体のreadyを宣言しない。各collectionが100件を超えるとcountsをnullにし、部分値を全体の0件と偽らない。
+
+常駐 `.sweep()` は有界cursorと時間budgetを使い、requestとattemptの処理順を交互にする。Slack不通でexecution側の本文TTL処理まで止めない。terminal本文を収集してもmetadata tombstone、consume、execution fence、marker、audit、used-IDを削除しない。active/needs_review/不明配送は通常retentionで保護する。期限切れの実行権限は正規の監査付きneeds_reviewへ収束し、無期限に本文TTLを延ばさない。
+
+manual reconcileはUIの承認や新しい送信許可ではない。previewとapplyの間の失効、fence変更、保存marker不一致を拒否する。providerの0件・不完全検索はunknown、複数はambiguousのまま扱う。取得結果とreason digestは同じ監査transactionで `local_approval_operation_evidence` のcanonical digestへ束縛する。raw reason、本文、tokenは保存しない。既にneeds_reviewの結果は証拠だけ記録し、terminal requestを再開しない。応答不明後は同じwriteを再試行せず、request statusと監査済み証拠を照合する。
+
+## metadata backupとrestoreの境界
+
+PR #362の専用DB前提をそのまま緩めず、personal版では固定allowlistのapproval/audit tableと運用証拠だけを論理exportする。Dispatcher event/Task本文、端末credential、未知tableは対象外。`approval_payload_secrets` はDDLだけを作り、値は一時DBにもコピーしない。full-file copy、VACUUM、freed pageの転送は行わない。正規の同一SQLite snapshotとwriter coordination内で構築し、1row 2MiB、全体100,000row/256MiBで打ち切る。copy完了後に署名manifest、全recordの認証済みindex membership、payload metadata、current audit anchor/clock、instance/config digestを検証する。private temp fileをfsyncし、既存fileを上書きしないlinkで公開する。
+
+candidateは常に `metadata_only_never_activate` である。`NativeLocalApprovalConnection` はbackup manifestのあるDBを拒否する。restoreはcandidateの署名済みanchor/clockと一致する現metadataを同じallowlist経路で新規destinationへ再構成する。candidate自体のraw copyやlive DB置換、保護head/key/used-nodeの巻戻しは行わない。古いbackup、scope/key/config/clock不一致、payload混入、sidecar付き候補、完全検証できないartifactはneeds_reviewとする。`continuity_verified` / `restored_metadata_only` は監査用metadataが一致した意味であり、過去pendingの復元・稼働再開ではない。
+
+復旧が必要な事故ではまず受付をsafe-offにし、保護head/監査/known accepted/unknownを読み取り照合する。本体DB喪失時にmetadata backupだけで旧pendingを復活させる経路はない。履歴の調査・保全後、別途承認された新世代または正規のDB復旧計画を作る。SQLite backupだけで失われたKeychainや使用済みIDの正本を再生成しない。

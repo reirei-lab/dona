@@ -1,3 +1,4 @@
+import {installLocalOperationsSchema} from "./local-operations.js";
 import {rotateProtectedKeys} from "./local-key-rotation.js";
 import {invalidateLocalApprovals} from "./local-invalidation.js";
 import {LocalMaintenanceStore,encodeLocalMaintenance} from "./local-maintenance.js";
@@ -57,6 +58,7 @@ export class NativeLocalApprovalConnection {
  readonly maintenance:LocalMaintenanceStore;readonly config:LocalApprovalNativeConfig;readonly providers:ApprovalTransactionProviders;readonly keys:ExternalApprovalKeys;
  private readonly native:NativeKeychainPort;private readonly nodesDb:Database.Database;
  constructor(readonly db:Database.Database,input:LocalApprovalNativeConfig,access?:typeof maintenanceAccess){
+  if(db.prepare("SELECT 1 FROM sqlite_master WHERE name='local_approval_backup_manifest'").get())throw Error("local_approval_metadata_only_database");
   this.config=localApprovalNativeConfigSchema.parse(input);const opened:{close():void}[]=[];
   try{
    this.native=new NativeKeychainPort();opened.push(this.native);
@@ -119,6 +121,7 @@ export function provisionNativeLocalApproval(db:Database.Database,input:LocalApp
  }finally{nodesDb?.close();native.close();}
 }
 export function initializeLocalApprovalRoots(db:Database.Database,providers:ApprovalTransactionProviders,scope:LocalApprovalNativeConfig["scope"]):void {
+ installLocalOperationsSchema(db);
  const nodes=new ApprovalMetadataNodes(db),indexes=new ApprovalIndexBlobs(db,scope),writer=new ApprovalMetadataPlanWriter(db,scope);
  const transaction=new ApprovalTransaction(db,providers),auditScope={instance_id:scope.instance_id,tenant_id:scope.workspace_id};
  const event:Omit<AuditEvent,"occurred_at">={scope:auditScope,actor:{kind:"system",id:"mac_operator"},action:"approval_request",operation:"slack.post_thread_reply.v1",resource_id:"local_approval_roots",outcome:"succeeded",reason:"none",session_ref:null,receipt_id:null,attempt_id:null,policy_revision:1,binding_revision:1,authz_revision:1};

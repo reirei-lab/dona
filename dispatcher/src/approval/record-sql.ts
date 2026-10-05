@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { z } from "zod";
-import { assertSecurityDurability } from "../audit/durability.js";
+import { assertSecurityReadAdmission } from "../audit/durability.js";
 import { verifyOpenDatabaseFile } from "../audit/file-identity.js";
 import { assertSynchronousResult } from "../audit/synchronous.js";
 import { verifyApprovalIndexSchema } from "./schema.js";
@@ -87,7 +87,7 @@ export class ApprovalRecordSql {
     try {
       assertSynchronousResult(scope); this.scope = Object.freeze(scopeSchema.parse(scope));
       if (db.inTransaction) throw Error();
-      assertSecurityDurability(db); verifyOpenDatabaseFile(db); verifyApprovalIndexSchema(db);
+      assertSecurityReadAdmission(db); verifyOpenDatabaseFile(db); verifyApprovalIndexSchema(db);
     } catch { throw new ApprovalRecordSqlError(); }
   }
   /** 固定partial UNIQUE indexによるmessage holderの存在確認。SQLを
@@ -145,6 +145,7 @@ export class ApprovalRecordSql {
    * これはSQL保存だけで、audit root更新と認可を代行しない。 */
   stage(input: readonly ApprovalRecordSqlChange[]): void {
     try {
+      if (this.db.readonly) throw new ApprovalRecordSqlError();
       const changes = this.checked(input);
       for (const { next, previous, table, row, old, primary } of changes) {
         if (previous?.digest === next.digest) continue;
