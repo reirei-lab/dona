@@ -54,3 +54,18 @@ test("Slack Taskのnative approvalをoperator receiptで限定許可し元owner�
  await assert.rejects(supervisor.approveTaskRequest(task.task_id,reply.event_id,pending.revision,'unrelated',true),/requires_user_reply/);
  await supervisor.approveTaskRequest(task.task_id,reply.event_id,pending.revision,q.question_id,true);assert.equal(approvals,1);
 }finally{await f.dispose();}});
+
+test("再起動後の再pairは旧端末のreceiptを現在の操作権限で照合し二重作成しない",async()=>{const f=await fixture();try{
+ const original=operatorCommand(f.db,f.config,{token:f.session.token,...create});
+ f.auth.resetSessions();
+ const readOnly=f.auth.pair(f.auth.issueCode(['tasks:read']).code);
+ const lookup={operation:'receipt',input:{request_id:'first',operation:'create'}};
+ assert.throws(()=>operatorCommand(f.db,f.config,{token:readOnly.token,...lookup}),/denied/);
+ const next=f.auth.pair(f.auth.issueCode(['tasks:submit']).code);
+ assert.notEqual(next.session.device_id,f.session.session.device_id);
+ assert.deepEqual(operatorCommand(f.db,f.config,{token:next.token,...lookup}).receipt,original.receipt);
+ const recovered=operatorCommand(f.db,f.config,{token:next.token,...create});
+ assert.ok('outcome' in recovered);assert.equal(recovered.outcome,'reused');assert.equal(f.db.tasks.scanSnapshot().length,1);
+ assert.throws(()=>operatorCommand(f.db,f.config,{token:next.token,...create,input:{...create.input,objective:'異なる依頼'}}),/conflict/);
+ f.auth.revoke(next.session.device_id);assert.throws(()=>operatorCommand(f.db,f.config,{token:next.token,...lookup}),/denied/);
+}finally{await f.dispose();}});

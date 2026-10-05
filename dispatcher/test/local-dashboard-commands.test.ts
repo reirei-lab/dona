@@ -13,13 +13,17 @@ const input={request_id:"request",objective:"調査する",workspace:{kind:"scra
 const logger={debug(){},info(){},warn(){},error(){}};
 async function fixture(){const {root,config}=await tempConfig();const db=new DispatcherDatabase(config.databasePath);const created=db.createLocalDashboardTask(authority,input,config.jobsWorkspaceRoot,config.jobResultsDir);return {root,config,db,created,async dispose(){db.close();await fs.rm(root,{recursive:true,force:true});}};}
 
-test("local ownerの作成receiptは再起動・response loss後も一意、異内容と他端末を混同しない",async()=>{
+test("local ownerの作成receiptは再起動・response loss後も一意、再pair後も同operatorへ復元し別ownerは拒否する",async()=>{
  const f=await fixture();try{
   assert.equal(f.created.task.state,"active");assert.equal(f.created.row.status,"queued");assert.equal(f.db.hasLocalDashboardJobOwner(f.created.row.job_id),true);
   assert.equal(f.created.row.channel_id,null);assert.equal(f.created.row.thread_ts,null);
   assert.equal(f.db.createLocalDashboardTask({...authority,grant_revision:2},input,f.config.jobsWorkspaceRoot,f.config.jobResultsDir).outcome,"reused");
   assert.throws(()=>f.db.createLocalDashboardTask(authority,{...input,objective:"異内容"},f.config.jobsWorkspaceRoot,f.config.jobResultsDir),/conflict/);
-  assert.equal(f.db.getLocalDashboardReceipt({...authority,device_id:"elsewhere"},input.request_id),undefined);
+  assert.equal(f.db.getLocalDashboardReceipt({...authority,device_id:"elsewhere"},input.request_id)?.task_id,f.created.task.task_id);
+  assert.equal(f.db.getLocalDashboardReceipt({...authority,owner_id:"other"},input.request_id),undefined);
+  assert.equal(f.db.getLocalDashboardReceipt({...authority,instance_id:"other"},input.request_id),undefined);
+  const recovered=f.db.createLocalDashboardTask({...authority,device_id:"repaired"},input,f.config.jobsWorkspaceRoot,f.config.jobResultsDir);
+  assert.equal(recovered.outcome,"reused");assert.equal(recovered.receipt.device_id,authority.device_id);
   const reopened=new DispatcherDatabase(f.config.databasePath);try{assert.equal(reopened.getLocalDashboardReceipt(authority,input.request_id)?.task_id,f.created.task.task_id);assert.equal(reopened.createLocalDashboardTask(authority,input,f.config.jobsWorkspaceRoot,f.config.jobResultsDir).row.job_id,f.created.row.job_id);}finally{reopened.close();}
  }finally{await f.dispose();}
 });
@@ -115,5 +119,14 @@ test("receipt保存に失敗したcreateはevent・Job・Taskを一緒にrollbac
   const before={events:f.db.list().length,tasks:f.db.tasks.scanSnapshot().length};
   assert.throws(()=>f.db.createLocalDashboardTask(authority,{...input,request_id:"second"},f.config.jobsWorkspaceRoot,f.config.jobResultsDir),/simulated_receipt_failure/);
   assert.equal(f.db.list().length,before.events);assert.equal(f.db.tasks.scanSnapshot().length,before.tasks);assert.equal(f.db.getLocalDashboardReceipt(authority,"second"),undefined);
+ }finally{sql.close();await f.dispose();}
+});
+
+test("旧device別receiptが同じrequest IDで重複する場合は推測せず停止する",async()=>{
+ const f=await fixture(),sql=new Database(f.config.databasePath);try{
+  sql.prepare(`INSERT INTO local_dashboard_command_receipts SELECT 'legacy-duplicate',instance_id,owner_id,'legacy-device',grant_revision,request_id,operation,canonical_sha256,task_id,attempt_id,task_revision,event_id,created_at FROM local_dashboard_command_receipts LIMIT 1`).run();
+  assert.throws(()=>f.db.getLocalDashboardReceipt(authority,input.request_id),/receipt_ambiguous/);
+  assert.throws(()=>f.db.createLocalDashboardTask(authority,input,f.config.jobsWorkspaceRoot,f.config.jobResultsDir),/receipt_ambiguous/);
+  assert.equal(f.db.tasks.scanSnapshot().length,1);
  }finally{sql.close();await f.dispose();}
 });

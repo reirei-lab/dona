@@ -29,10 +29,16 @@ export class LocalDashboardCommands {
   }
   private key(authority:LocalDashboardAuthority,requestId:string):string {
     authoritySchema.parse(authority);identifier.parse(requestId);
-    return digest([authority.instance_id,authority.owner_id,authority.device_id,requestId]);
+    return digest([authority.instance_id,authority.owner_id,requestId]);
   }
   receipt(authority:LocalDashboardAuthority,requestId:string):LocalDashboardReceipt|undefined {
-    return this.sql.prepare("SELECT * FROM local_dashboard_command_receipts WHERE receipt_id=?").get(this.key(authority,requestId)) as LocalDashboardReceipt|undefined;
+    this.key(authority,requestId);
+    // Device identity is audit evidence. Recovery belongs to the same stable
+    // operator, after the caller checks the current device capability.
+    const rows=this.sql.prepare("SELECT * FROM local_dashboard_command_receipts WHERE instance_id=? AND owner_id=? AND request_id=? LIMIT 2")
+      .all(authority.instance_id,authority.owner_id,requestId) as LocalDashboardReceipt[];
+    if(rows.length>1)throw Error("local_dashboard_receipt_ambiguous");
+    return rows[0];
   }
   task(authority:LocalDashboardAuthority,taskId:string) {
     authoritySchema.parse(authority);const task=this.dispatcher.tasks.get(taskId);
