@@ -142,3 +142,17 @@ test('readinessは有効sessionと固定health routeだけを使い秘密field�
   revoke=true;assert.equal((await request(port,null,'/api/readiness',{cookie})).status,401);
  }finally{await server.close();await fs.rm(root,{recursive:true,force:true});}
 });
+test('session照会のtransport障害は503、明示的な失効だけ401にする',async()=>{
+ const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'dobs-session-')));await fs.chmod(root,0o700);
+ const socket=path.join(root,'c.sock'),port=await freePort(),fixture=new OperatorFixture();let unavailable=false,checks=0,failAt=0;
+ const backend={async call<T>(route:string,body:Record<string,unknown>):Promise<T>{if(route==='session'&&(unavailable||++checks===failAt))throw Error('fixture_transport_timeout');return fixture.call<T>(route,body);}};
+ const server=new DashboardServer({backend,origin:'https://observer.example',port,controlSocket:socket,version:'test',page:{status:200,headers:{},body:'fixture'},reader:{list:()=>({items:[],next:null})} as unknown as DashboardTaskReader,observer:{} as DashboardObserver});
+ try{
+  await server.start();const issued=await backend.call<{code:string}>('admin/pair',{capabilities:['tasks:read']});
+  const login=await request(port,null,'/api/pair',{method:'POST',body:{code:issued.code},origin:'https://observer.example'}),cookie=login.headers['set-cookie']![0]!.split(';')[0]!;
+  unavailable=true;assert.equal((await request(port,null,'/api/session',{cookie})).status,503);
+  unavailable=false;assert.equal((await request(port,null,'/api/session',{cookie})).status,200);
+  failAt=checks+2;const postRead=await request(port,null,'/api/tasks',{cookie});assert.equal(postRead.status,503);assert.ok(!postRead.body.includes('items'));
+  await backend.call('admin/revoke',{});assert.equal((await request(port,null,'/api/session',{cookie})).status,401);
+ }finally{await server.close();await fs.rm(root,{recursive:true,force:true});}
+});

@@ -21,7 +21,13 @@ test('実HTTPS browserから実Dispatcherへ依頼・取消・質問を送り、
   await page.goto(origin);await expect(page.locator('#pairing')).toBeVisible();
   const issued=await f.request('/pair',{control:true,body:{capabilities:['tasks:read','tasks:submit','tasks:cancel']}});expect(issued.status).toBe(200);
   await page.getByLabel('接続コード').fill(issued.body.code);await page.getByRole('button',{name:'この端末を接続する',exact:true}).click();
-  await page.getByLabel('Donaへの依頼').fill('ブラウザからの依頼');await page.getByRole('button',{name:'依頼する',exact:true}).click();
+  await page.getByLabel('Donaへの依頼').fill('ブラウザからの依頼');
+  // Interrupt only this fixture's private UDS, preserving the authenticated session.
+  await fs.rename(f.config.socketPath,f.config.socketPath+'.offline');
+  try{await page.getByRole('button',{name:'更新',exact:true}).click();await expect(page.locator('#connection')).toContainText('接続が切れています');await expect(page.locator('#pairing')).toBeHidden();expect(await page.locator('#objective').inputValue()).toBe('ブラウザからの依頼');}
+  finally{await fs.rename(f.config.socketPath+'.offline',f.config.socketPath);}
+  await page.getByRole('button',{name:'更新',exact:true}).click();await expect(page.getByLabel('Donaへの依頼')).toBeVisible();await expect(page.getByLabel('Donaへの依頼')).toHaveValue('ブラウザからの依頼');
+  await page.getByRole('button',{name:'依頼する',exact:true}).click();
   await expect(page.locator('#command-status')).toContainText('依頼を受け付けました');expect(posts).toBe(1);expect(f.db.tasks.scanSnapshot()).toHaveLength(1);
   // Browser submits a stale revision through the real HTTP/BFF/Dispatcher path.
   let stale=true;

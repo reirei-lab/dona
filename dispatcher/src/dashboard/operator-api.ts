@@ -53,7 +53,7 @@ export async function operatorRequest(database:DispatcherDatabase, route:string,
     case "pair": return auth.pair(z.strictObject({code:z.string().max(128)}).parse(input).code);
     case "session": {
       const value=auth.session(tokenSchema.parse(input).token);
-      if(!value)throw new OperatorAuthError("denied");return value;
+      return value;
     }
     case "logout": auth.logout(tokenSchema.parse(input).token);return {ok:true};
     case "credential/status": {

@@ -52,7 +52,8 @@ export class DashboardServer {
     return /^[A-Za-z0-9_-]{43}$/.test(token)?token:null;
   }
   private async session(token:string):Promise<OperatorSession|null> {
-    try{return validateOperatorSession(await this.options.backend.call('session',{token}));}catch{return null;}
+    const value=await this.options.backend.call('session',{token});
+    return value===null?null:validateOperatorSession(value);
   }
   private cookie(value:string,age=43200):string{return `${cookieName}=${value}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${age}`;}
   private async body(req:http.IncomingMessage):Promise<Record<string,unknown>> {
