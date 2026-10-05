@@ -7,14 +7,40 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { CanonicalBuild } from "../src/adapters.js";
+import { CanonicalBuild, canonicalDiagnosticStep } from "../src/adapters.js";
+import { ProcessRunner } from "../src/process.js";
+import type { CommandResult } from "../src/types.js";
 import { tempPolicy } from "./helpers.js";
 
 const execute = promisify(execFile);
 const preflight = fileURLToPath(new URL("../../scripts/self-update-install-preflight.mjs", import.meta.url));
 const installer = fileURLToPath(new URL("../../scripts/install-self-update.sh", import.meta.url));
+const developerInstaller = fileURLToPath(new URL("../../scripts/install-launchd.sh", import.meta.url));
+type WaitForLaunchdServiceAbsent = (
+  domain: string,
+  label: string,
+  timeoutMs: number,
+  options?: {
+    observe?: (target: string, timeoutMs: number) => Promise<boolean>;
+    sleep?: (milliseconds: number) => Promise<void>;
+    now?: () => number;
+    intervalMs?: number;
+    settledObservations?: number;
+  },
+) => Promise<void>;
+const preflightModule = await import(pathToFileURL(preflight).href) as {
+  waitForLaunchdServiceAbsent: WaitForLaunchdServiceAbsent;
+};
+const { waitForLaunchdServiceAbsent } = preflightModule;
+
+test("developer installer atomically creates and shares the access receipt key",async()=>{
+  const source=await fs.readFile(developerInstaller,"utf8");
+  assert.match(source,/openssl rand -hex 32/);
+  assert.match(source,/mv "\$DISPATCHER_TOKEN_PATH\.tmp" "\$DISPATCHER_TOKEN_PATH"/);
+  assert.equal(source.match(/<key>DONA_UPDATE_INTERNAL_TOKEN_PATH<\/key>/g)?.length,2);
+});
 
 async function run(mode: string, ...values: string[]): Promise<void> {
   await execute(process.execPath, [preflight, mode, ...values]);
@@ -109,7 +135,60 @@ test("control-plane upgrade preflight requires exact updater health and only ter
   }
 });
 
-test("macOS keeps a hardened staged updater renamable by reopening only its root", {
+test("control-plane upgradeはDispatcherのquiesceとdrain完了を要求する", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-dispatcher-drain-")),socketPath=path.join(root,"dispatcher.sock");
+  let polls=0;
+  const server=http.createServer((request,response)=>{
+    const body=request.url==="/v1/admin/quiesce"?{schema_version:1,protocol:1,service:"dispatcher",quiescing:true,drained:false,in_flight:1,unsafe_states:["event.dispatching"]}:{schema_version:1,protocol:1,service:"dispatcher",quiescing:true,drained:++polls>1,in_flight:polls>1?0:1,unsafe_states:polls>1?[]:["event.dispatching"]};
+    response.writeHead(request.url==="/v1/admin/quiesce"?202:200,{"content-type":"application/json"});response.end(JSON.stringify(body));
+  });
+  try { await new Promise<void>((resolve,reject)=>{server.once("error",reject);server.listen(socketPath,resolve);}); await run("quiesce-dispatcher",socketPath,"2".repeat(40)); assert.ok(polls>1); }
+  finally { await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve())); await fs.rm(root,{recursive:true,force:true}); }
+});
+
+test("launchdの登録解除はstale registrationが消えてから安定観測する", async () => {
+  const observations = [true, false, true, false, false, false];
+  let elapsed = 0;
+  const targets: string[] = [];
+  await waitForLaunchdServiceAbsent("gui/501", "dev.dona.dispatcher", 1_000, {
+    observe: async (target: string) => {
+      targets.push(target);
+      return observations.shift() ?? false;
+    },
+    sleep: async (milliseconds: number) => { elapsed += milliseconds; },
+    now: () => elapsed,
+    intervalMs: 10,
+    settledObservations: 3,
+  });
+  assert.deepEqual(targets, Array(6).fill("gui/501/dev.dona.dispatcher"));
+});
+
+test("launchdの登録解除timeoutは対象labelを保持し、plist切替前に失敗する", async () => {
+  let elapsed = 0;
+  await assert.rejects(
+    waitForLaunchdServiceAbsent("gui/501", "dev.dona.dispatcher", 25, {
+      observe: async () => true,
+      sleep: async (milliseconds: number) => { elapsed += milliseconds; },
+      now: () => elapsed,
+      intervalMs: 10,
+      settledObservations: 3,
+    }),
+    /dev\.dona\.dispatcher remained registered after bootout timeout/,
+  );
+});
+
+test("launchdの登録観測自体が応答しない場合もdeadlineで失敗する", async () => {
+  await assert.rejects(
+    waitForLaunchdServiceAbsent("gui/501", "dev.dona.dispatcher", 20, {
+      observe: async () => new Promise<boolean>(() => undefined),
+      intervalMs: 1,
+      settledObservations: 3,
+    }),
+    /launchd registration observation timed out/,
+  );
+});
+
+test("macOS preserves hardened descendants when renaming a reopened staged updater", {
   skip: process.platform !== "darwin",
 }, async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-control-rename-"));
@@ -123,8 +202,7 @@ test("macOS keeps a hardened staged updater renamable by reopening only its root
     await fs.chmod(entrypoint, 0o400);
     await fs.chmod(child, 0o500);
     await fs.chmod(staged, 0o500);
-    await assert.rejects(execute("/bin/mv", [staged, destination]), /Permission denied/);
-
+    assert.equal((await fs.stat(staged)).mode & 0o777, 0o500);
     await fs.chmod(staged, 0o700);
     await execute("/bin/mv", [staged, destination]);
     assert.equal((await fs.stat(destination)).mode & 0o777, 0o700);
@@ -146,8 +224,21 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /control-plane-receipt\.json/);
   assert.doesNotMatch(source, /\.control-plane-receipt\.json\.tmp/);
   assert.match(source, /control-plane-receipt\.json\.\$\$\.\$RANDOM\.tmp/);
-  assert.match(source, /dispatcher_v2_to_v3_online_backup_v1/);
+  assert.match(source, /dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1/);
   assert.match(source, /updater\.previous\.sqlite3/);
+  assert.match(source, /dev\.dona\.dispatcher\.previous\.plist/);
+  assert.match(source, /dev\.dona\.dispatcher\.next\.plist/);
+  assert.match(source, /launchctl bootout "\$DOMAIN\/dev\.dona\.dispatcher"/);
+  assert.match(source,/DISPATCHER_RESTORE_REQUIRED=1[\s\S]*wait_dispatcher_unregistered[\s\S]*\/bin\/mv "\$BACKUP_ROOT\/dev\.dona\.dispatcher\.next\.plist"/);
+  assert.match(source,/if \[\[ "\$DISPATCHER_RESTORE_REQUIRED" == "1"[\s\S]*wait_dispatcher_unregistered[\s\S]*bootstrap_dispatcher_reconciled "旧Updaterの復旧後の旧Dispatcher再登録"/);
+  assert.match(source,/launchctl bootout "\$DOMAIN\/dev\.dona\.dispatcher" \|\| dispatcher_bootout_exit=\$\?[\s\S]*wait_dispatcher_unregistered/);
+  const restoreBranch = source.slice(source.indexOf('if [[ "$DISPATCHER_RESTORE_REQUIRED" == "1"'));
+  const restoreBootout = restoreBranch.indexOf('launchctl bootout "$DOMAIN/dev.dona.dispatcher" || dispatcher_bootout_exit=$?');
+  const restoreWait = restoreBranch.indexOf("wait_dispatcher_unregistered", restoreBootout);
+  assert.ok(restoreBootout >= 0 && restoreBootout < restoreWait);
+  assert.doesNotMatch(restoreBranch.slice(0, restoreBootout), /launchctl print "\$DOMAIN\/dev\.dona\.dispatcher"/);
+  assert.match(source, /bootstrap_dispatcher_reconciled "新しいDispatcher plistの登録"/);
+  assert.match(source, /wait-launchd-unregistered/);
   assert.match(source, /updater\.database-was-absent/);
   assert.match(source, /PRAGMA integrity_check/);
   assert.match(source, /PRESTOP_NONTERMINAL_COUNT/);
@@ -163,6 +254,13 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /exact SHAの登録済み状態を確認しました/);
   assert.match(source, /expected SHAの未登録状態を確認しました/);
   assert.doesNotMatch(source, /launchctl bootstrap[^\n]*\|\| true/);
+  const restoreRequired = source.indexOf("DISPATCHER_RESTORE_REQUIRED=1");
+  const quiesce = source.indexOf('quiesce-dispatcher "$DISPATCHER_SOCKET"');
+  const bootout = source.indexOf('launchctl bootout "$DOMAIN/dev.dona.dispatcher"', quiesce);
+  const waitUnregistered = source.indexOf("wait_dispatcher_unregistered", bootout);
+  const plistSwap = source.indexOf('/bin/mv "$BACKUP_ROOT/dev.dona.dispatcher.next.plist"', waitUnregistered);
+  assert.ok(restoreRequired >= 0 && restoreRequired < quiesce);
+  assert.ok(quiesce < bootout && bootout < waitUnregistered && waitUnregistered < plistSwap);
   assert.doesNotMatch(source, /\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]/u);
   const hardenedUpgradeTree = source.indexOf('find "$BACKUP_ROOT/updater.next" -type d -exec chmod 500 {} +');
   const writableUpgradeRoot = source.indexOf('chmod 700 "$BACKUP_ROOT/updater.next"');
@@ -207,6 +305,9 @@ test("an existing immutable release is reusable only with the exact control-plan
     await fs.writeFile(manifestPath, JSON.stringify(manifest));
     await fs.writeFile(path.join(stagedRelease, "release-manifest.json"), JSON.stringify({ ...manifest, built_at: "different" }));
     await run("validate-existing-release", existingRelease, stagedRelease, sha);
+    await fs.writeFile(path.join(stagedRelease, "release-manifest.json"), JSON.stringify({ ...manifest, compatibility: { ...manifest.compatibility, rollback_safe: false } }));
+    await assert.rejects(run("validate-existing-release", existingRelease, stagedRelease, sha), /compatibility does not match/);
+    await fs.writeFile(path.join(stagedRelease, "release-manifest.json"), JSON.stringify({ ...manifest, built_at: "different" }));
     await fs.writeFile(path.join(existingRelease, "updater", "dist", "cli.js"), "tampered\n");
     await assert.rejects(
       run("validate-existing-release", existingRelease, stagedRelease, sha),
@@ -287,6 +388,39 @@ test("stable updater uses separate controller-owned npm config files", async () 
   }
 });
 
+test("canonical diagnostic steps normalize the sources/slack component to an allowed identifier", () => {
+  assert.equal(canonicalDiagnosticStep("sources/slack", ["ci"]), "sources.slack:npm-ci");
+  assert.match(canonicalDiagnosticStep("sources/slack", ["run", "typecheck"]), /^[a-z0-9._:-]+$/);
+});
+
+test("pre-activation command errors preserve timeout diagnostics before bounded output", async () => {
+  const { root, policy } = await tempPolicy();
+  const result: CommandResult = {
+    exit_code: null,
+    stdout: `assertion failed\ntoken=secret-value\n${"x".repeat(2_000)}`,
+    stderr: "control checkpoint stream",
+    timed_out: true,
+    output_truncated: true,
+    output_checkpoint: "file=file-start test/api.test.ts; last_finish=case-finish test/api.test.ts:012345abcdef#1; timeout=test/api.test.ts:fedcba543210#1",
+    exit_signal: "SIGKILL",
+    cleanup_status: "term=group-sent,kill=group-sent,closed=yes",
+  };
+  const runner = { run: async () => result } as unknown as ProcessRunner;
+  try {
+    await assert.rejects(new CanonicalBuild(policy, runner).toolchain(), (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      assert.match(message, /checkpoint=file=file-start test\/api\.test\.ts; last_finish=case-finish test\/api\.test\.ts:012345abcdef#1; timeout=test\/api\.test\.ts:fedcba543210#1/);
+      assert.match(message, /runner=exit:null,signal:SIGKILL,cleanup:term=group-sent,kill=group-sent,closed=yes/);
+      assert.match(message, /stderr=control checkpoint stream; stdout=assertion failed/);
+      assert.equal(message.includes("secret-value"), false);
+      assert.ok(message.length <= 1_000);
+      return true;
+    });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("failed install cleanup removes only the generated staging directory", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-install-cleanup-"));
   const releaseRoot = path.join(root, "releases");
@@ -303,5 +437,90 @@ test("failed install cleanup removes only the generated staging directory", asyn
     await assert.rejects(run("cleanup-staging", releaseRoot, sibling));
   } finally {
     await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("generation target validation rejects a mismatched installed updater before upgrade", async () => {
+  const home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "dona-generation-target-")));
+  const root = path.join(home, ".dona", "g", "a".repeat(12));
+  const rendered = path.join(home, "rendered");
+  const launchAgents = path.join(home, "LaunchAgents");
+  const sha = "b".repeat(40);
+  const plist = (label: string, program: string, environment: Record<string, string>) =>
+    `<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>${label}</string>` +
+    `<key>ProgramArguments</key><array><string>/usr/bin/node</string><string>${program}</string><string>serve</string></array>` +
+    `<key>EnvironmentVariables</key><dict>${Object.entries(environment).map(([key, value]) => `<key>${key}</key><string>${value}</string>`).join("")}</dict></dict></plist>`;
+  try {
+    for (const suffix of ["control/updater", "runtime/releases", `runtime/releases/${sha}`, "config", "logs", "run"]) {
+      await fs.mkdir(path.join(root, suffix), { recursive: true });
+    }
+    await fs.mkdir(launchAgents);
+    await fs.symlink(path.join(root, "runtime/releases", sha), path.join(root, "runtime/current"));
+    await fs.writeFile(path.join(root, "control/updater.sqlite3"), "fixture");
+    await fs.writeFile(path.join(root, "control/policy.json"), JSON.stringify({
+      control_root: path.join(root, "control"), config_root: path.join(root, "config"),
+      release_root: path.join(root, "runtime/releases"), current_pointer: path.join(root, "runtime/current"),
+      dispatcher_socket: path.join(root, "run/d.sock"), slack_socket: path.join(root, "run/s.sock"),
+      dispatcher_internal_token_file: path.join(root, "control/dispatcher.token"),
+    }));
+    await fs.writeFile(path.join(launchAgents, "dev.dona.updater.plist"), plist("dev.dona.updater", path.join(root, "control/updater/dist/cli.js"), {
+      DONA_UPDATE_POLICY_PATH: path.join(root, "control/policy.json"), DONA_UPDATER_BUILD_SHA: sha,
+    }));
+    await fs.writeFile(path.join(launchAgents, "dev.dona.dispatcher.plist"), plist("dev.dona.dispatcher", path.join(root, "runtime/current/dispatcher/dist/cli.js"), {
+      DONA_UPDATER_SOCKET_PATH: path.join(root, "control/updater.sock"),
+      DONA_UPDATE_INTERNAL_TOKEN_PATH: path.join(root, "control/dispatcher.token"),
+      DONA_SOCKET_PATH: path.join(root, "run/d.sock"), SLACK_HEALTH_SOCKET_PATH: path.join(root, "run/s.sock"),
+      DONA_DATABASE_PATH: path.join(root, "dona.sqlite3"),
+      DONA_RELEASE_MANIFEST_PATH: path.join(root, "runtime/current/release-manifest.json"),
+      DONA_RESULTS_DIR: path.join(root, "results"),
+      DONA_JOB_RESULTS_DIR: path.join(root, "job-results"),
+      DONA_JOB_PROGRESS_DATABASE_PATH: path.join(root, "job-progress.sqlite3"),
+      DONA_UPDATE_NOTIFICATION_DATABASE_PATH: path.join(root, "update-notifications.sqlite3"),
+      DOTENV_CONFIG_PATH: path.join(root, "config/dispatcher.env"),
+      GENERATION_ONLY: "preserved",
+    }));
+    await fs.writeFile(path.join(launchAgents, "dev.dona.slack-adapter.plist"), plist("dev.dona.slack-adapter", path.join(root, "runtime/current/sources/slack/dist/index.js"), {
+      DONA_SOCKET_PATH: path.join(root, "run/d.sock"),
+      SLACK_HEALTH_SOCKET_PATH: path.join(root, "run/s.sock"),
+      DOTENV_CONFIG_PATH: path.join(root, "config/slack.env"),
+      DONA_UPDATE_INTERNAL_TOKEN_PATH: path.join(root, "control/dispatcher.token"),
+      DONA_RELEASE_MANIFEST_PATH: path.join(root, "runtime/current/release-manifest.json"),
+    }).replace("<string>serve</string>", ""));
+    const testBin = path.join(home, "bin");
+    await fs.mkdir(testBin);
+    for (const name of ["herdr", "codex"]) {
+      await fs.writeFile(path.join(testBin, name), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    }
+    await execute(process.execPath, [fileURLToPath(new URL("../../scripts/render-self-update-templates.mjs", import.meta.url)), rendered, sha, root, "generation"], {
+      env: { ...process.env, PATH: `${testBin}:${process.env.PATH}` },
+    });
+    const helper = fileURLToPath(new URL("../../scripts/validate-generation-install-target.py", import.meta.url));
+    const renderedDispatcher = path.join(rendered, "dev.dona.dispatcher.plist");
+    const beforeStage = await fs.readFile(renderedDispatcher);
+    await execute("/usr/bin/python3", [helper, root, rendered, launchAgents, "--stage-recovery"], { env: { ...process.env, HOME: home } });
+    assert.deepEqual(await fs.readFile(renderedDispatcher), beforeStage);
+    await execute("/usr/bin/python3", [helper, root, rendered, launchAgents, "--upgrade-control"], { env: { ...process.env, HOME: home } });
+    const updated = await fs.readFile(path.join(rendered, "dev.dona.dispatcher.plist"), "utf8");
+    assert.match(updated, /GENERATION_ONLY/);
+    const receipt = path.join(root, "control/control-plane-receipt.json");
+    await fs.mkdir(receipt);
+    await assert.rejects(execute("/usr/bin/python3", [helper, root, rendered, launchAgents, "--stage-recovery"], { env: { ...process.env, HOME: home } }));
+    await fs.rmdir(receipt);
+    const dispatcherPlist = path.join(launchAgents, "dev.dona.dispatcher.plist");
+    const originalDispatcher = await fs.readFile(dispatcherPlist, "utf8");
+    await fs.writeFile(dispatcherPlist, originalDispatcher.replace(path.join(root, "job-results"), path.join(home, "other/job-results")));
+    await assert.rejects(execute("/usr/bin/python3", [helper, root, rendered, launchAgents, "--stage-recovery"], { env: { ...process.env, HOME: home } }));
+    await fs.writeFile(dispatcherPlist, originalDispatcher);
+    const slackPlist = path.join(launchAgents, "dev.dona.slack-adapter.plist");
+    const originalSlack = await fs.readFile(slackPlist, "utf8");
+    await fs.writeFile(slackPlist, originalSlack.replace(path.join(root, "control/dispatcher.token"), path.join(home, "other/dispatcher.token")));
+    await assert.rejects(execute("/usr/bin/python3", [helper, root, rendered, launchAgents, "--stage-recovery"], { env: { ...process.env, HOME: home } }));
+    await fs.writeFile(slackPlist, originalSlack);
+    await fs.writeFile(path.join(launchAgents, "dev.dona.updater.plist"), plist("dev.dona.updater", path.join(home, "other/updater/dist/cli.js"), {
+      DONA_UPDATE_POLICY_PATH: path.join(root, "control/policy.json"), DONA_UPDATER_BUILD_SHA: sha,
+    }));
+    await assert.rejects(execute("/usr/bin/python3", [helper, root, rendered, launchAgents, "--stage-recovery"], { env: { ...process.env, HOME: home } }));
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
   }
 });

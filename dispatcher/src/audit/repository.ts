@@ -1,3 +1,4 @@
+import { isDispatcherCoreTrigger } from "../dispatcher-core-triggers.js";
 import { assertSecurityDurability } from "./durability.js";
 import Database from "better-sqlite3";
 import { types } from "node:util";
@@ -88,7 +89,7 @@ export function verifyAuditSchema(db: Database.Database): void {
       try { expected.exec(schemaSql); expectedShape = shape(expected); } finally { expected.close(); }
     }
     if (shape(db) !== expectedShape || db.prepare("SELECT 1 FROM sqlite_temp_master WHERE substr(lower(name),1,15)='security_audit_' OR substr(lower(tbl_name),1,15)='security_audit_'").get()) throw new AuditIntegrityError();
-    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND substr(lower(name),1,15)!='security_audit_' AND substr(lower(name),1,9)!='approval_'").get()
+    if ((db.prepare("SELECT name,tbl_name,sql FROM sqlite_master WHERE type='trigger' AND substr(lower(name),1,15)!='security_audit_' AND substr(lower(name),1,9)!='approval_'").all() as Array<{name:string;tbl_name:string;sql:string}>).some(row => !isDispatcherCoreTrigger(row))
       || db.prepare("SELECT 1 FROM sqlite_temp_master WHERE type='trigger'").get()) throw new AuditIntegrityError();
     if (db.prepare("SELECT 1 FROM sqlite_master WHERE substr(lower(name),1,9)='approval_' OR substr(lower(tbl_name),1,9)='approval_'").get()) verifyApprovalSchema(db);
     const rows = db.prepare("SELECT version FROM security_audit_schema").all() as Array<{ version: number }>;

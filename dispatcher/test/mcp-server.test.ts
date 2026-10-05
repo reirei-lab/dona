@@ -15,13 +15,22 @@ describe("Dona Dispatcher MCP server", () => {
     const calls: Array<{ method: string; args: unknown[] }> = [];
     let planError: Error | undefined;
     const api: DispatcherJobClient = {
+      async findIssueTask(eventId,repository,issueNumber) {calls.push({method:"findIssueTask",args:[eventId,repository,issueNumber]});return {task:{task_id:"existing"}};},
+      async inspectWorker(jobId,sourceEventId) { calls.push({method:"inspectWorker",args:[jobId,sourceEventId]}); return {worker:{state:"inactive"}}; },
+      async resumeJob(jobId,input) { calls.push({method:"resumeJob",args:[jobId,input]}); return {outcome:"created",job_id:"job_01m1es03xy5cf8d9pm5cwx4srv"}; },
       async createJob(input) {
         calls.push({ method: "createJob", args: [input] });
         return { schema_version: 1, job: { job_id: "job_01m1es03xy5cf8d9pm5cwx4srv" } };
       },
-      async getJob(jobId, sourceEventId) {
-        calls.push({ method: "getJob", args: [jobId, sourceEventId] });
-        return { schema_version: 1, job: { job_id: jobId, status: "running" } };
+      async delegateScheduledWork(eventId) {
+        calls.push({ method: "delegateScheduledWork", args: [eventId] });
+        return { schema_version: 1, outcome: "created", job: { job_id: "job_01m1es03xy5cf8d9pm5cwx4srv" } };
+      },
+      async getJob(jobId, sourceEventId, options) {
+        calls.push({ method: "getJob", args: options===undefined?[jobId, sourceEventId]:[jobId,sourceEventId,options] });
+        return { schema_version: 1, job: { job_id: jobId, status: "running", notification_state:"needs_review", notification_authorization_phase:"preflight" },
+          ...(options?.includeLiveSession?{live_session:{query_status:"observed",identity_match:true},reconciliation:{state:"consistent_running"},receipt:{receipt_id:"lsr_0123456789abcdef0123456789abcdef"}}:{}),
+          ...(options?.liveSessionReceiptId?{live_session:{query_status:"observed",identity_match:true},reconciliation:{state:"consistent_running"},receipt:{receipt_id:options.liveSessionReceiptId}}:{}) };
       },
       async listEventJobs(...args) {
         calls.push({ method: "listEventJobs", args });
@@ -29,6 +38,10 @@ describe("Dona Dispatcher MCP server", () => {
       },
       async listThreadJobs(...args) {
         calls.push({ method: "listThreadJobs", args });
+        return { schema_version: 1, jobs: [] };
+      },
+      async listOwnerJobs(sourceEventId) {
+        calls.push({ method: "listOwnerJobs", args: [sourceEventId] });
         return { schema_version: 1, jobs: [] };
       },
       async steerJob(jobId, input) {
@@ -56,29 +69,63 @@ describe("Dona Dispatcher MCP server", () => {
         calls.push({ method: "cancelSelfUpdate", args: [input] });
         return { schema_version: 1, state: "cancelled" };
       },
+      async previewSchedule(input) { calls.push({ method: "previewSchedule", args: [input] }); return { schema_version: 1 }; },
+      async createSchedule(input) { calls.push({ method: "createSchedule", args: [input] }); return { schema_version: 1 }; },
+      async getSchedule(...args) { calls.push({ method: "getSchedule", args }); return { schema_version: 1 }; },
+      async listSchedules(...args) { calls.push({ method: "listSchedules", args }); return { schema_version: 1 }; },
+      async updateSchedule(...args) { calls.push({ method: "updateSchedule", args }); return { schema_version: 1 }; },
+      async transitionSchedule(...args) { calls.push({ method: "transitionSchedule", args }); return { schema_version: 1 }; },
+      async getScheduleHistory(...args) { calls.push({ method: "getScheduleHistory", args }); return { schema_version: 1 }; },
     };
     const server = createDispatcherMcpServer(api, logger);
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     try {
+      await client.callTool({name:"inspect_job_worker",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",source_event_id:"evt_01K00000000000000000000000"}});
+      assert.equal(calls.pop()?.method,"inspectWorker");
+      await client.callTool({name:"resume_job",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",source_event_id:"evt_01K00000000000000000000000",instruction:"残作業を引継ぐ"}});
+      assert.deepEqual(calls.pop(),{method:"resumeJob",args:["job_01m1es03xy5cf8d9pm5cwx4srv",{source_event_id:"evt_01K00000000000000000000000",instruction:"残作業を引継ぐ"}]});
+      const found=await client.callTool({name:"find_issue_task",arguments:{source_event_id:"evt_01K00000000000000000000000",repository:"org/repo",issue_number:24}});
+      assert.notEqual(found.isError,true);
+      assert.deepEqual(calls.pop(),{method:"findIssueTask",args:["evt_01K00000000000000000000000","org/repo",24]});
       const listed = await client.listTools();
+      assert.equal(listed.tools.find(tool=>tool.name==="authorize_job_notification")?.annotations?.idempotentHint,false);
       assert.deepEqual(listed.tools.map(({ name }) => name), [
+        "delegate_task", "get_task", "inspect_task_recovery", "reconcile_task_result", "find_issue_task", "list_tasks", "get_task_questions", "answer_task_question", "respond_task_approval", "pause_task", "resume_task", "cancel_task", "steer_task", "retry_task",
         "delegate_job",
+        "delegate_scheduled_work",
         "list_event_jobs",
         "list_thread_jobs",
+        "list_owner_jobs",
+        "inspect_job_worker",
+        "resume_job",
         "get_job_status",
+        "authorize_job_notification",
+        "record_schedule_job_access",
         "steer_job",
         "cancel_job",
         "plan_self_update",
         "apply_self_update",
         "get_self_update_status",
         "cancel_self_update",
+        "preview_schedule",
+        "create_schedule",
+        "get_schedule",
+        "list_schedules",
+        "update_schedule",
+        "pause_schedule",
+        "resume_schedule",
+        "cancel_schedule",
+        "get_schedule_history",
       ]);
-      assert.equal(listed.tools.find(({ name }) => name === "get_job_status")?.annotations?.readOnlyHint, true);
+      assert.equal(listed.tools.find(({ name }) => name === "get_job_status")?.annotations?.readOnlyHint, false);
+      assert.equal(listed.tools.find(({ name }) => name === "get_job_status")?.annotations?.idempotentHint, false);
       assert.equal(listed.tools.find(({ name }) => name === "cancel_job")?.annotations?.destructiveHint, true);
       assert.equal(listed.tools.find(({ name }) => name === "plan_self_update")?.annotations?.readOnlyHint, true);
       assert.equal(listed.tools.find(({ name }) => name === "apply_self_update")?.annotations?.destructiveHint, true);
+      assert.equal(listed.tools.find(({ name }) => name === "update_schedule")?.annotations?.destructiveHint, true);
+      assert.equal(listed.tools.find(({ name }) => name === "pause_schedule")?.annotations?.destructiveHint, true);
 
       const result = await client.callTool({
         name: "delegate_job",
@@ -89,6 +136,9 @@ describe("Dona Dispatcher MCP server", () => {
           workspace_kind: "github",
           repository: "owner/repo",
           base_ref: "main",
+          display_name: "短い作業名",
+          issue_repository: "owner/repo",
+          issue_number: 87,
         },
       });
       assert.equal(result.isError, undefined);
@@ -99,19 +149,71 @@ describe("Dona Dispatcher MCP server", () => {
           job_key: "repo.audit",
           objective: "調査してPRを作る",
           workspace: { kind: "github", repository: "owner/repo", base_ref: "main" },
+          display: { short_name: "短い作業名", issue: { repository: "owner/repo", number: 87 } },
         }],
       }]);
+
+      const scheduled = await client.callTool({
+        name: "delegate_scheduled_work",
+        arguments: { event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV" },
+      });
+      assert.equal(scheduled.isError, undefined);
+      assert.deepEqual((scheduled.structuredContent as Record<string,unknown>).action, {
+        tool: "delegate_scheduled_work", source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV",
+        job_id: "job_01m1es03xy5cf8d9pm5cwx4srv", outcome: "created",
+      });
+      assert.deepEqual(calls[1], { method: "delegateScheduledWork", args: ["evt_01M1ES03XY5CF8D9PM5CWX4SRV"] });
 
       const status = await client.callTool({
         name: "get_job_status",
         arguments: { job_id: "job_01m1es03xy5cf8d9pm5cwx4srv", source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV" },
       });
       assert.equal(status.isError, undefined);
+      assert.equal((status.structuredContent as {job:Record<string,unknown>}).job.notification_authorization_phase,"preflight");
       assert.equal((status.structuredContent as { job: { status: string } }).job.status, "running");
-      assert.deepEqual(calls[1], {
+      assert.deepEqual(calls[2], {
         method: "getJob",
         args: ["job_01m1es03xy5cf8d9pm5cwx4srv", "evt_01M1ES03XY5CF8D9PM5CWX4SRV"],
       });
+      const liveStatus=await client.callTool({name:"get_job_status",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",source_event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV",include_live_session:true}});
+      assert.equal((liveStatus.structuredContent as {live_session:{identity_match:boolean}}).live_session.identity_match,true);
+      assert.deepEqual(calls[3],{method:"getJob",args:["job_01m1es03xy5cf8d9pm5cwx4srv","evt_01M1ES03XY5CF8D9PM5CWX4SRV",{includeLiveSession:true}]});
+      const receiptStatus=await client.callTool({name:"get_job_status",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",source_event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV",live_session_receipt_id:"lsr_0123456789abcdef0123456789abcdef"}});
+      assert.equal((receiptStatus.structuredContent as {receipt:{receipt_id:string}}).receipt.receipt_id,"lsr_0123456789abcdef0123456789abcdef");
+      const beforeConflict=calls.length;const conflict=await client.callTool({name:"get_job_status",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",source_event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV",include_live_session:true,live_session_receipt_id:"lsr_0123456789abcdef0123456789abcdef"}});
+      assert.equal(conflict.isError,true);assert.equal(calls.length,beforeConflict);
+      const preview = await client.callTool({ name: "preview_schedule", arguments: {
+        source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV",
+        definition: { recurrence: { version: 1, kind: "once", at: "2026-09-08T00:00:00Z" }, action: { kind: "reminder", body: "確認" } },
+        after: "2026-09-06T00:00:00Z", before_or_equal: "2026-09-09T00:00:00Z", limit: 10,
+      } });
+      assert.equal(preview.isError, undefined);
+      assert.equal(calls.at(-1)?.method, "previewSchedule");
+      const scheduleListed = await client.callTool({ name: "list_schedules", arguments: {
+        source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV", limit: 10, cursor: "12",
+      } });
+      assert.equal(scheduleListed.isError, undefined);
+      assert.deepEqual(calls.at(-1), { method: "listSchedules", args: ["evt_01M1ES03XY5CF8D9PM5CWX4SRV", 10, "12"] });
+      for (const cursor of ["01", "9007199254740992"]) {
+        const beforeInvalidCursor: number = calls.length;
+        const invalidCursor = await client.callTool({ name: "list_schedules", arguments: {
+          source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV", limit: 10, cursor,
+        } });
+        assert.equal(invalidCursor.isError, true);
+        assert.equal(calls.length, beforeInvalidCursor);
+      }
+      const maxCursor = await client.callTool({ name: "list_schedules", arguments: {
+        source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV", limit: 10, cursor: "9007199254740991",
+      } });
+      assert.equal(maxCursor.isError, undefined);
+      assert.deepEqual(calls.at(-1), { method: "listSchedules", args: ["evt_01M1ES03XY5CF8D9PM5CWX4SRV", 10, "9007199254740991"] });
+      const beforeInvalid = calls.length;
+      const invalidKey = await client.callTool({ name: "create_schedule", arguments: {
+        source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV", idempotency_key: "request.1",
+        definition: { recurrence: { version: 1, kind: "once", at: "2026-09-08T00:00:00Z" }, action: { kind: "reminder", body: "確認" } },
+      } });
+      assert.equal(invalidKey.isError, true);
+      assert.equal(calls.length, beforeInvalid);
 
       const body = {
         schema_version: 1,
@@ -144,6 +246,7 @@ describe("Dona Dispatcher MCP server", () => {
           error: { code: errorCode, message: `${errorCode} message` },
         });
       },
+      previewSchedule:notUsed, createSchedule:notUsed, getSchedule:notUsed, listSchedules:notUsed, updateSchedule:notUsed, transitionSchedule:notUsed, getScheduleHistory:notUsed,
       getJob: notUsed,
       listEventJobs: notUsed,
       listThreadJobs: notUsed,
@@ -196,6 +299,7 @@ describe("Dona Dispatcher MCP server", () => {
         assert.equal((input as { objective: string }).objective, objective);
         return { schema_version: 1, job: { job_id: "job_01m1es03xy5cf8d9pm5cwx4srv" } };
       },
+      previewSchedule:notUsed, createSchedule:notUsed, getSchedule:notUsed, listSchedules:notUsed, updateSchedule:notUsed, transitionSchedule:notUsed, getScheduleHistory:notUsed,
       getJob: notUsed,
       async listEventJobs(_sourceEventId, _jobKey, canonicalPayloadSha256) {
         listCalls += 1;
@@ -255,6 +359,7 @@ describe("Dona Dispatcher MCP server", () => {
         createCalls += 1;
         throw new DispatcherClientError(undefined, "Dispatcher request timed out after 10000ms");
       },
+      previewSchedule:notUsed, createSchedule:notUsed, getSchedule:notUsed, listSchedules:notUsed, updateSchedule:notUsed, transitionSchedule:notUsed, getScheduleHistory:notUsed,
       getJob: notUsed,
       async listEventJobs(sourceEventId, jobKey, canonicalPayloadSha256) {
         listCalls += 1;

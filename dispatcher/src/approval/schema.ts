@@ -1,3 +1,4 @@
+import { isDispatcherCoreTrigger } from "../dispatcher-core-triggers.js";
 import Database from "better-sqlite3";
 import { markDatabasePayloadHistory, verifyDatabasePayloadHistory } from "../payload-backup-boundary.js";
 import { assertSecurityDurability } from "../audit/durability.js";
@@ -327,7 +328,7 @@ function verifiedVersion(db: Database.Database): number {
       || db.pragma("ignore_check_constraints", { simple: true }) !== 0
       || db.pragma("encoding", { simple: true }) !== "UTF-8") throw new ApprovalSchemaError();
     const triggers = db.prepare("SELECT name,tbl_name,sql FROM sqlite_master WHERE type='trigger' AND substr(lower(name),1,9)!='approval_'").all() as Array<{name:string;tbl_name:string;sql:string}>;
-    if (triggers.some(row => row.name !== "security_audit_no_update" || row.tbl_name !== "security_audit_records"
+    if (triggers.filter(row => !isDispatcherCoreTrigger(row)).some(row => row.name !== "security_audit_no_update" || row.tbl_name !== "security_audit_records"
       || row.sql !== "CREATE TRIGGER security_audit_no_update BEFORE UPDATE ON security_audit_records\n          BEGIN SELECT RAISE(ABORT, 'security_audit_append_only'); END")) throw new ApprovalSchemaError();
     if (db.prepare("SELECT 1 FROM sqlite_temp_master WHERE type='trigger'").get()) throw new ApprovalSchemaError();
     if (db.prepare("SELECT 1 FROM sqlite_temp_master WHERE substr(lower(name),1,9)='approval_' OR substr(lower(tbl_name),1,9)='approval_'").get()) throw new ApprovalSchemaError();

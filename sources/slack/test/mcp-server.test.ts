@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { describe, test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -33,11 +34,14 @@ class MemoryKeychain implements KeychainStore {
 }
 
 class FakeSlackClient implements SlackApiClient {
+  channelLookups = 0;
   readonly posts: Array<{
     channelId: string;
     text: string;
     threadTs?: string;
     replyBroadcast: boolean;
+    mrkdwn?: boolean;
+    parse?: "none";
   }> = [];
   readonly sessionStatuses: Array<{
     channelId: string;
@@ -64,16 +68,19 @@ class FakeSlackClient implements SlackApiClient {
       ],
     };
   }
-  async getChannel(): Promise<SlackChannel> {
+  async getChannel(channelId: string): Promise<SlackChannel> {
+    this.channelLookups += 1;
     return {
-      id: "C123",
+      id: channelId,
       name: "general",
-      isPrivate: false,
+      isPrivate: channelId.startsWith("G"),
       isArchived: false,
       isMember: true,
       isShared: false,
+      isMpim: channelId === "GMPIM",
     };
   }
+  async hasChannelMember(_channelId:string,userId:string):Promise<boolean> { return userId==="U1"; }
   async listUsers(): Promise<SlackUserPage> {
     return { users: [await this.getUser()] };
   }
@@ -129,6 +136,8 @@ class FakeSlackClient implements SlackApiClient {
     text: string;
     threadTs?: string;
     replyBroadcast: boolean;
+    mrkdwn?: boolean;
+    parse?: "none";
   }): Promise<SlackPostResult> {
     this.posts.push(input);
     return { channelId: input.channelId, messageTs: "2.3", ...(input.threadTs ? { threadTs: input.threadTs } : {}) };
@@ -166,7 +175,7 @@ describe("Dona Slack MCP server", () => {
       logger,
       () => fake,
     );
-    const server = createSlackMcpServer(registry, logger);
+    const server = createSlackMcpServer(registry, logger,input=>JSON.stringify(input));
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -179,6 +188,7 @@ describe("Dona Slack MCP server", () => {
           "list_workspaces",
           "list_channels",
           "get_channel",
+          "check_user_channel_access",
           "list_users",
           "get_user",
           "get_thread",
@@ -193,6 +203,9 @@ describe("Dona Slack MCP server", () => {
         listed.tools.find(({ name }) => name === "get_thread")?.annotations?.readOnlyHint,
         true,
       );
+      const accessResult=await client.callTool({name:"check_user_channel_access",arguments:{workspace:"company",channel_id:"C123",user_id:"U1",event_id:"evt_test"}});
+      assert.deepEqual(accessResult.structuredContent,{workspace:"company",workspace_id:"T123",channel_id:"C123",user_id:"U1",authorized:true,channel_kind:"other",channel_user_id:null,
+        access_receipt:JSON.stringify({event_id:"evt_test",workspace_id:"T123",channel_id:"C123",user_id:"U1",channel_kind:"other",channel_user_id:null})});
       assert.equal(
         listed.tools.find(({ name }) => name === "post_message")?.annotations?.readOnlyHint,
         false,
@@ -239,6 +252,8 @@ describe("Dona Slack MCP server", () => {
           channel_id: "C123",
           text: "hello",
           thread_ts: "1.2",
+          mrkdwn: false,
+          parse: "none",
         },
       });
       assert.equal(result.isError, undefined);
@@ -247,15 +262,115 @@ describe("Dona Slack MCP server", () => {
           channelId: "C123",
           text: "hello",
           threadTs: "1.2",
-          replyBroadcast: false,
+          replyBroadcast: true,
+          mrkdwn: false,
+          parse: "none",
         },
       ]);
       assert.deepEqual(result.structuredContent, {
         workspace: "company",
         channel_id: "C123",
         message_ts: "2.3",
+        body_sha256: createHash("sha256").update("hello").digest("hex"),
         thread_ts: "1.2",
+        reply_broadcast: true,
+        mrkdwn: false,
+        parse: "none",
       });
+
+      const scheduledResult = await client.callTool({
+        name: "post_message",
+        arguments: {
+          workspace: "company",
+          channel_id: "C123",
+          text: "scheduled",
+          mrkdwn: true,
+          event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+        },
+      });
+      assert.deepEqual(fake.posts.at(-1), {
+        channelId: "C123",
+        text: "scheduled",
+        replyBroadcast: false,
+        mrkdwn: true,
+        parse: "none",
+        identityBlockId: `dona-job-${createHash("sha256").update("evt_01m1zfewbjx8v0844yrrkqwzc7").digest("hex").slice(0,32)}`,
+      });
+      assert.deepEqual(scheduledResult.structuredContent, {
+        workspace: "company",
+        channel_id: "C123",
+        message_ts: "2.3",
+        body_sha256: createHash("sha256").update("scheduled").digest("hex"),
+        reply_broadcast: false,
+        mrkdwn: true,
+        parse: "none",
+        event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+      });
+
+      const mentionResult = await client.callTool({
+        name: "post_message",
+        arguments: {
+          workspace: "company",
+          channel_id: "C123",
+          text: "<https://example.com|link> <!channel> <!here> <@U123> <@U123|name> <!subteam^S123>",
+          mrkdwn: true,
+          event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+        },
+      });
+      const safeText = "<https://example.com|link> &lt;!channel> &lt;!here> &lt;@U123> &lt;@U123|name> &lt;!subteam^S123>";
+      assert.equal(fake.posts.at(-1)?.text, safeText);
+      assert.equal((mentionResult.structuredContent as { body_sha256?: string })?.body_sha256, createHash("sha256").update(safeText).digest("hex"));
+
+      const plainScheduledResult = await client.callTool({
+        name: "post_message",
+        arguments: {
+          workspace: "company",
+          channel_id: "C123",
+          text: "schedule notice",
+          mrkdwn: false,
+          event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+        },
+      });
+      assert.equal(fake.posts.at(-1)?.mrkdwn, false);
+      assert.equal((plainScheduledResult.structuredContent as { mrkdwn?: boolean })?.mrkdwn, false);
+
+      await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "D123", text: "dm", thread_ts: "1.2",
+      } });
+      assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
+
+      const lookupsBeforeExplicitFalse = fake.channelLookups;
+      await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "GMPIM", text: "quiet", thread_ts: "1.2",
+        reply_broadcast: false,
+      } });
+      assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
+      assert.equal(fake.channelLookups, lookupsBeforeExplicitFalse);
+
+      await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "GPRIVATE", text: "private", thread_ts: "1.2",
+      } });
+      assert.equal(fake.posts.at(-1)?.replyBroadcast, true);
+
+      await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "GMPIM", text: "group dm", thread_ts: "1.2",
+      } });
+      assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
+
+      await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "C123", text: "job", thread_ts: "1.2",
+        mrkdwn: true,
+        event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+      } });
+      assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
+
+      const postsBeforeMissingFormat = fake.posts.length;
+      const missingFormatResult = await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "C123", text: "job", thread_ts: "1.2",
+        event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+      } });
+      assert.equal(missingFormatResult.isError, true);
+      assert.equal(fake.posts.length, postsBeforeMissingFormat);
 
       const fileResult = await client.callTool({
         name: "get_file",

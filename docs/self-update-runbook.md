@@ -1,5 +1,7 @@
 # Self-update運用runbook
 
+Slack経由の更新が内部状態で止まる場合は、[CLIからの停止更新](operations/offline-update.md)を使用できます。`./scripts/dona-update`で準備・停止・データ保持・更新・再起動を実行します。
+
 ## 導入前確認
 
 1. macOS GUI userで、`node`、`npm`、`git`、`gh`、`herdr`がabsolute pathへ解決できることを確認します。
@@ -36,6 +38,29 @@ cleanなcanonical main checkoutで明示的に実行します。installerはfetc
 5. updaterは新規Slack ingressとDispatcher dequeueを止め、処理中の1件と`dona-main`のidleを待ってからCodexを終了します。owner-onlyの`config/dispatcher.env`と`config/slack.env`をMCPへ接続し、target releaseから同じpaneへ新しい`dona-main`を起動した後、Dispatcher、Slack Adapterの順に再開します。
 6. `get_self_update_status`で`runtime_state`、`runtime_operations`、`notification_state`、outbox、`main_agent`のcwd/sessionを確認します。terminal通知はmain agentを経由せず、専用workerから元Slack threadへ戻ります。`notification_state: reported`になるまで次のupdateは開始されません。
 
+### 稼働中のbackground worker
+
+旧Dispatcherがoperator回復CLIを持たず、残存`needs_review`が通常更新とcontrol-plane更新の両方を塞ぐ場合は、[停止下bootstrap手順](operations/offline-recovery-bootstrap.md)でexact releaseをstageし、承認済みmaintenance windowに限って復旧する。
+
+現行のrelease間には、Herdr agent identityとjob単位のresult grantを次のDispatcherへ引き継いだことを証明するreceiptがありません。このため、`running`、`blocked`、`needs_review`等のworkerが残る場合は、isolated result pathでも更新を継続しません。stable Updaterはquiesce前とDispatcher drain後にowner-privateなjob DBを再読し、handoff不能または観測不能ならservice停止、schema migration、pointer切替より前に停止します。workerをcancel/closeしたり、promptを再送したりしません。
+
+Dispatcherの`update-safety`と`drain-status`に出るworker件数と`unsafe_states`は集計値だけです。`active_worker_handoff_unavailable`ならworkerのterminal Resultとnotificationを通常のDispatcherで回収・確認してから、新しいexact planで再開します。`worker_state_unverified`や`jobs.handoff_observation_unknown`ではDBの所有者、状態、healthを読み取りで照合し、更新writeを反復しません。稼働workerを跨ぐ更新は、release間のidentity・grant・terminal ownerを検証するhandoff契約とprocess境界テストが完成するまで未対応です。
+
+### 失敗診断log
+
+pre-activation中の`npm ci/test/typecheck/build`は、memory上の`output_limit_bytes`とは独立して、受信時からstdout/stderrをstream種別付きで保存します。保存先はstable Updaterの`control_root/diagnostics/logs`だけで、directoryは0700、fileは0600です。request/attempt/stepとDBでbindしたopaque `log_id`からのみ参照し、caller指定path、絶対path、symlink、hard link、管理root外の参照は拒否します。
+
+- 既定のper-log上限は8 MiB、aggregate上限は64 MiB、retentionは14日です。上限後もcommand監視とSIGTERM→1秒grace→SIGKILL cleanupは継続します。
+- `get_self_update_status`の`diagnostics`は新しい順に最大32件だけを返し、`diagnostics_total_count`と`diagnostics_omitted_count`で全件数と省略数を示します。各項目は`log_id`、attempt、step、redaction後byte size、`complete` / `truncated` / `write_failed` / `purged` / `missing` / `size_mismatch` / `read_error`と、最大4 KiBのredacted tailだけを含み、private absolute pathは返しません。
+- token、URL、local pathはbounded carry bufferとUTF-8 decoderを通して永続化前にredactします。DB error summary、logger、terminal outboxには従来どおり短いsummaryとopaque IDだけが入り、raw stdout/stderrは入りません。
+- temp fileのまま停止したcaptureは、SQLiteの`updater_writer_lease`をtransactionで取得し、その後にUpdater API socketを取得した単一writerのservice起動時だけ安全性を再検証して回収し、`write_failed`へ落とします。別の生存PIDがleaseを保持している場合はsocketへ触れず起動を拒否し、停止時はservice loopを止めてからleaseを解放します。crash後のdead PIDだけをCASで引き継ぎ、PID再利用など生存判定が曖昧な場合はfail closedにします。read-only CLIによるDB openはactive captureを変更しません。final file不在やsize不一致も`complete`へ丸めません。診断保存の失敗はupdate failureを成功へ変えません。
+- control DBは診断logのcontent digestとwriter leaseを含む`user_version = 7`へforward-onlyで移行します。schema 7を読めない旧stable Updaterへのbinary差戻しは行わず、stable Updaterの配布・backup・rollback確認は通常のアプリself-updateやこのPRのmergeとは別の、明示承認付きcontrol-plane更新として扱います。
+- retentionは常駐serviceが60秒ごとに評価し、terminal requestだけを古い順に対象とします。active captureとnon-terminal requestを削除せず、purge後もDB recordと元byte sizeを保持します。
+
+terminal workerのdrain契約もstable Updaterの実装に依存する。旧版のstable Updaterは新しいtargetの`required_control_plane_capability`を受け入れない。guarded `--upgrade-control`でexact target SHAのstable Updaterとreceiptを先に配置し、新しいplanとactivation前のcapability照合が成功した場合だけ切替へ進む。PR mergeや通常self-updateをcontrol-plane更新の代用にしない。
+
+この機能を含むアプリPRのmergeだけでは、稼働中のstable Updaterへ新しいcapture実装やDB migrationは配布されません。production control planeへの反映は、別のmaintenance window、exact SHA確認、明示承認を伴う`--upgrade-control`の責務です。
+
 Codex hostのwrite approvalは、停止時間・target・migrationを理解したbusiness approvalの代替ではありません。
 
 schema境界を越えるtargetは、policyの`compatibility_transitions`へsource/target compatibilityと必要なcontrol-plane capabilityを完全一致で列挙します。旧形式policyは空のtransition集合として扱うため、従来どおり単一`compatibility`と一致するtarget以外をfail closedします。repository上のtransition追加だけではproduction policyやstable updaterは変化しません。guarded control-plane installを別途承認・実施してexact updater SHAとpolicyを確認した後に、新しいplanを生成します。これは`apply_self_update`、DB migration、pointer切替、service操作の承認を兼ねません。
@@ -53,9 +78,13 @@ reconcileはpointer、receipt、DB fence/checkpoint、保存済みruntime intent
 
 ## Stable control-plane更新と既存インシデント補正
 
+`dona-main`の`gpt-6.1-sol`／`low`設定もstable Updaterの起動実装です。既存installへ適用するには、この変更を含むexact SHAの`--upgrade-control`と新Updaterのversion health確認を先に完了し、その後同じ新releaseの通常plan/applyを行います。runtimeだけの更新成功ではmain設定の反映を保証しません。[モデル設定の適用条件](operations/codex-model-settings.md#既存installへの適用条件)を確認してください。
+
 セルフアップデート通知の重複防止は、Slack Appのcustom message metadata schemaに依存しません。通知本文を表示するsection blockの`block_id`へ決定論的な`notification_id`を埋め、同じBotの投稿だけをthread全pageから照合します。このfieldは通常のmessage read/write権限で永続化・再読できるため、manifest変更、`metadata.message:read`、App再認可、外部状態のattestationは不要です。
 
 maintenance windowを確保し、cleanな最新main checkoutで次を実行します。`needs_review`はterminalなので存在してもよいですが、未承認planを含む非terminal requestが1件でもあれば拒否します。
+
+世代別installを更新する場合は、対象の既存rootを第二引数へ絶対パスで明示します（例: `./scripts/install-self-update.sh --upgrade-control "$HOME/.dona/g/<generation>"`）。installerはそのrootの既存policy、current pointer、Updater/Dispatcher plistを照合し、別のinstallを指す場合は停止前に拒否します。既定installを更新する場合は従来どおり引数を省略します。対象rootを推測せず、稼働中plistと照合してから指定してください。
 
 ```sh
 ./scripts/install-self-update.sh --upgrade-control
@@ -92,7 +121,7 @@ previous Dispatcherと全Slack workspaceのprevious SHA healthまで確認でき
 
 schema rolloutは通常の単発self-updateへ混ぜない。production source `7dbaab72e3387f94f6c8a2289a685b90b100d083`は`config/release-compatibility.production-v2.json`どおりschema 2だけをread/writeするため、schema-v3 targetへの通常rollback互換性はない。`config/update-compatibility-transitions.json`へsource SHA、source/target compatibility、previous release contract、必要なcontrol-plane capabilityをexactに固定し、plannerとactivation直前の双方で同じtransitionを検証する。移行失敗時はv2 pointer rollbackを推測せず、Online Backup receiptと停止下restore境界へ従う。
 
-schema activation前には、同じexact SHAから`--upgrade-control`されたstable updaterのhealthとowner-only `control-plane-receipt.json`が一致し、capability `dispatcher_v2_to_v3_online_backup_v1`を示すことも必須とする。不明・旧updaterではplan時とpointer切替直前の双方で拒否する。これはproduction更新の許可ではなく、実行には別途exact planの明示承認が必要である。
+schema activation前には、同じexact SHAから`--upgrade-control`されたstable updaterのhealthとowner-only `control-plane-receipt.json`が一致し、capability `dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1`を示すことも必須とする。不明・旧updaterではplan時とpointer切替直前の双方で拒否する。これはproduction更新の許可ではなく、実行には別途exact planの明示承認が必要である。
 
 migration/activation planは次の順序を崩さない。
 
@@ -111,3 +140,5 @@ legacy compatibilityとして、`job_key`省略時の`legacy-default`、`duplica
 ## Retention
 
 current、previous、active attemptを常に保護し、それ以外の直近2 successful releaseも残します。disk floor 2 GiB未満ではstageを開始しません。`doctor`はcleanup候補をdry-run表示し、success後cleanupはSHA形式・realpath containment・owner/modeを再検証したreleaseだけを対象にします。
+
+診断logのretentionはrelease retentionとは別です。policyの`diagnostic_log_limit_bytes`、`diagnostic_aggregate_limit_bytes`、`diagnostic_retention_days`を使い、terminal requestのfinalized logだけをpurgeします。

@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import test from "node:test";
 import Database from "better-sqlite3";
 import { DispatcherDatabase, JobCreationError, migrateDispatcherDatabase } from "../../src/database.js";
+import { assertTaskGenerationFile } from "../../src/task-execution.js";
 import { tempConfig } from "../helpers.js";
 
 const owner = { instance_id: "instance", tenant_id: "tenant", principal_id: "principal" };
@@ -89,4 +90,38 @@ test("blockedとneeds_reviewのweb jobもownerが明示解放するまではquot
     }
     db.close();
   }
+});
+
+test("Web Resultはownerを検証して保存しSlack通知を生成しない", async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const db = new DispatcherDatabase(config.databasePath); t.after(() => db.close());
+  const job = db.createWebJob(input("9".repeat(64)), config.jobsWorkspaceRoot, config.jobResultsDir).row;
+  db.beginJobPreparation(job.job_id); db.beginJobDispatch(job.job_id); db.markJobRunning(job.job_id);
+  const result = { schema_version: 1 as const, job_id: job.job_id, status: "completed" as const,
+    summary: "done", completed_at: new Date().toISOString() };
+  const raw = new Database(config.databasePath); t.after(() => raw.close());
+  raw.prepare("UPDATE jobs SET actor_id='other' WHERE job_id=?").run(job.job_id);
+  assert.throws(() => db.saveJobResult(job.job_id, result, job.result_path), /web_job_owner_mismatch/);
+  assert.equal(db.getJob(job.job_id)?.status, "running");
+  raw.prepare("UPDATE jobs SET actor_id=? WHERE job_id=?").run(owner.principal_id, job.job_id);
+  db.saveJobResult(job.job_id, result, job.result_path);
+  const receipt = db.enqueueJobNotification(job.job_id);
+  assert.equal(receipt.row.event_id, job.source_event_id);
+  assert.equal(receipt.row.source, "web");
+  assert.equal(db.enqueueJobNotification(job.job_id).duplicate, true);
+  assert.equal((raw.prepare("SELECT count(*) AS n FROM events WHERE source='dona_job'").get() as {n:number}).n, 0);
+});
+
+
+test("Task世代に保存したWeb JobはDispatcher再起動の世代検査を妨げない", async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  let db = new DispatcherDatabase(config.databasePath);
+  db.tasks.assertFreshExecutionModel();
+  const created = db.createWebJob(input("8".repeat(64)), config.jobsWorkspaceRoot, config.jobResultsDir);
+  db.close();
+  assert.doesNotThrow(() => assertTaskGenerationFile(config.databasePath));
+  db = new DispatcherDatabase(config.databasePath); t.after(() => db.close());
+  assert.doesNotThrow(() => db.tasks.assertFreshExecutionModel());
+  assert.equal(db.getWebCommandReceipt(created.receipt.receipt_id, owner)?.job_id, created.row.job_id);
+  assert.equal(db.getJob(created.row.job_id)?.status, "queued");
 });

@@ -31,7 +31,7 @@ AdapterはHerdrやDispatcherのSQLiteを直接操作しません。使用して�
 2. 「Basic Information」→「App-Level Tokens」でtokenを発行します。
 3. App-Level Tokenには`connections:write`だけを付与します。
 4. Event Subscriptionsを有効にし、必要なBot Eventsを登録します。
-5. OAuth scopesを確認し、Appをworkspaceへinstall/reinstallします。
+5. OAuth scopes（owner DM照会用の`im:read`を含む）を確認し、Appをworkspaceへinstall/reinstallします。既存Appへscopeを追加した場合も各workspaceでreinstallが必要です。
 6. Botを受信対象チャンネルへ招待します。
 7. Request URLは設定しません。
 
@@ -122,7 +122,7 @@ cd ../..
 codex mcp list
 ```
 
-設定では読み取りツールをそのまま使え、`set_agent_session_status`、`post_message`、`add_reaction`は実行前に承認対象となる`default_tools_approval_mode = "writes"`を指定しています。既に起動している`dona-main`へ反映するには、そのCodexエージェントを再起動してください。Codexのproject-scoped `.codex/config.toml` とstdio MCP設定については[OpenAI公式ドキュメント](https://developers.openai.com/codex/mcp)も参照できます。
+設定では読み取りツールをそのまま使え、`set_agent_session_status`、`post_message`、`add_reaction`は実行前に承認対象となる`default_tools_approval_mode = "writes"`を指定しています。App Serverの管理下で起動するmainでは、launcherが固定したDona Slack/Dispatcher MCPだけを`approve`へ上書きし、ツール側のevent/owner認可を通して実行します。OS操作や他のMCPの承認はこの例外に含みません。既に起動している`dona-main`へ反映するには、そのCodexエージェントを再起動してください。Codexのproject-scoped `.codex/config.toml` とstdio MCP設定については[OpenAI公式ドキュメント](https://developers.openai.com/codex/mcp)も参照できます。
 
 MCPだけを手動で起動するデバッグ用コマンドもありますが、通常はCodexに起動させます。
 
@@ -176,3 +176,7 @@ create/steer/cancel/promptのtimeout・切断はblind retryせず、read-only re
 後続入力は先に`list_thread_jobs`を使います。0件なら操作せず、1件なら依頼意図との一致を確認します。複数候補かつ明示`job_id`なしなら質問し、本文類似・最新時刻・job_keyから選択せずbroadcastしません。外部自由文のID、command/path/token/private URLを未検証で制御引数へ使いません。対象確定後だけ現在のfollow-up `source_event_id`と明示`job_id`でsteer/status/cancelし、cross-threadを拒否します。
 
 委任後はgroup terminalまでprocessingを保ち、個別progressでは投稿・active遷移をしません。attentionはsuspended、all_terminalは結果集約後activeです。通知のstatus取得にも現在の通知event_idを使います。group DB lifecycleはDispatcherの既存実装が所有します。
+
+## Task世代の通常実行
+
+通常の長時間作業は`delegate_task`、状態確認は`get_task` / `list_tasks`を使う。Task IDはworker交代後も維持され、Attempt（内部job）は履歴として残る。ProjectはDispatcherの投影であり、workerは担当fieldを書かない。旧job操作の記述は旧世代の保守用で、新Taskの制御にはTask IDとrevisionを使う。詳細はリポジトリの`docs/operations/task-execution.md`とADR 0004を参照する。

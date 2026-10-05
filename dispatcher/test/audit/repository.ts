@@ -631,3 +631,10 @@ test("prepare stateはmutation前に失効しprepare例外はanchorを予約し�
  assert.equal(f.store.calls.length,before);assert.throws(()=>assertCurrentAuditReadState(f.db,prepared!),AuditIntegrityError);
  assert.equal(count(f.db,"decisions"),1);
 });
+
+test("既知Dispatcher triggerも定義を改変したら監査を許可しない", t => {
+  const { db, repository } = setup(t, true);
+  assert.equal(repository.verify().sequence, 0);
+  db.exec("DROP TRIGGER event_job_binding_immutable; CREATE TRIGGER event_job_binding_immutable BEFORE UPDATE ON event_job_bindings BEGIN SELECT 1; END");
+  assert.throws(() => repository.verify(), AuditIntegrityError);
+});

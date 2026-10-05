@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { readJobResultEnvelope } from "../src/job-result.js";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
+import Database from "better-sqlite3";
 
 import { DispatcherDatabase } from "../src/database.js";
 import type { DispatcherConfig } from "../src/config.js";
@@ -96,6 +100,7 @@ function fakeRuntime(overrides: Partial<JobAgentRuntime>): JobAgentRuntime {
     async prompt() { throw new Error("must not prompt"); },
     async wait() { throw new Error("must not wait"); },
     async cancel() { throw new Error("must not cancel"); },
+    async cleanup() { throw new Error("must not cleanup"); },
     ...overrides,
   };
 }
@@ -128,7 +133,7 @@ test("web cancelは初回Result照合を待ち高速完了jobをcancellingへ戻
     config.jobsWorkspaceRoot, config.jobResultsDir).row;
   let releasePrompt!: () => void; const prompting = new Promise<void>(resolve => { releasePrompt = resolve; });
   const runtime = fakeRuntime({
-    async prepare() { await fs.mkdir(config.jobResultsDir, { recursive: true }); return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+    async prepare() { await fs.mkdir(path.dirname(job.result_path), { recursive: true }); return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
     async get() { return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 }; },
     async prompt() { await fs.writeFile(job.result_path, JSON.stringify({ schema_version: 1, job_id: job.job_id, status: "completed",
       summary: "done", completed_at: new Date().toISOString() })); await prompting; return ok("done"); },
@@ -186,7 +191,7 @@ test("terminal Result回収中のweb cancelは同じjob lockで直列化する",
   const reading = new Promise<void>(resolve => { releaseRead = resolve; });
   const started = new Promise<void>(resolve => { readStarted = resolve; });
   const runtime = fakeRuntime({
-    async prepare() { await fs.mkdir(config.jobResultsDir, { recursive: true }); return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+    async prepare() { await fs.mkdir(path.dirname(job.result_path), { recursive: true }); return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
     async get() { return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 }; },
     async prompt() { return ok("working"); }, async wait() { await waiting; return ok("done"); },
     async cancel() { cancelCalls++; return ok("done"); },
@@ -222,6 +227,103 @@ afterEach(async () => {
 });
 
 describe("JobSupervisor", () => {
+  for (const agentPresent of [true, false]) {
+    test(`cancel of stale preparation ${agentPresent ? "retains unknown agent" : "records name-based agent absence"}`, async () => {
+      const { root, config } = await tempConfig();
+      roots.push(root);
+      const database = new DispatcherDatabase(config.databasePath);
+      const job = createScratchJob(database, config, `Ev-stale-preparing-cancel-${agentPresent}`);
+      database.beginJobPreparation(job.job_id);
+      database.recoverStaleJobs();
+      let cancelCalls = 0;
+      const supervisor = new JobSupervisor(database, fakeRuntime({
+        async get() { return agentPresent ? ok("working") : failed("agent_not_found"); },
+        async cancel() { cancelCalls += 1; return ok("idle"); },
+      }), config, logger, () => undefined);
+      if (agentPresent) await assert.rejects(supervisor.cancel(job.job_id, job.source_event_id), /requires review/);
+      else await supervisor.cancel(job.job_id, job.source_event_id);
+      assert.equal(cancelCalls, 0);
+      assert.equal(database.getJob(job.job_id)?.status, agentPresent ? "needs_review" : "cancelled");
+      assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+      database.close();
+    });
+  }
+  test("cancel leaves an identity-recorded stale preparation agent in the drain gate", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stale-preparing-known-cancel");
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id, "workspace", "pane");
+    database.recoverStaleJobs();
+    let cancelled = false;
+    const supervisor = new JobSupervisor(database, fakeRuntime({
+      async get() { return ok(cancelled ? "idle" : "working"); },
+      async cancel() { cancelled = true; return ok("idle"); },
+    }), config, logger, () => undefined);
+    await supervisor.cancel(job.job_id, job.source_event_id);
+    assert.equal(cancelled, true);
+    assert.equal(database.getJob(job.job_id)?.status, "cancelled");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    database.close();
+  });
+
+  test("keeps a stale preparation with unknown agent identity in review after a later prepare failure", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.maxAttempts = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stale-preparing-orphan");
+    database.beginJobPreparation(job.job_id);
+    database.recoverStaleJobs();
+    let prepares = 0;
+    const supervisor = new JobSupervisor(database, fakeRuntime({
+      async prepare() { prepares += 1; throw new Error("worktree verification failed"); },
+    }), config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "needs_review");
+    assert.equal(prepares, 1);
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "stale_preparing_agent_unverified");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    await supervisor.stop();
+    database.close();
+  });
+  test("keeps an identity-recorded stale agent in review after a later prepare failure", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.maxAttempts = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stale-preparing-known-orphan");
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id, "workspace", "pane");
+    database.recoverStaleJobs();
+    const supervisor = new JobSupervisor(database, fakeRuntime({
+      async prepare() { throw new Error("worktree verification failed"); },
+    }), config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "needs_review");
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "stale_preparing_agent_unverified");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("name-based absence after stale preparation keeps the drain gate", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stale-preparing-reviewed-cancel");
+    database.beginJobPreparation(job.job_id);
+    database.recoverStaleJobs();
+    database.markJobNeedsReview(job.job_id, "stale_preparing_agent_unverified", "agent state unknown");
+    const supervisor = new JobSupervisor(database, fakeRuntime({
+      async cancel() { return failed("agent_not_found"); },
+    }), config, logger, () => undefined);
+    await supervisor.cancel(job.job_id, job.source_event_id);
+    assert.equal(database.getJob(job.job_id)?.status, "cancelled");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    database.close();
+  });
+
   test("fills global slots round-robin without exceeding the per-event limit", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -601,6 +703,7 @@ describe("JobSupervisor", () => {
           return new Promise((resolve) => { releaseWait = resolve; });
         },
         async cancel() { return new Promise((resolve) => { releaseCancel = resolve; }); },
+        async get() { return ok("idle"); },
       });
       const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
       let restarted: JobSupervisor | undefined;
@@ -777,7 +880,7 @@ describe("JobSupervisor", () => {
     const database = new DispatcherDatabase(config.databasePath);
     const source = database.enqueue(eventEnvelope("Ev-background")).row;
     const job = database.createJob(
-      { source_event_id: source.event_id, objective: "調査する", workspace: { kind: "scratch" } },
+      { source_event_id: source.event_id, objective: "調査する", workspace: { kind: "scratch" }, display: { short_name: "結果確認" } },
       config.jobsWorkspaceRoot,
       config.jobResultsDir,
     ).row;
@@ -786,7 +889,7 @@ describe("JobSupervisor", () => {
     let workerWakeCount = 0;
     const runtime: JobAgentRuntime = {
       async prepare() {
-        await fs.mkdir(config.jobResultsDir, { recursive: true });
+        await fs.mkdir(path.dirname(job.result_path), { recursive: true });
         return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" };
       },
       async get() { return ok("idle"); },
@@ -803,6 +906,7 @@ describe("JobSupervisor", () => {
           output: { format: "markdown", text: "結果です" },
           completed_at: new Date().toISOString(),
         };
+        await fs.mkdir(path.dirname(job.result_path), { recursive: true });
         await fs.writeFile(`${job.result_path}.tmp`, JSON.stringify(result));
         await fs.rename(`${job.result_path}.tmp`, job.result_path);
         return ok("working");
@@ -915,7 +1019,8 @@ describe("JobSupervisor", () => {
 
     const notifications = jobs.map((job) => database.get(database.getJob(job.job_id)!.completion_event_id!)!);
     const transitions = notifications.map((row) => (JSON.parse(row.payload_json).group as Record<string, unknown>).transition);
-    assert.deepEqual(transitions.sort(), ["all_terminal", "progress"]);
+    assert.deepEqual(transitions.sort(), ["all_terminal", "all_terminal"]);
+    assert.equal(new Set(notifications.map(row=>row.event_id)).size,1);
     const owner = notifications.find((row) => (JSON.parse(row.payload_json).group as Record<string, unknown>).transition === "all_terminal")!;
     const ownerGroup = JSON.parse(owner.payload_json).group as { total: number; jobs: Array<{ job_id: string }> };
     assert.equal(ownerGroup.total, 2);
@@ -984,7 +1089,7 @@ describe("JobSupervisor", () => {
     const source = database.enqueue(eventEnvelope("Ev-steer-source")).row;
     const followUp = database.enqueue(eventEnvelope("Ev-steer-follow-up")).row;
     const job = database.createJob(
-      { source_event_id: source.event_id, objective: "長い作業", workspace: { kind: "scratch" } },
+      { source_event_id: source.event_id, objective: "長い作業", workspace: { kind: "scratch" }, display: { short_name: "表示専用" } },
       config.jobsWorkspaceRoot,
       config.jobResultsDir,
     ).row;
@@ -995,10 +1100,11 @@ describe("JobSupervisor", () => {
     const steers: string[] = [];
     const steerTargets: string[] = [];
     const steerTimeouts: Array<number | undefined> = [];
+    const submissionModes: Array<boolean | undefined> = [];
     const runtime: JobAgentRuntime = {
       async prepare() { throw new Error("not used"); },
-      async get() { return ok("working"); },
-      async prompt(agentName, text, _signal, timeoutMs) { steerTargets.push(agentName); steers.push(text); steerTimeouts.push(timeoutMs); return ok("working"); },
+      async get() { return ok("idle"); },
+      async prompt(agentName, text, _signal, timeoutMs, submissionOnly) { steerTargets.push(agentName); steers.push(text); steerTimeouts.push(timeoutMs); submissionModes.push(submissionOnly); return ok("idle"); },
       async wait() { return { ...ok("working"), ok: false, timedOut: true, errorCode: "timeout" }; },
       async cancel() { return ok("idle"); },
     };
@@ -1008,7 +1114,44 @@ describe("JobSupervisor", () => {
     assert.deepEqual(steers, ["追加条件"]);
     assert.deepEqual(steerTargets, [job.agent_name]);
     assert.deepEqual(steerTimeouts, [undefined]);
+    assert.deepEqual(submissionModes, [true]);
     assert.equal(database.getJob(job.job_id)?.steer_state, "accepted");
+    database.close();
+  });
+  test("queued follow-up receipt reports a duplicate after another follow-up", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-queued-followup-source")).row;
+    const first = database.enqueue(eventEnvelope("Ev-queued-followup-first")).row;
+    const second = database.enqueue(eventEnvelope("Ev-queued-followup-second")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "調査",
+      workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const supervisor = new JobSupervisor(database, fakeRuntime({}), config, logger, () => undefined);
+    assert.equal((await supervisor.steer(job.job_id, first.event_id, "A")).duplicate, false);
+    assert.equal((await supervisor.steer(job.job_id, second.event_id, "B")).duplicate, false);
+    assert.equal((await supervisor.steer(job.job_id, first.event_id, "A")).duplicate, true);
+    assert.equal(database.getJob(job.job_id)?.objective.split("[DONA_FOLLOW_UP]").length, 3);
+    database.close();
+  });
+  test("name-based steer absence keeps the terminal worker fence", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-steer-terminal-source")).row;
+    const followUp = database.enqueue(eventEnvelope("Ev-steer-terminal-follow-up")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "完了と競合",
+      workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    markRunning(database, job.job_id);
+    const runtime = fakeRuntime({ async prompt() {
+      database.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id,
+        status: "completed", summary: "完了", completed_at: new Date().toISOString() }, job.result_path);
+      return failed("agent_not_found");
+    } });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    await assert.rejects(supervisor.steer(job.job_id, followUp.event_id, "追加条件"), /agent_not_found/);
+    assert.equal(database.getJob(job.job_id)?.status, "completed");
+    assert.equal(database.getJob(job.job_id)?.steer_state, null);
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "terminal_steer_worker_unverified");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     database.close();
   });
 
@@ -1018,7 +1161,7 @@ describe("JobSupervisor", () => {
     const database = new DispatcherDatabase(config.databasePath);
     const source = database.enqueue(eventEnvelope("Ev-resumed-agent-name")).row;
     const job = database.createJob(
-      { source_event_id: source.event_id, objective: "実装する", workspace: { kind: "scratch" } },
+      { source_event_id: source.event_id, objective: "実装する", workspace: { kind: "scratch" }, display: { short_name: "表示専用" } },
       config.jobsWorkspaceRoot,
       config.jobResultsDir,
     ).row;
@@ -1029,7 +1172,7 @@ describe("JobSupervisor", () => {
     const waitTargets: string[] = [];
     const runtime: JobAgentRuntime = {
       async prepare() { throw new Error("not used"); },
-      async get() { return ok("working"); },
+      async get() { return ok("idle"); },
       async prompt() { return ok("working"); },
       async wait(agentName) {
         waitTargets.push(agentName);
@@ -1054,7 +1197,7 @@ describe("JobSupervisor", () => {
     const source = database.enqueue(eventEnvelope("Ev-cancel-source")).row;
     const followUp = database.enqueue(eventEnvelope("Ev-cancel-follow-up")).row;
     const job = database.createJob(
-      { source_event_id: source.event_id, objective: "修正する", workspace: { kind: "scratch" } },
+      { source_event_id: source.event_id, objective: "修正する", workspace: { kind: "scratch" }, display: { short_name: "表示専用" } },
       config.jobsWorkspaceRoot,
       config.jobResultsDir,
     ).row;
@@ -1065,7 +1208,7 @@ describe("JobSupervisor", () => {
     const cancelTargets: string[] = [];
     const runtime: JobAgentRuntime = {
       async prepare() { throw new Error("not used"); },
-      async get() { return ok("working"); },
+      async get() { return ok("idle"); },
       async prompt() { return ok("working"); },
       async wait() { return ok("working"); },
       async cancel(agentName) { cancelTargets.push(agentName); return ok("idle"); },
@@ -1076,6 +1219,51 @@ describe("JobSupervisor", () => {
     assert.deepEqual(cancelTargets, [job.agent_name]);
     assert.equal(result.row.status, "cancelled");
     database.close();
+  });
+
+  test("does not overwrite an accepted cancellation when monitor returns", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-cancel-monitor-race"); markRunning(database,job.job_id);
+    let resolveWait!: (value:HerdrCommandResult)=>void; let waiting=false;
+    let cancelled=false; const runtime=fakeRuntime({
+      async wait(){waiting=true; return await new Promise<HerdrCommandResult>(resolve=>{resolveWait=resolve;});},
+      async cancel(){cancelled=true;return ok("idle");}, async get(){return ok(cancelled?"idle":"working");},
+    });
+    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined); supervisor.start();
+    await waitFor(()=>waiting); await supervisor.cancel(job.job_id,job.source_event_id); resolveWait(ok("done"));
+    await waitFor(()=>database.getJob(job.job_id)?.status==="cancelled"); await supervisor.stop();
+    assert.equal(database.getJob(job.job_id)?.status,"cancelled"); database.close();
+  });
+
+  test("collects a result published while cancellation is stopping the agent", async () => {
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-cancel-late-result"); markRunning(database,job.job_id);
+    let published=false;
+    const runtime=fakeRuntime({
+      async cancel(){return ok("idle");},
+      async get(){
+        if(!published) {
+          published=true; await fs.mkdir(path.dirname(job.result_path),{recursive:true});
+          await fs.writeFile(job.result_path,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()}));
+        }
+        return ok("idle");
+      },
+    });
+    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined);
+    const result=await supervisor.cancel(job.job_id,job.source_event_id);
+    assert.equal(result.row.status,"completed"); database.close();
+  });
+
+  test("treats pre-prompt agent absence as a completed cancellation", async () => {
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath); const job=createScratchJob(database,config,"Ev-pre-prompt-cancel");
+    database.beginJobPreparation(job.job_id);
+    const runtime=fakeRuntime({async cancel(){return failed("agent_not_found");}});
+    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined);
+    const result=await supervisor.cancel(job.job_id,job.source_event_id);
+    assert.equal(result.row.status,"cancelled"); database.close();
   });
 
   test("prompt status timeout後も再送せずbounded reconcileする", async () => {
@@ -1121,7 +1309,7 @@ describe("JobSupervisor", () => {
     let gets = 0;
     const runtime = fakeRuntime({
       async prepare() {
-        await fs.mkdir(config.jobResultsDir, { recursive: true });
+        await fs.mkdir(path.dirname(job.result_path), { recursive: true });
         return { herdrWorkspaceId: "w1", herdrPaneId: "p1" };
       },
       async prompt() {
@@ -1155,7 +1343,7 @@ describe("JobSupervisor", () => {
     const updated = database.getJob(job.job_id)!;
     assert.equal(updated.status, "completed", `${updated.last_error_code}: ${updated.last_error_message}`);
     assert.equal(prompts, 1);
-    assert.equal(gets, 2);
+    assert.ok(gets >= 2);
     assert.ok(database.getJob(job.job_id)?.prompt_accepted_at);
     database.close();
   });
@@ -1220,7 +1408,7 @@ describe("JobSupervisor", () => {
     let prompted = false;
     const runtime = fakeRuntime({
       async prepare() {
-        await fs.mkdir(config.jobResultsDir, { recursive: true });
+        await fs.mkdir(path.dirname(job.result_path), { recursive: true });
         return { herdrWorkspaceId: "w1", herdrPaneId: "p1" };
       },
       async prompt() { prompted = true; return failed("agent_prompt_stalled"); },
@@ -1253,7 +1441,7 @@ describe("JobSupervisor", () => {
     let promptCount = 0;
     const runtime = fakeRuntime({
       async prepare() {
-        await fs.mkdir(config.jobResultsDir, { recursive: true });
+        await fs.mkdir(path.dirname(job.result_path), { recursive: true });
         return { herdrWorkspaceId: "w1", herdrPaneId: "p1" };
       },
       async prompt() {
@@ -1416,7 +1604,7 @@ describe("JobSupervisor", () => {
     let prompted = false;
     const runtime = fakeRuntime({
       async prepare() {
-        await fs.mkdir(config.jobResultsDir, { recursive: true });
+        await fs.mkdir(path.dirname(job.result_path), { recursive: true });
         return { herdrWorkspaceId: "w1", herdrPaneId: "p1" };
       },
       async prompt() { prompted = true; return failed("agent_prompt_stalled"); },
@@ -1498,7 +1686,7 @@ describe("JobSupervisor", () => {
     const database = new DispatcherDatabase(config.databasePath);
     const job = createScratchJob(database, config, "Ev-cross-job-result");
     markRunning(database, job.job_id);
-    await fs.mkdir(config.jobResultsDir, { recursive: true });
+    await fs.mkdir(path.dirname(job.result_path), { recursive: true });
     await fs.writeFile(job.result_path, JSON.stringify({
       schema_version: 1,
       job_id: "job_01m1f3zzzzzzzzzzzzzzzzzzzz",
@@ -1526,13 +1714,101 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("invalid Result agentはidle後にcloseと不在確認を行う", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-invalid-result-stop-idle");
+    markRunning(database,job.job_id);
+    database.markJobNeedsReview(job.job_id,"invalid_result","invalid Result");
+    let gets=0;
+    const supervisor=new JobSupervisor(database,fakeRuntime({async cancel(){return ok("working");},async get(){return gets++===0?ok("idle"):failed("agent_not_found");},async closeAgent(){return ok("done");}}),config,logger,()=>undefined);
+    await (supervisor as unknown as {stopInvalidResultAgent(job:JobRow):Promise<void>}).stopInvalidResultAgent(database.getJob(job.job_id)!);
+    assert.equal(gets,2);
+    assert.equal(database.getJob(job.job_id)?.last_error_code,"invalid_result_agent_stopped");
+    database.close();
+  });
+
+  test("preserves an unknown invalid Result stop fence before rereading the Result", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-invalid-result-stop-unknown");
+    markRunning(database,job.job_id);
+    database.markJobNeedsReview(job.job_id,"invalid_result","invalid Result");
+    database.recordInvalidResultAgentStopFailure(job.job_id,"cancel acceptance unknown");
+    await fs.mkdir(path.dirname(job.result_path), { recursive: true });
+    await fs.writeFile(job.result_path, "not-json");
+    let gets=0;
+    let cancels=0;
+    const supervisor=new JobSupervisor(database,fakeRuntime({
+      async get(){gets+=1;return ok("working");},
+      async cancel(){cancels+=1;return ok("idle");},
+    }),config,logger,()=>undefined);
+    await (supervisor as unknown as {reconcileAmbiguousScheduledJob(job:JobRow):Promise<boolean>})
+      .reconcileAmbiguousScheduledJob(database.getJob(job.job_id)!);
+    assert.equal(gets,1);
+    assert.equal(cancels,0);
+    assert.equal(database.getJob(job.job_id)?.last_error_code,"invalid_result_agent_stop_unknown");
+    database.close();
+  });
+
+  test("accepts a valid Result after an unknown invalid Result stop is confirmed", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-invalid-result-stop-recovered");
+    markRunning(database,job.job_id);
+    database.markJobNeedsReview(job.job_id,"invalid_result","invalid Result");
+    database.recordInvalidResultAgentStopFailure(job.job_id,"cancel acceptance unknown");
+    await fs.mkdir(path.dirname(job.result_path), { recursive: true });
+    await fs.writeFile(job.result_path,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()}));
+    let gets=0;
+    const supervisor=new JobSupervisor(database,fakeRuntime({async get(){return gets++===0?ok("idle"):failed("agent_not_found");},async closeAgent(){return ok("done");}}),config,logger,()=>undefined);
+    await (supervisor as unknown as {reconcileAmbiguousScheduledJob(job:JobRow):Promise<boolean>})
+      .reconcileAmbiguousScheduledJob(database.getJob(job.job_id)!);
+    assert.equal(database.getJob(job.job_id)?.status,"completed");
+    database.close();
+  });
+
+  test("routes a newly invalid Result directly to the agent stop fence", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-invalid-result-stop-now");
+    markRunning(database,job.job_id);
+    database.markJobNeedsReview(job.job_id,"invalid_result","invalid Result");
+    let cancels=0,gets=0;
+    const supervisor=new JobSupervisor(database,fakeRuntime({
+      async cancel(){cancels+=1;return ok("idle");},
+      async get(){return gets++===0?ok("idle"):failed("agent_not_found");},
+      async closeAgent(){return ok("done");},
+    }),config,logger,()=>undefined);
+    await (supervisor as unknown as {reconcileAmbiguousScheduledJob(job:JobRow):Promise<boolean>})
+      .reconcileAmbiguousScheduledJob(database.getJob(job.job_id)!);
+    assert.equal(cancels,1);
+    assert.equal(database.getJob(job.job_id)?.last_error_code,"invalid_result_agent_stopped");
+    database.close();
+  });
+
+  test("recovers a valid Result written while an invalid Result agent stops normally", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-invalid-result-stop-valid");
+    markRunning(database,job.job_id);
+    database.markJobNeedsReview(job.job_id,"invalid_result","invalid Result");
+    await fs.mkdir(path.dirname(job.result_path), { recursive: true });
+    await fs.writeFile(job.result_path,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()}));
+    let gets=0;
+    const supervisor=new JobSupervisor(database,fakeRuntime({async cancel(){return ok("working");},async get(){return gets++===0?ok("idle"):failed("agent_not_found");},async closeAgent(){return ok("done");}}),config,logger,()=>undefined);
+    await (supervisor as unknown as {stopInvalidResultAgent(job:JobRow):Promise<void>}).stopInvalidResultAgent(database.getJob(job.job_id)!);
+    assert.equal(database.getJob(job.job_id)?.status,"completed");
+    database.close();
+  });
+
   test("preserves a worker-reported failure and emits a job_failed notification", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
     const job = createScratchJob(database, config, "Ev-reported-failure");
     markRunning(database, job.job_id);
-    await fs.mkdir(config.jobResultsDir, { recursive: true });
+    await fs.mkdir(path.dirname(job.result_path), { recursive: true });
     await fs.writeFile(job.result_path, JSON.stringify({
       schema_version: 1,
       job_id: job.job_id,
@@ -1580,8 +1856,26 @@ describe("JobSupervisor", () => {
     );
     const updated = database.getJob(job.job_id)!;
     assert.equal(updated.status, "needs_review");
-    assert.equal(updated.last_error_code, "timeout");
+    assert.equal(updated.last_error_code, "cancel_acceptance_unknown");
     assert.equal(cancelCount, 1);
+    database.close();
+  });
+
+  test("keeps the supervisor loop alive when one cancellation needs notification reconciliation", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-reconcile-warning");
+    markRunning(database,job.job_id);
+    database.markJobNeedsReview(job.job_id,"cancel_acceptance_unknown","取消応答不明");
+    let listed=false,warned=false;
+    (database as unknown as {listAmbiguousScheduledJobs():JobRow[]}).listAmbiguousScheduledJobs=()=>listed?[]:(listed=true,[database.getJob(job.job_id)!]);
+    (database as unknown as {settleAmbiguousCancellation():void}).settleAmbiguousCancellation=()=>{throw new Error("prior_notification_requires_reconciliation");};
+    const testLogger:Logger={debug(){},info(){},warn(message){if(message==="Scheduled job reconciliation requires review") warned=true;},error(){}};
+    const supervisor=new JobSupervisor(database,fakeRuntime({async get(){return ok("idle");}}),config,testLogger,()=>undefined);
+    supervisor.start();
+    await waitFor(()=>warned);
+    assert.equal(supervisor.isRunning(),true);
+    await supervisor.stop();
     database.close();
   });
 
@@ -1620,6 +1914,233 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("legacy shared-grant agentはctrl+c後にcloseしてから停止済みにする",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath),job=createScratchJob(database,config,"Ev-legacy-close");
+    let marked=false; const calls:string[]=[];
+    (database as unknown as {listLegacySharedGrantJobs():JobRow[]}).listLegacySharedGrantJobs=()=>[job];
+    (database as unknown as {markLegacySharedGrantAgentStopped(jobId:string):void}).markLegacySharedGrantAgentStopped=id=>{assert.equal(id,job.job_id);marked=true;};
+    const runtime=fakeRuntime({async cancel(){calls.push("cancel");return ok("idle");},async closeAgent(){calls.push("close");return ok("done");},async get(){calls.push("get");return failed("agent_not_found");}});
+    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined);
+    await (supervisor as unknown as {stopLegacySharedGrantAgents():Promise<void>}).stopLegacySharedGrantAgents();
+    assert.deepEqual(calls,["cancel","close","get"]); assert.equal(marked,true);
+    database.close();
+  });
+  test("terminal jobのidle観測だけでは停止証拠を作らない",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-terminal-stop-proof");
+    const raw=new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='completed',last_error_code='terminal_steer_worker_unverified' WHERE job_id=?")
+      .run(job.job_id);
+    raw.close();
+    let reads=0;
+    const runtime=fakeRuntime({async get(){reads+=1;return ok("idle");}});
+    const supervisor=new JobSupervisor(database,runtime,{...config,queuePollMs:5},logger,()=>undefined);
+    supervisor.start();
+    await waitFor(()=>database.getJob(job.job_id)?.completion_event_id!==null);
+    assert.equal(database.getJob(job.job_id)?.last_error_code,"terminal_steer_worker_unverified");
+    assert.equal(database.updateSafetyStatus().active_worker_count,1);
+    assert.equal(reads,0);
+    await supervisor.stop();database.close();
+  });
+  test("legacy terminal accepted steer stays unsafe after name-based absence", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-legacy-terminal-accepted-steer");
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='completed',steer_state='accepted' WHERE job_id=?").run(job.job_id);
+    raw.close();
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    const supervisor = new JobSupervisor(database, fakeRuntime({ async get() { return failed("agent_not_found"); } }),
+      { ...config, queuePollMs: 5 }, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.completion_event_id !== null);
+    assert.equal(database.getJob(job.job_id)?.steer_state, "accepted");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    await supervisor.stop(); database.close();
+  });
+  test("normal terminal worker remains in drain gate after name-based absence", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-normal-terminal-stop-proof");
+    markRunning(database, job.job_id);
+    database.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id,
+      status: "completed", summary: "完了", completed_at: new Date().toISOString() }, job.result_path);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    const supervisor = new JobSupervisor(database, fakeRuntime({ async get() { return failed("agent_not_found"); } }),
+      { ...config, queuePollMs: 5 }, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.completion_event_id !== null);
+    const raw = new Database(config.databasePath);
+    assert.equal(raw.prepare("SELECT stopped_at FROM job_terminal_worker_stop_proofs WHERE job_id=?").get(job.job_id), undefined);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    raw.close();
+    await supervisor.stop(); database.close();
+  });
+  test("terminal cleanup sends once to the persisted job agent and observes list disappearance", async () => {
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-terminal-cleanup-stopped");
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id,"w1","w1:p1","session-1");
+    database.beginJobDispatch(job.job_id); database.markJobRunning(job.job_id);
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},job.result_path);
+    const identity=JSON.stringify(["w1","w1:p1",job.agent_name,"session-1"]);
+    let stopped=false, sends=0;
+    const supervisor=new JobSupervisor(database,fakeRuntime({
+      async get(){return stopped?failed("agent_not_found"):{...ok("done"),agentIdentity:identity};},
+      async cancel(name){assert.equal(name,job.agent_name);sends++;stopped=true;return ok("done");},
+      async listAgents(){return {...ok("done"),stdout:JSON.stringify({result:{type:"agent_list",agents:[]}})};},
+    }),{...config,queuePollMs:5},logger,()=>undefined);
+    supervisor.start();
+    const raw=new Database(config.databasePath);
+    await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="stopped");
+    assert.equal(sends,1);
+    await supervisor.stop(); raw.close(); database.close();
+  });
+
+  test("terminal cleanup sends by job name without a saved session or matching pane identity", async () => {
+    for(const caseName of ["missing","reused"]) {
+      const {root,config}=await tempConfig(); roots.push(root);
+      const database=new DispatcherDatabase(config.databasePath);
+      const job=createScratchJob(database,config,`Ev-terminal-cleanup-${caseName}`);
+      database.beginJobPreparation(job.job_id);
+      database.setJobRuntime(job.job_id,"w1","w1:p1",caseName==="missing"?undefined:"session-1");
+      database.beginJobDispatch(job.job_id);database.markJobRunning(job.job_id);
+      database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},job.result_path);
+      let sends=0;
+      const supervisor=new JobSupervisor(database,fakeRuntime({
+        async get(){return sends?failed("agent_not_found"):{...ok("done"),agentIdentity:JSON.stringify(["other","other:pane",job.agent_name,"replacement"])};},
+        async cancel(name){assert.equal(name,job.job_id);sends++;return ok("done");},
+        async listAgents(){return {...ok("done"),stdout:JSON.stringify({result:{type:"agent_list",agents:[]}})};},
+      }),{...config,queuePollMs:5},logger,()=>undefined);
+      supervisor.start(); const raw=new Database(config.databasePath);
+      await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="stopped");
+      assert.equal(sends,1);await supervisor.stop();raw.close();database.close();
+    }
+  });
+  test("terminal cleanup reconciles an interrupted claim without resending", async () => {
+    const {root,config}=await tempConfig();roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-terminal-cleanup-restart");
+    database.beginJobPreparation(job.job_id);database.setJobRuntime(job.job_id,"w1","w1:p1","session-1");
+    database.beginJobDispatch(job.job_id);database.markJobRunning(job.job_id);
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},job.result_path);
+    assert.equal(database.claimTerminalWorkerCleanup(job.job_id,job.agent_name),true);
+    database.close();
+    const reopened=new DispatcherDatabase(config.databasePath);
+    let sends=0;
+    const supervisor=new JobSupervisor(reopened,fakeRuntime({
+      async get(){return failed("agent_not_found");},
+      async cancel(){sends++;return ok("done");},
+      async listAgents(){return {...ok("done"),stdout:JSON.stringify({result:{type:"agent_list",agents:[]}})};},
+    }),{...config,queuePollMs:5},logger,()=>undefined);
+    supervisor.start();const raw=new Database(config.databasePath);
+    await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="stopped");
+    assert.equal(sends,0);await supervisor.stop();raw.close();reopened.close();
+  });
+  test("terminal cleanup records an ambiguous send timeout once", async () => {
+    const {root,config}=await tempConfig();roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-terminal-cleanup-timeout");
+    database.beginJobPreparation(job.job_id);database.setJobRuntime(job.job_id,"w1","w1:p1","session-1");
+    database.beginJobDispatch(job.job_id);database.markJobRunning(job.job_id);
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},job.result_path);
+    const identity=JSON.stringify(["w1","w1:p1",job.agent_name,"session-1"]);
+    let sends=0;
+    const supervisor=new JobSupervisor(database,fakeRuntime({
+      async get(){return {...ok("done"),agentIdentity:identity};},
+      async cancel(){sends++;return failed("timeout",true);},
+      async listAgents(){return {...ok("done"),stdout:JSON.stringify({result:{type:"agent_list",agents:[{name:job.agent_name,pane_id:"w1:p1"}]}})};},
+    }),{...config,queuePollMs:5,jobCommandTimeoutMs:60},logger,()=>undefined);
+    supervisor.start();const raw=new Database(config.databasePath);
+    await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="unknown");
+    await new Promise(resolve=>setTimeout(resolve,30));
+    assert.equal(sends,1);await supervisor.stop();raw.close();database.close();
+  });
+  test("terminal cleanup retries a transient pre-send observation failure", async () => {
+    const {root,config}=await tempConfig();roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-terminal-cleanup-read-timeout");
+    database.beginJobPreparation(job.job_id);database.setJobRuntime(job.job_id,"w1","w1:p1","session-1");
+    database.beginJobDispatch(job.job_id);database.markJobRunning(job.job_id);
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},job.result_path);
+    const identity=JSON.stringify(["w1","w1:p1",job.agent_name,"session-1"]);
+    let transient=true,sends=0;
+    const supervisor=new JobSupervisor(database,fakeRuntime({
+      async get(){return transient?failed("timeout",true):sends?failed("agent_not_found"):{...ok("idle"),agentIdentity:identity};},
+      async cancel(){sends++;return ok("idle");},
+      async listAgents(){return {...ok("idle"),stdout:JSON.stringify({result:{type:"agent_list",agents:[]}})};},
+    }),{...config,queuePollMs:5},logger,()=>undefined);
+    supervisor.start();const raw=new Database(config.databasePath);
+    await new Promise(resolve=>setTimeout(resolve,30));
+    assert.equal((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome,"pending");
+    assert.equal(sends,0);
+    transient=false;
+    await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="stopped");
+    assert.equal(sends,1);await supervisor.stop();raw.close();database.close();
+  });
+  test("terminal cleanup observation does not delay notification publishing", async () => {
+    const {root,config}=await tempConfig();roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-terminal-cleanup-nonblocking");
+    database.beginJobPreparation(job.job_id);database.setJobRuntime(job.job_id,"w1","w1:p1","session-1");
+    database.beginJobDispatch(job.job_id);database.markJobRunning(job.job_id);
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},job.result_path);
+    const identity=JSON.stringify(["w1","w1:p1",job.agent_name,"session-1"]);
+    let releaseRead:((result:HerdrCommandResult)=>void)|undefined,reads=0,sends=0;
+    const blockedRead=new Promise<HerdrCommandResult>(resolve=>{releaseRead=resolve;});
+    const supervisor=new JobSupervisor(database,fakeRuntime({
+      async get(){reads++;return reads===1?blockedRead:sends?failed("agent_not_found"):{...ok("idle"),agentIdentity:identity};},
+      async cancel(){sends++;return ok("idle");},
+      async listAgents(){return {...ok("idle"),stdout:JSON.stringify({result:{type:"agent_list",agents:[]}})};},
+    }),{...config,queuePollMs:5},logger,()=>undefined);
+    supervisor.start();
+    await waitFor(()=>typeof database.getJob(job.job_id)?.completion_event_id==="string");
+    assert.equal(sends,0);
+    releaseRead!({...ok("idle"),agentIdentity:identity});
+    await waitFor(()=>sends===1);
+    await supervisor.stop();database.close();
+  });
+  test("terminal cleanup waits for the same worker to become idle", async () => {
+    const {root,config}=await tempConfig();roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-terminal-cleanup-working");
+    database.beginJobPreparation(job.job_id);database.setJobRuntime(job.job_id,"w1","w1:p1","session-1");
+    database.beginJobDispatch(job.job_id);database.markJobRunning(job.job_id);
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},job.result_path);
+    const identity=JSON.stringify(["w1","w1:p1",job.agent_name,"session-1"]);
+    let state:"working"|"idle"="working",sends=0;
+    const supervisor=new JobSupervisor(database,fakeRuntime({
+      async get(){return sends?failed("agent_not_found"):{...ok(state),agentIdentity:identity};},
+      async cancel(name){assert.equal(name,job.agent_name);sends++;return ok("idle");},
+      async listAgents(){return {...ok("idle"),stdout:JSON.stringify({result:{type:"agent_list",agents:[]}})};},
+    }),{...config,queuePollMs:5},logger,()=>undefined);
+    supervisor.start();const raw=new Database(config.databasePath);
+    await new Promise(resolve=>setTimeout(resolve,30));
+    assert.equal(sends,0);
+    assert.equal((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome,"pending");
+    state="idle";
+    await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="stopped");
+    assert.equal(sends,1);await supervisor.stop();raw.close();database.close();
+  });
+  test("terminal cleanup excludes an in-flight steer from claim", async () => {
+    const {root,config}=await tempConfig();roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-terminal-cleanup-steer");
+    database.beginJobPreparation(job.job_id);database.setJobRuntime(job.job_id,"w1","w1:p1","session-1");
+    database.beginJobDispatch(job.job_id);database.markJobRunning(job.job_id);
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},job.result_path);
+    const raw=new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET steer_state='dispatching' WHERE job_id=?").run(job.job_id);
+    assert.equal(database.listTerminalWorkerCleanupCandidates().length,0);
+    assert.equal(database.claimTerminalWorkerCleanup(job.job_id,"identity"),false);
+    raw.prepare("UPDATE jobs SET steer_state=NULL WHERE job_id=?").run(job.job_id);
+    assert.equal(database.listTerminalWorkerCleanupCandidates().length,1);
+    assert.equal(database.claimTerminalWorkerCleanup(job.job_id,"different-agent"),false);
+    raw.close();database.close();
+  });
   test("discovers cleanup candidates from progress directories instead of cancelled history", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -1686,6 +2207,7 @@ describe("JobSupervisor", () => {
     let maximum = 0;
     const runtime = fakeRuntime({
       async cancel() { return ok("idle"); },
+      async get() { return ok("idle"); },
       async wait(_agentName, signal) {
         concurrent += 1;
         maximum = Math.max(maximum, concurrent);
@@ -1755,4 +2277,70 @@ describe("JobSupervisor", () => {
     const supervisor=new JobSupervisor(database,runtime,{...config,queuePollMs:5},logger,()=>undefined,progress as never); supervisor.start();
     await waitFor(()=>disabled); await supervisor.stop(); assert.equal(reports,1); database.close();
   });
+});
+
+for (const valid of [true, false]) test(`legacy timestamp producer to DB: ${valid}`, async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  const database = new DispatcherDatabase(config.databasePath);
+  const job = createScratchJob(database, config, `Ev-timestamp-${valid}`);
+  markRunning(database, job.job_id);
+  await fs.mkdir(path.dirname(job.result_path), { recursive: true });
+  const tmp = `${job.result_path}.tmp`;
+  // Python's UTC producer keeps its six-digit precision; only its known UTC suffix changes.
+  const pythonUtc = "2026-09-26T05:27:59.719371+00:00";
+  const timestamp = valid ? pythonUtc.replace("+00:00", "Z") : pythonUtc;
+  const candidate = { schema_version: 1, job_id: job.job_id, status: "completed", summary: "fixture", completed_at: timestamp };
+  const validate = () => spawnSync(process.execPath, ["--import", "tsx", fileURLToPath(new URL("../src/job-result-validate.ts", import.meta.url)), tmp, job.job_id], { encoding: "utf8" });
+  await fs.writeFile(tmp, "{malformed private fixture");
+  assert.equal(validate().status, 1);
+  assert.equal(existsSync(job.result_path), false);
+  await fs.writeFile(tmp, JSON.stringify(candidate), { mode: 0o600 });
+  const checked = validate();
+  assert.equal(checked.status, valid ? 0 : 1);
+  if (valid) {
+    await fs.rename(tmp, job.result_path);
+    assert.equal((await readJobResultEnvelope(job.result_path, job.job_id)).completed_at, timestamp);
+  } else {
+    assert.match(checked.stderr, /completed_at.*trailing Z/);
+    assert.equal(checked.stderr.includes(timestamp), false);
+    assert.equal(existsSync(job.result_path), false);
+    // Simulate an already published legacy invalid final, bypassing prevalidation.
+    await fs.copyFile(tmp, job.result_path);
+    const original = await fs.readFile(job.result_path);
+    await fs.writeFile(tmp, JSON.stringify({ ...candidate, completed_at: "private secret https://private.invalid" }));
+    const rejected = validate();
+    assert.equal(rejected.status, 1);
+    assert.equal(rejected.stderr.includes("private"), false);
+    assert.deepEqual(await fs.readFile(job.result_path), original);
+  }
+  const supervisor = new JobSupervisor(database, fakeRuntime({}), config, logger, () => undefined);
+  try {
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.completion_event_id !== null);
+    await supervisor.stop();
+    const stored = database.getJob(job.job_id)!;
+    assert.equal(stored.status, valid ? "completed" : "needs_review");
+    if (valid) assert.equal(JSON.parse(stored.result_json!).completed_at, timestamp);
+    else {
+      assert.equal(stored.result_json, null);
+      assert.equal(stored.completed_at, null);
+      assert.equal(stored.last_error_code, "invalid_result");
+      assert.match(stored.last_error_message!, /completed_at.*trailing Z/);
+    }
+    // fakeRuntime throws on prepare/prompt/wait: ingestion cannot replay worker side effects.
+  } finally { await supervisor.stop(); database.close(); }
+});
+
+test("native質問待ちの同じAttemptではprogress directoryを保持する",async()=>{
+ const {root,config}=await tempConfig();roots.push(root);const database=new DispatcherDatabase(config.databasePath);
+ const job=createScratchJob(database,config,"question-progress");markRunning(database,job.job_id);
+ const directory=path.dirname(jobProgressPath(job));await fs.mkdir(directory,{recursive:true});
+ const runtime=fakeRuntime({async wait(){return {...ok("blocked"),errorCode:"runtime_question_pending"};}});
+ const supervisor=new JobSupervisor(database,runtime,config,logger,()=>{});supervisor.start();
+ try{
+  await waitFor(()=>database.getJob(job.job_id)?.status==="blocked");
+  await new Promise(resolve=>setTimeout(resolve,30));
+  await fs.writeFile(path.join(directory,"progress.json.tmp"),"after answer");await fs.rename(path.join(directory,"progress.json.tmp"),path.join(directory,"progress.json"));
+  assert.equal(await fs.readFile(path.join(directory,"progress.json"),"utf8"),"after answer");
+ }finally{await supervisor.stop();database.close();}
 });

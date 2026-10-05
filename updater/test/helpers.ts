@@ -36,16 +36,19 @@ export async function tempPolicy(): Promise<{ root: string; policy: UpdatePolicy
       launchd: { dispatcher_label: "dev.dona.dispatcher", slack_label: "dev.dona.slack-adapter" },
       executables: {
         git: "/usr/bin/git", npm: "/usr/bin/npm", node: "/usr/bin/node", launchctl: "/bin/launchctl",
-        gh: "/usr/bin/gh", herdr: "/usr/bin/herdr",
+        gh: "/usr/bin/gh", herdr: "/usr/bin/herdr", codex: "/usr/bin/codex",
       },
       timeouts: {
         command_ms: 5_000, health_ms: 100, drain_ms: 100, agent_drain_ms: 100,
         agent_exit_ms: 100, agent_start_ms: 100, reconcile_ms: 2_000, lease_ms: 1_000,
       },
       output_limit_bytes: 64 * 1024,
+      diagnostic_log_limit_bytes: 256 * 1024,
+      diagnostic_aggregate_limit_bytes: 2 * 1024 * 1024,
+      diagnostic_retention_days: 14,
       disk_floor_bytes: 0,
       retain_successful: 2,
-      required_checks: ["Verify dispatcher", "Verify sources/slack", "Verify updater"],
+      required_checks: ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS"],
       require_verified_signature: false,
       compatibility: {
         protocol: 1,
