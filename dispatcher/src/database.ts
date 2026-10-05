@@ -1,4 +1,6 @@
 import {archiveRuntimeBinding, installRuntimeBindingArchive, type JobRuntimeBinding} from "./runtime-binding-archive.js";
+import { OperatorAuthRegistry } from "./dashboard/operator-auth.js";
+import { OperatorWebAuthn } from "./dashboard/operator-webauthn.js";
 import { TaskRepository, taskMayAcceptLateResult } from "./task-execution.js";
 import { jobSnapshot, workspaceJobId, handoffKey, type HandoffRecord, type WorkerObservation } from "./job-handoff.js";
 import { createHash, randomUUID, randomBytes } from "node:crypto";
@@ -1048,6 +1050,8 @@ export class DispatcherDatabase {
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
   readonly tasks: TaskRepository;
+  readonly operatorAuth: OperatorAuthRegistry;
+  operatorWebAuthn: OperatorWebAuthn | undefined;
   readonly localDashboard: LocalDashboardCommands;
   private readonly schemaWrite: 2 | 3;
   private webJobProjectionReady = false;
@@ -1185,12 +1189,18 @@ export class DispatcherDatabase {
       } catch(error) { return (error as NodeJS.ErrnoException).code==="ENOENT"; }
     });
     this.tasks = new TaskRepository(this.db, this);
+    this.operatorAuth = new OperatorAuthRegistry(this.db);
     installRuntimeBindingArchive(this.db);
     this.localDashboard = new LocalDashboardCommands(this.db,this,this.jobAdmissionLimits.jobsPerEventMax);
   }
 
   close(): void {
     this.db.close();
+  }
+
+  configureOperatorOrigin(origin:string):void {
+    this.operatorWebAuthn=new OperatorWebAuthn(this.db,this.operatorAuth,origin);
+    this.operatorAuth.resetSessions();
   }
 
   assertReadableWritable(): void {

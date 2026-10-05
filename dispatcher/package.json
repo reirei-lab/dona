@@ -21,6 +21,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "@simplewebauthn/server": "14.0.3",
     "better-sqlite3": "^12.11.1",
     "dotenv": "^17.2.2",
     "moment-timezone": "0.5.48",

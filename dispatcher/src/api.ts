@@ -1,4 +1,6 @@
 import { taskRequestSchema, taskIdSchema } from "./task-execution.js";
+import { operatorRequest } from "./dashboard/operator-api.js";
+import { OperatorAuthError } from "./dashboard/operator-auth.js";
 import { githubQuery, verifyTaskIssue } from "./task-github.js";
 import fs from "node:fs/promises";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
@@ -236,6 +238,12 @@ export class DispatcherApi {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
+      if(url.pathname.startsWith("/v1/dashboard/")) {
+        if(this.shuttingDown)throw new ApiRequestError(503,"shutting_down","Dispatcher is shutting down");
+        if(request.method!=="POST"||url.search)throw new ApiRequestError(400,"invalid_request","Invalid dashboard request");
+        const result=await operatorRequest(this.database,url.pathname.slice("/v1/dashboard/".length),await this.readJson(request));
+        sendJson(response,200,result);return;
+      }
       if (request.method === "GET" && url.pathname === "/health/live") {
         sendJson(response, 200, { schema_version: 1, status: "live" });
         return;
@@ -515,7 +523,9 @@ export class DispatcherApi {
         duplicate: result.duplicate,
       });
     } catch (error) {
-      if (error instanceof BodyTooLargeError) {
+      if(error instanceof OperatorAuthError) {
+        sendJson(response,error.code==="denied"?403:error.code==="limit"?429:error.code==="conflict"?409:400,{error:`operator_auth_${error.code}`});
+      } else if (error instanceof BodyTooLargeError) {
         sendJson(response, 413, errorBody("request_too_large", "Request body exceeds the configured limit"));
       } else if (error instanceof RequestValidationError) {
         sendJson(response, 400, errorBody("invalid_request", error.message));
