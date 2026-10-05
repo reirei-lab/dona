@@ -51,7 +51,11 @@ test("会話取得中の失効・Attempt変更は古い本文を返さず、切�
     const content: ConversationContent = {name:db.getJob(task.current_attempt_id)!.agent_name,generation:"g1",role:"worker",thread_id:"thread",attempt_id:task.current_attempt_id,connected:true,observed_at:new Date().toISOString(),state:"working",items:[],events:[],cursor:1,oldest_sequence:1,gap:false,truncated:false};
     let action = () => {};
     const observer = new DashboardObserver(reader,{async conversations(){return {items:[content],next:null};},async conversation(){action();return content;}});
-    assert.equal((await observer.detail(task.task_id,()=>authority))!.runtime.status,"observed");
+    (content as unknown as Record<string,unknown>).raw_tool_arguments="private tool input";
+    content.items=[{id:"item",turn_id:"turn",kind:"tool_progress",text:"private tool output",status:"completed"}];
+    const initial=await observer.detail(task.task_id,()=>authority);
+    assert.equal(initial!.runtime.status,"observed");
+    assert.equal(JSON.stringify(initial).includes("private tool"),false);
     action=()=>{authority=null;};
     assert.equal(await observer.detail(task.task_id,()=>authority),null);
     authority={revision:"2",task:()=>true,conversation:()=>true};
