@@ -113,6 +113,17 @@ test("main要求はpending受付で解放しterminalを新しい固定threadイ�
  await ingress.tick();assert.equal(f.counts().sends,1);
  const notification=dispatcher.getByExternalId("dona_approval",`external:${requestId}:terminal`);assert.ok(notification);assert.deepEqual(JSON.parse(notification.reply_target_json!),{kind:"slack_thread",workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts});assert.equal(JSON.parse(notification.payload_json).state,"succeeded");
  await ingress.tick();assert.equal(f.counts().sends,1);assert.equal(results.length,1);
+ // 実DispatcherWorkerを通してmain promptとEvent Resultまで処理する。
+ const {DispatcherWorker}=await import("../src/worker.js"),{tempConfig,waitFor}=await import("./helpers.js"),fs=await import("node:fs/promises");
+ const temporary=await tempConfig();t.after(()=>fs.rm(temporary.root,{recursive:true,force:true}));await fs.mkdir(temporary.config.resultsDir,{recursive:true});
+ let prompts=0;const ok=(agentStatus:"idle"|"done")=>({ok:true,stdout:"",stderr:"",exitCode:0,timedOut:false,aborted:false,agentStatus});
+ const worker=new DispatcherWorker(dispatcher,{get:async()=>ok("idle"),wait:async()=>ok("done"),prompt:async(prompt)=>{
+  prompts++;assert.ok(prompt.includes('"source":"dona_approval"'));assert.ok(prompt.includes(requestId));assert.ok(prompt.includes("同じ本文を再投稿しない"));assert.ok(!prompt.includes(intent.text));
+  const resultPath=/^result_path: (.+)$/m.exec(prompt)![1]!;
+  await fs.writeFile(resultPath,JSON.stringify({schema_version:1,event_id:notification.event_id,status:"completed",summary:"外部承認の結果を確認",actions:[],memory_candidates:[],completed_at:new Date().toISOString()}));return ok("done");
+ }},temporary.config,{debug(){},info(){},warn(){},error(){}});
+ worker.start();try{await waitFor(()=>dispatcher.get(notification.event_id)?.status==="completed");assert.equal(prompts,1);}finally{await worker.stop();}
+
  f.setSourceAuthorizer(()=>false);
  assert.equal(f.service.status(actor,requestId).execution?.state,"succeeded");
  assert.ok(f.service.list(actor).items.some(item=>item.request_id===requestId));

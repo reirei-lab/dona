@@ -1,5 +1,17 @@
+import {z} from "zod";
 import type { EventEnvelope } from "./types.js";
 import { stableStringify } from "./validation.js";
+
+const approvalId=z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
+const approvalCoordinates={workspace_id:approvalId,channel_id:approvalId,thread_ts:z.string().regex(/^[0-9]+\.[0-9]+$/)};
+const approvalTerminalEnvelope=z.strictObject({schema_version:z.literal(1),source:z.literal("dona_approval"),
+ external_event_id:z.string().max(160),type:z.literal("external_approval_finished"),occurred_at:z.iso.datetime(),
+ subject:z.strictObject({...approvalCoordinates,actor_id:approvalId}),
+ payload:z.strictObject({request_id:approvalId,source_event_id:z.string().regex(/^evt_[0-9a-hjkmnp-tv-z]{26}$/i),
+ state:z.enum(["succeeded","failed","cancelled","rejected","expired","execution_cancelled","consume_expired","delivery_failed","needs_review"])}),
+ reply_target:z.strictObject({kind:z.literal("slack_thread"),...approvalCoordinates})
+}).refine(e=>e.external_event_id===`external:${e.payload.request_id}:terminal`&&
+ e.subject.workspace_id===e.reply_target.workspace_id&&e.subject.channel_id===e.reply_target.channel_id&&e.subject.thread_ts===e.reply_target.thread_ts);
 
 export function envelopeFromRow(row: {
   schema_version: number;
@@ -12,7 +24,7 @@ export function envelopeFromRow(row: {
   reply_target_json: string | null;
   trace_json: string | null;
 }): EventEnvelope {
-  if (row.source !== "slack" && row.source !== "dona_job" && row.source !== "dona_update" && row.source !== "dona_schedule" && !(row.source === "web" && ["worker_question","worker_question_reply"].includes(row.event_type))) {
+  if (row.source !== "dona_approval" && row.source !== "slack" && row.source !== "dona_job" && row.source !== "dona_update" && row.source !== "dona_schedule" && !(row.source === "web" && ["worker_question","worker_question_reply"].includes(row.event_type))) {
     throw new Error(`Unsupported event source: ${row.source}`);
   }
   const envelope: EventEnvelope = {
@@ -29,6 +41,10 @@ export function envelopeFromRow(row: {
         : (JSON.parse(row.reply_target_json) as Record<string, unknown>),
   };
   if (row.trace_json !== null) envelope.trace = JSON.parse(row.trace_json) as Record<string, unknown>;
+  if(row.source === "dona_approval") {
+    if(row.schema_version!==1)throw Error("unsupported_approval_event_version");
+    return approvalTerminalEnvelope.parse(envelope);
+  }
   return envelope;
 }
 

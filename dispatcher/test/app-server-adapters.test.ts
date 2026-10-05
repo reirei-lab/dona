@@ -204,3 +204,14 @@ test("旧Web Jobを通常Codex runtimeへ渡してもworkspace・agentを作ら�
  assert.equal(db.getJob(job.job_id)?.status,"blocked");assert.equal(db.getJob(job.job_id)?.last_error_code,"runtime_profile_unavailable");
  await assert.rejects(fs.stat(job.workspace_path),{code:"ENOENT"});assert.equal(calls,0);
 });
+
+test('通常workerの管理下Slack/Dispatcher MCPを明示無効化しtyped要求だけを使わせる',async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath),runtime=new AppServerJobRuntime(config);
+ try{
+  config.jobCommandTimeoutMs=5000;config.codexPath=path.join(root,'codex-fixture');
+  await fs.writeFile(config.codexPath,"#!/bin/sh\nprintf '%s' '[{\"name\":\"dona_slack\"},{\"name\":\"dona_dispatcher\"},{\"name\":\"development_tool\"}]'\n",{mode:0o700});
+  const event=db.enqueue(eventEnvelope('managed-worker-mcp')).row,job=db.createJob({source_event_id:event.event_id,objective:'test',workspace:{kind:'scratch'}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+  let calls=0;runtime.client.start=async input=>{calls++;assert.equal(input.role,'worker');assert.equal(input.attemptId,job.job_id);assert.ok(input.args.includes('mcp_servers.dona_slack.enabled=false'));assert.ok(input.args.includes('mcp_servers.dona_dispatcher.enabled=false'));assert.ok(!input.args.includes('mcp_servers.development_tool.enabled=false'));return {name:input.name,generation:'g',thread_id:'t',state:'idle'} as AgentRecord;};
+  await runtime.prepare(job);assert.equal(calls,1);
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});

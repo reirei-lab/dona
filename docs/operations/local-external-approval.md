@@ -104,3 +104,10 @@ PR #362の専用DB前提をそのまま緩めず、personal版では固定allowl
 candidateは常に `metadata_only_never_activate` である。`NativeLocalApprovalConnection` はbackup manifestのあるDBを拒否する。restoreはcandidateの署名済みanchor/clockと一致する現metadataを同じallowlist経路で新規destinationへ再構成する。candidate自体のraw copyやlive DB置換、保護head/key/used-nodeの巻戻しは行わない。古いbackup、scope/key/config/clock不一致、payload混入、sidecar付き候補、完全検証できないartifactはneeds_reviewとする。`continuity_verified` / `restored_metadata_only` は監査用metadataが一致した意味であり、過去pendingの復元・稼働再開ではない。
 
 復旧が必要な事故ではまず受付をsafe-offにし、保護head/監査/known accepted/unknownを読み取り照合する。本体DB喪失時にmetadata backupだけで旧pendingを復活させる経路はない。履歴の調査・保全後、別途承認された新世代または正規のDB復旧計画を作る。SQLite backupだけで失われたKeychainや使用済みIDの正本を再生成しない。
+
+
+## managed経路と自由文の境界
+
+workerのDona管理下MCPは `dona_slack` / `dona_dispatcher` を無効化し、外部投稿要求はhostが実Attempt/turnへ束縛したtyped toolで受ける。承認結果イベントにはrequest IDと状態だけを渡し、exact draftをmainへ転送しない。
+
+一般のworker Result・質問の自由文をmainが要約する場合、その意味が承認回避の代理投稿かを機械的に判別する保証はない。現在の代理投稿禁止は運用指示であり、文面heuristicによる強制や、全managed経路のprovenance強制を実装済みとは扱わない。mainの通常返信・結果通知を維持し、この残境界を理由に #20 / #21 を完了扱いしない。同一OS利用者が別途設定したclient/credentialの完全隔離も保証しない。
