@@ -12,6 +12,7 @@ stable updater -> immutable release -> ordered restart -> dona_update completion
 
 - [`dispatcher/`](./dispatcher/README.md): 永続キュー、`dona-main`への直列投入、バックグラウンドJob supervisor、別プロセスのstdio MCP
 - [`sources/slack/`](./sources/slack/README.md): Socket Mode Adapterと、同じKeychain認証を使う別プロセスのstdio MCP
+- [`sources/web/`](./sources/web/README.md): 実装中のWeb認証・session保護部品。listenerと監査付きsession保存は後続で接続
 - [`updater/`](./updater/README.md): 更新対象から独立したstable controller、専用SQLite/outbox、immutable release、activation/rollback
 
 Slack AdapterはRuntime hostやSQLiteを直接操作しません。Dispatcherからエージェントへの入口は一方向です。エージェントがSlack操作を選んだ場合は、別プロセスのDona Slack MCPを使います。
@@ -44,8 +45,16 @@ Herdrからの移行とRuntime host自体の更新は、[`scripts/dona-update`](
 
 `install-self-update.sh`、`install-launchd.sh`および旧Herdrのrunbookは旧世代の導入・復旧用です。App Server世代の通常起動には使いません。routine self-updateはstable hostを残してmainとアプリのreleaseを切り替えますが、既存の保守的なworker safety判定により拒否される場合は外部更新を使います。
 
+## Web Adapterの設計
+
+[Web trust boundary ADR](./docs/adr/0002-web-trust-boundary.md)と[decision / deployment fixture](./docs/adr/fixtures/web-trust-boundary.md)に、identity・tenant・session・approvalの契約を記載しています。設計成果物であり、Web runtimeやapproval実行の有効化ではありません。
+
+[Supervisor approval ADR](./docs/adr/0001-supervisor-approval.md)と[contract fixture](./docs/adr/fixtures/supervisor-approval-contracts.md)に、承認のtrust boundary、lifecycle、UX、運用方針、release gateを記載しています。
+
 ## 全体検証
 
 ```sh
 npm run verify
 ```
+
+Web認証部品の検証は `npm --prefix sources/web ci` の後、rootの `npm run verify:web` で行う。この段階では開発launcherやrelease manifestへWeb serviceを接続せず、通常の `npm run dev` は既存serviceだけを起動する。

@@ -245,7 +245,8 @@ test("旧Result pathの再openはCASを動かさず別CLI起動で回復でき�
   } finally {recover.close();}
 });
 
-test("v2 bridgeのoperator台帳と未投稿監査記録をv3 job再構築後も保持する",async()=>{
+test("v2 bridgeのoperator台帳と未投稿監査記録をv3 job再構築後も保持する",async(t)=>{
+  t.mock.timers.enable({apis:["Date"],now:new Date("2026-10-05T00:00:00.000Z")});
   const {root,config}=await tempConfig();roots.push(root);
   const initial=new Database(config.databasePath);
   initial.exec(await fs.readFile(new URL("./fixtures/schema-v2.sql",import.meta.url),"utf8"));

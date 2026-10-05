@@ -244,6 +244,8 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /PRESTOP_NONTERMINAL_COUNT/);
   assert.match(source, /stable updaterを停止しません/);
   assert.match(source, /updater\.next" -type f -exec chmod 400/);
+  assert.ok(source.includes('"$NODE_PATH" "$FINAL_RELEASE/updater/dist/release-permissions.js" "$FINAL_RELEASE"'));
+  assert.ok(!source.includes('find "$FINAL_RELEASE" -type f -exec chmod 400'));
   assert.match(source, /SELECT COUNT\(\*\) FROM update_requests WHERE state NOT IN/);
   assert.match(source, /旧stable updaterをlaunchdへ再登録できません/);
   assert.match(source, /旧stable updaterの復旧healthを確認できません/);
@@ -492,6 +494,10 @@ test("generation target validation rejects a mismatched installed updater before
     await execute(process.execPath, [fileURLToPath(new URL("../../scripts/render-self-update-templates.mjs", import.meta.url)), rendered, sha, root, "generation"], {
       env: { ...process.env, PATH: `${testBin}:${process.env.PATH}` },
     });
+    const renderedPolicy = JSON.parse(await fs.readFile(path.join(rendered, "policy.json"), "utf8"));
+    assert.deepEqual(renderedPolicy.required_checks, [
+      "Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS", "Verify sources/web",
+    ]);
     const helper = fileURLToPath(new URL("../../scripts/validate-generation-install-target.py", import.meta.url));
     const renderedDispatcher = path.join(rendered, "dev.dona.dispatcher.plist");
     const beforeStage = await fs.readFile(renderedDispatcher);
@@ -521,4 +527,25 @@ test("generation target validation rejects a mismatched installed updater before
   } finally {
     await fs.rm(home, { recursive: true, force: true });
   }
+});
+
+test('署名hostのrenderは指定設定と既存policyを保持し固定binaryへ向ける',async()=>{
+ const home=await fs.mkdtemp(path.join(os.tmpdir(),'dona-host-render-'));
+ try{
+  const base=path.join(home,'Dona'),bin=path.join(home,'bin');await fs.mkdir(bin);
+  for(const name of ['herdr','codex'])await fs.writeFile(path.join(bin,name),'#!/bin/sh\nexit 0\n',{mode:0o700});
+  const config={team_id:'ABCDEFGHIJ',access_group:'ABCDEFGHIJ.dev.dona.approval',signing_identity_sha1:'a'.repeat(40),provisioning_profile:path.join(home,'host.provisionprofile')};
+  const file=path.join(home,'host.json');await fs.writeFile(file,JSON.stringify(config),{mode:0o600});
+  const script=fileURLToPath(new URL('../../scripts/render-self-update-templates.mjs',import.meta.url)),dest=path.join(home,'rendered');
+  await execute(process.execPath,[script,dest,'a'.repeat(40),base,'',file,'forward_only'],{env:{...process.env,PATH:`${bin}:${process.env.PATH}`}});
+  const policy=JSON.parse(await fs.readFile(path.join(dest,'policy.json'),'utf8'));assert.deepEqual(policy.signed_host,config);assert.deepEqual(policy.task_generation_update,{mode:"forward_only",schema:4,task_execution_version:1});
+  const plist=await fs.readFile(path.join(dest,'dev.dona.dispatcher.plist'),'utf8');assert.match(plist,/current\/signed-host\/DonaDispatcher.app\/Contents\/MacOS\/DonaDispatcher/);assert.doesNotMatch(plist,/current\/dispatcher\/dist\/cli.js/);
+  await fs.mkdir(policy.control_root,{recursive:true});await fs.copyFile(path.join(dest,'policy.json'),path.join(policy.control_root,'policy.json'));await fs.chmod(path.join(policy.control_root,'policy.json'),0o600);
+  const next=path.join(home,'rendered-next');await execute(process.execPath,[script,next,'b'.repeat(40),base],{env:{...process.env,PATH:`${bin}:${process.env.PATH}`}});
+  const preserved=JSON.parse(await fs.readFile(path.join(next,'policy.json'),'utf8'));assert.deepEqual(preserved.signed_host,config);assert.deepEqual(preserved.task_generation_update,policy.task_generation_update);
+ }finally{await fs.rm(home,{recursive:true,force:true});}
+});
+
+test("offline preserve control upgrade verifies the installed split data identity and retains generated bindings", async () => {
+  await execute("/usr/bin/python3", [fileURLToPath(new URL("./generation-install-fixture.py", import.meta.url))]);
 });

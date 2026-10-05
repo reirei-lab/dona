@@ -70,6 +70,9 @@ function text(value: unknown): string | null {
 }
 
 export interface PlanMaterial {
+  signed_host_digest?: string | null;
+  signed_host_transition?: string | null;
+  activation_mode?: "forward_only" | null;
   current_sha: string;
   target_sha: string;
   previous_sha: string | null;
@@ -114,9 +117,9 @@ export class UpdateDatabase {
     this.db.pragma("busy_timeout = 2000");
     this.db.pragma("foreign_keys = ON");
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 7) {
+    if (version > 10) {
       this.db.close();
-      throw new Error(`Updater database schema ${version} is newer than supported schema 7`);
+      throw new Error(`Updater database schema ${version} is newer than supported schema 10`);
     }
     if (options.readonly) this.db.pragma("query_only = ON");
     else this.migrate();
@@ -130,7 +133,7 @@ export class UpdateDatabase {
 
   private migrate(): void {
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 7) throw new Error(`Updater database schema ${version} is newer than supported schema 7`);
+    if (version > 10) throw new Error(`Updater database schema ${version} is newer than supported schema 10`);
     const migrate = (sql: string): void => {
       this.db.transaction(() => { this.db.exec(sql); })();
     };
@@ -318,6 +321,9 @@ export class UpdateDatabase {
       ALTER TABLE update_diagnostic_logs ADD COLUMN content_sha256 TEXT;
       PRAGMA user_version = 7;
     `);
+    if (version <= 7) migrate(`ALTER TABLE update_requests ADD COLUMN signed_host_digest TEXT; PRAGMA user_version = 8;`);
+    if (version <= 8) migrate(`ALTER TABLE update_requests ADD COLUMN signed_host_transition TEXT; PRAGMA user_version = 9;`);
+    if (version <= 9) migrate(`ALTER TABLE update_requests ADD COLUMN activation_mode TEXT; PRAGMA user_version = 10;`);
   }
 
   close(): void {
@@ -502,10 +508,10 @@ export class UpdateDatabase {
       const existing = this.db.prepare("SELECT * FROM update_requests WHERE source_event_id = ?")
         .get(request.source_event_id) as UpdateRow | undefined;
       if (existing) {
-        const mismatch = existing.reply_target_json !== replyTargetJson ||
+        const mismatch = (existing.activation_mode ?? null)!==(material.activation_mode ?? null) || existing.reply_target_json !== replyTargetJson ||
           existing.current_sha !== material.current_sha || existing.target_sha !== material.target_sha ||
           existing.policy_version !== material.policy_version || existing.compatibility_json !== compatibilityJson ||
-          existing.transition_json !== transitionJson;
+          existing.transition_json !== transitionJson || (existing.signed_host_digest ?? null) !== (material.signed_host_digest ?? null) || (existing.signed_host_transition ?? null) !== (material.signed_host_transition ?? null);
         if (mismatch) throw new Error("A plan for this source event already exists with different material");
         return { row: existing, plan: this.planFromRow(existing), duplicate: true };
       }
@@ -522,6 +528,9 @@ export class UpdateDatabase {
       const requestId = `upd_${ulid(at.getTime()).toLowerCase()}`;
       const planId = `plan_${ulid(at.getTime() + 1).toLowerCase()}`;
       const canonicalPlan = {
+        ...(material.activation_mode ? {activation_mode:material.activation_mode,database_policy:"preserve",automatic_rollback:false} : {}),
+        ...(material.signed_host_digest ? {signed_host_digest:material.signed_host_digest} : {}),
+        ...(material.signed_host_transition ? {signed_host_transition:material.signed_host_transition} : {}),
         schema_version: 1,
         plan_id: planId,
         policy_version: material.policy_version,
@@ -537,11 +546,11 @@ export class UpdateDatabase {
       this.db.prepare(`
         INSERT INTO update_requests (
           request_id, source_event_id, reply_target_json, state, current_sha, target_sha, previous_sha,
-          plan_id, plan_hash, policy_version, compatibility_json, transition_json, rollback_compatible, created_at, updated_at
-        ) VALUES (?, ?, ?, 'awaiting_approval', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          plan_id, plan_hash, policy_version, compatibility_json, transition_json, signed_host_digest, signed_host_transition, activation_mode, rollback_compatible, created_at, updated_at
+        ) VALUES (?, ?, ?, 'awaiting_approval', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         requestId, request.source_event_id, replyTargetJson, material.current_sha, material.target_sha,
-        material.previous_sha, planId, planHash, material.policy_version, compatibilityJson, transitionJson,
+        material.previous_sha, planId, planHash, material.policy_version, compatibilityJson, transitionJson, material.signed_host_digest ?? null, material.signed_host_transition ?? null, material.activation_mode ?? null,
         material.rollback_compatible ? 1 : 0, createdAt, createdAt,
       );
       const row = this.getRequired(requestId);
@@ -553,6 +562,8 @@ export class UpdateDatabase {
       return { row, plan: this.planFromRow(row), duplicate: false };
     })();
   }
+
+  getPlan(planId: string): UpdateRow | undefined { return this.db.prepare("SELECT * FROM update_requests WHERE plan_id = ?").get(planId) as UpdateRow | undefined; }
 
   approve(input: ApplyRequest, at = new Date()): { row: UpdateRow; duplicate: boolean } {
     return this.db.transaction(() => {
@@ -1064,6 +1075,9 @@ export class UpdateDatabase {
   private planFromRow(row: UpdateRow): UpdatePlan {
     return {
       schema_version: 1,
+      ...(row.activation_mode ? {activation_mode:row.activation_mode,database_policy:"preserve",automatic_rollback:false} : {}),
+      ...(row.signed_host_digest ? {signed_host_digest:row.signed_host_digest} : {}),
+      ...(row.signed_host_transition ? {signed_host_transition:row.signed_host_transition} : {}),
       plan_id: row.plan_id,
       plan_hash: row.plan_hash,
       policy_version: row.policy_version,

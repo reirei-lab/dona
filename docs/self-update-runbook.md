@@ -29,6 +29,14 @@ cleanなcanonical main checkoutで明示的に実行します。installerはfetc
 
 `--bootstrap`だけが、既存Slack Adapter→Dispatcherの順にbootoutし、stable updater→Dispatcher→Slack Adapterの順にbootstrapします。commandの結果が曖昧なら反復せず、`launchctl print gui/$UID/<label>`とhealthを確認します。実行中stable updaterはinstallerもbootoutしません。
 
+## 停止更新で作成済みの世代のcontrol更新
+
+既存 `~/.dona/g/offline-<12hex>` はコード・controlと、保持した旧データ世代が分かれる場合がある。`--upgrade-control <既存code root>` は現在のpolicy、Dispatcher/Slackのinstalled plist、両private envのDB/socketを照合し、同じownerの実DB/socketを保持する。生成policy/plistだけを新コード向けに更新し、データpathを新世代へ付け替えない。不一致・symlink・他scope・観測不能では停止する。任意rootや初回installへの一般許可ではない。
+
+Task schema4の同世代更新では `DONA_TASK_GENERATION_UPDATE=forward_only ./scripts/install-self-update.sh --upgrade-control <既存code root>` を使う。これはcontrol-plane更新だけの操作で、後続のexact plan承認を兼ねない。署名host未設定・外部承認未設定の観測専用導入では、profileや `DONA_LOCAL_APPROVAL_CONFIG` は不要。既に設定された値を環境変数省略で解除することはできない。
+
+このinstallerは独立した `control/runtime` のApp Server runtimeを更新しない。dashboardの会話APIが必要な場合はruntimeの対応versionも別途確認する。DispatcherとBFFの更新成功だけで会話観測の利用開始としない。
+
 ## 通常update
 
 1. Donaは`plan_self_update(source_event_id)`を呼びます。

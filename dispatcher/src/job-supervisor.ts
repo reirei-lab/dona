@@ -15,6 +15,7 @@ import { buildJobPrompt, jobProgressPath } from "./job-prompt.js";
 import { JobResultNotFoundError, readJobResultEnvelope } from "./job-result.js";
 import type { Logger } from "./logger.js";
 import type { JobRow } from "./types.js";
+import type { WebCommandIdentity } from "./database.js";
 import type { JobProgressCoordinator } from "./job-progress.js";
 import { buildLiveSessionReceipt, expectedLiveSessionIdentity, type LiveSessionReceiptProjection } from "./live-session.js";
 
@@ -98,6 +99,7 @@ export interface JobControlResult {
 interface ActiveJob {
   sourceEventId: string;
   operation: Promise<void>;
+  startup: Promise<void>;
 }
 
 interface SupervisorClock {
@@ -190,6 +192,7 @@ export class JobSupervisor {
     private readonly wakeEventWorker: () => void,
     private progress?: JobProgressCoordinator,
     private readonly clock: SupervisorClock = systemClock,
+    private readonly readResult: typeof readJobResultEnvelope = readJobResultEnvelope,
   ) {}
 
   isRunning(): boolean {
@@ -222,21 +225,22 @@ export class JobSupervisor {
     } catch {this.logger.warn("Worker question reconciliation deferred",{error_code:"runtime_questions_unavailable"});}
   }
   async taskQuestions(id:string,eventId:string):Promise<unknown> {
-    const task=this.database.tasks.assertOwner(id,eventId),job=this.database.getJob(task.current_attempt_id)!;
+    const task=this.database.assertTaskApprovalOwner(id,eventId),job=this.database.getJob(task.current_attempt_id)!;
     if(!this.runtime.questions)throw Error("task_questions_unavailable");
     const questions=await this.runtime.questions(job.agent_name,true);
-    const fresh=this.database.tasks.assertOwner(id,eventId);
+    const fresh=this.database.assertTaskApprovalOwner(id,eventId);
     if(fresh.current_attempt_id!==job.job_id)throw Error("task_revision_conflict");
-    return {task_id:id,revision:fresh.revision,questions:questions.filter(q=>JSON.stringify([q.generation,q.thread_id])===this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id).map(q=>({question_id:q.question_id,kind:q.kind,state:q.state,request:JSON.parse(q.payload_json)}))};
+    const source=this.database.get(eventId)!,operatorApproval=source.source==="web"&&source.event_type==="worker_question_reply"&&JSON.parse(source.payload_json).request_kind==="approval"?JSON.parse(source.payload_json).question_id:undefined;
+    return {task_id:id,revision:fresh.revision,questions:questions.filter(q=>(!operatorApproval||(q.kind==="approval"&&q.question_id===operatorApproval))&&JSON.stringify([q.generation,q.thread_id])===this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id).map(q=>({question_id:q.question_id,kind:q.kind,state:q.state,request:JSON.parse(q.payload_json)}))};
   }
   async approveTaskRequest(id:string,eventId:string,revision:number,questionId:string,accepted:boolean):Promise<unknown> {
-    const initial=this.database.tasks.assertOwner(id,eventId,true);
+    const initial=this.database.assertTaskApprovalOwner(id,eventId,true);
     return this.serialized(initial.current_attempt_id,async()=>{
       if(!this.runtime.questions||!this.runtime.approveRequest)throw Error("task_approval_unavailable");
       const job=this.database.getJob(initial.current_attempt_id)!,request=(await this.runtime.questions(job.agent_name,true)).find(q=>q.question_id===questionId);
-      const task=this.database.tasks.assertOwner(id,eventId,true);
+      const task=this.database.assertTaskApprovalOwner(id,eventId,true);
       if(!request||request.kind!=="approval"||JSON.stringify([request.generation,request.thread_id])!==this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id||task.current_attempt_id!==job.job_id)throw Error("task_approval_not_current");
-      if(!this.database.hasWorkerApprovalReply(job.job_id,questionId,eventId))throw Error("task_approval_requires_user_reply");
+      if(!this.database.hasWorkerApprovalReply(job.job_id,questionId,eventId,accepted))throw Error("task_approval_requires_user_reply");
       if(request.answer_hash===createHash("sha256").update(stableStringify({accepted})).digest("hex")&&["answering","resolved"].includes(request.state))return {task_id:id,question_id:questionId,state:request.state};
       if(task.revision!==revision||task.desired_state!=="running"||task.stop_state!=="none"||!["active","waiting"].includes(task.state))throw Error("task_approval_not_current");
       const response=await this.runtime.approveRequest(job.agent_name,questionId,accepted);
@@ -247,6 +251,10 @@ export class JobSupervisor {
     const initial=this.database.tasks.assertOwner(id,eventId);
     return this.serialized(initial.current_attempt_id,async()=>{
       let task=this.database.tasks.assertOwner(id,eventId);const job=this.database.getJob(task.current_attempt_id)!;
+      const source=this.database.get(eventId)!;
+      if(source.source==="web"&&source.event_type==="worker_question_reply"){
+        if(!this.database.localDashboard.matchesRecordedReply(eventId,job.job_id,questionId,"question",answers))throw Error("task_question_reply_mismatch");
+      }
       const old= (await this.runtime.questions?.(job.agent_name,true))?.find(q=>q.question_id===questionId);
       task=this.database.tasks.assertOwner(id,eventId);
       if(task.current_attempt_id!==job.job_id)throw Error("task_revision_conflict");
@@ -335,6 +343,17 @@ export class JobSupervisor {
     } catch(error) {
       if(!(error instanceof JobResultNotFoundError)) {this.database.tasks.wait(task,"result_conflict");return;}
     }
+    // 外部tool待機が未確定steerのreceipt待ちを上書きしてはいけない。
+    if(task.desired_state==="running"&&(task.steer_pending_event_id||task.wait_reason==="steer_acceptance_unknown"||job.steer_state==="dispatching")) {this.database.tasks.wait(task,"steer_acceptance_unknown",60_000);return;}
+    const externalRecovery=this.database.tasks.externalApprovalRecovery(job.job_id);
+    if(task.desired_state==="running"&&externalRecovery.state!=="ready") {this.database.tasks.wait(task,externalRecovery.state==="unknown"?"external_effect_unknown":"external_approval",30_000);return;}
+    if(job.last_error_code==="runtime_external_approval_pending"&&task.desired_state==="running"&&task.stop_state==="none"){
+      if(!this.runtime.observeWorker){this.database.tasks.wait(task,"observation_unknown");return;}
+      const observed=await this.observeWorker(job);
+      if(observed.state==="waiting"||observed.state==="working"){this.database.tasks.wait(task,"external_approval",30_000);return;}
+      if(observed.state==="unknown"){this.database.tasks.wait(task,"observation_unknown");return;}
+      // 消失したtool callを人間待ちと偽らない。下の停止確認を経て通常のAttempt回復へ進む。
+    }
     if(job.last_error_code==="runtime_question_pending"&&task.desired_state==="running"&&task.stop_state==="none"&&this.runtime.questions) {
       const pending=await this.runtime.questions(job.agent_name);
       if(pending.length){this.database.tasks.wait(task,"human_input");return;}
@@ -358,7 +377,7 @@ export class JobSupervisor {
     if(task.stop_state==="stopped") {this.database.tasks.replaceStopped(task.task_id,this.config.jobResultsDir);this.wake();return;}
     if(task.desired_state==="running"&&task.stop_state==="none") {
       const reason=taskRecoveryReason(job);
-      if(reason!=="observation_unknown"&&job.last_error_code!=="runtime_question_pending"&&task.wait_reason!=="resume_requested"&&!capacityWait) {this.database.tasks.wait(task,reason);return;}
+      if(reason!=="observation_unknown"&&job.last_error_code!=="runtime_question_pending"&&job.last_error_code!=="runtime_external_approval_pending"&&task.wait_reason!=="resume_requested"&&!capacityWait) {this.database.tasks.wait(task,reason);return;}
     }
     if(!this.runtime.observeWorker||!this.runtime.retireWorker||!this.runtime.workerRetired){this.database.tasks.wait(task,"observation_unknown");return;}
     if(task.stop_state==="none"||task.stop_state==="not_sent") {
@@ -623,6 +642,7 @@ export class JobSupervisor {
 
   cancel(jobId: string, sourceEventId: string, reason = "Cancelled by Dona"): Promise<JobControlResult> {
     return this.serialized(jobId, async () => {
+      await this.active.get(jobId)?.startup;
       const before = this.database.getJob(jobId);
       if (!before) throw new Error(`Job ${jobId} was not found`);
       this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
@@ -704,6 +724,35 @@ export class JobSupervisor {
       this.database.markJobCancelled(jobId, reason);
       this.trackCancelledWorkerCleanup(cancelling);
       this.wake();
+      return { row: this.database.getJob(jobId)!, duplicate: false };
+    });
+  }
+
+  cancelWeb(jobId: string, identity: WebCommandIdentity, reason = "Cancelled by verified web owner"): Promise<JobControlResult> {
+    if(this.database.tasks.forAttempt(jobId))return Promise.reject(new Error("task_control_required"));
+    return this.serialized(jobId, async () => {
+      await this.active.get(jobId)?.startup;
+      const before = this.database.assertWebJobOwner(jobId, identity);
+      if (before.status === "cancelled") return { row: before, duplicate: true };
+      if (before.status === "needs_review" && before.last_error_code === "web_cancel_acceptance_unknown") {
+        throw new Error("web_cancel_acceptance_unknown");
+      }
+      const cancelling = this.database.beginWebJobCancellation(jobId, identity);
+      if (["queued", "retryable_failed"].includes(before.status)) {
+        this.database.markJobCancelled(jobId, reason); this.wake();
+        return { row: this.database.getJob(jobId)!, duplicate: false };
+      }
+      const cancelled = await this.runtime.cancel(cancelling.agent_name, this.abortController.signal);
+      if (!cancelled.ok) {
+        if (before.status === "needs_review" && !cancelled.timedOut
+          && ["agent_not_found", "agent_not_running"].includes(cancelled.errorCode ?? "")) {
+          this.database.markJobCancelled(jobId, reason); this.wake();
+          return { row: this.database.getJob(jobId)!, duplicate: false };
+        }
+        this.database.markJobNeedsReview(jobId, "web_cancel_acceptance_unknown", commandMessage(cancelled));
+        this.wake(); throw new Error("web_cancel_acceptance_unknown");
+      }
+      this.database.markJobCancelled(jobId, reason); this.trackCancelledWorkerCleanup(cancelling); this.wake();
       return { row: this.database.getJob(jobId)!, duplicate: false };
     });
   }
@@ -1036,7 +1085,9 @@ export class JobSupervisor {
   }
 
   private launch(row: JobRow): void {
-    const operation = (row.status === "running" ? this.monitor(row) : this.startJob(row))
+    let startupReady!: () => void;
+    const startup = new Promise<void>(resolve => { startupReady = resolve; });
+    const operation = (row.status === "running" ? this.monitor(row, startupReady) : this.startJob(row, startupReady))
       .catch((error: unknown) => {
         this.logger.error("Job operation failed unexpectedly", {
           job_id: row.job_id,
@@ -1055,10 +1106,11 @@ export class JobSupervisor {
         this.active.delete(row.job_id);
         this.wake();
       });
-    this.active.set(row.job_id, { sourceEventId: row.source_event_id, operation });
+    this.active.set(row.job_id, { sourceEventId: row.source_event_id, operation, startup });
   }
 
-  private async startJob(row: JobRow): Promise<void> {
+  private async startJob(row: JobRow, startupReady: () => void = () => {}): Promise<void> {
+    try {
     if(!this.database.tasks.canRun(row))return;
     if(this.database.tasks.forAttempt(row.job_id)&&!this.runtime.observeWorker) {
       this.database.markJobNeedsReview(row.job_id,"worker_identity_unverified","Runtime cannot record a worker identity");return;
@@ -1077,6 +1129,10 @@ export class JobSupervisor {
     try {
       prepared = await this.runtime.prepare(preparing, this.abortController.signal);
     } catch (error) {
+      if(row.source==="web"&&error instanceof Error&&error.message==="runtime_profile_unavailable") {
+        this.database.markJobBlocked(row.job_id,"Web analysis runtime is not configured",["preparing"],"runtime_profile_unavailable");
+        return;
+      }
       if(error instanceof PreparedWorkspaceCleanupError) {
         this.database.setJobRuntime(row.job_id,error.herdrWorkspaceId,error.herdrPaneId,error.herdrAgentSessionId);
         this.database.markJobNeedsReview(row.job_id,error.errorCode,error.message);
@@ -1138,7 +1194,7 @@ export class JobSupervisor {
           this.database.markJobNeedsReview(row.job_id,"prompt_acceptance_unknown",commandMessage(prompted));
           return;
         }
-        await this.reconcileStalledPrompt(dispatching, promptBaseline ?? prompted);
+        await this.reconcileStalledPrompt(dispatching, promptBaseline ?? prompted, startupReady);
         return;
       }
       if (!prompted.timedOut && ["agent_not_found", "agent_not_running"].includes(prompted.errorCode ?? "")) {
@@ -1167,7 +1223,8 @@ export class JobSupervisor {
     this.database.markJobRunning(row.job_id);
     const running = this.database.getJob(row.job_id)!;
     this.logTransition(dispatching, running);
-    await this.monitor(running);
+    await this.monitor(running, startupReady);
+    } finally { startupReady(); }
   }
 
   private async readPromptBaseline(row: JobRow): Promise<HerdrCommandResult | undefined> {
@@ -1183,7 +1240,11 @@ export class JobSupervisor {
     }
   }
 
-  private async reconcileStalledPrompt(row: JobRow, initial: HerdrCommandResult): Promise<void> {
+  private async reconcileStalledPrompt(
+    row: JobRow,
+    initial: HerdrCommandResult,
+    startupReady: () => void = () => {},
+  ): Promise<void> {
     const startedAt = this.clock.now();
     const deadline = startedAt + this.config.jobPromptReconcileMs;
     let nextTick = startedAt;
@@ -1260,7 +1321,7 @@ export class JobSupervisor {
           this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input",["running"],observed.errorCode??"agent_blocked");
           return;
         }
-        await this.monitor(this.database.getJob(row.job_id)!);
+        await this.monitor(this.database.getJob(row.job_id)!, startupReady);
         return;
       }
     }
@@ -1285,7 +1346,7 @@ export class JobSupervisor {
 
   private async tryCompleteAfterUnknownAcceptance(row: JobRow): Promise<boolean> {
     try {
-      const result = await readJobResultEnvelope(row.result_path, row.job_id);
+      const result = await this.readResult(row.result_path, row.job_id);
       this.database.markJobRunning(row.job_id);
       this.database.saveJobResult(row.job_id, result, row.result_path);
       return true;
@@ -1296,13 +1357,15 @@ export class JobSupervisor {
     }
   }
 
-  private async monitor(row: JobRow): Promise<void> {
+  private async monitor(row: JobRow, startupReady: () => void = () => {}): Promise<void> {
+    try {
     if (this.database.getJob(row.job_id)?.status !== "running") return;
     const initialProgress=this.progress;
     try { await initialProgress?.ingest(this.database.getJob(row.job_id) ?? row); }
     catch (error) { await this.failOpenProgress(initialProgress,row.job_id,"job_progress_initial_ingest_failed",error); }
     if (await this.tryComplete(row, false)) return;
     if(this.database.tasks.forAttempt(row.job_id))await this.observeWorker(this.database.getJob(row.job_id)!);
+    startupReady();
     let keepPolling = true;
     const pollAbort = new AbortController();
     const stopPoll = (): void => pollAbort.abort();
@@ -1326,6 +1389,7 @@ export class JobSupervisor {
     try { waited = await this.runtime.wait(row.agent_name, this.abortController.signal); }
     finally { keepPolling = false; pollAbort.abort(); await pollProgress; this.abortController.signal.removeEventListener("abort", stopPoll); }
     if (waited.aborted || this.stopping) return;
+    await this.serialized(row.job_id, async () => {
     if (this.database.getJob(row.job_id)?.status !== "running") return;
     if (!waited.ok) {
       if (waited.timedOut || waited.errorCode === "timeout") {
@@ -1349,6 +1413,8 @@ export class JobSupervisor {
     if (["idle", "done"].includes(waited.agentStatus ?? "")) {
       await this.tryComplete(row, true);
     }
+    });
+    } finally { startupReady(); }
   }
 
   private async failOpenProgress(progress:JobProgressCoordinator|undefined,jobId:string,errorCode:string,error:unknown):Promise<void> {
@@ -1361,7 +1427,7 @@ export class JobSupervisor {
   private async tryComplete(row: JobRow, terminalAgentState: boolean): Promise<boolean> {
     let completed: JobRow;
     try {
-      const result = await readJobResultEnvelope(row.result_path, row.job_id);
+      const result = await this.readResult(row.result_path, row.job_id);
       this.database.saveJobResult(row.job_id, result, row.result_path);
       completed = this.database.getJob(row.job_id)!;
     } catch (error) {

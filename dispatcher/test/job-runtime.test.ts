@@ -20,6 +20,24 @@ afterEach(async () => {
 });
 
 describe("Codex background agent arguments", () => {
+  test("入力不要のコマンドは標準入力をpipeにせずEOFを渡す", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const fakeHerdrPath = path.join(root, "stdin-kind.mjs");
+    await fs.writeFile(fakeHerdrPath, `#!/usr/bin/env node
+import fs from "node:fs";
+process.stdout.write(JSON.stringify({
+  characterDevice: fs.fstatSync(0).isCharacterDevice(),
+  input: fs.readFileSync(0, "utf8"),
+  result: { agent_status: "idle" },
+}));
+`, { mode: 0o700 });
+    const result = await new HerdrJobAgentRuntime({ ...config, herdrPath: fakeHerdrPath }).get("fixture", undefined, 5_000);
+    assert.equal(result.ok, true);
+    assert.equal(result.agentStatus, "idle");
+    assert.equal(JSON.parse(result.stdout).characterDevice, true);
+    assert.equal(JSON.parse(result.stdout).input, "");
+  });
+
   test("rejects missing or malformed scheduled MCP identities", () => {
     assert.deepEqual(parseScheduledMcpInventory([{name:"slack"},{name:"github_1"}]),["slack","github_1"]);
     for(const inventory of [[{}],[{name:undefined}],[{name:""}],[{name:"bad.name"}],null])

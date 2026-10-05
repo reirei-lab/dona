@@ -21,6 +21,24 @@ REAL_ENSURE_MAIN = m.Runner.ensure_main
 REAL_QUIESCE = m.Runner.quiesce_old_slack
 
 
+class ReleasePreparationTests(unittest.TestCase):
+    def test_prepare_builds_web_distribution_before_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            release = Path(directory) / 'release'
+            calls = []
+            def command(argv, cwd, timeout):
+                calls.append((str(cwd.relative_to(release)), argv[1:]))
+                if argv[1:] == ['run', 'build']:
+                    (cwd / 'dist').mkdir(parents=True)
+                    (cwd / 'dist/index.js').write_text('fixture')
+            with patch.object(m, 'command', side_effect=command), patch.object(m, 'staging_space'):
+                m.build_release_components(release, Path(directory), {'executables': {'npm': '/test/npm'}})
+            self.assertEqual(calls, [(component, argv) for component in
+                ('dispatcher', 'sources/slack', 'sources/web', 'updater')
+                for argv in (['ci'], ['run', 'build'])])
+            self.assertTrue((release / 'sources/web/dist/index.js').is_file())
+
+
 class FixtureDatabase:
     def read(self, file, sql, args=()):
         with sqlite3.connect(Path(file).as_uri()+'?mode=ro',uri=True) as db:
@@ -64,7 +82,7 @@ class RunnerTest(unittest.TestCase):
         self.g = m.private_dir(self.home/'new')
         for name in ['config','control/updater','runtime']:
             m.private_dir(self.g/name)
-        checks = ['Verify dispatcher', 'Verify sources/slack', 'Verify updater', 'Verify self-hosted macOS']
+        checks = ['Verify dispatcher', 'Verify sources/slack', 'Verify updater', 'Verify self-hosted macOS', 'Verify sources/web']
         release = m.private_dir(self.g/'runtime/releases/target')
         m.private_dir(release/'config')
         (release/'config/update-policy.example.json').write_text(json.dumps({'required_checks': checks}))
@@ -369,7 +387,7 @@ with Server(p,Handler) as server: server.serve_forever()
         m.private_dir(release/'config')
         (release/'config/release-compatibility.json').write_text('{"schema_version":1,"protocol":1}')
         (release/'config/update-compatibility-transitions.json').write_text('{"transitions":[]}')
-        (release/'config/update-policy.example.json').write_text(json.dumps({'required_checks': ['Verify dispatcher', 'Verify sources/slack', 'Verify updater', 'Verify self-hosted macOS']}))
+        (release/'config/update-policy.example.json').write_text(json.dumps({'required_checks': ['Verify dispatcher', 'Verify sources/slack', 'Verify updater', 'Verify self-hosted macOS', 'Verify sources/web']}))
         for directory in ['config','control','logs','run']:
             m.private_dir(self.g/directory)
         plan={'generation':str(self.g),'release':str(release),'target_sha':'a'*40}
@@ -510,15 +528,15 @@ with Server(p,Handler) as server: server.serve_forever()
     def test_target_checks_extend_old_policy_only_after_target_trust(self):
         release = self.home/'target'
         m.private_dir(release/'config')
-        checks = ['Verify dispatcher', 'Verify sources/slack', 'Verify updater', 'Verify self-hosted macOS']
+        checks = ['Verify dispatcher', 'Verify sources/slack', 'Verify updater', 'Verify self-hosted macOS', 'Verify sources/web']
         m.atomic(release/'config/update-policy.example.json', m.encode({'required_checks': checks}))
         self.assertEqual(m.target_required_checks(release), checks)
-        old = {'executables': {'gh': 'fixture-gh'}, 'required_checks': checks[:3], 'require_verified_signature': False}
+        old = {'executables': {'gh': 'fixture-gh'}, 'required_checks': checks[:4], 'require_verified_signature': False}
         runs = [{'id': index, 'name': name, 'head_sha': 'a'*40, 'app': {'slug': 'github-actions'},
                  'status': 'completed', 'conclusion': 'success'} for index, name in enumerate(checks, 1)]
         with patch.object(m, 'command', return_value=json.dumps([{'check_runs': runs}])):
-            self.assertEqual(len(REAL_TRUST('a'*40, old)['checks']), 3)
-            self.assertEqual(len(REAL_TRUST('a'*40, dict(old, required_checks=checks))['checks']), 4)
+            self.assertEqual(len(REAL_TRUST('a'*40, old)['checks']), 4)
+            self.assertEqual(len(REAL_TRUST('a'*40, dict(old, required_checks=checks))['checks']), 5)
         runs[-1]['conclusion'] = 'failure'
         with patch.object(m, 'command', return_value=json.dumps([{'check_runs': runs}])):
             with self.assertRaisesRegex(RuntimeError, 'required_check_not_success'):

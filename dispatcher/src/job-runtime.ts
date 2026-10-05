@@ -52,7 +52,8 @@ function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void
   }
 }
 
-export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disabledMcpServers:readonly string[] = [], progressEnabled = true, executablePaths:readonly string[] = []): string[] {
+export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disabledMcpServers:readonly string[] = [], progressEnabled = true, executablePaths:readonly string[] = [], localDashboardOwned=false): string[] {
+  if(row.source==="web"&&!localDashboardOwned)throw Error("runtime_profile_unavailable");
   const resultDirectory=path.dirname(row.result_path);
   const expectedResultPath=path.join(config.jobResultsDir,row.job_id,"result.json");
   if(row.result_path!==expectedResultPath) throw new Error("Job result path does not match the Dispatcher-generated job path");
@@ -179,7 +180,11 @@ export function runProcess(
   env?: NodeJS.ProcessEnv,
 ): Promise<HerdrCommandResult> {
   return new Promise((resolve) => {
-    const child = spawn(executable, args, { shell: false, stdio: ["pipe", "pipe", "pipe"], ...(cwd?{cwd}:{}), ...(env?{env}:{}) });
+    // 入力不要の短命コマンドは、終了後の空 write による EPIPE を避ける。
+    // update-ref --stdin など実データを渡す場合だけ pipe を作る。
+    const child = stdin === ""
+      ? spawn(executable, args, { shell: false, stdio: ["ignore", "pipe", "pipe"], ...(cwd?{cwd}:{}), ...(env?{env}:{}) })
+      : spawn(executable, args, { shell: false, stdio: ["pipe", "pipe", "pipe"], ...(cwd?{cwd}:{}), ...(env?{env}:{}) });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -218,7 +223,7 @@ export function runProcess(
     child.stderr.on("data", (chunk: Buffer) => {
       if (stderr.length < 1_048_576) stderr += chunk.toString("utf8");
     });
-    child.stdin.on("error", (error) => {
+    child.stdin?.on("error", (error) => {
       stderr = error.message;
       terminate();
       finish({ ok: false, stdout, stderr, exitCode: child.exitCode, timedOut, aborted });
@@ -230,8 +235,7 @@ export function runProcess(
     child.once("close", (code) => {
       finish({ ok: code === 0 && !timedOut && !aborted, stdout, stderr, exitCode: code, timedOut, aborted });
     });
-    // 空文字のwriteでも終了済みの子にはEPIPEになり得る。入力なしはEOFだけを送る。
-    if(stdin.length)child.stdin.end(stdin);else child.stdin.end();
+    child.stdin?.end(stdin);
   });
 }
 

@@ -40,7 +40,13 @@ export interface SchemaRollout {
   schema_version: 1;
   phase: string;
   database_schema: number;
-  multi_job_enabled: boolean;
+  multi_job_enabled?: boolean;
+  task_execution_version?: 1;
+  online_migration?: false;
+  rollback_to_legacy?: false;
+  requires_old_worker_stop?: true;
+  requires_no_recreation_fence?: true;
+  preserve_old_database_and_artifacts?: true;
   capabilities?: string[];
   previous_release_sha?: string;
   previous_release_contract?: string;
@@ -98,6 +104,9 @@ export interface UpdatePlan {
   schema_version: 1;
   plan_id: string;
   plan_hash: string;
+  signed_host_digest?: string | null;
+  signed_host_transition?: string | null;
+  activation_mode?: "forward_only" | null;
   policy_version: string;
   current_sha: string;
   target_sha: string;
@@ -126,6 +135,9 @@ export interface UpdateRow {
   previous_sha: string | null;
   plan_id: string;
   plan_hash: string;
+  signed_host_digest?: string | null;
+  signed_host_transition?: string | null;
+  activation_mode?: "forward_only" | null;
   policy_version: string;
   compatibility_json: string;
   transition_json?: string | null;
@@ -220,6 +232,7 @@ export type CompletionLookupResult =
   | { outcome: "unavailable"; error_code: string };
 
 export interface HealthSnapshot {
+  runtime_host?: "signed-v1" | "node";
   service: "dispatcher" | "slack_adapter";
   live: boolean;
   observed?: boolean;

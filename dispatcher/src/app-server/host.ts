@@ -1,3 +1,5 @@
+import os from "node:os";
+import {createHash} from "node:crypto";
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
@@ -30,7 +32,13 @@ export async function serveRuntime(config:HostConfig):Promise<http.Server> {
       store.db.prepare("INSERT INTO host_owner VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET identity_json=excluded.identity_json,socket=excluded.socket").run(JSON.stringify(owner),config.socket);
     }).immediate();
   }catch(error){store.close();throw error;}
-  const manager=new AppServerManager(store,(args,cwd)=>new AppServerRpc(config.codex,args,cwd));
+  // macOSのsockaddr_un上限に収まるprivate directory。世代ごとに新規socketを使い、既存socketは削除しない。
+  const socketDirectory=path.join(os.tmpdir(),`dr-${process.getuid?.()}-${createHash("sha256").update(path.resolve(config.database)).digest("hex").slice(0,12)}`);
+  fs.mkdirSync(socketDirectory,{mode:0o700,recursive:true});
+  const manager=new AppServerManager(store,(args,cwd,agent,attach)=>{
+    if(!agent)throw Error("runtime_agent_identity_required");
+    return new AppServerRpc(config.codex,args,cwd,process.env,{socketPath:path.join(socketDirectory,createHash("sha256").update(agent.generation).digest("hex").slice(0,24)),...(attach?{attachPid:agent.pid!}:{})});
+  },true);
   const server=http.createServer(async(request,response)=>{
     const send=(status:number,value:unknown)=>{response.writeHead(status,{"content-type":"application/json"});response.end(JSON.stringify(value));};
     if(request.url==="/health/version"&&request.method==="GET"){send(200,{service:"runtime",status:"ready",build_sha:config.buildSha});return;}
@@ -38,10 +46,17 @@ export async function serveRuntime(config:HostConfig):Promise<http.Server> {
     try {
       let text="";for await(const chunk of request){text+=String(chunk);if(Buffer.byteLength(text)>1_048_576)throw Error("runtime_request_limit");}
       const p=JSON.parse(text) as Record<string,unknown>;if(typeof p.action!=="string")throw Error("runtime_action_invalid");
-      if(!["list","start","pendingQuestions"].includes(p.action)&&typeof p.name!=="string")throw Error("runtime_name_required");
+      if(!["list","start","pendingQuestions","conversations","externalRequests","externalRequest","externalAvailability"].includes(p.action)&&typeof p.name!=="string")throw Error("runtime_name_required");
       const name=p.name as string;
       let result:unknown;
       switch(p.action) {
+        case "externalAvailability":if(typeof p.enabled!=="boolean")throw Error("runtime_external_availability_invalid");result=manager.external.availability(p.enabled);break;
+        case "externalRequests":result=manager.externalRequests();break;
+        case "externalRequest":if(typeof p.id!=="string")throw Error("runtime_external_id_invalid");result=manager.external.get(p.id)??null;break;
+        case "resolveExternal":if(typeof p.id!=="string"||!p.result||typeof p.result!=="object"||Array.isArray(p.result))throw Error("runtime_external_result_invalid");result=manager.resolveExternal(name,p.id,p.result as {request_id:string|null;state:string});break;
+        case "conversations":if(p.after!==undefined&&typeof p.after!=="string")throw Error("runtime_conversation_cursor_invalid");result=manager.conversations(p.after as string|undefined);break;
+        case "conversationHistory":if(p.afterGeneration!==undefined&&typeof p.afterGeneration!=="string")throw Error("runtime_conversation_cursor_invalid");result=manager.conversationHistory(name,p.afterGeneration as string|undefined);break;
+        case "conversation":if(typeof p.generation!=="string"||(p.afterSequence!==undefined&&typeof p.afterSequence!=="number"))throw Error("runtime_conversation_request_invalid");result=await manager.conversation(name,p.generation,p.afterSequence as number|undefined);break;
         case "list":result=store.agents().map(r=>manager.status(r.name));break;
         case "status":result=manager.status(name)??null;break;
         case "start": {
@@ -70,6 +85,6 @@ export async function serveRuntime(config:HostConfig):Promise<http.Server> {
   let recovering=false;
   const recover=()=>{if(recovering)return;recovering=true;void manager.recover().finally(()=>{recovering=false;}).catch(()=>{});};
   const recoveryTimer=setInterval(recover,1000);recoveryTimer.unref();recover();
-  server.on("close",()=>{clearInterval(recoveryTimer);try{fs.unlinkSync(config.socket);}catch{}store.db.prepare("DELETE FROM host_owner WHERE identity_json=?").run(JSON.stringify(owner));store.close();});
+  server.on("close",()=>{clearInterval(recoveryTimer);manager.closeConnections();try{fs.unlinkSync(config.socket);}catch{}store.db.prepare("DELETE FROM host_owner WHERE identity_json=?").run(JSON.stringify(owner));store.close();});
   return server;
 }
