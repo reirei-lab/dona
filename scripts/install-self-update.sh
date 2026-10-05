@@ -203,7 +203,7 @@ if [[ "$MODE" == "--check" ]]; then
   exit 0
 fi
 
-if [[ -f "$INSTALL_TMP/rendered/signed-host.json" && ( "$MODE" == "--bootstrap" || "$MODE" == "--upgrade-control" ) ]]; then
+if [[ -f "$INSTALL_TMP/rendered/signed-host.json" && -d "$RUNTIME_ROOT/current/signed-host/DonaDispatcher.app" && ( "$MODE" == "--bootstrap" || "$MODE" == "--upgrade-control" ) ]]; then
   $NODE_PATH "$SCRIPT_DIR/verify-signed-dispatcher-release.mjs" "$RUNTIME_ROOT/current" "$INSTALL_TMP/rendered/signed-host.json"
 fi
 

@@ -53,7 +53,7 @@ def main():
         require(installed.get('Label') == label and candidate.get('Label') == label)
         argv = installed.get('ProgramArguments', [])
         expected_program = control / 'updater/dist/cli.js' if label.endswith('updater') else current / 'dispatcher/dist/cli.js'
-        if label == 'dev.dona.dispatcher' and policy.get('signed_host') is not None:
+        if label == 'dev.dona.dispatcher' and policy.get('signed_host') is not None and (active / 'signed-host/DonaDispatcher.app').is_dir():
             require(argv == [str(current / 'signed-host/DonaDispatcher.app/Contents/MacOS/DonaDispatcher'), 'serve'])
         else:
             require(len(argv) == 3 and argv[1] == str(expected_program) and argv[2] == 'serve')

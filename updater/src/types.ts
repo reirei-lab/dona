@@ -99,6 +99,7 @@ export interface UpdatePlan {
   plan_id: string;
   plan_hash: string;
   signed_host_digest?: string | null;
+  signed_host_transition?: string | null;
   policy_version: string;
   current_sha: string;
   target_sha: string;
@@ -128,6 +129,7 @@ export interface UpdateRow {
   plan_id: string;
   plan_hash: string;
   signed_host_digest?: string | null;
+  signed_host_transition?: string | null;
   policy_version: string;
   compatibility_json: string;
   transition_json?: string | null;
@@ -222,6 +224,7 @@ export type CompletionLookupResult =
   | { outcome: "unavailable"; error_code: string };
 
 export interface HealthSnapshot {
+  runtime_host?: "signed-v1" | "node";
   service: "dispatcher" | "slack_adapter";
   live: boolean;
   observed?: boolean;

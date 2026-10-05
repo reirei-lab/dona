@@ -43,7 +43,7 @@ describe("UpdateDatabase", () => {
     db.close();
   });
 
-  test("atomically migrates the released schema 1 database through schema 8", async () => {
+  test("atomically migrates the released schema 1 database through schema 9", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
     const databasePath = path.join(policy.control_root, "updater.sqlite3");
@@ -75,7 +75,7 @@ describe("UpdateDatabase", () => {
     assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'updater_writer_lease'").get());
     const diagnosticColumns = migrated.pragma("table_info(update_diagnostic_logs)") as Array<{ name: string }>;
     assert.ok(diagnosticColumns.some((column) => column.name === "content_sha256"));
-    assert.equal(migrated.pragma("user_version", { simple: true }), 8);
+    assert.equal(migrated.pragma("user_version", { simple: true }), 9);
     migrated.close();
   });
 
@@ -110,9 +110,9 @@ describe("UpdateDatabase", () => {
     const databasePath = path.join(policy.control_root, "updater.sqlite3");
     await fs.mkdir(policy.control_root, { recursive: true });
     const raw = new Database(databasePath);
-    raw.pragma("user_version = 9");
+    raw.pragma("user_version = 10");
     raw.close();
-    assert.throws(() => new UpdateDatabase(databasePath, { readonly: true }), /newer than supported schema 8/);
+    assert.throws(() => new UpdateDatabase(databasePath, { readonly: true }), /newer than supported schema 9/);
   });
 
   test("binds idempotent approval to the exact plan and detects payload mismatch", async () => {

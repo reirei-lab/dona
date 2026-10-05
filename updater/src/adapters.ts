@@ -26,6 +26,7 @@ import type {
   OutboxRow,
   SchemaRollout,
 } from "./types.js";
+import {DispatcherHostTransition,type HostTransition} from "./dispatcher-host-transition.js";
 import {AppServerMain} from "./app-server-main.js";
 import { fullSha, parseCompatibilityMetadata, sha256 } from "./validation.js";
 
@@ -756,8 +757,24 @@ export class RealRuntime implements RuntimePort {
     return resolved;
   }
 
-  async startDispatcher(): Promise<CommandResult> {
-    if(this.policy.signed_host){
+  async planDispatcherHostTransition(from:string,to:string):Promise<string|null>{
+    const health=await this.dispatcherHealth();if(!health.live||health.build_sha!==from)throw Error("host_transition_current_unverified");
+    return new DispatcherHostTransition(this.policy).plan(from,to);
+  }
+  async verifyDispatcherHostOriginal(t:HostTransition):Promise<void>{new DispatcherHostTransition(this.policy).verifyOriginal(t);}
+  async applyDispatcherHostTransition(t:HostTransition,direction:"target"|"original"):Promise<void>{
+    if(direction==="target"){
+      const release=path.join(this.policy.release_root,t.to_sha),manifest=JSON.parse(await fs.readFile(path.join(release,"release-manifest.json"),"utf8"));
+      await new CanonicalBuild(this.policy,this.runner).verifySignedHost(release,manifest);
+    }
+    new DispatcherHostTransition(this.policy).apply(t,direction,await this.dispatcherRegistered());
+  }
+  async startDispatcher(transition?:HostTransition): Promise<CommandResult> {
+    if(this.policy.signed_host && transition){
+      const current=await fs.realpath(this.policy.current_pointer);
+      if(current!==path.join(this.policy.release_root,transition.from_sha))throw Error("host_transition_legacy_sha_mismatch");
+      new DispatcherHostTransition(this.policy).verifyOriginal(transition);
+    } else if(this.policy.signed_host){
       const current=await fs.realpath(this.policy.current_pointer);
       const manifest=JSON.parse(await fs.readFile(path.join(current,"release-manifest.json"),"utf8"));
       await new CanonicalBuild(this.policy,this.runner).verifySignedHost(current,manifest);
@@ -1016,6 +1033,7 @@ export class RealRuntime implements RuntimePort {
       return {
         service,
         observed: true,
+        ...(response.runtime_host === "signed-v1" || response.runtime_host === "node" ? {runtime_host:response.runtime_host} : {}),
         live: response.status === "live" || response.status === "ready" ||
           (healthResponse.statusCode === 503 && response.status === "not_ready"),
         ready: response.status === "ready",

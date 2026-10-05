@@ -2960,6 +2960,7 @@ describe("UpdateController isolated end-to-end", () => {
 async function signedFixture() {
   const f=await fixture();const profile=path.join(f.policy.control_root,'test.provisionprofile');await fs.writeFile(profile,'profile-original',{mode:0o600});
   f.policy.signed_host={team_id:'ABCDEFGHIJ',access_group:'ABCDEFGHIJ.dev.dona.approval',signing_identity_sha1:'a'.repeat(40),provisioning_profile:profile};
+  const health=f.runtime.dispatcherHealth.bind(f.runtime);f.runtime.dispatcherHealth=async()=>({...await health(),runtime_host:'signed-v1'});
   return {...f,profile};
 }
 test('署名profile driftはapply前に拒否してplanへprivate設定を公開しない',async()=>{
@@ -2987,5 +2988,40 @@ test('署名済みrelease更新はprepareとrollback元検証を経て通常acti
  f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'signed-host-approval'});f.dispatcher.terminal=true;await f.controller.processNext();
  assert.ok(checks.includes('verify:'+currentSha));assert.ok(checks.includes('prepare:'+targetSha));
  assert.equal(f.database.get(response.request_id as string)?.state,'succeeded');
+ }finally{f.database.close();}
+});
+test('初回署名host切替はplan-bound plistを停止後に変更し署名host healthで完了する',async()=>{
+ const f=await signedFixture();try{
+ const digest='e'.repeat(64),changes:string[]=[];const health=f.runtime.dispatcherHealth.bind(f.runtime);
+ f.runtime.dispatcherHealth=async()=>{const h=await health();return {...h,runtime_host:h.build_sha===targetSha?'signed-v1':'node'};};
+ Object.assign(f.runtime,{
+ planDispatcherHostTransition:async()=>digest,
+ verifyDispatcherHostOriginal:async()=>{changes.push('verify');},
+ applyDispatcherHostTransition:async(t:{digest:string},direction:string)=>{
+ assert.equal(t.digest,digest);assert.equal(await f.runtime.dispatcherRegistered(),false);changes.push(direction);
+ },
+ });
+ Object.assign(f.build,{prepareSignedHost:async()=>{},verifySignedHost:async()=>{}});
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string;signed_host_transition:string};
+ assert.equal(plan.signed_host_transition,digest);
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'first-signed-host'});f.dispatcher.terminal=true;await f.controller.processNext();
+ assert.equal(f.database.get(response.request_id as string)?.state,'succeeded');assert.ok(changes.includes('target'));assert.equal(changes.includes('original'),false);
+ }finally{f.database.close();}
+});
+test('初回署名hostのplist復元可能性はDB rollback_safe falseを上書きしない',async()=>{
+ const f=await signedFixture();try{
+ Object.assign(f.runtime,{planDispatcherHostTransition:async()=>'e'.repeat(64)});
+ f.git.targetCompatibility={...f.git.targetCompatibility,rollback_safe:false};f.policy.compatibility=f.git.targetCompatibility;
+ await assert.rejects(f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget}),/target_is_not_rollback_compatible/);
+ assert.equal(f.runtime.calls.includes('stopDispatcher'),false);
+ }finally{f.database.close();}
+});
+test('target SHAが一致してもNodeで起動した場合はsigned update成功としない',async()=>{
+ const f=await signedFixture();try{
+ const health=f.runtime.dispatcherHealth.bind(f.runtime);f.runtime.dispatcherHealth=async()=>{const h=await health();return {...h,runtime_host:h.build_sha===targetSha?'node':'signed-v1'};};
+ Object.assign(f.build,{prepareSignedHost:async()=>{},verifySignedHost:async()=>{}});
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string};
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'wrong-target-host'});f.dispatcher.terminal=true;await f.controller.processNext();
+ assert.notEqual(f.database.get(response.request_id as string)?.state,'succeeded');
  }finally{f.database.close();}
 });

@@ -60,6 +60,9 @@ export interface ReleaseStorePort {
 }
 
 export interface RuntimePort {
+  planDispatcherHostTransition?(from: string, to: string): Promise<string | null>;
+  applyDispatcherHostTransition?(transition: import("./dispatcher-host-transition.js").HostTransition, direction: "target" | "original"): Promise<void>;
+  verifyDispatcherHostOriginal?(transition: import("./dispatcher-host-transition.js").HostTransition): Promise<void>;
   workerSafety(): Promise<{ safe: boolean; active_worker_count: number; error_code?: string }>;
   quiesceSlack(requestId: string, targetSha: string): Promise<DrainSnapshot>;
   quiesceDispatcher(requestId: string, targetSha: string): Promise<DrainSnapshot>;
@@ -72,7 +75,7 @@ export interface RuntimePort {
   migrateAppSchema(requestId: string, targetSha: string, previous: Compatibility, target: Compatibility): Promise<CommandResult>;
   appSchemaState(): Promise<{ user_version: number; integrity_ok: boolean; foreign_key_violations: number }>;
   schemaMigrationCapability(capability: string): Promise<{ ready: boolean; build_sha: string | null }>;
-  startDispatcher(): Promise<CommandResult>;
+  startDispatcher(transition?: import("./dispatcher-host-transition.js").HostTransition): Promise<CommandResult>;
   startSlack(): Promise<CommandResult>;
   waitForMainAgentIdle(): Promise<MainAgentObservation>;
   stopMainAgent(expected: MainAgentObservation): Promise<MainAgentStopResult>;

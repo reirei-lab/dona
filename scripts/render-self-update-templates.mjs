@@ -70,7 +70,7 @@ fs.mkdirSync(destination, { recursive: true, mode: 0o700 });
 for (const name of ["dev.dona.updater", "dev.dona.dispatcher", "dev.dona.slack-adapter"]) {
   let body = fs.readFileSync(path.join(repository, "launchd", `${name}.plist.in`), "utf8");
   for (const [key, value] of Object.entries(values)) body = body.replaceAll(`__${key}__`, xml(value));
-  if(name==="dev.dona.dispatcher" && signedHost) body=body.replace(
+  if(name==="dev.dona.dispatcher" && signedHost && (!fs.existsSync(path.join(values.RUNTIME_ROOT,"current")) || fs.existsSync(path.join(values.RUNTIME_ROOT,"current/signed-host/DonaDispatcher.app")))) body=body.replace(
     `<string>${xml(values.NODE)}</string>\n    <string>${xml(values.RUNTIME_ROOT)}/current/dispatcher/dist/cli.js</string>`,
     `<string>${xml(values.RUNTIME_ROOT)}/current/signed-host/DonaDispatcher.app/Contents/MacOS/DonaDispatcher</string>`);
   if (/__[A-Z_]+__/.test(body)) throw new Error(`Unresolved template token in ${name}`);

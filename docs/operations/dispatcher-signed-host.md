@@ -4,7 +4,7 @@
 
 ## 現在の到達点
 
-source hash検証付きisolated build、unsigned bundle stage、profile/署名doctorを提供する。署名済みprofileによる実起動、実Keychain CAS、通常self-updateからのsigned artifact配置は別の配備gateであり、これらが未検証なら本番対応完了ではない。既存通常installerはこのbundleへ自動切替しない。profile未発行の状態で既存approvalのsafe-offを解除しない。
+source hash検証付きisolated build、bundle stage、prepare中の署名、profile/署名doctor、通常self-updateと初回切替の接続を実装している。署名・実Keychain CAS・本番切替は未実施であり、code統合や隔離テスト成功を本番対応完了とは扱わない。profile未発行の状態で既存approvalのsafe-offを解除しない。
 
 ## 必要なidentityとprofile
 
@@ -27,7 +27,7 @@ stageはDispatcherのdist/native source/node_modulesとSlack adapterのdist/node
 
 ## 署名順序と検証
 
-署名はoperatorが別途明示実行する。build/package/doctorから自動署名しない。
+手動stageではoperatorが以下を明示実行する。build/package/doctor単体は署名しない。通常self-updateのprepareは明示設定されたidentity/profileを使い、同じ順序で署名とdoctorを実行する。
 
 1. stage内のnative Mach-O（`.node`、`.dylib`、native executable）を内側から、選択したDeveloper ID Application identityで署名する。汎用的な `--deep` 署名で順序を省略しない。
 2. `node scripts/refresh-dispatcher-host-native-manifests.mjs /absolute/new-stage/DonaDispatcher.app` を実行する。署名で変わったbinary hashを更新する。外側bundle署名後の実行は拒否する。
@@ -46,7 +46,7 @@ macOS credential accessの境界は署名されたhost/payloadである。同一
 
 ## updateへ接続する際の条件
 
-stable updaterのprepareで署名済みexact SHA bundleを作成/取得し、doctor完了後だけimmutable releaseへ配置する。署名する前のnative hashからmanifestを確定しない。launchdはbundle内 `Contents/MacOS/DonaDispatcher serve` を直接起動する。runtime/workerは独立して保持し、BFF再起動でworkerを停止しない。旧unsigned releaseへ戻る場合は外部承認をsafe-offにする。profile更新は新bundleとして扱い、active bundleをin-place変更しない。これらのinstaller/update統合と実signed smokeが未完了の間は手順だけを根拠にproduction readyとしない。
+stable updaterのprepareで署名済みexact SHA bundleを作成/取得し、doctor完了後だけimmutable releaseへ配置する。署名する前のnative hashからmanifestを確定しない。launchdはbundle内 `Contents/MacOS/DonaDispatcher serve` を直接起動する。runtime/workerは独立して保持し、BFF再起動でworkerを停止しない。旧unsigned releaseへ戻る場合は外部承認をsafe-offにする。profile更新は新bundleとして扱い、active bundleをin-place変更しない。installer/update統合は以下の経路を使う。実signed smokeが未検証の間はproduction readyとしない。
 
 参照: [署名daemonのapp構造](https://developer.apple.com/documentation/Xcode/signing-a-daemon-with-a-restricted-entitlement)、[Provisioning profile](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles)、[Apple silicon JIT](https://developer.apple.com/documentation/Apple-Silicon/porting-just-in-time-compilers-to-apple-silicon)。
 
@@ -60,4 +60,6 @@ stable updaterはconfigとprofile bytesのdigestをplan hashへ結び、applyと
 
 署名はprepare段階でだけ行い、native署名・manifest更新・bundle署名・doctor後にreleaseをpublishする。quiesceより前に失敗でき、旧workerを操作しない。restart/rollbackでもcurrent artifactとlaunchdのexact host引数を確認する。DB/Task schemaの既存rollback条件を緩和しない。
 
-この段階の通常経路はsigned→signed更新を対象とする。初回unsigned→signedは専用cutoverが未接続のため、`--upgrade-control` と `--bootstrap` は現在releaseが未署名ならservice停止前に拒否する。旧Nodeへ暗黙fallbackしない。stable updaterの管理DBはplan digest保持のためschema8へ移行し、schema7以前のbinaryへ管理DBを戻して起動しない。
+初回unsigned→signedでは、control設定に署名policyを導入しても既存Nodeのplistを保つ。update plan作成時に、現在のexact SHAと既知のNode引数、plist全体のsnapshotをprivate control-rootへ保存し、そのdigestをplan hashに束縛する。承認後にtarget signed artifactを検証し、worker安全確認とDispatcher停止確認を経て、plistをsigned host引数へ原子的に切り替える。実行途中のplist driftは拒否する。targetの完了判定にはSHAに加え `runtime_host:signed-v1` が必要となる。
+
+初回planに束縛された旧SHAへ戻す場合だけ、保存済みの旧plistを復元できる。これはDB/Task schemaのrollback許可ではない。`rollback_safe:false`、不可逆migration、停止未確認など既存の条件を引き続き適用する。通常signed policyに汎用unsigned fallbackは設けない。stable updater管理DBはplan/snapshot digest保持のためschema9へ移行し、schema8以前のbinaryへ管理DBを戻して起動しない。

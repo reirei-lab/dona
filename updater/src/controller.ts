@@ -163,7 +163,10 @@ export class UpdateController {
         throw new Error("stable_updater_exact_target_schema_migration_capability_required");
       }
     }
+    const hostTransition=this.policy.signed_host && this.runtime.planDispatcherHostTransition
+      ? await this.runtime.planDispatcherHostTransition(current.sha,git.target_sha) : null;
     const result = this.database.createPlan(request, {
+      signed_host_transition:hostTransition,
       signed_host_digest:signedHostPolicyDigest(this.policy),
       current_sha: current.sha,
       target_sha: git.target_sha,
@@ -179,7 +182,7 @@ export class UpdateController {
       duplicate: result.duplicate,
       plan: result.plan,
       preflight: {
-        signed_host: {enabled:!!this.policy.signed_host, artifact_verified:false},
+        signed_host: {enabled:!!this.policy.signed_host, artifact_verified:false, initial_transition:!!hostTransition},
         storage, toolchain, ci_trusted: git.ci_trusted, fast_forward: git.target_reachable,
         ...(controlPlane ? {
           control_plane_capability: transition?.required_control_plane_capability ?? git.target_rollout.required_control_plane_capability,
@@ -366,7 +369,7 @@ export class UpdateController {
       observation.receipt.to_sha === claimed.target_sha &&
       observation.receipt.fence <= claimed.fence &&
       observation.receipt.generation === claimed.activation_generation &&
-      this.healthMatches(dispatcherHealth, claimed.target_sha, false, targetCompatibility) &&
+      (this.hostMatches(claimed, dispatcherHealth, claimed.target_sha) && this.healthMatches(dispatcherHealth, claimed.target_sha, false, targetCompatibility)) &&
       this.healthMatches(slackHealth, claimed.target_sha, true, targetCompatibility) &&
       this.notificationReporterReady(dispatcherHealth, slackHealth) &&
       this.mainAgentMatchesReceipt(claimed, mainAgent)
@@ -381,7 +384,7 @@ export class UpdateController {
       observation.receipt.fence <= claimed.fence &&
       observation.receipt.generation === claimed.activation_generation &&
       activeManifest !== null &&
-      this.healthMatches(dispatcherHealth, claimed.current_sha, false, activeManifest.compatibility) &&
+      (this.hostMatches(claimed, dispatcherHealth, claimed.current_sha) && this.healthMatches(dispatcherHealth, claimed.current_sha, false, activeManifest.compatibility)) &&
       this.healthMatches(slackHealth, claimed.current_sha, true, activeManifest.compatibility) &&
       this.notificationReporterReady(dispatcherHealth, slackHealth) && mainAgentMatches(mainAgent)
     ) {
@@ -490,7 +493,10 @@ export class UpdateController {
       if(this.policy.signed_host && (!this.build.prepareSignedHost || !this.build.verifySignedHost))throw new Error("signed_host_build_unavailable");
       const activeManifest = await this.releases.readCurrentManifest();
       this.assertLease(row);
-      if(this.policy.signed_host)await this.build.verifySignedHost!(path.join(this.policy.release_root,row.current_sha),activeManifest);
+      if(this.policy.signed_host){
+        if(row.signed_host_transition){if(!this.runtime.verifyDispatcherHostOriginal || !this.runtime.applyDispatcherHostTransition)throw Error("host_transition_runtime_unavailable");await this.runtime.verifyDispatcherHostOriginal(this.hostTransition(row)!);}
+        else await this.build.verifySignedHost!(path.join(this.policy.release_root,row.current_sha),activeManifest);
+      }
       if (activeManifest.sha !== row.current_sha) {
         throw new Error("planned_current_release_is_no_longer_active");
       }
@@ -892,6 +898,8 @@ export class UpdateController {
         return;
       }
       const releasePath = `${this.policy.release_root}/${row.target_sha}`;
+      if(row.signed_host_transition)await this.runtime.applyDispatcherHostTransition!(this.hostTransition(row)!,"target");
+      this.assertLease(row);
       const receipt = await this.releases.activate(row, releasePath);
       this.assertLease(row);
       this.database.recordActivationGeneration(row.request_id, row.fence, receipt.generation, this.clock.now());
@@ -914,7 +922,7 @@ export class UpdateController {
         return;
       }
       const dispatcherStart = await this.ensureServiceStarted(
-        row, "start_target_dispatcher", "dispatcher", row.target_sha, () => this.runtime.startDispatcher(),
+        row, "start_target_dispatcher", "dispatcher", row.target_sha, () => this.startDispatcherFor(row,row.target_sha),
         targetCompatibility,
       );
       if (dispatcherStart === "deferred") return;
@@ -956,7 +964,7 @@ export class UpdateController {
         await this.rollback(row, "slack_wrong_target_sha", {});
         return;
       }
-      if (!this.healthMatches(dispatcherHealth, row.target_sha, false, targetCompatibility) ||
+      if (!(this.hostMatches(row, dispatcherHealth, row.target_sha) && this.healthMatches(dispatcherHealth, row.target_sha, false, targetCompatibility)) ||
         !this.healthMatches(slackHealth, row.target_sha, true, targetCompatibility) ||
         !this.notificationReporterReady(dispatcherHealth, slackHealth) ||
         !this.mainAgentMatchesReceipt(row, mainAgent)) {
@@ -1169,6 +1177,8 @@ export class UpdateController {
         await this.restoreTargetAfterDrain(row, "rollback_dispatcher_registration_restored", false, true);
         return;
       }
+      if(row.signed_host_transition)await this.runtime.applyDispatcherHostTransition!(this.hostTransition(row)!,"original");
+      this.assertLease(row);
       receipt = await this.releases.rollback(row);
       this.assertLease(row);
       this.database.recordActivationGeneration(row.request_id, row.fence, receipt.generation, this.clock.now());
@@ -1198,7 +1208,7 @@ export class UpdateController {
       originalStop?.previous_session_id ?? undefined;
     if (!(await this.ensurePreviousMainAgentStarted(row, paneId, previousSessionId))) return;
     const dispatcherStart = await this.ensureServiceStarted(
-      row, "start_previous_dispatcher", "dispatcher", row.current_sha, () => this.runtime.startDispatcher(),
+      row, "start_previous_dispatcher", "dispatcher", row.current_sha, () => this.startDispatcherFor(row,row.current_sha),
       previousCompatibility,
     );
     if (dispatcherStart !== "started") {
@@ -1224,7 +1234,7 @@ export class UpdateController {
       pointerFinal.receipt?.request_id !== row.request_id || pointerFinal.receipt.from_sha !== row.target_sha ||
       pointerFinal.receipt.to_sha !== row.current_sha || pointerFinal.receipt.generation !== row.activation_generation ||
       pointerFinal.receipt.fence > row.fence ||
-      !this.healthMatches(dispatcherFinal, row.current_sha, false, previousCompatibility) ||
+      !(this.hostMatches(row, dispatcherFinal, row.current_sha) && this.healthMatches(dispatcherFinal, row.current_sha, false, previousCompatibility)) ||
       !this.healthMatches(slackFinal, row.current_sha, true, previousCompatibility) ||
       !this.mainAgentMatchesOperation(row, "start_previous_main_agent", row.current_sha, mainFinal)) {
       this.deferOrReview(row, "rollback_previous_health_failed", "Previous runtime has not reached the exact verified state");
@@ -1265,7 +1275,7 @@ export class UpdateController {
     const scope = { dispatcherQuiesced, slackQuiesced };
     const dispatcherRestored = !dispatcherQuiesced || await this.restartQuiescedService(row,
       "restart_target_dispatcher_after_drain", "dispatcher", causeCode,
-      () => this.runtime.startDispatcher(), row.target_sha, failure, scope);
+      () => this.startDispatcherFor(row,row.target_sha), row.target_sha, failure, scope);
     const slackRestored = !slackQuiesced || await this.restartQuiescedService(row,
       "restart_target_slack_after_drain", "slack_adapter", causeCode,
       () => this.runtime.startSlack(), row.target_sha, failure, scope);
@@ -1287,7 +1297,7 @@ export class UpdateController {
       const manifest = await this.releases.releaseManifest(row.target_sha);
       const health = await this.runtime.dispatcherHealth();
       this.assertLease(row);
-      if (!manifest || !this.healthMatches(health, row.target_sha, false, manifest.compatibility)) {
+      if (!manifest || !(this.hostMatches(row, health, row.target_sha) && this.healthMatches(health, row.target_sha, false, manifest.compatibility))) {
         this.needsReview(row, "rollback_drain_dispatcher_health_unverified");
         return;
       }
@@ -1858,7 +1868,7 @@ export class UpdateController {
       const health = await this.waitForHealth(service, sha, compatibility);
       this.assertLease(row);
       if (health.live && health.build_sha && health.build_sha !== sha) return "wrong_sha";
-      if (this.healthMatches(health, sha, service === "slack_adapter", compatibility)) {
+      if (this.hostMatches(row, health, sha) && this.healthMatches(health, sha, service === "slack_adapter", compatibility)) {
         this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, { health }, this.clock.now());
         return "started";
       }
@@ -1869,7 +1879,7 @@ export class UpdateController {
     const before = service === "dispatcher" ? await this.runtime.dispatcherHealth() : await this.runtime.slackHealth();
     this.assertLease(row);
     if (before.live && before.build_sha && before.build_sha !== sha) return "wrong_sha";
-    if (this.healthMatches(before, sha, service === "slack_adapter", compatibility)) {
+    if (this.hostMatches(row, before, sha) && this.healthMatches(before, sha, service === "slack_adapter", compatibility)) {
       this.database.prepareRuntimeOperation(row.request_id, row.fence, kind, service, sha, null, {}, this.clock.now());
       this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, { health: before }, this.clock.now());
       return "started";
@@ -1883,7 +1893,7 @@ export class UpdateController {
         { error_code: "registration_or_launch_unverified" }, this.clock.now());
       const health = await this.waitForHealth(service, sha, compatibility);
       this.assertLease(row);
-      if (this.healthMatches(health, sha, service === "slack_adapter", compatibility)) {
+      if (this.hostMatches(row, health, sha) && this.healthMatches(health, sha, service === "slack_adapter", compatibility)) {
         this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null,
           { health }, this.clock.now());
         return "started";
@@ -1913,12 +1923,18 @@ export class UpdateController {
     const health = await this.waitForHealth(service, sha, compatibility);
     this.assertLease(row);
     if (health.live && health.build_sha && health.build_sha !== sha) return "wrong_sha";
-    if (this.healthMatches(health, sha, service === "slack_adapter", compatibility)) {
+    if (this.hostMatches(row, health, sha) && this.healthMatches(health, sha, service === "slack_adapter", compatibility)) {
       this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, { health }, this.clock.now());
       return "started";
     }
     this.deferOrReview(row, `${kind}_health_unavailable`, `The ${kind} command was accepted but versioned health was not observed`);
     return "deferred";
+  }
+
+  private hostMatches(row:UpdateRow,health:HealthSnapshot,sha:string):boolean {
+    if(health.service!=="dispatcher" || !this.policy.signed_host)return true;
+    if(row.signed_host_transition && sha===row.current_sha)return health.runtime_host!=="signed-v1";
+    return health.runtime_host==="signed-v1";
   }
 
   private healthMatches(
@@ -1975,7 +1991,7 @@ export class UpdateController {
     const scope = { dispatcherQuiesced, slackQuiesced };
     const dispatcherRestored = !dispatcherQuiesced || await this.restartQuiescedService(
       row, "restart_current_dispatcher", "dispatcher", causeCode,
-      () => this.runtime.startDispatcher(), row.current_sha, failure, scope,
+      () => this.startDispatcherFor(row,row.current_sha), row.current_sha, failure, scope,
     );
     const slackRestored = !slackQuiesced || await this.restartQuiescedService(
       row, "restart_current_slack", "slack_adapter", causeCode,
@@ -1998,7 +2014,7 @@ export class UpdateController {
       const currentManifest = await this.releases.releaseManifest(row.current_sha);
       const health = await this.runtime.dispatcherHealth();
       this.assertLease(row);
-      if (!currentManifest || !this.healthMatches(health, row.current_sha, false, currentManifest.compatibility)) {
+      if (!currentManifest || !(this.hostMatches(row, health, row.current_sha) && this.healthMatches(health, row.current_sha, false, currentManifest.compatibility))) {
         this.needsReview(row, "quiesce_recovery_dispatcher_health_failed");
         return;
       }
@@ -2047,7 +2063,7 @@ export class UpdateController {
       pointer = currentPointer;
       recoveryHealth = { dispatcher: dispatcherHealth, slack_adapter: slackHealth };
       servicesVerified = currentManifest !== null &&
-        this.healthMatches(dispatcherHealth, row.current_sha, false, currentManifest.compatibility) &&
+        (this.hostMatches(row, dispatcherHealth, row.current_sha) && this.healthMatches(dispatcherHealth, row.current_sha, false, currentManifest.compatibility)) &&
         this.healthMatches(slackHealth, row.current_sha, true, currentManifest.compatibility) &&
         this.notificationReporterReady(dispatcherHealth, slackHealth);
     }
@@ -2248,6 +2264,17 @@ export class UpdateController {
     };
   }
 
+  private hostTransition(row:UpdateRow){return row.signed_host_transition ? {digest:row.signed_host_transition,from_sha:row.current_sha,to_sha:row.target_sha} : undefined;}
+  private async startDispatcherFor(row:UpdateRow,sha:string):Promise<CommandResult>{
+    const transition=this.hostTransition(row);
+    if(transition){
+      if(!this.runtime.applyDispatcherHostTransition)throw Error("host_transition_runtime_unavailable");
+      await this.runtime.applyDispatcherHostTransition(transition,sha===row.current_sha?"original":"target");
+      return this.runtime.startDispatcher(sha===row.current_sha?transition:undefined);
+    }
+    return this.runtime.startDispatcher();
+  }
+
   private assertLease(row: UpdateRow): void {
     if((row.signed_host_digest ?? null)!==signedHostPolicyDigest(this.policy))throw new Error("signed_host_plan_drift");
     this.database.assertLease(row.request_id, row.fence, this.owner, this.clock.now());
@@ -2318,7 +2345,7 @@ export class UpdateController {
         this.releases.releaseManifest(row.current_sha),
       ]);
       return currentManifest !== null && pointer.current_sha === row.current_sha &&
-        this.healthMatches(dispatcherHealth, row.current_sha, false, currentManifest.compatibility) &&
+        (this.hostMatches(row, dispatcherHealth, row.current_sha) && this.healthMatches(dispatcherHealth, row.current_sha, false, currentManifest.compatibility)) &&
         this.healthMatches(slackHealth, row.current_sha, true, currentManifest.compatibility) &&
         mainAgentMatches(mainAgent);
     } catch {
