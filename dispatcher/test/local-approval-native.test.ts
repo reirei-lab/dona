@@ -27,3 +27,25 @@ test("同じapproval rootの再初期化は拒否する",t=>{
  const f=fixture(t,false);installApprovalExecutionMarkerSchema(f.db);initializeLocalApprovalRoots(f.db,f.providers,scope);
  assert.throws(()=>initializeLocalApprovalRoots(f.db,f.providers,scope));
 });
+
+test("protected maintenance phaseはconfig rollbackとCAS応答喪失をfail closedにする",async()=>{
+ const {LocalMaintenanceStore,encodeLocalMaintenance}=await import("../src/approval/local-maintenance.js");
+ let entry={revision:1,value:encodeLocalMaintenance({codec_version:1,active_key_version:1,phase:"ready",operation_id:null,next_key_version:null,recovery_mark:null})},lost=false;
+ const store=new LocalMaintenanceStore({read:()=>({...entry}),compareExchange:(expected,value)=>{assert.deepEqual(expected,entry);entry={revision:entry.revision+1,value};if(lost)throw Error("response lost");return {...entry};}});
+ store.requireReady(1);const before=store.read();lost=true;
+ assert.throws(()=>store.change(before,{...before.state,phase:"rotation",operation_id:"rotate",next_key_version:2,operation_config_digest:"a".repeat(64)}));
+ assert.throws(()=>store.requireReady(1));assert.equal(store.read().state.phase,"rotation");lost=false;
+ const current=store.read();store.change(current,{codec_version:1,active_key_version:2,phase:"ready",operation_id:null,next_key_version:null,recovery_mark:null,last_rotation:{from:1,to:2,operation_id:"rotate",config_digest:"a".repeat(64)}});
+ store.requireReady(2);assert.throws(()=>store.requireReady(1));assert.equal(store.read().state.last_rotation?.from,1);
+});
+
+test("rotationは無効化完了前にreadyにせず旧configの更新前crashをread-only復旧する",async()=>{
+ const {LocalMaintenanceStore,encodeLocalMaintenance}=await import("../src/approval/local-maintenance.js"),{rotateProtectedKeys}=await import("../src/approval/local-key-rotation.js");
+ let entry={revision:1,value:encodeLocalMaintenance({codec_version:1,active_key_version:1,phase:"ready",operation_id:null,next_key_version:null,recovery_mark:null})};
+ const store=new LocalMaintenanceStore({read:()=>({...entry}),compareExchange:(old,value)=>{assert.deepEqual(old,entry);return entry={revision:entry.revision+1,value};}});
+ const trace:string[]=[];let fail=true;const ports={change:(old:ReturnType<typeof store.read>,next:Parameters<typeof store.change>[1])=>store.change(old,next),stageNewKeys:()=>{trace.push("stage");},auditAndInvalidate:()=>{trace.push("invalidate");if(fail)throw Error("fixture interrupted");},retireOldKeys:()=>{trace.push("retire");}};
+ assert.throws(()=>rotateProtectedKeys(store,1,2,"a".repeat(64),ports));assert.equal(store.read().state.phase,"rotation");assert.deepEqual(trace,["stage","invalidate"]);assert.throws(()=>store.requireReady(1));
+ fail=false;assert.equal(rotateProtectedKeys(store,1,2,"a".repeat(64),ports),2);assert.deepEqual(trace,["stage","invalidate","stage","invalidate","retire"]);store.requireReady(2);
+ const writes=entry.revision;assert.equal(rotateProtectedKeys(store,1,2,"a".repeat(64),ports),2);assert.equal(entry.revision,writes);assert.equal(trace.length,5);
+ assert.throws(()=>rotateProtectedKeys(store,1,2,"b".repeat(64),ports));assert.throws(()=>rotateProtectedKeys(store,2,4,"a".repeat(64),ports));
+});

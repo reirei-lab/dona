@@ -8,9 +8,12 @@ export const externalReplyTool={type:"function",name:"dona_request_thread_reply"
 export interface ExternalToolRequest {request_id:string;agent:string;generation:string;thread_id:string;turn_id:string;call_id:string;rpc_id_json:string;role:"main"|"worker";attempt_id:string|null;source_event_id:string|null;operation_slot:string;text:string;state:"pending"|"answering"|"resolved"|"expired";result_json:string|null;created_at:string}
 /** Runtime専用の入力待ち。Codex approval/questionとは別のtyped callとする。 */
 export class ExternalToolQueue {
+ private availableUntil=0;
+ availability(enabled:boolean){this.availableUntil=enabled?Date.now()+30000:0;return {enabled,ttl_ms:enabled?30000:0};}
  constructor(private readonly store:RuntimeStore){store.db.exec(`CREATE TABLE IF NOT EXISTS external_tool_requests(request_id TEXT PRIMARY KEY,agent TEXT NOT NULL,generation TEXT NOT NULL,thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,call_id TEXT NOT NULL,rpc_id_json TEXT NOT NULL,role TEXT NOT NULL,attempt_id TEXT,source_event_id TEXT,operation_slot TEXT NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL,result_json TEXT,created_at TEXT NOT NULL,UNIQUE(agent,generation,call_id));`);}
  expireRestart(){this.store.db.prepare("UPDATE external_tool_requests SET state='expired',text='' WHERE state IN ('pending','answering')").run();}
  accept(agent:AgentRecord,message:RpcMessage):ExternalToolRequest{
+  if(this.availableUntil<=Date.now())throw Error("runtime_external_unavailable");
   const p=message.params as Record<string,unknown>;
   if(p.tool!==externalReplyTool.name||p.namespace!==null&&p.namespace!==undefined||typeof p.callId!=="string"||p.callId.length>128||!p.callId||p.threadId!==agent.thread_id||p.turnId!==agent.turn_id||message.id===undefined)throw Error("runtime_external_identity_invalid");
   const input=args.parse(p.arguments),config=JSON.parse(agent.config_json);

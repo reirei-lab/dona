@@ -47,3 +47,15 @@ factoryは既存Dispatcherと同じ正規DB fileを `openSecurityDatabase` で�
 mainは暗号化requestの作成後にpending handleを受け取り、そのeventを完了できる。terminal結果は保存済みreply targetへの新しい `dona_approval` eventとする。workerは `task_external_approval_checkpoints` と同じtool callを保ち、通常のnative質問/実行承認とは混ぜない。tool responseはserverRequest/resolvedで確認するまで回答中とし、応答不明だけでTaskを再開しない。Runtime再起動で失われた未完了callはexpiredとして停止し、承認の再実行権限にしない。task cancel/pauseやAttempt置換後のsourceではconsume/sendを開始しない。
 
 承認者はdevice/revisionを含むauthority全体のhashを監査済みdecisionのactor IDへ束縛する。補助JSONだけでauthorityを作れず、consume/start/送信直前にも現在grantを確認する。要求端末Aと承認端末Bが異なる場合もBの失効を無視しない。内部event/expiryの走査はimmutable履歴のcursorをboundedに巡回し、先頭の接続障害だけで後続要求を永久に止めない。
+
+## 鍵更新とMac再起動後の復旧
+
+通常起動はDB外のmaintenance manifestが `ready` で、設定のactive key versionと一致するときだけ許可する。`rotation` / `boot_recovery` の途中で停止した場合もsafe-offを維持する。Macの対話TTYから固定CLIの `rotate --next-version N` / `recover` を使い、前者は `instance/workspace/owner:rotate:N`、後者は `instance/workspace/owner:recover` をexact確認する。常駐laneを停止してin-flight処理を待ち、business/security connectionを閉じてから実施する。HTTP、MCP、通常起動から保守操作を実行しない。
+
+`rotateNativeLocalApproval` は次の1世代だけを作り、旧keyをverification-onlyとして保持する。旧監査の検証key、used-IDと保護rootを削除しない。旧pending request、consume前のdecision、送信結果が不明なexecutionは保守監査とともにneeds_reviewへ固定し、旧payloadを消去して再送を許可しない。新keyの有効期間は89日で、期限前の保守を計画する。期限切れ後も旧keyで履歴を検証し、新audit keyで更新する正規経路を使える。
+
+manifest更新後に設定JSONの保存だけが失敗した場合は、同じ旧設定と同じnext versionで再実行できる。manifest内のexact設定digestと完了したrotationを照合し、保護状態を書き換えず新設定を返す。異なる設定やversionへの便乗更新は拒否する。途中失敗は同じexact保守操作として人が再開し、DB/Keychainを消してやり直さない。
+
+`recoverNativeLocalApproval` はboot identity変更を確認し、UTCを後退させず保護clockのCAS headを新bootへ移す。旧expiry、使用済みID、監査rootは保持し、旧未完了権限を失効してから受付を再開する。clock rollbackや監査anchor不一致を無条件resetで回避しない。key期限切れとboot変更が同時なら `rotate` が新keyで同じ復旧を行う。DB復元や不明な監査commitの一般的な修復手段ではない。
+
+Runtimeの外部tool受付は常駐approval laneが `externalAvailability(true)` で更新する30秒のheartbeatを必要とする。未設定、停止、切断、heartbeat失効時の新規callは即時に利用不可として返す。`false` は新規だけを止め、既存pending要求や承認済み操作を勝手に拒否・再実行しない。

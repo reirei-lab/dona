@@ -151,3 +151,15 @@ test("先頭20件が解決不能でも21件目のdecisionを次のbounded scan�
  await f.service.executePending();assert.equal(f.counts().sends,0);
  await f.service.executePending();assert.equal(f.counts().sends,1);assert.equal(scans,2);
 });
+
+test("operator復旧は旧承認と不明実行をneeds_reviewへ固定しpayloadを削除する",async t=>{
+ const {invalidateLocalApprovals}=await import("../src/approval/local-invalidation.js");
+ for(const unknown of [false,true]){
+  const f=setup(t),{created}=await approved(f);if(unknown){f.setSend({outcome:"unknown"});await f.service.executePending();}
+  const beforeSends=f.counts().sends;
+  invalidateLocalApprovals(f.db,f.providers,scope,actor.owner_id);
+  const status=f.service.status(actor,created.request_handle);assert.equal(unknown?status.execution?.state:status.state,"needs_review");
+  assert.equal((f.db.prepare("SELECT COUNT(*) n FROM approval_payload_secrets").get() as {n:number}).n,0);
+  await f.service.executePending();assert.equal(f.counts().sends,beforeSends);
+ }
+});

@@ -120,6 +120,15 @@ export class ProtectedClockMarks implements ClockMarkStore {
     this.access = new HeadAccess(scope, port, nodes);
   }
   read(): ClockMark { return guard(() => { const { head } = this.access.read(); if (head.kind !== "clock_mark") throw new ProtectedHeadError(); return head.state; }); }
+  /** 明示operator maintenance専用。通常reserveではboot変更を引き続き拒否する。
+   * callerはDB外maintenance phaseを先に確定し、全旧権限を無効化するまで受付を再開しない。 */
+  rebaseForOperator(expectedInput:ClockMark,proposedInput:ClockMark):ClockMark {
+    return guard(()=>{
+      const before=this.access.read(),expected=parseClockMark(expectedInput),proposed=parseClockMark(proposedInput);
+      if(before.head.kind!=="clock_mark"||canonical(expected)!==canonical(before.head.state)||proposed.boot_id===expected.boot_id||proposed.previous_transaction_id!==expected.transaction_id||proposed.transaction_id===expected.transaction_id||Date.parse(proposed.effective_utc)<Date.parse(expected.effective_utc))throw new ProtectedHeadError();
+      const after=this.access.update(before,proposed,proposed.transaction_id);if(after.kind!=="clock_mark")throw new ProtectedHeadError();return after.state;
+    });
+  }
   reserve(expectedInput: ClockMark, proposedInput: ClockMark): ClockMark {
     return guard(() => {
       assertSynchronousResult(expectedInput); assertSynchronousResult(proposedInput);

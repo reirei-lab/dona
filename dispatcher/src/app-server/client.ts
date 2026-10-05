@@ -20,6 +20,7 @@ export class RuntimeClient {
       request.setTimeout(this.timeoutMs,()=>request.destroy(Error("runtime_response_unknown")));request.on("error",reject);request.end(body);
     });
   }
+  externalAvailability(enabled:boolean):Promise<{enabled:boolean;ttl_ms:number}>{return this.call("externalAvailability",{enabled});}
   externalRequest(id:string):Promise<ExternalToolRequest|null>{return this.call("externalRequest",{id});}
   externalRequests():Promise<ExternalToolRequest[]>{return this.call("externalRequests");}
   resolveExternal(name:string,id:string,result:{request_id:string|null;state:string}):Promise<unknown>{return this.call("resolveExternal",{name,id,result});}

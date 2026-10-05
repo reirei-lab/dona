@@ -245,10 +245,15 @@ test("外部reply dynamic toolは実turnへ束縛しnative質問と分離する"
  const tool=fake.replace("method:'item/tool/requestUserInput'","method:'item/tool/call'").replace("itemId:'item-test',questions:[{id:'choice',question:'どちら？',isSecret:false,options:null}]","callId:'call-external',namespace:null,tool:'dona_request_thread_reply',arguments:{operation_slot:'reply_one',text:'確認した本文'}");
  await fs.writeFile(script,tool);const store=new RuntimeStore(path.join(root,"runtime.db")),manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));
  try{
+  assert.throws(()=>manager.external.accept({} as never,{} as never),/runtime_external_unavailable/);
+  manager.external.availability(true);
   const agent=await manager.start({name:"main-external",role:"main",cwd:root,release:root,args:[],threadConfig:{}});
   const eventId="evt_01m3e2ht7qs79vf480z5qefeat";
   await manager.prompt(agent.name,eventId,"承認を要求");await until(()=>manager.external.pending().length===1);
   const row=manager.externalRequests()[0]!;assert.equal(row.source_event_id,eventId);assert.equal(row.attempt_id,null);assert.equal(row.text,"確認した本文");assert.equal(store.questions(agent.name).length,0);
+  manager.external.availability(false);
+  assert.equal(manager.external.pending().length,1);
+  assert.throws(()=>manager.external.accept({} as never,{} as never),/runtime_external_unavailable/);
   assert.equal(manager.status(agent.name)?.state,"waiting");manager.resolveExternal(agent.name,row.request_id,{request_id:"approval",state:"pending"});
   await until(()=>manager.status(agent.name)?.state==="idle");assert.equal(manager.external.get(row.request_id)?.text,"");
   assert.equal(manager.resolveExternal(agent.name,row.request_id,{request_id:"approval",state:"pending"}).state,"resolved");

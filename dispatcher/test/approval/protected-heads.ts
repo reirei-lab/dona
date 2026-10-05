@@ -223,3 +223,12 @@ test("既存の監査transactionへ接続しanchor reserve不明時に業務DB�
   assert.throws(() => audit.verify()); assert.throws(() => store.restart("later"));
   assert.equal(auditPort.writes, 5); assert.equal(clockPort.writes, 3);
 });
+
+test("operator boot rebaseはUTC high-waterとused-IDを保ち通常reserveでは許さない",t=>{
+ const f=fixture(t),clock=new ProtectedClockMarks(clockScope,f.port,f.nodes),before=clock.read();
+ const proposed={...before,transaction_id:"operator_rebase",previous_transaction_id:before.transaction_id,boot_id:"next_boot",continuous_ms:5,effective_utc:"2026-09-20T00:00:00.000Z"};
+ assert.throws(()=>clock.reserve(before,proposed));assert.throws(()=>clock.rebaseForOperator(before,{...proposed,effective_utc:"2026-09-18T00:00:00.000Z"}));
+ assert.deepEqual(clock.rebaseForOperator(before,proposed),proposed);assert.throws(()=>clock.rebaseForOperator(before,proposed));
+ const later=next(proposed,"after_rebase");assert.deepEqual(clock.reserve(proposed,later),later);
+ assert.throws(()=>clock.rebaseForOperator(later,{...proposed,previous_transaction_id:later.transaction_id,boot_id:"third_boot",effective_utc:"2026-09-21T00:00:00.000Z"}));
+});
