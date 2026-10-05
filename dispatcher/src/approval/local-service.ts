@@ -22,6 +22,19 @@ export function approvalLoop(tick:()=>Promise<unknown>,failure:()=>void,interval
  };
  return {start(){if(running)return;running=true;run();},async stop(){running=false;clearTimeout(timer);await pending;}};
 }
+export function approvalAdmission<T extends {ready:boolean;reason?:string}>(ports:{health():T;authorize():boolean;sweep():unknown;availability(ready:boolean):Promise<unknown>;tick():Promise<unknown>}){
+ let admitted=false;
+ const health=()=>{try{const value=ports.health();if(!value.ready)return value;if(!ports.authorize())return {...value,ready:false,reason:'operator_state_unverified'};return admitted?value:{...value,ready:false,reason:'operations_unavailable'};}catch{return {ready:false,reason:'protected_state_unverified'};}};
+ const disable=async()=>{admitted=false;await ports.availability(false).catch(()=>{});};
+ const tick=async()=>{try{
+  if(!ports.health().ready||!ports.authorize()){await disable();return;}
+  ports.sweep();
+  if(!ports.authorize())throw Error('operator_state_unverified');
+  await ports.availability(true);if(!ports.authorize())throw Error('operator_state_unverified');
+  await ports.tick();if(!ports.health().ready||!ports.authorize())throw Error('operator_state_unverified');admitted=true;
+ }catch(error){await disable();throw error;}};
+ return {health,tick,disable};
+}
 export async function openLocalApprovalService(database:DispatcherDatabase,config:DispatcherConfig,wake:()=>void,failure:()=>void){
  if(!config.localApprovalConfigPath)return undefined;
  const nativeConfig=readLocalApprovalNativeConfig(config.localApprovalConfigPath);
@@ -33,28 +46,25 @@ export async function openLocalApprovalService(database:DispatcherDatabase,confi
   const token=await localApprovalCredential(nativeConfig.slack_workspace_alias);
   const revisionKey=createHmac('sha256',native.keys.content(null).secret).update('dona.local-approval.thread-revision.v1').digest();
   const slack=new LocalSlackApprovalProvider(nativeConfig.scope.workspace_id,token,revisionKey);
-  let ingress:LocalExternalApprovalIngress;
-  const service=new LocalExternalApprovalService(sql,native.providers,nativeConfig.scope,native.keys,{
-   authorize:a=>database.operatorAuth.authorize(a,'approvals:external'),
-   authorizeSource:s=>ingress?.authorizeSource(s)===true,
-   verifyStepUp:r=>database.operatorWebAuthn?.verifyReceipt(r,r,'approvals:external')===true,
-  },slack);
-  const operations=new LocalApprovalOperations(sql,native.providers,nativeConfig.scope,native.keys,{
+  const operator={
    owner_id:nativeConfig.owner_id,authorize:()=>{try{
     native!.maintenance.requireReady(nativeConfig.key_version);
     const current=sql.prepare('SELECT instance_id,owner_id FROM dashboard_operator_identity WHERE singleton=1').get() as {instance_id:string;owner_id:string}|undefined;
     return typeof process.getuid==='function'&&process.getuid()===process.geteuid?.()&&current?.instance_id===nativeConfig.scope.instance_id&&current.owner_id===nativeConfig.owner_id&&stableStringify(readLocalApprovalNativeConfig(config.localApprovalConfigPath!))===stableStringify(nativeConfig);
    }catch{return false;}},
-  },{reconcile:(...args)=>slack.reconcile(...args)});
+  };
+  let ingress:LocalExternalApprovalIngress;
+  const service=new LocalExternalApprovalService(sql,native.providers,nativeConfig.scope,native.keys,{
+   authorize:a=>operator.authorize()&&database.operatorAuth.authorize(a,'approvals:external'),
+   authorizeSource:s=>operator.authorize()&&ingress?.authorizeSource(s)===true,
+   verifyStepUp:r=>database.operatorWebAuthn?.verifyReceipt(r,r,'approvals:external')===true,
+  },slack);
+  const operations=new LocalApprovalOperations(sql,native.providers,nativeConfig.scope,native.keys,operator,{reconcile:(...args)=>slack.reconcile(...args)});
   const runtime=new RuntimeClient(runtimeSocket(config));
   ingress=database.createExternalApprovalIngress(runtime,service,{...nativeConfig.scope,owner_id:nativeConfig.owner_id,main_agent:config.agentName},wake);
-  const loop=approvalLoop(async()=>{
-   const ready=native!.doctor().ready;
-   if(ready)operations.sweep(performance.now()+500);
-   await runtime.externalAvailability(ready);
-   if(ready)await ingress.tick();
-  },failure);
-  const stop=async()=>{await loop.stop();await runtime.externalAvailability(false).catch(()=>{});};
-  return {service,async start(){await runtime.externalAvailability(native!.doctor().ready);loop.start();},stop,health:()=>native!.doctor(),async close(){await stop();native!.close();sql.close();}};
+  const admission=approvalAdmission({health:()=>native!.doctor(),authorize:operator.authorize,sweep:()=>operations.sweep(performance.now()+500),availability:ready=>runtime.externalAvailability(ready),tick:()=>ingress.tick()});
+  const loop=approvalLoop(admission.tick,failure);
+  const stop=async()=>{await loop.stop();await admission.disable();};
+  return {service,async start(){loop.start();},stop,health:admission.health,async close(){await stop();native!.close();sql.close();}};
  }catch(error){native?.close();sql.close();throw error;}
 }
