@@ -159,7 +159,7 @@ export function parsePolicy(input: unknown): UpdatePolicy {
     herdr: absolute(executables.herdr, "executables.herdr"),
     codex: absolute(executables.codex, "executables.codex"),
   };
-  const fixedChecks = ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS"];
+  const fixedChecks = ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS", "Verify sources/web"];
   const requiredChecks = value.required_checks;
   if (!Array.isArray(requiredChecks) || requiredChecks.length !== fixedChecks.length ||
     !fixedChecks.every((check) => requiredChecks.includes(check))) {

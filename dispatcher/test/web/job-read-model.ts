@@ -278,8 +278,10 @@ test("別principalと未知jobを同じnot_found projectionにする",t=>{const 
 test("can_cancelはowner・scope・現行cancel受付状態を満たす場合だけ公開する",t=>{const f=fixture(t);
   const broker=new WebJobReadBroker(readAuth(owner,["job:read:own","job:cancel:own"]) as never,f.jobs);
   for(const [status,expected] of [["queued",true],["preparing",true],["dispatching",true],["retryable_failed",true],["running",true],["blocked",true],["needs_review",true],["cancelling",false],["completed",false]] as const){
-    const job=f.seed(owner,status);const detail=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"});
-    assert.equal(detail.status,"succeeded");if(detail.status==="succeeded"&&detail.kind==="detail")assert.equal(detail.job.control.can_cancel,expected,status);
+    const job=f.seed(owner,status);const task=f.jobs.tasks.attachWebAttempt(f.jobs.getJob(job)!,job);
+    f.raw.prepare("UPDATE jobs SET status=? WHERE job_id=?").run(status,job);
+    const detail=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"});
+    assert.equal(detail.status,"succeeded");if(detail.status==="succeeded"&&detail.kind==="detail"){assert.equal(detail.job.control.can_cancel,expected,status);assert.equal(detail.job.control.task_id,task.task_id);assert.equal(detail.job.control.revision,f.jobs.tasks.get(task.task_id)!.revision);}
   }
   const unknown=f.seed(owner,"needs_review");f.raw.prepare("UPDATE jobs SET last_error_code='web_cancel_acceptance_unknown' WHERE job_id=?").run(unknown);
   const unknownDetail=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${unknown}`,context:"context"});
@@ -366,3 +368,22 @@ test("ownとgrantedの両scopeは両方のjobをunionしcursorへbindする",t=>
   const after=broker.execute({codec_version:1,operation:"list",method:"GET",target:"/api/jobs",context:"context"});
   assert.equal(after.status,"succeeded");if(after.status==="succeeded"&&after.kind==="list")assert.deepEqual(after.items.map(item=>item.job_id),[ownJob]);
 });
+
+ test("Taskだけの取消更新も接続中Web readerのcursorへ同じtransactionで記録する",t=>{
+  const f=fixture(t),job=f.seed(owner,"running");
+  const task=f.jobs.tasks.attachWebAttempt(f.jobs.getJob(job)!,job);
+  f.raw.prepare("UPDATE jobs SET status='running',dispatch_started_at=? WHERE job_id=?").run("2026-09-21T00:00:00.000Z",job);
+  const broker=new WebJobReadBroker(readAuth(owner,["job:read:own","job:cancel:own"]) as never,f.jobs);
+  const before=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"});
+  assert.equal(before.status,"succeeded");if(before.status!=="succeeded"||before.kind!=="detail")return;
+  const command={...owner,task_id:task.task_id,attempt_id:job,revision:task.revision,idempotency_key:"1".repeat(64)};
+  assert.throws(()=>f.jobs.cancelWebTask({...command,idempotency_key:"invalid"}),/web_command_invalid/);
+  const unchanged=broker.execute({codec_version:1,operation:"events",method:"GET",target:`/api/jobs/${job}/events`,context:"context",cursor:before.event_cursor});
+  assert.equal(unchanged.status,"succeeded");if(unchanged.status!=="succeeded"||unchanged.kind!=="events")return;
+  assert.equal(unchanged.changed,false);
+  f.jobs.cancelWebTask(command);
+  const after=broker.execute({codec_version:1,operation:"events",method:"GET",target:`/api/jobs/${job}/events`,context:"context",cursor:before.event_cursor});
+  assert.equal(after.status,"succeeded");if(after.status!=="succeeded"||after.kind!=="events")return;
+  assert.equal(after.changed,true);assert.equal(after.job.status,"running");assert.equal(after.job.control.can_cancel,false);
+  assert.equal(after.job.control.revision,task.revision+1);assert.notEqual(after.event_cursor,before.event_cursor);
+ });

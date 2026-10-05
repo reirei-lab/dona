@@ -213,6 +213,40 @@ export class TaskRepository {
       return {outcome:"created" as const,task:this.get(id)!};
     }).immediate();
   }
+  /** Web admission remains inert until a protected analysis runtime is composed. */
+  attachWebAttempt(job:JobRow,requestKey:string):TaskRow {
+    if(job.source!=="web"||this.forAttempt(job.job_id))throw new Error("web_task_attachment_conflict");
+    const event=this.dispatcher.get(job.source_event_id);
+    if(event?.source!=="web"||event.reply_target_json!==null)throw new Error("web_job_owner_mismatch");
+    const id=`task_${ulid().toLowerCase()}`,now=new Date().toISOString();
+    this.sql.prepare(`INSERT INTO tasks(task_id,source_event_id,task_key,request_sha256,current_attempt_id,max_attempts,retry_delay_ms,objective,created_at,updated_at,state,wait_reason)
+      VALUES(?,?,?,?,?,1,60000,?,?,?,'waiting','runtime_profile_unavailable')`)
+      .run(id,job.source_event_id,requestKey,hash({objective:job.objective,workspace:job.workspace_json}),job.job_id,job.objective,now,now);
+    this.sql.prepare("INSERT INTO task_attempts(attempt_id,task_id,number,created_at) VALUES(?,?,1,?)").run(job.job_id,id,now);
+    this.stampAttempt(job,id,1);
+    this.sql.prepare("UPDATE jobs SET status='blocked',last_error_code='runtime_profile_unavailable',last_error_message=NULL WHERE job_id=?").run(job.job_id);
+    this.activateSchema();return this.get(id)!;
+  }
+  /** Internal read-only snapshot; callers must authorize each item before disclosing it. */
+  scanSnapshot(afterTaskId?:string,limit=100):TaskRow[] {
+    if(!Number.isInteger(limit)||limit<1||limit>100)throw new Error("task_snapshot_limit_invalid");
+    return this.sql.prepare("SELECT * FROM tasks WHERE task_id>? ORDER BY task_id LIMIT ?").all(afterTaskId??"",limit) as TaskRow[];
+  }
+  attempts(id:string):Array<{attempt_id:string;number:number;outcome:string|null;created_at:string;ended_at:string|null}> {
+    return this.sql.prepare("SELECT attempt_id,number,outcome,created_at,ended_at FROM task_attempts WHERE task_id=? ORDER BY number").all(id) as ReturnType<TaskRepository["attempts"]>;
+  }
+  cancelWeb(id:string,attemptId:string,revision:number):TaskRow {
+    const task=this.get(id);
+    if(!task||task.current_attempt_id!==attemptId||task.revision!==revision)throw new Error("task_revision_conflict");
+    const job=this.dispatcher.getJob(attemptId)!;
+    if(job.source!=="web")throw new Error("web_job_owner_mismatch");
+    if(["completed","failed","cancelled"].includes(task.state))throw new Error("task_terminal");
+    const now=new Date().toISOString();
+    this.sql.prepare("UPDATE tasks SET state='waiting',desired_state='cancelled',wait_reason='cancel_requested',next_check_at=?,revision=revision+1,updated_at=? WHERE task_id=?").run(now,now,id);
+    if(["queued","blocked"].includes(job.status)&&!job.dispatch_started_at&&!job.herdr_pane_id&&!job.herdr_workspace_id)
+      this.sql.prepare("UPDATE jobs SET status='cancelled',completed_at=?,updated_at=?,last_error_code=NULL,last_error_message=NULL WHERE job_id=?").run(now,now,attemptId);
+    return this.get(id)!;
+  }
   private stampAttempt(job:JobRow,taskId:string,number:number):void {
     const workspace={...JSON.parse(job.workspace_json),_dona_task:{task_id:taskId,attempt_id:job.job_id,attempt_number:number}};
     this.sql.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(JSON.stringify(workspace),job.job_id);
@@ -362,6 +396,7 @@ export class TaskRepository {
   candidates(at=new Date()):TaskRow[] {
     return this.sql.prepare(`SELECT t.* FROM tasks t JOIN jobs j ON j.job_id=t.current_attempt_id
       WHERE t.state IN ('active','waiting','paused') AND NOT (t.state='paused' AND t.wait_reason='paused') AND (t.next_check_at IS NULL OR t.next_check_at<=?)
+      AND NOT (t.desired_state='running' AND COALESCE(t.wait_reason,'')='runtime_profile_unavailable')
       AND (j.status IN ('needs_review','blocked') OR t.desired_state<>'running' OR t.wait_reason IN ('cancel_requested','pause_requested','resume_requested','worker_stop_pending','steer_acceptance_unknown'))
       ORDER BY COALESCE(t.next_check_at,t.created_at),t.task_id LIMIT 8`).all(at.toISOString()) as TaskRow[];
   }

@@ -494,6 +494,10 @@ test("generation target validation rejects a mismatched installed updater before
     await execute(process.execPath, [fileURLToPath(new URL("../../scripts/render-self-update-templates.mjs", import.meta.url)), rendered, sha, root, "generation"], {
       env: { ...process.env, PATH: `${testBin}:${process.env.PATH}` },
     });
+    const renderedPolicy = JSON.parse(await fs.readFile(path.join(rendered, "policy.json"), "utf8"));
+    assert.deepEqual(renderedPolicy.required_checks, [
+      "Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS", "Verify sources/web",
+    ]);
     const helper = fileURLToPath(new URL("../../scripts/validate-generation-install-target.py", import.meta.url));
     const renderedDispatcher = path.join(rendered, "dev.dona.dispatcher.plist");
     const beforeStage = await fs.readFile(renderedDispatcher);

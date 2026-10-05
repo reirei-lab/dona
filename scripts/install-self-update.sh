@@ -253,7 +253,7 @@ fi
 $GH_PATH api --method GET "repos/hiragram/dona/commits/$INSTALL_SHA/check-runs" -f per_page=100 > "$INSTALL_TMP/check-runs.json"
 $NODE_PATH -e '
 const runs = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).check_runs ?? [];
-for (const name of ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS"]) {
+for (const name of ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS", "Verify sources/web"]) {
   const candidates = runs.filter((run) => run.name === name && run.head_sha === process.argv[2] && run.app?.slug === "github-actions");
   const latest = candidates.sort((a, b) => b.id - a.id)[0];
   if (!latest || latest.status !== "completed" || latest.conclusion !== "success") {
@@ -283,7 +283,7 @@ $GIT_PATH -C "$REPOSITORY_DIR" archive --format=tar --output="$INSTALL_TMP/relea
 
 mkdir -p "$INSTALL_TMP/npm-cache"
 /usr/bin/touch "$INSTALL_TMP/npm-userconfig" "$INSTALL_TMP/npm-globalconfig"
-for component in dispatcher sources/slack updater; do
+for component in dispatcher sources/slack sources/web updater; do
   COMPONENT_DIR="$STAGING_DIR/$component"
   env -i PATH="$(dirname "$NODE_PATH"):$(dirname "$NPM_PATH"):/usr/bin:/bin:/usr/sbin:/sbin" \
     CI=1 NO_COLOR=1 npm_config_cache="$INSTALL_TMP/npm-cache" npm_config_audit=false npm_config_fund=false \

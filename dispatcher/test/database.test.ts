@@ -353,6 +353,7 @@ describe("DispatcherDatabase", () => {
     migration.prepare("UPDATE jobs SET updated_at=? WHERE job_id='job-running'")
       .run("2026-09-03T01:00:00.000Z");
     assert.notEqual(migration.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='web_job_projection_update'").get(), undefined);
+    assert.notEqual(migration.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='web_task_projection_update'").get(), undefined);
     migration.close();
 
     const v3 = new DispatcherDatabase(config.databasePath);

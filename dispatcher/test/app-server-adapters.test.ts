@@ -39,17 +39,17 @@ test("scratch continuationの作業ディレクトリ消失・symlinkを拒否�
  }finally{await fs.rm(root,{recursive:true,force:true});}
 });
 
-for(const phase of ["accepted","no_thread","status_lost","not_sent"] as const)test(`worker start応答喪失の${phase}を分類し再送しない`,async()=>{
+for(const phase of ["accepted","no_thread","status_lost","not_sent","confirmed_not_sent"] as const)test(`worker start応答喪失の${phase}を分類し再送しない`,async()=>{
  const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath),runtime=new AppServerJobRuntime(config,true,undefined,()=>phase==="accepted");
  try{
   config.jobCommandTimeoutMs=5000;config.codexPath=path.join(root,"codex-stub");await fs.writeFile(config.codexPath,"#!/bin/sh\ncat >/dev/null\necho '[]'\n",{mode:0o700});
   const event=db.enqueue(eventEnvelope(phase)).row;
   const job=db.createJob({source_event_id:event.event_id,objective:"test",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
   let starts=0,agent:AgentRecord|null=null;
-  runtime.client.start=async input=>{assert.equal(input.threadConfig.approvalsReviewer,"user");assert.equal(input.threadConfig.approvalPolicy,phase==="accepted"?undefined:"never");starts++;agent={name:input.name,role:"worker",cwd:input.cwd,generation:"accepted",thread_id:phase==="no_thread"?null:"thread",config_json:JSON.stringify(input)} as AgentRecord;throw Object.assign(Error("lost"),phase==="not_sent"?{code:"ECONNREFUSED"}:{});};
+  runtime.client.start=async input=>{assert.equal(input.threadConfig.approvalsReviewer,"user");assert.equal(input.threadConfig.approvalPolicy,phase==="accepted"?undefined:"never");starts++;agent={name:input.name,role:"worker",cwd:input.cwd,generation:"accepted",thread_id:phase==="no_thread"?null:"thread",config_json:JSON.stringify(input)} as AgentRecord;if(phase==="confirmed_not_sent")throw new RuntimeResponseError("runtime_start_not_sent",409);throw Object.assign(Error("lost"),phase==="not_sent"?{code:"ECONNREFUSED"}:{});};
   runtime.client.status=async()=>{if(phase==="status_lost")throw Error("lost");return agent;};
   await assert.rejects(runtime.prepare(job),error=>{
-   if(phase==="not_sent"){assert.match(String(error),/runtime_start_not_sent/);assert.equal(error instanceof PreparedWorkspaceCleanupError,false);}
+   if(phase==="not_sent"||phase==="confirmed_not_sent"){assert.match(String(error),/runtime_start_not_sent/);assert.equal(error instanceof PreparedWorkspaceCleanupError,false);}
    else {assert.ok(error instanceof PreparedWorkspaceCleanupError,String(error));assert.equal(error.errorCode,"runtime_preparation_unknown");assert.equal(error.herdrAgentSessionId,phase==="status_lost"?undefined:JSON.stringify(["accepted",phase==="no_thread"?null:"thread"]));}
    return true;
   });
@@ -188,4 +188,19 @@ test("launchdの最小PATHでもnpm版CodexのMCP inventoryを取得する",asyn
   process.env.PATH="/usr/bin:/bin:/usr/sbin:/sbin";
   await runtime.prepare(job);assert.equal(starts,1);assert.equal(process.env.PATH,"/usr/bin:/bin:/usr/sbin:/sbin");
  }finally{if(saved===undefined)delete process.env.PATH;else process.env.PATH=saved;db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("旧Web Jobを通常Codex runtimeへ渡してもworkspace・agentを作らずprofile待ちにする",async t=>{
+ const {root,config}=await tempConfig();t.after(()=>fs.rm(root,{recursive:true,force:true}));
+ const db=new DispatcherDatabase(config.databasePath);t.after(()=>db.close());
+ const runtime=new AppServerJobRuntime(config);
+ const job=db.createWebJob({instance_id:"instance",tenant_id:"tenant",principal_id:"principal",idempotency_key:"a".repeat(64),objective:"analysis",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+ let calls=0;runtime.client.status=async()=>{calls++;throw Error("unexpected runtime call");};
+ await assert.rejects(runtime.prepare(job),/runtime_profile_unavailable/);
+ await assert.rejects(fs.stat(job.workspace_path),{code:"ENOENT"});assert.equal(calls,0);
+ const supervisor=new JobSupervisor(db,runtime,config,{debug(){},info(){},warn(){},error(){}},()=>{});
+ // Exercise the supervisor admission boundary without starting long-lived loops.
+ await (supervisor as unknown as {startJob(row:JobRow):Promise<void>}).startJob(job);
+ assert.equal(db.getJob(job.job_id)?.status,"blocked");assert.equal(db.getJob(job.job_id)?.last_error_code,"runtime_profile_unavailable");
+ await assert.rejects(fs.stat(job.workspace_path),{code:"ENOENT"});assert.equal(calls,0);
 });

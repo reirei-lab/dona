@@ -20,7 +20,7 @@ export const webJobProjectionSchema = z.strictObject({ job_id: id,
   created_at: utc, updated_at: utc, completed_at: utc.nullable(), progress: progress.nullable(),
   result: z.strictObject({ status: z.enum(["completed","failed"]), summary: z.string().max(2000), completed_at: utc,
     artifacts: z.array(artifact).max(32) }).nullable(), error_code: z.string().max(128).nullable(),
-  control: z.strictObject({ can_cancel: z.boolean() }) });
+  control: z.strictObject({ can_cancel: z.boolean(), task_id: id.optional(), revision: z.number().int().positive().optional() }) });
 export type WebJobProjection = z.infer<typeof webJobProjectionSchema>;
 export const webJobReadResultSchema = z.union([
   z.strictObject({ status:z.literal("succeeded"), kind:z.literal("list"), items:z.array(webJobProjectionSchema).max(50), next_cursor:cursor.nullable() }),

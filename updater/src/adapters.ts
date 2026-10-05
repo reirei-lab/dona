@@ -306,7 +306,7 @@ export class CanonicalBuild implements BuildPort {
     npm_version: string;
     compatibility: Compatibility;
   }> {
-    const components = ["dispatcher", "sources/slack", "updater"] as const;
+    const components = ["dispatcher", "sources/slack", "sources/web", "updater"] as const;
     const lockHashes: Record<string, string> = {};
     const npmEnvironment = await isolatedNpmEnvironment(this.policy, {
       npm_config_audit: "false",
@@ -352,7 +352,7 @@ export class CanonicalBuild implements BuildPort {
 }
 
 export function canonicalDiagnosticStep(
-  component: "dispatcher" | "sources/slack" | "updater",
+  component: "dispatcher" | "sources/slack" | "sources/web" | "updater",
   args: readonly string[],
 ): string {
   return `${component.replaceAll("/", ".")}:npm-${args.join("-")}`;

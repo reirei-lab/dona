@@ -11,7 +11,7 @@ export type WebJobReadInput=z.infer<typeof webJobReadInputSchema>;
 const artifact=z.strictObject({name:z.string().min(1).max(128),kind:z.enum(["file","report","log","other"]),media_type:z.string().min(1).max(128).optional(),size_bytes:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional()});
 export const webJobProjectionSchema=z.strictObject({job_id:id,status:z.enum(["queued","preparing","dispatching","running","retryable_failed","cancelling","blocked","completed","failed","cancelled","needs_review"]),
   created_at:utc,updated_at:utc,completed_at:utc.nullable(),progress:z.strictObject({sequence:z.number().int().min(0),phase:z.enum(["preparing","implementing","testing","reviewing","waiting_ci","reconciling"]),updated_at:utc}).nullable(),
-  result:z.strictObject({status:z.enum(["completed","failed"]),summary:z.string().max(2000),completed_at:utc,artifacts:z.array(artifact).max(32)}).nullable(),error_code:z.string().max(128).nullable(),control:z.strictObject({can_cancel:z.boolean()})});
+  result:z.strictObject({status:z.enum(["completed","failed"]),summary:z.string().max(2000),completed_at:utc,artifacts:z.array(artifact).max(32)}).nullable(),error_code:z.string().max(128).nullable(),control:z.strictObject({can_cancel:z.boolean(),task_id:id.optional(),revision:z.number().int().positive().optional()})});
 export const webJobReadResultSchema=z.union([
   z.strictObject({status:z.literal("succeeded"),kind:z.literal("list"),items:z.array(webJobProjectionSchema).max(50),next_cursor:cursor.nullable()}),
   z.strictObject({status:z.literal("succeeded"),kind:z.literal("detail"),job:webJobProjectionSchema,event_cursor:cursor}),
