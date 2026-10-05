@@ -55,7 +55,7 @@ export class DashboardObserver {
     if (!current || current.revision !== authority.revision || !current.task(id)) return null;
     const after = this.tasks.snapshot(id, attemptId);
     if (!after) return null;
-    if (after.fingerprint !== before.fingerprint) return {snapshot: publicSnapshot(after, current.conversation(id)), runtime: {status: "unavailable"}};
+    if (after.fingerprint !== before.fingerprint || after.request !== before.request) return {snapshot: publicSnapshot(after, current.conversation(id)), runtime: {status: "unavailable"}};
     if (!current.conversation(id)) observed = {status: "forbidden"};
     return {snapshot: publicSnapshot(after, current.conversation(id)), runtime: observed};
   }

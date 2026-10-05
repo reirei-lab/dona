@@ -26,12 +26,13 @@ export function sanitizeObservationText(value:string,limit=8192):string {
   if(value.length>131072)return "[上限を超える内容を省略]";
   let text=value.replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|$))/g,"").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g,"");
   const decodedText=decodedObservationText(text);
-  for(const match of credentialFields(decodedText)){const rest=decodedText.slice(match.index!+match[0].length);if(/^[ \t]*(?:\r?\n|[\[{]|[|>][+-]?[0-9]?[ \t]*(?:\r?\n|$))/.test(rest))return "[機密情報を含む内容を省略]";}
+  // YAML tag/anchor/commentや複数行scalarも含め、既知credential assignmentがあるfield全体を省略する。
+  if(credentialFields(decodedText).length>0)return "[機密情報を含む内容を省略]";
   if(/-----BEGIN [^-]*PRIVATE KEY|DONA_(?:JOB|EVENT)_(?:BEGIN|END)/i.test(decodedText))return "[保護された内容を省略]";
   text=text.split("\n").map(line=>{
     const decoded=decodedObservationText(line);
     if(decoded!==line&&/(?:^|[\s"']|\/)(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains|\.env(?:\.[\w-]+)?|auth\.json|credentials(?:\.json)?)(?:\/|$|[\s"'])/i.test(decoded))return "[保護されたパスを含む行を省略]";
-    if(credentialFields(decoded).length>0||/(?:xox[a-z]-|xapp-|gh[pousr]_|github_pat_|sk-(?:proj-)?[A-Za-z0-9_-]{8}|\b(?:AKIA|ASIA)[A-Z0-9]{16}|--(?:token|password|secret|api-key|header)\s+\S+|\b(?:Bearer|Basic)\s+\S+|https?:\/\/[^\s/]+@|(?:files|hooks)\.slack\.com|[?&](?:signature|sig|token|key|x-amz-[\w-]+)=|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/i.test(decoded))return "[機密情報を含む行を省略]";
+    if(/(?:xox[a-z]-|xapp-|gh[pousr]_|github_pat_|sk-(?:proj-)?[A-Za-z0-9_-]{8}|\b(?:AKIA|ASIA)[A-Z0-9]{16}|--(?:token|password|secret|api-key|header)\s+\S+|\b(?:Bearer|Basic)\s+\S+|https?:\/\/[^\s/]+@|(?:files|hooks)\.slack\.com|[?&](?:signature|sig|token|key|x-amz-[\w-]+)=|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/i.test(decoded))return "[機密情報を含む行を省略]";
     return line.replace(/(?:~|\/[^\s"'<>]*)\/(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains)(?:\/[^\s"'<>]*)?/g,"[保護されたパス]").replace(/(^|[\s"'<>])(?:[^\s"'<>]*\/)?(?:\.env(?:\.[\w-]+)?|auth\.json|credentials(?:\.json)?)(?=\s|$|["'<>])/g,"$1[保護されたパス]").replace(/\/(?:Users|home)\/[^/\s]+/g,"~");
   }).join("\n");
   return text.slice(0,limit);
@@ -73,6 +74,11 @@ export function projectItem(value:unknown,turnId:string):ConversationItem|undefi
         const f=record(raw),kind=record(f.kind);if(typeof f.path!=="string"||!["add","delete","update"].includes(String(kind.type)))return [];
         if(typeof f.diff!=="string")return [{path:f.path,change:kind.type as ConversationFile["change"]}];
         if(f.diff.length>131072){out.truncated=true;return [{path:f.path,change:kind.type as ConversationFile["change"]}];}
+        // Codex FileChange Add/Deleteのdiffはraw content。Updateだけがunified diff。
+        if(kind.type==="add"||kind.type==="delete"){
+          const lines=f.diff.length===0?0:f.diff.split("\n").length-(f.diff.endsWith("\n")?1:0);
+          return [{path:f.path,change:kind.type as ConversationFile["change"],additions:kind.type==="add"?lines:0,deletions:kind.type==="delete"?lines:0}];
+        }
         let additions=0,deletions=0,inHunk=false;
         for(const line of f.diff.split("\n")){
           if(line.startsWith("diff --git ")){inHunk=false;continue;}

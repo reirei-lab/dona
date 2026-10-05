@@ -20,7 +20,7 @@ test("credentialとcontrol pathはsource別の全表示fieldで永続投影前�
  for(const text of ['token="private"','Authorization: Bearer private','xoxb-private','ghp_private','-----BEGIN PRIVATE KEY-----\nprivate','https://files.slack.com/private','password%3Dprivate','password\\u003dprivate'])assert.ok(!sanitizeObservationText(text).includes("private"));
  assert.ok(!sanitizeObservationText('cat /Users/alice/.dona/config/dispatcher.env').includes("dispatcher.env"));
  assert.equal(sanitizeObservationText('/Users/alice/project/src/app.ts'),'~/project/src/app.ts');
- const item=projectItem({id:"c",type:"commandExecution",command:'TOKEN="private" npm test',aggregatedOutput:'ok\npassword=private\nend'},turn)!;assert.ok(!JSON.stringify(item).includes("private"));assert.ok(item.output?.includes("ok"));
+ const item=projectItem({id:"c",type:"commandExecution",command:'TOKEN="private" npm test',aggregatedOutput:'ok\npassword=private\nend'},turn)!;assert.ok(!JSON.stringify(item).includes("private"));assert.equal(item.output,"[機密情報を含む内容を省略]");
  assert.deepEqual(projectNotification("item/agentMessage/delta",{turnId:turn,itemId:"a",delta:"xoxb-"}),{kind:"item/agentMessage/delta",turn_id:turn,item_id:"a"});
 });
 test("projected DTO再読はkind別allowlist、bounded text/files、改変差分は行数だけ",()=>{
@@ -79,4 +79,19 @@ test("YAML block scalarの既知credential値も次行へ残さない",()=>{
   const text=`AWS_SECRET_ACCESS_KEY: ${indicator}\n  sensitive-placeholder\nnext: public`;
   assert.ok(!sanitizeObservationText(text).includes('sensitive-placeholder'));
  }
+});
+
+test("known credential assignmentのfield全体をYAML comment/tag/anchorやscalar構文によらず省略する",()=>{
+ for(const value of ["| # confidential","!!str |","&credential |",">- # folded","# comment","!!str &credential |2-"]){
+  const text=`normal preceding output\nOPENAI_API_KEY: ${value}\n  sensitive-placeholder\nnormal following output`;
+  assert.equal(sanitizeObservationText(text),"[機密情報を含む内容を省略]");
+  assert.equal(projectItem({id:"tool",type:"commandExecution",aggregatedOutput:text},turn)?.output,"[機密情報を含む内容を省略]");
+ }
+ assert.equal(sanitizeObservationText("normal output\n3 tests passed"),"normal output\n3 tests passed");
+});
+test("Codex Add/Deleteのraw contentはprefixによらずファイル行数を数える",()=>{
+ // rust-v0.160.0 thread_history.rs: FileChange::Add(content="hello\\n") → FileUpdateChange(diff="hello\\n")。
+ for(const kind of ["add","delete"]){for(const [diff,lines] of [["hello\n",1],["hello\nworld",2],["+++counter\n---counter\n",2],["\n",1],["",0],["hello\r\nworld\r\n",2]] as const){
+  const file=projectItem({id:"file",type:"fileChange",changes:[{path:"src/file.ts",kind:{type:kind},diff}]},turn)?.files?.[0];assert.equal(file?.additions,kind==="add"?lines:0);assert.equal(file?.deletions,kind==="delete"?lines:0);
+ }}
 });

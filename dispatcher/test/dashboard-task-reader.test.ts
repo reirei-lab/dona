@@ -40,6 +40,25 @@ test("観測readerは非公開Taskを除いてからpageを作り、実行DBを�
   } finally { reader?.close();db.close();await fs.rm(root,{recursive:true,force:true}); }
 });
 
+test("会話権限がない端末の応答は依頼本文だけの変更に依存しない", async () => {
+  const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);
+  const {default:Database}=await import("better-sqlite3"),sql=new Database(config.databasePath);
+  let reader:DashboardTaskReader|undefined;
+  try {
+    const event=db.enqueue(eventEnvelope("private-request-fingerprint")).row;
+    const task=db.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:"private-request",objective:"非公開の候補A",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+    reader=new DashboardTaskReader(config.databasePath);
+    const observer=new DashboardObserver(reader,{async conversations(){throw Error("must not read");},async conversation(){throw Error("must not read");}});
+    const authority=()=>({revision:"1",task:()=>true,conversation:()=>false});
+    const before=await observer.detail(task.task_id,authority);
+    sql.prepare("UPDATE jobs SET objective=? WHERE job_id=?").run("非公開の候補B",task.current_attempt_id);
+    const after=await observer.detail(task.task_id,authority);
+    assert.equal(reader.snapshot(task.task_id)!.request,"非公開の候補B");
+    assert.deepEqual(after,before);
+    assert.equal(after!.snapshot.request,undefined);
+  } finally {reader?.close();sql.close();db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
 test("会話取得中の失効・Attempt変更は古い本文を返さず、切断をTask失敗にしない", async () => {
   const {root, config} = await tempConfig();
   const db = new DispatcherDatabase(config.databasePath);
@@ -59,6 +78,13 @@ test("会話取得中の失効・Attempt変更は古い本文を返さず、切�
     const initial=await observer.detail(task.task_id,()=>authority);
     assert.equal(initial!.runtime.status,"observed");
     assert.equal(JSON.stringify(initial).includes("private tool"),false);
+    const {default:Database}=await import("better-sqlite3"),sql=new Database(config.databasePath);
+    try {
+      action=()=>{sql.prepare("UPDATE jobs SET objective=? WHERE job_id=?").run("変更された依頼",task.current_attempt_id);};
+      const changedRequest=await observer.detail(task.task_id,()=>authority);
+      assert.equal(changedRequest!.runtime.status,"unavailable");
+      assert.equal(changedRequest!.snapshot.request,"変更された依頼");
+    } finally {sql.close();}
     action=()=>{authority=null;};
     assert.equal(await observer.detail(task.task_id,()=>authority),null);
     authority={revision:"2",task:()=>true,conversation:()=>true};
@@ -162,8 +188,9 @@ test('Dona本体の履歴は別grantを要求しrole/threadの一致とI/O中失
   assert.deepEqual((await observer.mainList(auth))!.items.map(row=>row.generation),['current','old']);
   assert.equal((await observer.mainDetail('dona_main','old',auth))!.status,'observed');
   const {projectItem}=await import('../src/app-server/observation.js');
-  main.items=[projectItem({id:'command',type:'commandExecution',command:'npm test',aggregatedOutput:'3 tests passed\nAuthorization: Bearer hidden_token',exitCode:0,durationMs:123,status:'completed'},'turn')!,
-    projectItem({id:'request',type:'userMessage',content:[{type:'text',text:'テストを実行して'}]},'turn')!];
+  main.items=[projectItem({id:'command',type:'commandExecution',command:'npm test',aggregatedOutput:'3 tests passed',exitCode:0,durationMs:123,status:'completed'},'turn')!,
+    projectItem({id:'request',type:'userMessage',content:[{type:'text',text:'テストを実行して'}]},'turn')!,
+    projectItem({id:'private-output',type:'commandExecution',aggregatedOutput:'3 tests passed\nAuthorization: Bearer hidden_token'},'turn')!];
   const details=await observer.mainDetail('dona_main','current',auth);
   assert.ok(details);
   assert.equal(details.status,'observed');
@@ -172,6 +199,7 @@ test('Dona本体の履歴は別grantを要求しrole/threadの一致とI/O中失
     assert.equal(details.conversation.items[0]!.duration_ms,123);
     assert.match(details.conversation.items[0]!.output!,/3 tests passed/);
     assert.equal(details.conversation.items[1]!.text,'テストを実行して');
+    assert.equal(details.conversation.items[2]!.output,'[機密情報を含む内容を省略]');
     assert.equal(JSON.stringify(details).includes('hidden_token'),false);
   }
 

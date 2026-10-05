@@ -111,7 +111,9 @@ export class DashboardTaskReader {
             runtime_binding={agent_name:row.agent_name,generation:row.generation,thread_id:row.thread_id};
         }
       }
-      const fingerprint = createHash("sha256").update(JSON.stringify({task, attempts, selected_attempt_id, result, request, archived, identity:identity??null})).digest("hex");
+      // The fingerprint is public even without conversation permission. Do not
+      // make the private request recoverable through candidate hashing.
+      const fingerprint = createHash("sha256").update(JSON.stringify({task, attempts, selected_attempt_id, result, archived, identity:identity??null})).digest("hex");
       const runtime_binding_state:DashboardTaskSnapshot["runtime_binding_state"]=runtime_binding?"verified":identity||archived.length?"invalid":"missing";
       return {task, attempts, selected_attempt_id, result, request, fingerprint, runtime_binding, runtime_binding_state};
     })();
