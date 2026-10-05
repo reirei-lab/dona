@@ -29,6 +29,9 @@ type Request=Extract<ApprovalRecord,{kind:"request"}>;
 const hash=(value:unknown)=>createHash("sha256").update(stableStringify(value)).digest("hex");
 const tx=()=>"local_"+randomUUID().replaceAll("-","");
 const denied={status:"denied",reason:"unauthorized"} as const;
+export class ExternalApprovalPrecommitError extends Error {
+ constructor(){super("external_approval_precommit_rejected");this.name="ExternalApprovalPrecommitError";}
+}
 export interface ExternalApprovalKeys extends ApprovalCreateKeyLookup {
  wrappingVersion(version:number|null):ApprovalPayloadKey;
  notificationVersion(version:number):ApprovalNotificationKey;
@@ -140,13 +143,18 @@ export class LocalExternalApprovalService {
   return presentation;
  }
  async decide(authority:ExternalApprovalAuthority,input:ExternalApprovalStepUp){
+  const {actor,receipt,observation,card}=await (async()=>{
+   try{
   const actor=this.checked(authority),receipt=externalStepUpSchema.parse(input);
   if(stableStringify({instance_id:receipt.instance_id,owner_id:receipt.owner_id,device_id:receipt.device_id,grant_revision:receipt.grant_revision})!==stableStringify(actor))throw Error("external_approval_step_up_invalid");
-  const request=this.requestRecord(receipt.request_id),snapshot=this.snapshot(request);
+  const request=this.requestRecord(receipt.request_id);
   const observation=await this.observe(request);
   const card=this.card(request),now=this.now();
   if(receipt.expires_at>request.row.expires_at||Date.parse(receipt.expires_at)>Date.parse(now.effective_utc)+120000||Date.parse(receipt.expires_at)<=Date.parse(now.effective_utc)
    ||card.row.message_ref!=="web_"+receipt.presentation_digest||this.auth.verifyStepUp(receipt)!==true)throw Error("external_approval_step_up_invalid");
+  return {actor,receipt,observation,card};
+   }catch{throw new ExternalApprovalPrecommitError();}
+  })();
   const approverId="operator_"+hash(actor);
   this.db.prepare("INSERT OR IGNORE INTO local_external_approvers VALUES(?,?)").run(approverId,stableStringify(actor));
   if((this.db.prepare("SELECT authority_json FROM local_external_approvers WHERE authority_hash=?").get(approverId) as {authority_json:string}).authority_json!==stableStringify(actor))throw Error("external_approval_approver_unverified");

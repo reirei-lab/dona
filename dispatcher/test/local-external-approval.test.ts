@@ -4,7 +4,7 @@ import {fixture,scope,content,wrapping,notification,start} from "./approval/fixt
 import {executionKey} from "./approval/fixtures/execution.js";
 import {installApprovalExecutionMarkerSchema} from "../src/approval/schema.js";
 import {emptyMetadataRoot} from "../src/approval/metadata-tree.js";
-import {LocalExternalApprovalService,type ExternalApprovalStepUp} from "../src/approval/local-external-service.js";
+import {LocalExternalApprovalService,ExternalApprovalPrecommitError,type ExternalApprovalStepUp} from "../src/approval/local-external-service.js";
 import type {ExternalSlackPort,ExternalSendResult} from "../src/approval/local-external-types.js";
 import {externalRichText,LocalSlackApprovalProvider} from "../src/approval/local-slack-provider.js";
 const actor={instance_id:scope.instance_id,owner_id:"local_owner",device_id:"device",grant_revision:1};
@@ -46,7 +46,7 @@ test("送信応答喪失後はrestart・thread変化後も再送せずexact照�
  assert.equal((await f.make().executePending()).items[0]?.state,"succeeded");assert.deepEqual(f.counts(),{sends:1,reconciles:1});
 });
 test("step-up、snapshot、grant失効では外部callを開始しない",async t=>{
- const f=setup(t),{receipt}=await approved(f);f.setAllowed(false);await assert.rejects(f.service.decide(actor,receipt),/unauthorized/);
+ const f=setup(t),{receipt}=await approved(f);f.setAllowed(false);await assert.rejects(f.service.decide(actor,receipt),ExternalApprovalPrecommitError);
  await f.service.executePending();assert.equal(f.counts().sends,0);
  f.setAllowed(true);f.setChanged();await f.service.executePending();assert.equal(f.counts().sends,0);
 });
@@ -73,8 +73,8 @@ test("異なるdevice claim・偽step-up・同一key別本文・rejectを分離�
  const duplicate=await f.service.request(actor,intent);assert.equal(duplicate.status,"reused");
  assert.equal((await f.service.request(actor,{...intent,text:"差替え"})).status,"denied");
  const view=await f.service.present(actor,created.request_handle),receipt:ExternalApprovalStepUp={...actor,receipt_id:"reject",request_id:created.request_handle,decision:"reject",presentation_digest:view.presentation_digest,expires_at:"2026-09-19T00:01:00.000Z"};
- await assert.rejects(f.service.decide(actor,{...receipt,device_id:"different"}),/step_up/);
- f.setVerified(false);await assert.rejects(f.service.decide(actor,receipt),/step_up/);f.setVerified(true);
+ await assert.rejects(f.service.decide(actor,{...receipt,device_id:"different"}),ExternalApprovalPrecommitError);
+ f.setVerified(false);await assert.rejects(f.service.decide(actor,receipt),ExternalApprovalPrecommitError);f.setVerified(true);
  const rejected=await f.service.decide(actor,receipt);assert.equal(rejected.status,"decided");
  assert.equal((await f.service.executePending()).items[0]?.state,"rejected");assert.equal(f.counts().sends,0);
 });
@@ -209,4 +209,13 @@ test("遅い新規要求が連続しても巡回phaseはexecutorを永久に飛�
  const service={requestFromSource:async()=>{requests++;now+=6000;throw Error("observe timeout");},executePending:async()=>{executions++;}} as any;
  const ingress=dispatcher.createExternalApprovalIngress(runtime,service,{...scope,owner_id:actor.owner_id,main_agent:"main"});
  try{await ingress.tick();assert.equal(requests,1);assert.equal(executions,0);await ingress.tick();assert.equal(requests,2);assert.equal(executions,1);}finally{clock.mock.restore();}
+});
+
+test("期限切れ署名はdecision前の確定拒否となり台帳を変更しない",async t=>{
+ const f=setup(t),created=await f.service.request(actor,intent);if(created.status==="denied")throw Error();
+ const view=await f.service.present(actor,created.request_handle);
+ const before=(f.db.prepare("SELECT total_changes() n").get() as {n:number}).n;
+ await assert.rejects(f.service.decide(actor,{...actor,receipt_id:"expired",request_id:created.request_handle,decision:"approve",presentation_digest:view.presentation_digest,expires_at:start}),ExternalApprovalPrecommitError);
+ assert.equal(f.service.status(actor,created.request_handle).decision,null);
+ assert.equal((f.db.prepare("SELECT total_changes() n").get() as {n:number}).n,before);
 });
