@@ -268,12 +268,14 @@ class RollbackPreparationTests(unittest.TestCase):
                  'plists':{'dev.dona.updater':{'WorkingDirectory':'/old/broken-updater'}},
                  'configs':{key:{'values':{'KEEP':'old'}} for key in ('dispatcher','slack')}}
             plan={'release':str(release),'node':'/new/node'}
-            with patch.object(m.common,'installed_codex',return_value='/new/codex'),patch.object(m,'command') as command:
+            with patch.object(m.common,'installed_codex',return_value='/new/codex'),patch.object(m.common,'target_required_checks',return_value=['old-required','Verify sources/web']),patch.object(m,'command') as command:
                 m.prepare_rollback(run,inv,plan)
             staged=run/'rollback/control/updater'
             self.assertFalse(staged.is_symlink())
             self.assertEqual((staged/'dist/adapters.js').read_text(),'current adapter accepts wBR:p1')
             self.assertEqual(m.read_json(run/'rollback/control/policy.json')['release_root'],'/old/releases')
+            self.assertEqual(m.read_json(run/'rollback/control/policy.json')['required_checks'],['old-required','Verify sources/web'])
+            self.assertNotIn('required_checks',inv['policy'])
             self.assertIn('/old/releases/sha', (run/'rollback/config/mcp-dispatcher.mjs').read_text())
             self.assertEqual(command.call_args.args[0][0],'/new/node')
             self.assertIn(str(staged/'dist/policy.js'),command.call_args.args[0][3])

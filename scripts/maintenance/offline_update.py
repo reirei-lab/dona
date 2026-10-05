@@ -299,6 +299,9 @@ def prepare_rollback(run, inv, plan):
     control = common.private_dir(root/'control')
     policy = copy.deepcopy(inv['policy'])
     policy['executables']['codex'] = common.installed_codex()
+    # 復旧用control-planeも新版binaryと同じ必須CI集合を使う。旧release/stateは保持する。
+    # prepare()でtarget SHAの旧集合とtarget集合を検証済み。
+    policy['required_checks'] = common.target_required_checks(plan['release'])
     atomic(control/'policy.json', encode(policy))
     # 復旧対象は旧releaseのまま、main lifecycleの実装は検証済みの新版を使う。
     shutil.copytree(Path(plan['release'])/'updater', control/'updater', symlinks=True)

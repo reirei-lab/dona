@@ -28,3 +28,25 @@ test("release manifest は Web lockfile を含め、欠落時は公開しない"
     assert.deepEqual(Object.keys(manifest.lock_hashes).sort(), ["dispatcher", "sources/slack", "sources/web", "updater"]);
   } finally { fs.rmSync(root, {recursive: true, force: true}); }
 });
+
+
+test("installer は Web CI の成功を必須にする", () => {
+  const installer = fs.readFileSync(new URL("../scripts/install-self-update.sh", import.meta.url), "utf8");
+  const validator = installer.match(/\$NODE_PATH -e '(\nconst runs = JSON.parse[\s\S]*?)' "\$INSTALL_TMP\/check-runs.json"/)[1];
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dona-web-install-ci-"));
+  const sha = "b".repeat(40);
+  const checks = ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS", "Verify sources/web"];
+  try {
+    const file = path.join(root, "checks.json");
+    for (const state of ["success", "missing", "failure", "skipped", "in_progress"]) {
+      const runs = checks.filter(name => state !== "missing" || name !== "Verify sources/web").map((name, id) => ({
+        name, id, head_sha: sha, app: {slug: "github-actions"},
+        status: name === "Verify sources/web" && state === "in_progress" ? state : "completed",
+        conclusion: name === "Verify sources/web" ? state : "success",
+      }));
+      fs.writeFileSync(file, JSON.stringify({check_runs: runs}));
+      const result = spawnSync(process.execPath, ["-e", validator, file, sha], {encoding: "utf8"});
+      assert.equal(result.status === 0, state === "success", state);
+    }
+  } finally { fs.rmSync(root, {recursive: true, force: true}); }
+});
