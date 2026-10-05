@@ -10,7 +10,9 @@ export class OperatorStream {
  private position(scope:string,value:Value):Position{
   const runtime='runtime'in value?value.runtime:value,c=runtime.status==='observed'?runtime.conversation:null;
   return {scope,binding:hash(['snapshot'in value?value.snapshot.selected_attempt_id:null,c?[c.name,c.generation,c.thread_id,c.attempt_id]:runtime.status]),
-   fingerprint:hash(['snapshot'in value?value.snapshot.fingerprint:null,c?[c.state,c.connected,c.cursor,c.items]:runtime.status]),sequence:c?.cursor??0,expires:Date.now()+300_000};
+   // cursor本文は復号不要で読めるため、非公開本文の候補照合に使える通常hashを返さない。
+   // requestはObserverが会話閲覧を許可した投影にだけ存在する。
+   fingerprint:createHmac('sha256',this.key).update(JSON.stringify(['operator-stream-position-v1',scope,'snapshot'in value?[value.snapshot.fingerprint,value.snapshot.request??null]:null,c?[c.state,c.connected,c.cursor,c.items]:runtime.status])).digest('hex'),sequence:c?.cursor??0,expires:Date.now()+300_000};
  }
  private seal(position:Position):string{const body=Buffer.from(JSON.stringify(position)).toString('base64url');return body+'.'+createHmac('sha256',this.key).update(body).digest('base64url');}
  read(cursor:unknown,scope:string):Position|null{

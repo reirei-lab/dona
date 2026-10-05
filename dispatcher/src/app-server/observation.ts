@@ -19,16 +19,23 @@ function credentialFields(text:string):RegExpMatchArray[] {
     .filter(match=>/(?:token|password|secret|apikey|authorization|cookie|credential|accesskey|privatekey)/i.test(match[1]!.replace(/[_ -]/g,"")));
 }
 function unescapeObservationText(value:string):string {
-  return value.replace(/\\u([0-9a-f]{4})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16))).replace(/\\\//g,"/").replace(/\\+(["'])/g,"$1");
+  return value.replace(/\\+u([0-9a-f]{4})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16))).replace(/\\\//g,"/").replace(/\\+(["'])/g,"$1");
 }
 function decodedObservationText(value:string):string {
-  let text=value;for(let i=0;i<2;i++){try{text=decodeURIComponent(text);}catch{text=text.replace(/%([0-9a-f]{2})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16)));}text=unescapeObservationText(text);}return text;
+  let text=value;
+  // 検査専用の保守的正規化。多重JSONのbackslash runをUnicode文字の前に残さない。
+  for(let i=0;i<8;i++){
+    const previous=text;try{text=decodeURIComponent(text);}catch{text=text.replace(/%([0-9a-f]{2})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16)));}
+    text=unescapeObservationText(text);if(text===previous)break;
+  }
+  return text;
 }
 /** 表示専用。既知credential/control pathを削除する。未知の秘密を完全検出する保証ではない。 */
 export function sanitizeObservationText(value:string,limit=8192):string {
   if(value.length>131072)return "[上限を超える内容を省略]";
   let text=value.replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|$))/g,"").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g,"");
   const decodedText=decodedObservationText(text);
+  if(/\\+(?:u[0-9a-f]{4}|["'/])|%[0-9a-f]{2}/i.test(decodedText))return "[多重encodeされた内容を省略]";
   // YAML tag/anchor/commentや複数行scalarも含め、既知credential assignmentがあるfield全体を省略する。
   if(credentialFields(decodedText).length>0)return "[機密情報を含む内容を省略]";
   if(/-----BEGIN [^-]*PRIVATE KEY|DONA_(?:JOB|EVENT)_(?:BEGIN|END)/i.test(decodedText))return "[保護された内容を省略]";
@@ -36,9 +43,9 @@ export function sanitizeObservationText(value:string,limit=8192):string {
     const decoded=decodedObservationText(line);
     // URI userinfoのpercent-encoded '/'や空白はdecodeすると区切りに見える。
     // 元表記も検査し、実際のauthority境界を失う前に伏せる。
-    if(/[a-z][a-z0-9+.-]*:\/\/[^\s/]+@/i.test(unescapeObservationText(line)))return "[機密情報を含む行を省略]";
+    if(/(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s/]+@/i.test(unescapeObservationText(line)))return "[機密情報を含む行を省略]";
     if(decoded!==line&&/(?:^|[\s"']|\/)(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains|\.env(?:\.[\w-]+)?|auth\.json|credentials(?:\.json)?)(?:\/|$|[\s"'])/i.test(decoded))return "[保護されたパスを含む行を省略]";
-    if(/(?:xox[a-z]-|xapp-|gh[pousr]_|github_pat_|sk-(?:proj-)?[A-Za-z0-9_-]{8}|\b(?:AKIA|ASIA)[A-Z0-9]{16}|--(?:token|password|secret|api-key|header)\s+\S+|\b(?:Bearer|Basic)\s+\S+|[a-z][a-z0-9+.-]*:\/\/[^\s/]+@|(?:files|hooks)\.slack\.com|[?&](?:signature|sig|token|key|x-amz-[\w-]+)=|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/i.test(decoded))return "[機密情報を含む行を省略]";
+    if(/(?:xox[a-z]-|xapp-|gh[pousr]_|github_pat_|sk-(?:proj-)?[A-Za-z0-9_-]{8}|\b(?:AKIA|ASIA)[A-Z0-9]{16}|--(?:token|password|secret|api-key|header)\s+\S+|\b(?:Bearer|Basic)\s+\S+|(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s/]+@|(?:files|hooks)\.slack\.com|[?&](?:signature|sig|token|key|x-amz-[\w-]+)=|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/i.test(decoded))return "[機密情報を含む行を省略]";
     return line.replace(/(?:~|\/[^\s"'<>]*)\/(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains)(?:\/[^\s"'<>]*)?/g,"[保護されたパス]").replace(/(^|[\s"'<>])(?:[^\s"'<>]*\/)?(?:\.env(?:\.[\w-]+)?|auth\.json|credentials(?:\.json)?)(?=\s|$|["'<>])/g,"$1[保護されたパス]").replace(/\/(?:Users|home)\/[^/\s]+/g,"~");
   }).join("\n");
   return text.slice(0,limit);
@@ -117,10 +124,21 @@ export function projectItem(value:unknown,turnId:string):ConversationItem|undefi
   return sanitizeConversationItem(out);
 }
 export function projectHistory(value:unknown):{threadId:string|undefined;items:ConversationItem[];truncated:boolean} {
-  const thread=record(record(value).thread),turns=Array.isArray(thread.turns)?thread.turns:[],items:ConversationItem[]=[];let truncated=turns.length>100;
-  for(const raw of turns.slice(-100)){const turn=record(raw),id=identifier(turn.id);if(!id)continue;const source=Array.isArray(turn.items)?turn.items:[];if(source.length>200)truncated=true;for(const item of source.slice(-200)){const projected=projectItem(item,id);if(projected){items.push(projected);if(projected.truncated)truncated=true;}}}
-  const bounded:ConversationItem[]=[];let bytes=0;for(const item of items.slice(-200).reverse()){const size=Buffer.byteLength(JSON.stringify(item));if(bytes+size>524288){truncated=true;break;}bytes+=size;bounded.unshift(item);}
-  return {threadId:typeof thread.id==="string"?thread.id:undefined,items:bounded,truncated:truncated||items.length>200};
+  const thread=record(record(value).thread),turns=Array.isArray(thread.turns)?thread.turns:[],items:ConversationItem[]=[];
+  let truncated=turns.length>100,bytes=0,inspected=0;
+  // 最新から採用し上限でprojection自体を止める。古い重いtool payloadを先に処理しない。
+  outer:for(let ti=turns.length-1;ti>=Math.max(0,turns.length-100);ti--){
+    if(items.length>=200||inspected>=1000){truncated=true;break;}
+    const turn=record(turns[ti]),id=identifier(turn.id);if(!id)continue;
+    const source=Array.isArray(turn.items)?turn.items:[];if(source.length>200)truncated=true;
+    for(let ii=source.length-1;ii>=Math.max(0,source.length-200);ii--){
+      if(items.length>=200||inspected>=1000){truncated=true;break outer;}
+      inspected++;const projected=projectItem(source[ii],id);if(!projected)continue;
+      const size=Buffer.byteLength(JSON.stringify(projected));if(bytes+size>524288){truncated=true;break outer;}
+      bytes+=size;items.push(projected);if(projected.truncated)truncated=true;
+    }
+  }
+  return {threadId:typeof thread.id==="string"?thread.id:undefined,items:items.reverse(),truncated};
 }
 export function projectNotification(method:string|undefined,value:unknown):Omit<ObservationEvent,"sequence"|"observed_at">|undefined {
   const p=record(value),turn=record(p.turn),turnId=identifier(p.turnId)??identifier(turn.id),itemId=identifier(p.itemId)??identifier(record(p.item).id);

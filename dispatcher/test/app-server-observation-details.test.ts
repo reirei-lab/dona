@@ -106,3 +106,27 @@ test("Codex Add/Deleteのraw contentはprefixによらずファイル行数を�
   const file=projectItem({id:"file",type:"fileChange",changes:[{path:"src/file.ts",kind:{type:kind},diff}]},turn)?.files?.[0];assert.equal(file?.additions,kind==="add"?lines:0);assert.equal(file?.deletions,kind==="delete"?lines:0);
  }}
 });
+
+test("多重JSON内のUnicode credential keyはbackslashを残さず検査する",()=>{
+ for(const key of [String.raw`TOK\u0045N`,String.raw`OPENAI_API_K\u0045Y`,String.raw`AWS_S\u0045CRET_ACCESS_KEY`]){
+  let text=`{"${key}":"sensitive-placeholder"}`;
+  for(let depth=0;depth<7;depth++){
+   assert.ok(!sanitizeObservationText(text).includes("sensitive-placeholder"),`depth ${depth}`);
+   assert.ok(!JSON.stringify(projectItem({id:"m",type:"mcpToolCall",tool:"inspect",result:{content:[{type:"text",text}]}},turn)).includes("sensitive-placeholder"));
+   text=JSON.stringify(text);
+  }
+ }
+ for(const key of [String.raw`TOK\u005cu0045N`,String.raw`TOK\\\\u0045N`,String.raw`TOK%5C%5Cu0045N`])assert.ok(!sanitizeObservationText(`${key}=sensitive-placeholder`).includes("sensitive-placeholder"));
+ assert.equal(sanitizeObservationText(String.raw`普通のUnicode表示 \u65e5`),String.raw`普通のUnicode表示 \u65e5`);
+});
+test("履歴は最新200投影で止まり古いturnやitemのpayloadに触れず時系列へ戻す",()=>{
+ const old={get id():string{throw Error("old turn projected");}};
+ const newest=Array.from({length:200},(_,i)=>({id:`i${i}`,type:"agentMessage",text:String(i)}));
+ const result=projectHistory({thread:{id:"thread",turns:[old,{id:turn,items:newest}]}});
+ assert.equal(result.items.length,200);assert.equal(result.items[0]?.text,"0");assert.equal(result.items.at(-1)?.text,"199");assert.equal(result.truncated,true);
+});
+test("履歴byte上限到達後は古い高負荷itemを投影しない",()=>{
+ let inspected=0;const items=Array.from({length:200},(_,i)=>({id:`i${i}`,type:"agentMessage",get text(){inspected++;if(i<130)throw Error("old payload projected");return "x".repeat(8192);}}));
+ const result=projectHistory({thread:{id:"thread",turns:[{id:turn,items}]}});
+ assert.equal(result.truncated,true);assert.ok(result.items.length<70);assert.ok(inspected<210);assert.equal(result.items.at(-1)?.id,"i199");assert.ok(Buffer.byteLength(JSON.stringify(result.items))<525000);
+});
