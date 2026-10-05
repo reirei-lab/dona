@@ -188,3 +188,19 @@ Web schemaはversion付き追加migrationとし、既存Slack/job ownerをWeb de
 OIDCのclaimとcode flow検証は[OpenID Connect Core](https://openid.net/specs/openid-connect-core-1_0.html)、PKCEとredirect防御は[OAuth Security BCP / RFC 9700](https://www.rfc-editor.org/rfc/rfc9700)、online token状態は[RFC 7662](https://www.rfc-editor.org/rfc/rfc7662)を参照する。本ADRはprovider適合条件を追加しており、OIDC対応だけで採用可能とはしない。
 
 cookie/sessionとCSRFの防御は[OWASP Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)と[CSRF Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)、署名・RP/origin・UV検証は[WebAuthn](https://www.w3.org/TR/webauthn-3/)を参照する。hardware/non-backup制限、TTL、role、retentionはDona固有の決定である。
+
+## App Server内部transportと観測（Issue #370）
+
+2026-10-05時点の検証対象は **Codex CLI 0.160.0**。[公式App Server仕様](https://learn.chatgpt.com/docs/app-server)と同binaryの生成schemaを照合した。runtime hostのHTTP-over-UDS制御APIと、agentごとのApp Server接続は別物として扱う。後者は `app-server --listen unix://PATH` のWebSocket Upgradeで接続し、main/workerのprocess分離を維持する。標準入力transportは隔離fixture用に残す。
+
+Codex 0.160.0は指定PATHをprivateなdaemon socketへのsymlinkとして作る。runtimeは指定directory、link owner、実体socketのowner/mode、実体directoryのowner/modeを検査し、socket実体のpath/device/inodeをmode 0600のsidecarへ保存する。再接続は同じagent generation・PID開始identityと保存済みsocket実体を要求する。既存socket、dangling symlink、sidecarの衝突では起動を拒否し、他processのsocketを削除しない。旧世代socket資源は自動削除しない。
+
+内部 `conversations` はDonaのruntime DBに登録されたagentだけを最大100件ずつ返す。`conversation(name,generation,afterSequence?)` はexact generationを前後で照合し、`thread/read(includeTurns:false)` と `thread/turns/list(limit:20,itemsView:full)` だけを使う。0.160.0のmetadata-only readとページ取得を実機で検証した。履歴閲覧はthread resume、turn start、process起動を行わない。runtimeの名前・generation・thread・attempt IDはDispatcher側のTask/Attemptへの結合用であり、ブラウザの指定だけで認可されるものではない。
+
+観測projectionにはassistant文章とtool種別・状態だけを含める。DONA_JOB等を含むuser文章、system/developer指示、tool引数・出力、stderrは除外する。assistant文章自体の秘密除去を保証する仕組みではないため、本文取得は別途会話scopeを認可し、Web公開時の文字列処理を通す。mainの混在threadをloginだけで公開してはならない。
+
+完了itemのsafe projectionも最大200件・512KiB・24時間保持し、停止後はそのbounded cacheをgap/truncated付きで返す。通知はagent generationごとに最大1000件・24時間保持し、読取時と追加時に期限を適用する。イベントsequenceとcursorは永続化する。再起動・切断・保持期限超過・未来cursorは `gap:true` として返す。snapshotのcursorはApp Serverへの履歴要求前に取得するため、履歴と差分は重複し得るが要求中の差分を飛ばさない。利用側はitem IDで重複を整理し、gap・truncatedを表示してsnapshotを取り直す。Codex通知には再送保証がなく、切断中の完全性は主張しない。
+
+接続断ではworkerを失敗や停止にせずunknownにする。runtimeの定期照合は生存PIDに再接続してmetadataを読むだけで、受理不明writeを再送しない。idleのread証拠だけを状態回復に使い、失われたnative questionの回答権限や進行中turnの制御を推測で復元しない。停止intentは再接続より優先する。Web再起動とworker停止は連動させない。
+
+隔離smokeは `DONA_TEST_CODEX=/absolute/path/to/codex node --import ./dispatcher/node_modules/tsx/dist/loader.mjs --test dispatcher/test/app-server-unix.test.ts` で実行する。指定binaryのversion一致を必須とし、専用CODEX_HOMEとHTTP 401だけを返すlocalhost providerでhistoryを生成する。実認証・実モデルAPI・本番workerは使用しない。
