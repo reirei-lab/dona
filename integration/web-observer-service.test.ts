@@ -1,3 +1,4 @@
+import {OperatorFixture} from '../dispatcher/test/dashboard-operator-fixture.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs/promises';
@@ -28,7 +29,7 @@ async function exit(child:ChildProcess,signal:NodeJS.Signals='SIGTERM'){if(child
 
 test('実CLIはpairing・観測・SIGKILL回復・preserve更新・rollbackでworkerとDBを保全する',{timeout:90000},async()=>{
  const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'dobs-cli-'))),runtimeSocket=path.join(root,'r.sock'),control=path.join(root,'c.sock');
- const db=new DispatcherDatabase(path.join(root,'d.sqlite3')),calls:string[]=[];let process:ChildProcess|undefined;let runtime:http.Server|undefined;let worker:ChildProcess|undefined;
+ const db=new DispatcherDatabase(path.join(root,'d.sqlite3')),calls:string[]=[];let process:ChildProcess|undefined;let runtime:http.Server|undefined;let auth:http.Server|undefined;let worker:ChildProcess|undefined;
  try{
   const event=db.enqueue(eventEnvelope('observer-service-cli')).row;
   const created=db.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:'cli-observation',objective:'private objective',workspace:{kind:'scratch'}}),path.join(root,'work'),path.join(root,'results'));
@@ -43,7 +44,9 @@ test('実CLIはpairing・観測・SIGKILL回復・preserve更新・rollbackでwo
   await fs.writeFile(path.join(releaseA,'package.json'),'{"type":"module"}');await fs.symlink(path.join(repo,'dispatcher/node_modules'),path.join(releaseA,'dispatcher/node_modules'));
   const manifest=(sha:string)=>JSON.stringify({sha,lock_hashes:{'sources/web':'c'.repeat(64)}});
   await fs.writeFile(path.join(releaseA,'release-manifest.json'),manifest(a));await fs.cp(releaseA,releaseB,{recursive:true});await fs.writeFile(path.join(releaseB,'release-manifest.json'),manifest(b));await fs.symlink(releaseA,pointer);
-  const listen=await port(),config=path.join(root,'config.json');await fs.writeFile(config,JSON.stringify({schema_version:1,origin:'https://observer.example',port:listen,control_socket:control,dispatcher_database:path.join(root,'d.sqlite3'),runtime_socket:runtimeSocket,active_release_pointer:pointer}),{mode:0o600});
+  const authSocket=path.join(root,'a.sock'),fixture=new OperatorFixture();
+  auth=http.createServer(async(req,res)=>{try{let raw='';for await(const chunk of req)raw+=String(chunk);const result=await fixture.call((req.url??'').replace('/v1/dashboard/',''),JSON.parse(raw));res.setHeader('content-type','application/json');res.end(JSON.stringify(result));}catch{res.writeHead(403);res.end('{}');}});await new Promise<void>(r=>auth!.listen(authSocket,r));await fs.chmod(authSocket,0o600);
+  const listen=await port(),config=path.join(root,'config.json');await fs.writeFile(config,JSON.stringify({schema_version:1,origin:'https://observer.example',port:listen,control_socket:control,dispatcher_socket:authSocket,dispatcher_database:path.join(root,'d.sqlite3'),runtime_socket:runtimeSocket,active_release_pointer:pointer}),{mode:0o600});
   runtime=http.createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=String(chunk);const input=JSON.parse(raw)as{action:string};calls.push(input.action);
    const record={name:agent,generation:'g1',role:'worker',thread_id:'thread-1',attempt_id:attempt,connected:true,observed_at:new Date().toISOString(),state:'working'};
    const result=input.action==='conversations'?{items:[record],next:null}:{...record,items:[{id:'i1',turn_id:'t1',kind:'assistant_message',text:'fixture worker progress'}],events:[],cursor:0,oldest_sequence:0,gap:false,truncated:false};
@@ -68,5 +71,5 @@ test('実CLIはpairing・観測・SIGKILL回復・preserve更新・rollbackでwo
    assert.equal(worker.exitCode,null);await once(worker.stdout!,'data');await start(sha);assert.equal((await request(listen,null,'/api/tasks',{cookie})).status,401);
   }
   assert.equal(JSON.stringify(db.tasks.get(created.task.task_id)),before);assert.equal(worker.exitCode,null);assert.ok(calls.every(action=>['conversations','conversation'].includes(action)));
- }finally{if(process)await exit(process);if(worker)await exit(worker);if(runtime)await new Promise<void>(r=>runtime!.close(()=>r()));db.close();await fs.rm(root,{recursive:true,force:true});}
+ }finally{if(process)await exit(process);if(worker)await exit(worker);if(auth)await new Promise<void>(r=>auth!.close(()=>r()));if(runtime)await new Promise<void>(r=>runtime!.close(()=>r()));db.close();await fs.rm(root,{recursive:true,force:true});}
 });

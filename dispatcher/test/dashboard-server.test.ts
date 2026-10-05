@@ -1,3 +1,4 @@
+import {OperatorFixture} from "./dashboard-operator-fixture.js";
 import assert from "node:assert/strict";
 import {test} from "node:test";
 import fs from "node:fs/promises";
@@ -20,7 +21,7 @@ async function request(port:number,socket:string|null,target:string,options:{met
 test("private controlの一回限りcodeで登録し、cross-origin・未認証・失効sessionを拒否する",async()=>{
   const root=await fs.mkdtemp(path.join(os.tmpdir(),"dobs-"));await fs.chmod(root,0o700);
   const socket=path.join(await fs.realpath(root),"c.sock"),port=await freePort();let reads=0;
-  const server=new DashboardServer({origin:"https://observer.example",port,controlSocket:socket,version:"test",
+  const server=new DashboardServer({backend:new OperatorFixture(),origin:"https://observer.example",port,controlSocket:socket,version:"test",
     page:{status:200,headers:{},body:"<html>observer</html>"},reader:{list(){reads++;return {items:[],next:null};}} as unknown as DashboardTaskReader,
     observer:{} as DashboardObserver});
   try{
@@ -59,7 +60,7 @@ test("service再起動でcookieを失効し、実Taskの継続とsnapshotを維�
   const reader=new DashboardTaskReader(config.databasePath);const before=db.tasks.get(task.task_id);
   let runtimeReads=0;
   const runtime={async conversations(){runtimeReads++;return {items:[],next:null};},async conversation(){runtimeReads++;throw Error("history unavailable");}};
-  const options={origin:"https://observer.example",port,controlSocket:socket,version:"test",page:{status:200,headers:{},body:"observer"},reader,observer:new DashboardObserver(reader,runtime)};
+  const options={backend:new OperatorFixture(),origin:"https://observer.example",port,controlSocket:socket,version:"test",page:{status:200,headers:{},body:"observer"},reader,observer:new DashboardObserver(reader,runtime)};
   let server=new DashboardServer(options);
   try{
     await server.start();const code=JSON.parse((await request(port,socket,"/pair",{method:"POST"})).body).code;
@@ -73,4 +74,35 @@ test("service再起動でcookieを失効し、実Taskの継続とsnapshotを維�
     assert.deepEqual(db.tasks.get(task.task_id),before);
     assert.equal(runtimeReads,1);
   }finally{await server.close();reader.close();db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test('backendで失効したsessionはruntime待機後に再照合され本文を送信しない',async()=>{
+ const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'dobs-revoke-')));await fs.chmod(root,0o700);
+ const backend=new OperatorFixture(),port=await freePort(),socket=path.join(root,'c.sock');let entered!:()=>void,release!:()=>void;
+ const started=new Promise<void>(r=>entered=r),waiting=new Promise<void>(r=>release=r);let selected:string|undefined;
+ const server=new DashboardServer({backend,origin:'https://observer.example',port,controlSocket:socket,version:'test',page:{status:200,headers:{},body:''},reader:{} as DashboardTaskReader,
+  observer:{async detail(_id:string,_auth:unknown,_sequence:unknown,attempt?:string){selected=attempt;entered();await waiting;return {private_text:'MUST_NOT_LEAK'};}} as unknown as DashboardObserver});
+ try{
+  await server.start();const issued=JSON.parse((await request(port,socket,'/pair',{method:'POST'})).body);
+  const paired=await request(port,null,'/api/pair',{method:'POST',origin:'https://observer.example',body:{code:issued.code}}),cookie=paired.headers['set-cookie']![0]!.split(';')[0]!;
+  const reading=request(port,null,'/api/tasks/task_one?attempt=attempt_old',{cookie});await started;
+  await backend.call('admin/revoke',{});release();const result=await reading;assert.equal(selected,'attempt_old');assert.equal(result.status,401);assert.equal(result.body.includes('MUST_NOT_LEAK'),false);
+ }finally{release?.();await server.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test('main専用grantを制御socketで発行しpublic adminと未許可Taskを拒否する',async()=>{
+ const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'dobs-cap-')));await fs.chmod(root,0o700);
+ const backend=new OperatorFixture(),port=await freePort(),socket=path.join(root,'c.sock');
+ const server=new DashboardServer({backend,origin:'https://observer.example',port,controlSocket:socket,version:'test',page:{status:200,headers:{},body:''},reader:{} as DashboardTaskReader,
+  observer:{async mainList(authorize:()=>{mainConversation:()=>boolean}){assert.equal(authorize().mainConversation(),true);return{items:[],next:null};},async mainDetail(name:string,generation:string){return{status:'observed',conversation:{name,generation}};}} as unknown as DashboardObserver});
+ try{
+  await server.start();const issued=JSON.parse((await request(port,socket,'/pair',{method:'POST',body:{capabilities:['conversations:main:read']}})).body);
+  const paired=await request(port,null,'/api/pair',{method:'POST',origin:'https://observer.example',body:{code:issued.code}}),cookie=paired.headers['set-cookie']![0]!.split(';')[0]!;
+  assert.deepEqual(JSON.parse((await request(port,null,'/api/session',{cookie})).body).capabilities,['conversations:main:read']);
+  assert.equal((await request(port,null,'/api/tasks',{cookie})).status,403);
+  assert.equal((await request(port,null,'/api/conversations/main',{cookie})).status,200);
+  assert.equal((await request(port,null,'/api/conversations/main/dona_main/generation',{cookie})).status,200);
+  assert.equal((await request(port,null,'/v1/dashboard/admin/revoke',{method:'POST',origin:'https://observer.example',body:{},cookie})).status,404);
+  assert.equal(backend.sessions.size,1);
+ }finally{await server.close();await fs.rm(root,{recursive:true,force:true});}
 });

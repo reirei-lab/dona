@@ -2,13 +2,14 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import net from "node:net";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import type { DashboardTaskReader } from "./task-reader.js";
 import type { DashboardObserver, DashboardAuthority } from "./observer.js";
 
-interface Session { csrf: string; expires: number; revision: string }
+import { validateOperatorSession, type OperatorBackend, type OperatorSession } from "./operator-client.js";
 export interface DashboardServerOptions {
   origin: string; port: number; controlSocket: string; version: string;
+  backend: OperatorBackend;
   reader: DashboardTaskReader; observer: DashboardObserver;
   page: {status: number; headers: Record<string,string>; body: string};
 }
@@ -20,8 +21,6 @@ export class DashboardServer {
   private readonly server: http.Server;
   private readonly control: http.Server;
   private readonly origin: URL;
-  private readonly sessions = new Map<string,Session>();
-  private pairing: {code:string; expires:number} | undefined;
   private failures = 0;
   private failureWindow = 0;
   private controlIdentity: {dev:number;ino:number} | undefined;
@@ -32,7 +31,7 @@ export class DashboardServer {
     if (this.origin.protocol!=="https:" || this.origin.origin!==options.origin || this.origin.username || this.origin.password
       || !Number.isSafeInteger(options.port) || options.port<1024 || options.port>65535) throw Error("dashboard_configuration_invalid");
     this.server=http.createServer({maxHeaderSize:8192,requestTimeout:10000,headersTimeout:5000},(req,res)=>{void this.receive(req,res);});
-    this.control=http.createServer({maxHeaderSize:2048,requestTimeout:5000,headersTimeout:3000},(req,res)=>this.operator(req,res));
+    this.control=http.createServer({maxHeaderSize:2048,requestTimeout:5000,headersTimeout:3000},(req,res)=>{void this.operator(req,res);});
     for(const server of [this.server,this.control]) {
       server.maxRequestsPerSocket=1;server.keepAliveTimeout=1;server.maxConnections=32;
       server.on("upgrade",(_req,socket)=>socket.destroy());server.on("connect",(_req,socket)=>socket.destroy());
@@ -44,12 +43,13 @@ export class DashboardServer {
     const body=type.startsWith("application/json")?JSON.stringify(value):String(value);
     res.writeHead(status,{...headers,"content-type":type,"content-length":Buffer.byteLength(body),connection:"close",...extra});res.end(body);
   }
-  private session(req:http.IncomingMessage):{key:string;value:Session}|null {
+  private token(req:http.IncomingMessage):string|null {
     const cookies=(req.headers.cookie??"").split(";").map(x=>x.trim()).filter(x=>x.startsWith(`${cookieName}=`));
-    if(cookies.length!==1)return null;
-    const key=cookies[0]!.slice(cookieName.length+1),value=this.sessions.get(key);
-    if(!value || performance.now()>=value.expires){this.sessions.delete(key);return null;}
-    return {key,value};
+    if(cookies.length!==1)return null;const token=cookies[0]!.slice(cookieName.length+1);
+    return /^[A-Za-z0-9_-]{43}$/.test(token)?token:null;
+  }
+  private async session(token:string):Promise<OperatorSession|null> {
+    try{return validateOperatorSession(await this.options.backend.call('session',{token}));}catch{return null;}
   }
   private cookie(value:string,age=43200):string{return `${cookieName}=${value}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${age}`;}
   private async body(req:http.IncomingMessage):Promise<Record<string,unknown>> {
@@ -74,56 +74,71 @@ export class DashboardServer {
         || (req.method!=="GET"&&req.headers.origin!==this.origin.origin)) {this.reply(res,403,{error:"origin_invalid"});return;}
       const target=req.url??"";
       if(req.method==="GET"&&(target==="/"||target==="/pair")){this.reply(res,200,this.options.page.body,"text/html; charset=utf-8",this.options.page.headers);return;}
-      if(req.method==="GET"&&target==="/health/version"){this.reply(res,200,{version:this.options.version,mode:"read_only",pairing_required:true});return;}
+      if(req.method==="GET"&&target==="/health/version"){this.reply(res,200,{version:this.options.version,mode:"paired_operator",pairing_required:true});return;}
       if(req.method==="POST"&&target==="/api/pair"){
         const now=performance.now();if(now-this.failureWindow>60000){this.failureWindow=now;this.failures=0;}
         if(this.failures>=8){this.reply(res,429,{error:"pairing_rate_limited"});return;}
         const body=await this.body(req);this.failures++;
-        if(Object.keys(body).length!==1||typeof body.code!=="string"||!this.pairing||performance.now()>=this.pairing.expires||!equal(body.code,this.pairing.code)) {this.reply(res,403,{error:"pairing_invalid"});return;}
-        this.pairing=undefined;
-        for(const [key,value] of this.sessions)if(now>=value.expires)this.sessions.delete(key);
-        if(this.sessions.size>=16){this.reply(res,429,{error:"session_limit"});return;}
-        const key=randomBytes(32).toString("base64url"),csrf=randomBytes(32).toString("base64url");
-        this.sessions.set(key,{csrf,expires:performance.now()+12*3600000,revision:randomBytes(16).toString("hex")});
-        this.reply(res,200,{csrf},undefined,{"set-cookie":this.cookie(key)});return;
+        if(Object.keys(body).length!==1||typeof body.code!=="string"){this.reply(res,403,{error:"pairing_invalid"});return;}
+        let paired:{token:string;session:OperatorSession};
+        try{paired=await this.options.backend.call('pair',{code:body.code});paired.session=validateOperatorSession(paired.session);if(!/^[A-Za-z0-9_-]{43}$/.test(paired.token))throw Error();}
+        catch{this.reply(res,403,{error:"pairing_invalid"});return;}
+        this.reply(res,200,paired.session,undefined,{"set-cookie":this.cookie(paired.token)});return;
       }
-      const session=this.session(req);
-      if(!session){this.reply(res,401,{error:"session_invalid"});return;}
-      if(req.method==="GET"&&target==="/api/session"){this.reply(res,200,{csrf:session.value.csrf,scope:"dona_observation"});return;}
+      const token=this.token(req),session=token?await this.session(token):null;
+      if(!token||!session){this.reply(res,401,{error:"session_invalid"});return;}
+      if(req.method==="GET"&&target==="/api/session"){this.reply(res,200,session);return;}
       if(req.method==="POST"&&target==="/api/logout"){
-        if(typeof req.headers["x-csrf-token"]!=="string"||!equal(req.headers["x-csrf-token"],session.value.csrf)){this.reply(res,403,{error:"csrf_invalid"});return;}
-        this.sessions.delete(session.key);this.reply(res,200,{ok:true},undefined,{"set-cookie":this.cookie("",0)});return;
+        if(typeof req.headers["x-csrf-token"]!=="string"||!equal(req.headers["x-csrf-token"],session.csrf)){this.reply(res,403,{error:"csrf_invalid"});return;}
+        await this.options.backend.call('logout',{token});this.reply(res,200,{ok:true},undefined,{"set-cookie":this.cookie("",0)});return;
       }
-      const authority=():DashboardAuthority|null=>{
-        const current=this.session(req);return current?.key===session.key?{revision:current.value.revision,task:()=>true,conversation:()=>true}:null;
+      const has=(capability:string)=>session.capabilities.includes(capability);
+      const authority=():DashboardAuthority=>({revision:JSON.stringify([session.instance_id,session.owner_id,session.device_id,session.grant_revision,session.capabilities]),task:()=>has('tasks:read'),conversation:()=>has('conversations:worker:read'),mainConversation:()=>has('conversations:main:read')});
+      const recheck=async()=>{
+        const current=await this.session(token);
+        if(!current||JSON.stringify(current)!==JSON.stringify(session)){this.reply(res,401,{error:"session_invalid"});return false;}return true;
       };
       const url=new URL(target,this.origin);
       if(req.method==="GET"&&url.pathname==="/api/tasks"){
         const keys=[...url.searchParams.keys()];if(keys.some(k=>k!=="after")||keys.length>1)throw Error("query_invalid");
+        if(!has("tasks:read")){this.reply(res,403,{error:"scope_denied"});return;}
         const result=this.options.reader.list(()=>true,url.searchParams.get("after"));
-        this.reply(res,200,result);return;
+        if(!await recheck())return;this.reply(res,200,result);return;
       }
-      const match=/^\/api\/tasks\/([A-Za-z0-9_-]{1,128})(\/events)?$/.exec(target);
+      const match=/^\/api\/tasks\/([A-Za-z0-9_-]{1,128})(\/events)?$/.exec(url.pathname);
       if(req.method==="GET"&&match){
-        const detail=await this.options.observer.detail(match[1]!,authority);
-        if(!authority()){this.reply(res,401,{error:"session_invalid"});return;}
+        const keys=[...url.searchParams.keys()];if(keys.some(k=>k!=="attempt")||keys.length>1)throw Error("query_invalid");
+        if(!has('tasks:read')){this.reply(res,403,{error:'scope_denied'});return;}
+        const detail=await this.options.observer.detail(match[1]!,authority,undefined,url.searchParams.get('attempt')??undefined);
+        if(!await recheck())return;
         if(!detail){this.reply(res,404,{error:"not_found"});return;}
         if(match[2])this.reply(res,200,`event: task\ndata: ${JSON.stringify(detail)}\n\n`,"text/event-stream; charset=utf-8");
         else this.reply(res,200,detail);return;
+      }
+      const main=/^\/api\/conversations\/main(?:\/([A-Za-z0-9_-]{1,160})\/([A-Za-z0-9_-]{1,160}))?$/.exec(url.pathname);
+      if(req.method==='GET'&&main){
+        if(url.search)throw Error('query_invalid');if(!has('conversations:main:read')){this.reply(res,403,{error:'scope_denied'});return;}
+        const result=main[1]?await this.options.observer.mainDetail(main[1],main[2]!,authority):await this.options.observer.mainList(authority);
+        if(!await recheck())return;this.reply(res,result?200:404,result??{error:'not_found'});return;
       }
       this.reply(res,404,{error:"not_found"});
     } catch {this.reply(res,503,{error:"observation_unavailable"});}
     finally {this.active--;}
   }
-  private operator(req:http.IncomingMessage,res:http.ServerResponse):void {
-    if(req.method==="GET"&&req.url==="/health/version"){this.reply(res,200,{version:this.options.version,mode:"read_only",sessions:this.sessions.size});return;}
-    if(req.method!=="POST"||req.headers["content-length"]!=="0"||req.headers["transfer-encoding"]!==undefined){this.reply(res,400,{error:"invalid_request"});return;}
-    if(req.url==="/pair"){
-      const code=randomBytes(12).toString("base64url");this.pairing={code,expires:performance.now()+300000};this.failures=0;
-      this.reply(res,200,{code,expires_in_seconds:300,origin:this.origin.origin,scope:"all_dona_observations"});return;
-    }
-    if(req.url==="/revoke"){this.sessions.clear();this.pairing=undefined;this.reply(res,200,{ok:true});return;}
-    this.reply(res,404,{error:"not_found"});
+  private async operator(req:http.IncomingMessage,res:http.ServerResponse):Promise<void> {
+    try {
+      if(req.method==='GET'&&req.url==='/health/version'){const status=await this.options.backend.call<Record<string,unknown>>('admin/status',{});this.reply(res,200,{...status,version:this.options.version,mode:'paired_operator'});return;}
+      if(req.method!=='POST'||req.headers['transfer-encoding']!==undefined){this.reply(res,400,{error:'invalid_request'});return;}
+      const body=req.headers['content-length']==='0'?{}:await this.body(req);
+      if(req.url==='/pair'){
+        if(Object.keys(body).some(key=>key!=='capabilities'))throw Error();
+        const capabilities=body.capabilities??['tasks:read','conversations:worker:read'];
+        if(!Array.isArray(capabilities)||!capabilities.every(c=>typeof c==='string'))throw Error();
+        const result=await this.options.backend.call<Record<string,unknown>>('admin/pair',{capabilities});this.failures=0;this.reply(res,200,{...result,origin:this.origin.origin});return;
+      }
+      if(req.url==='/revoke'){if(Object.keys(body).some(key=>key!=='device_id')||(body.device_id!==undefined&&typeof body.device_id!=='string'))throw Error();this.reply(res,200,await this.options.backend.call('admin/revoke',body));return;}
+      this.reply(res,404,{error:'not_found'});
+    }catch{this.reply(res,503,{error:'operator_unavailable'});}
   }
   async start():Promise<void> {
     const socket=this.options.controlSocket,parent=path.dirname(socket),uid=process.getuid?.();
@@ -131,6 +146,8 @@ export class DashboardServer {
     const directory=fs.lstatSync(parent);
     if(!directory.isDirectory()||directory.uid!==uid||(directory.mode&0o777)!==0o700 )throw Error("dashboard_control_invalid");
     await this.removeStaleControl(socket,uid);
+    const reset=await this.options.backend.call<{ok:boolean}>("admin/reset",{origin:this.options.origin});
+    if(reset?.ok!==true)throw Error("dashboard_operator_reset_failed");
     try {
       await new Promise<void>((resolve,reject)=>{this.control.once("error",reject);this.control.listen(socket,()=>{this.control.off("error",reject);resolve();});});
       fs.chmodSync(socket,0o600);const stat=fs.lstatSync(socket);this.controlIdentity={dev:stat.dev,ino:stat.ino};
@@ -152,7 +169,7 @@ export class DashboardServer {
     fs.unlinkSync(socket);
   }
   async close():Promise<void> {
-    this.closed=true;this.sessions.clear();this.pairing=undefined;
+    this.closed=true;
     for(const server of [this.server,this.control]){server.closeAllConnections();if(server.listening)await new Promise<void>(resolve=>server.close(()=>resolve()));}
     const socket=this.options.controlSocket;
     if(this.controlIdentity&&fs.existsSync(socket)){const stat=fs.lstatSync(socket);if(stat.dev===this.controlIdentity.dev&&stat.ino===this.controlIdentity.ino)fs.unlinkSync(socket);}

@@ -1,3 +1,4 @@
+import {OperatorFixture} from '../../../dispatcher/test/dashboard-operator-fixture.js';
 import {expect,test} from '@playwright/test';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -32,7 +33,7 @@ test('実HTTPS proxyとSecure cookieで観測し、別Originと失効後の閲�
   const runtimeCalls:string[]=[],record:ObservedConversation={name,generation:'fixture_generation',role:'worker',thread_id:'thread_one',attempt_id:task.current_attempt_id,connected:true,observed_at:new Date().toISOString(),state:'working'};
   const observer=new DashboardObserver(reader,{conversations:async()=>{runtimeCalls.push('conversations');return{items:[record],next:null};},conversation:async()=>{runtimeCalls.push('conversation');return{...record,items:[{id:'item_one',turn_id:'turn_one',kind:'assistant_message',text:'HTTPS経由のワーカー進捗 <img src=x onerror=alert(1)>'}],events:[],cursor:0,oldest_sequence:0,gap:false,truncated:false};}});
   const backend=await freePort(),publicPort=await freePort(),origin=`https://localhost:${publicPort}`;
-  server=new DashboardServer({origin,port:backend,controlSocket:socket,version:'a'.repeat(40),reader,observer,page:observerDashboardPage()});await server.start();
+  server=new DashboardServer({backend:new OperatorFixture(),origin,port:backend,controlSocket:socket,version:'a'.repeat(40),reader,observer,page:observerDashboardPage()});await server.start();
   const cert=await fs.readFile(new URL('../../../test-fixtures/tls/loopback-fixture-cert.pem',import.meta.url));
   const key=await fs.readFile(new URL('../../../test-fixtures/tls/loopback-fixture-key.pem',import.meta.url));
   // Fixture TLS termination preserves the incoming Host like Tailscale Serve.

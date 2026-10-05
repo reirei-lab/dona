@@ -1,6 +1,6 @@
 # 別端末からDonaの作業を観測する
 
-このserviceはTailscale等のprivate networkでHTTPS公開する閲覧専用dashboardである。接続コードを受け取った端末は、そのDonaのすべてのTaskとワーカーの会話を閲覧できる。端末ごとのTask範囲制限はない。Webから依頼、取消、再開、質問への回答、承認はできない。従来のOIDC command dashboardとは別の起動構成である。
+この手順はTailscale等のprivate networkでHTTPS公開する、個人用dashboardの起動と観測を扱う。Macで発行した接続コードに固定されたcapabilityだけを端末へ付与する。既定の閲覧権限は、そのDonaのすべてのTaskとワーカーの会話を対象とし、端末ごとのTask範囲制限はない。Dona本体の会話と操作の権限は別途Macで明示する。
 
 ## 設定と起動
 
@@ -14,6 +14,7 @@ releaseはWebとDispatcherのbuild成果、Web lockhash付きmanifestを含む�
   "active_release_pointer": "/absolute/runtime/current",
   "control_socket": "/absolute/private/observer/control.sock",
   "dispatcher_database": "/absolute/current/dona.sqlite3",
+  "dispatcher_socket": "/absolute/current/dispatcher.sock",
   "runtime_socket": "/absolute/current/runtime.sock"
 }
 ```
@@ -48,7 +49,7 @@ Macのterminalで `node <release>/dispatcher/dist/dashboard/cli.js pair <config.
 
 ## 更新・復旧と資源
 
-serviceは追加DBを作らず、session/codeはメモリにのみ保持する。永続資源はowner-only設定、専用plist、ログ、immutable releaseである。Task/Attempt/Result/worktree/runtime DBをWebの更新・復旧でコピー、移動、書換えしない。観測readerはSQLiteのread-only connectionだけを開く。
+BFFは追加DBを作らず、Dispatcherが既存DBにoperator/device認可を保存する。session/codeはDispatcherのメモリにのみ保持する。BFFの永続資源はowner-only設定、専用plist、ログ、immutable releaseである。Task/Attempt/Result/worktree/runtime DBをWebの更新・復旧でコピー、移動、書換えしない。観測readerはSQLiteのread-only connectionだけを開く。
 
 pointer追随modeでは、既存updaterがpreserve updateまたはrollbackでcurrentを切り替えると、最大1秒後にWebだけを停止し、launchdがcurrent上の新binaryを起動する。切替は検出するだけでWebがupdaterを操作することはない。設定のTask DB/runtime socket pathはpreserve updateで安定している必要があり、fresh generation切替ではoperatorが再設定する。pointer不正、manifest不一致、Web binaryのない旧releaseへのrollbackでは閲覧を停止したままにし、自動復旧成功を主張しない。旧release側にobserverがなければ対応releaseへ戻すかWeb serviceをstopする。
 
@@ -57,3 +58,12 @@ pointer追随modeでは、既存updaterがpreserve updateまたはrollbackでcur
 起動時にcontrol socketが残っている場合、serviceはowner/modeとinodeを照合し、接続がECONNREFUSEDだった同じsocketだけを回収する。稼働中または接続結果が不明なsocketは拒否する。拒否時は対象serviceのlaunchd登録・実process・socket所有を照合する。未確認socketを手動で消して起動し直す手順にはしない。
 
 version応答はservice起動の証拠であり、Tailscale経由のTLS、ブラウザ接続、runtime会話取得、preserve update/rollbackを証明しない。それぞれ隔離harnessと対象端末で検証する。package配置やこの手順の追加だけで#374/#146を完了としない。
+
+
+### Dispatcher側の端末認可への移行
+
+`dispatcher_socket` は所有者専用の Dispatcher UDS を明示する必須設定です。旧設定はこの値を追加してから再起動します。BFF 自身は接続コードや session を保存せず、Dispatcher で認可し、本文を返す直前にも session を再照合します。BFF 起動時は設定された HTTPS origin を Dispatcher へ固定し、既存 session を失効させます。
+
+Mac の `pair` コマンドには `--capability` を複数指定できます。省略時は `tasks:read` と `conversations:worker:read` だけです。Dona 本体の会話は `--capability conversations:main:read` を明示します。指定した集合がそのコードの付与範囲になるため、Task も見る場合は各 read capability を併記してください。操作権限も Mac で明示した範囲に限られます。
+
+`revoke --device <device_id>` は対象端末を失効させ、引数なしは全端末を失効させます。`status` は Dispatcher の認可状態を表示します。接続コードは引き続き対話 terminal の `pair` だけに表示し、service log へ記録しません。
