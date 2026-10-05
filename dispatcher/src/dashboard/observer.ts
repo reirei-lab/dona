@@ -43,7 +43,7 @@ export class DashboardObserver {
         const seen = new Set<string>();
         // Bounded runtime inventory: do not scan personal Codex sessions.
         for (let page = 0; page < 100; page++) {
-          const result = await this.runtime.conversations(cursor);
+          const result = await withinDeadline(this.runtime.conversations(cursor), started);
           const currentAuthority = authorize();
           if (!currentAuthority || currentAuthority.revision !== authority.revision || !currentAuthority.task(id) || !currentAuthority.conversation(id)) return null;
           if (performance.now() - started > 5000 || result.items.length > 100) throw Error("observation_inventory_limit");
@@ -52,7 +52,7 @@ export class DashboardObserver {
           const match = matches[0];
           if (match && match.name !== expectedAgent) throw Error("observation_identity_changed");
           if (match) {
-            const content = await this.runtime.conversation(match.name,match.generation,afterSequence);
+            const content = await withinDeadline(this.runtime.conversation(match.name,match.generation,afterSequence), started);
             if (performance.now() - started > 5000 || content.name !== match.name || content.generation !== match.generation || content.role !== "worker"
               || content.thread_id !== match.thread_id || content.attempt_id !== before.task.current_attempt_id) throw Error("observation_identity_changed");
             observed = {status: "observed", conversation: content}; break;
@@ -71,4 +71,15 @@ export class DashboardObserver {
     if (!current.conversation(id)) observed = {status: "forbidden"};
     return {snapshot: after, runtime: observed};
   }
+}
+
+async function withinDeadline<T>(operation: Promise<T>, started: number): Promise<T> {
+  const remaining = 5000 - (performance.now() - started);
+  if (remaining <= 0) throw Error("observation_deadline");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([operation, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(Error("observation_deadline")), remaining);
+    })]);
+  } finally { clearTimeout(timer); }
 }
