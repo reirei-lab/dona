@@ -7,7 +7,7 @@ import { stableStringify } from "./validation.js";
 const id = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/);
 const slack = z.strictObject({ kind: z.literal("slack_thread"), workspace_id: id, channel_id: id, thread_ts: z.string().regex(/^\d{1,20}\.\d{6}$/) });
 const schedule = z.strictObject({ kind: z.literal("schedule"), tenant_id: id, owner_id: id, schedule_id: id, run_id: id, revision: z.number().int().positive() });
-export const jobOwnerSchema = z.discriminatedUnion("kind", [slack, schedule]);
+export const jobOwnerSchema = z.discriminatedUnion("kind", [slack, schedule, z.strictObject({kind:z.literal("local_dashboard"),instance_id:id,owner_id:id})]);
 const target = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("thread"), workspace_id: id, channel_id: id, thread_ts: z.string().regex(/^\d{1,20}\.\d{6}$/) }),
   z.strictObject({ kind: z.literal("channel"), workspace_id: id, channel_id: id }),

@@ -63,7 +63,7 @@ export class AppServerAgentClient implements HerdrClient {
 /** legacyのDB列名は履歴保持のため残すが、値はApp Server agent/thread identity。 */
 export class AppServerJobRuntime implements JobAgentRuntime {
   readonly client:RuntimeClient;
-  constructor(private readonly config:DispatcherConfig,private progressEnabled=true,private readonly expectedSession?:(jobId:string)=>string|undefined,private readonly taskOwned:(jobId:string)=>boolean=()=>false){this.client=new RuntimeClient(runtimeSocket(config),95_000);}
+  constructor(private readonly config:DispatcherConfig,private progressEnabled=true,private readonly expectedSession?:(jobId:string)=>string|undefined,private readonly taskOwned:(jobId:string)=>boolean=()=>false,private readonly localDashboardOwned:(jobId:string)=>boolean=()=>false){this.client=new RuntimeClient(runtimeSocket(config),95_000);}
   private matchesSession(row:JobRow,agent:AgentRecord):boolean {
     if(!this.expectedSession)return true;
     const expected=this.expectedSession(row.job_id);
@@ -85,7 +85,7 @@ export class AppServerJobRuntime implements JobAgentRuntime {
   answerQuestion(name:string,id:string,answers:Record<string,{answers:string[]}>){return this.client.answer(name,id,answers);}
   disableProgress():void{this.progressEnabled=false;}
   async prepare(row:JobRow,signal?:AbortSignal):Promise<PreparedJobRuntime>{
-    if(row.source==="web")throw Error("runtime_profile_unavailable");
+    if(row.source==="web"&&(!this.taskOwned(row.job_id)||!this.localDashboardOwned(row.job_id)))throw Error("runtime_profile_unavailable");
     const workspace=workspaceFromJob(row),provisioner=new JobWorkspace(this.config);
     const expected=workspace.kind==="scratch"?path.join(this.config.jobsWorkspaceRoot,"scratch",workspaceJobId(row)):
       path.join(this.config.jobsWorkspaceRoot,"github",...workspace.repository.split("/"),"worktrees",workspaceJobId(row));
@@ -112,7 +112,7 @@ export class AppServerJobRuntime implements JobAgentRuntime {
       await verifyScheduledSandbox(path.dirname(row.result_path),executablePaths,row.workspace_path,this.config.jobCommandTimeoutMs,
         (executable,args,timeout)=>runProcess(executable,args,timeout,signal));
     }
-    const baseline=codexAgentArguments(row,this.config,[],this.progressEnabled,executablePaths);
+    const baseline=codexAgentArguments(row,this.config,[],this.progressEnabled,executablePaths,this.localDashboardOwned(row.job_id));
     const trust=baseline.find(value=>value.startsWith("projects = "))!;
     // launchd may omit Node from PATH even though this process uses a pinned Node.
     // Codex's npm entrypoint has an /usr/bin/env node shebang.

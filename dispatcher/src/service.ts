@@ -56,7 +56,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     new SystemClock(), createLogger("dispatcher_slack_reminders"), Math.min(config.queuePollMs, 60_000));
   jobSupervisor = new JobSupervisor(
     database,
-    new AppServerJobRuntime(config, jobProgress !== undefined,id=>database.getJobLiveSessionIdentity(id)?.herdr_agent_session_id??undefined,id=>!!database.tasks.forAttempt(id)),
+    new AppServerJobRuntime(config, jobProgress !== undefined,id=>database.getJobLiveSessionIdentity(id)?.herdr_agent_session_id??undefined,id=>!!database.tasks.forAttempt(id),id=>database.hasLocalDashboardJobOwner(id)),
     config,
     createLogger("dispatcher_jobs"),
     () => worker.wake(),

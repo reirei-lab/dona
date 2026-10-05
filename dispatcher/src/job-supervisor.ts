@@ -239,7 +239,7 @@ export class JobSupervisor {
       const job=this.database.getJob(initial.current_attempt_id)!,request=(await this.runtime.questions(job.agent_name,true)).find(q=>q.question_id===questionId);
       const task=this.database.tasks.assertOwner(id,eventId,true);
       if(!request||request.kind!=="approval"||JSON.stringify([request.generation,request.thread_id])!==this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id||task.current_attempt_id!==job.job_id)throw Error("task_approval_not_current");
-      if(!this.database.hasWorkerApprovalReply(job.job_id,questionId,eventId))throw Error("task_approval_requires_user_reply");
+      if(!this.database.hasWorkerApprovalReply(job.job_id,questionId,eventId,accepted))throw Error("task_approval_requires_user_reply");
       if(request.answer_hash===createHash("sha256").update(stableStringify({accepted})).digest("hex")&&["answering","resolved"].includes(request.state))return {task_id:id,question_id:questionId,state:request.state};
       if(task.revision!==revision||task.desired_state!=="running"||task.stop_state!=="none"||!["active","waiting"].includes(task.state))throw Error("task_approval_not_current");
       const response=await this.runtime.approveRequest(job.agent_name,questionId,accepted);
@@ -250,6 +250,10 @@ export class JobSupervisor {
     const initial=this.database.tasks.assertOwner(id,eventId);
     return this.serialized(initial.current_attempt_id,async()=>{
       let task=this.database.tasks.assertOwner(id,eventId);const job=this.database.getJob(task.current_attempt_id)!;
+      const source=this.database.get(eventId)!;
+      if(source.source==="web"&&source.event_type==="worker_question_reply"){
+        if(!this.database.localDashboard.matchesRecordedReply(eventId,job.job_id,questionId,"question",answers))throw Error("task_question_reply_mismatch");
+      }
       const old= (await this.runtime.questions?.(job.agent_name,true))?.find(q=>q.question_id===questionId);
       task=this.database.tasks.assertOwner(id,eventId);
       if(task.current_attempt_id!==job.job_id)throw Error("task_revision_conflict");

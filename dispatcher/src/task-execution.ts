@@ -1,3 +1,4 @@
+import {readEventJobBinding} from "./job-routing.js";
 import {checkpointSnapshot,type TaskCheckpoint} from "./task-checkpoint.js";
 import Database from "better-sqlite3";
 import { ulid } from "ulid";
@@ -163,6 +164,11 @@ export class TaskRepository {
     const task=this.get(id);if(!task)throw new Error("task_owner_mismatch");
     try{this.dispatcher.assertJobSourceMatchesThread(task.current_attempt_id,eventId);}catch{throw new Error("task_owner_mismatch");}
     const event=this.dispatcher.get(eventId);
+    if(event?.source==="web"&&this.dispatcher.hasLocalDashboardJobOwner(task.current_attempt_id)) {
+      const binding=readEventJobBinding(this.sql,eventId);
+      if(binding?.owner.kind!=="local_dashboard")throw new Error("task_owner_mismatch");
+      return task;
+    }
     if(!event||!["slack","dona_job"].includes(event.source))throw new Error("task_owner_mismatch");
     if(event.source==="dona_job"&&JSON.parse(event.subject_json).source_event_id!==task.source_event_id)throw new Error("task_owner_mismatch");
     const original=this.dispatcher.get(task.source_event_id)!;
@@ -226,6 +232,14 @@ export class TaskRepository {
     this.stampAttempt(job,id,1);
     this.sql.prepare("UPDATE jobs SET status='blocked',last_error_code='runtime_profile_unavailable',last_error_message=NULL WHERE job_id=?").run(job.job_id);
     this.activateSchema();return this.get(id)!;
+  }
+  attachLocalDashboardAttempt(job:JobRow,requestKey:string):TaskRow {
+    if(!this.dispatcher.hasLocalDashboardJobOwner(job.job_id)||this.forAttempt(job.job_id))throw Error("local_dashboard_owner_mismatch");
+    const id=`task_${ulid().toLowerCase()}`,now=new Date().toISOString();
+    this.sql.prepare(`INSERT INTO tasks(task_id,source_event_id,task_key,request_sha256,current_attempt_id,max_attempts,retry_delay_ms,objective,created_at,updated_at)
+      VALUES(?,?,?,?,?,3,60000,?,?,?)`).run(id,job.source_event_id,requestKey,hash({objective:job.objective,workspace:job.workspace_json}),job.job_id,job.objective,now,now);
+    this.sql.prepare("INSERT INTO task_attempts(attempt_id,task_id,number,created_at) VALUES(?,?,1,?)").run(job.job_id,id,now);
+    this.stampAttempt(job,id,1);this.activateSchema();return this.get(id)!;
   }
   /** Internal read-only snapshot; callers must authorize each item before disclosing it. */
   scanSnapshot(afterTaskId?:string,limit=100):TaskRow[] {

@@ -33,6 +33,7 @@ import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
 import type { RegistryPrincipal } from "./web/domain.js";
 import { createJobDisplayLabel } from "./job-display-label.js";
+import { LocalDashboardCommands, type LocalDashboardAuthority, type LocalDashboardCreate, type LocalDashboardCancel, type LocalDashboardQuestionReply } from "./local-dashboard-commands.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding, type JobBinding } from "./job-routing.js";
 import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
 import {
@@ -1047,6 +1048,7 @@ export class DispatcherDatabase {
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
   readonly tasks: TaskRepository;
+  readonly localDashboard: LocalDashboardCommands;
   private readonly schemaWrite: 2 | 3;
   private webJobProjectionReady = false;
   private readonly migrationHook: DispatcherMigrationHook;
@@ -1184,6 +1186,7 @@ export class DispatcherDatabase {
     });
     this.tasks = new TaskRepository(this.db, this);
     installRuntimeBindingArchive(this.db);
+    this.localDashboard = new LocalDashboardCommands(this.db,this,this.jobAdmissionLimits.jobsPerEventMax);
   }
 
   close(): void {
@@ -1445,13 +1448,15 @@ export class DispatcherDatabase {
       : {};
     const subject = JSON.parse(sourceEvent.subject_json) as Record<string, unknown>;
     const webSource = sourceEvent.source === "web" && sourceEvent.reply_target_json === null;
-    const workspaceId = webSource ? stringValue(subject.tenant_id) : stringValue(replyTarget.workspace_id);
+    const binding = readEventJobBinding(this.db, sourceEvent.event_id);
+    const localOwner=binding?.owner.kind==="local_dashboard"?binding.owner:undefined;
+    const workspaceId = webSource ? (localOwner?.instance_id??stringValue(subject.tenant_id)) : stringValue(replyTarget.workspace_id);
     const channelId = webSource ? undefined : stringValue(replyTarget.channel_id);
     const threadTs = webSource ? undefined : stringValue(replyTarget.thread_ts);
-    if (webSource && (!workspaceId || !stringValue(subject.instance_id) || !stringValue(subject.principal_id))) {
+    if (webSource && !localOwner && (!workspaceId || !stringValue(subject.instance_id) || !stringValue(subject.principal_id))) {
       throw new Error(`Event ${sourceEvent.event_id} does not have a Web principal`);
     }
-    const binding = readEventJobBinding(this.db, sourceEvent.event_id);
+    if (localOwner && (!webSource || sourceEvent.event_type!=="local_task_submit" || subject.instance_id!==localOwner.instance_id || subject.owner_id!==localOwner.owner_id))throw Error("local_dashboard_owner_mismatch");
     if (!webSource && !binding) throw new Error(`Event ${sourceEvent.event_id} does not have an authorized job owner`);
     if (binding?.owner.kind === "schedule" && parsedRequest.workspace.kind !== "scratch") {
       throw new ScheduledJobCreationError("scheduled_workspace_mismatch", "Scheduled work permits only a scratch workspace");
@@ -1539,7 +1544,7 @@ export class DispatcherDatabase {
         workspaceId,
         channelId,
         threadTs,
-        webSource ? stringValue(subject.principal_id) : stringValue(subject.actor_id),
+        webSource ? (localOwner?.owner_id??stringValue(subject.principal_id)) : stringValue(subject.actor_id),
         parsedRequest.objective,
         workspaceJson,
         timestamp,
@@ -1599,11 +1604,12 @@ export class DispatcherDatabase {
       if(!job||!task||task.current_attempt_id!==jobId||task.desired_state!=="running"||task.stop_state!=="none"||
         !(["running","blocked"].includes(job.status)||(job.status==="needs_review"&&taskMayAcceptLateResult(job)))||question.state!=="pending"||question.agent!==job.agent_name||JSON.stringify([question.generation,question.thread_id])!==this.getJobLiveSessionIdentity(jobId)?.herdr_agent_session_id)return;
       const source=this.getRequired(job.source_event_id),binding=readEventJobBinding(this.db,job.source_event_id);
-      if(!binding||binding.owner.kind!=="slack_thread")return;
-      const envelope:EventEnvelope={schema_version:1,source:"dona_job",type:"worker_question",external_event_id:`question:${question.question_id}`,
-        occurred_at:question.created_at,subject:{job_id:jobId,source_event_id:job.source_event_id,workspace_id:job.workspace_id!,channel_id:job.channel_id!,thread_ts:job.thread_ts!,actor_id:job.actor_id!},
+      if(!binding||!["slack_thread","local_dashboard"].includes(binding.owner.kind))return;
+      const local=binding.owner.kind==="local_dashboard"?binding.owner:undefined;
+      const envelope:EventEnvelope={schema_version:1,source:local?"web":"dona_job",type:"worker_question",external_event_id:`question:${question.question_id}`,
+        occurred_at:question.created_at,subject:{job_id:jobId,source_event_id:job.source_event_id,...(local?{instance_id:local.instance_id,owner_id:local.owner_id}:{workspace_id:job.workspace_id!,channel_id:job.channel_id!,thread_ts:job.thread_ts!,actor_id:job.actor_id!})},
         payload:{task_id:task.task_id,question_id:question.question_id,request_kind:question.kind},
-        reply_target:JSON.parse(source.reply_target_json!),trace:{job_id:jobId,source_event_id:job.source_event_id}};
+        reply_target:source.reply_target_json?JSON.parse(source.reply_target_json):null,trace:{job_id:jobId,source_event_id:job.source_event_id}};
       const result=this.enqueue(envelope,new Date(question.created_at));
       if(result.payloadMismatch)throw Error("task_question_notification_conflict");
       insertEventJobBinding(this.db,result.row.event_id,binding);
@@ -1612,7 +1618,13 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
-  hasWorkerApprovalReply(jobId:string,questionId:string,eventId:string):boolean {
+  hasWorkerApprovalReply(jobId:string,questionId:string,eventId:string,accepted?:boolean):boolean {
+    if(this.hasLocalDashboardJobOwner(jobId)){
+      const event=this.get(eventId);if(!event||event.source!=="web"||event.event_type!=="worker_question_reply")return false;
+      const payload=JSON.parse(event.payload_json);
+      try{this.tasks.assertOwner(payload.task_id,eventId,true);}catch{return false;}
+      return typeof accepted==="boolean"&&this.localDashboard.matchesRecordedReply(eventId,jobId,questionId,"approval",accepted);
+    }
     // Dispatcherの永続sequenceを使い、Slack/host間の時計差を認可に用いない。
     return this.db.prepare(`SELECT 1 FROM events notification JOIN events reply ON reply.sequence>notification.sequence
       WHERE notification.source='dona_job' AND notification.event_type='worker_question'
@@ -1662,6 +1674,20 @@ export class DispatcherDatabase {
       return { outcome: "created" as const, row: created.row, receipt };
     }).immediate();
   }
+
+  createLocalDashboardTask(authority:LocalDashboardAuthority,input:LocalDashboardCreate,workspaceRoot:string,resultDir:string) {
+    return this.localDashboard.create(authority,input,workspaceRoot,resultDir);
+  }
+  cancelLocalDashboardTask(authority:LocalDashboardAuthority,input:LocalDashboardCancel) {
+    return this.localDashboard.cancel(authority,input);
+  }
+  enqueueLocalDashboardQuestionReply(authority:LocalDashboardAuthority,input:LocalDashboardQuestionReply) {
+    return this.localDashboard.reply(authority,input);
+  }
+  getLocalDashboardReceipt(authority:LocalDashboardAuthority,requestId:string) {
+    return this.localDashboard.receipt(authority,requestId);
+  }
+  hasLocalDashboardJobOwner(jobId:string):boolean {return this.localDashboard.isLocalJob(jobId);}
 
   createWebTask(input: WebCommandIdentity & { idempotency_key: string; objective: string; workspace: CreateJobRequest["workspace"] },
     workspaceRoot:string,resultDir:string) {
@@ -3493,7 +3519,7 @@ export class DispatcherDatabase {
   }
 
   private assertJobCompletionBinding(job: JobRow): void {
-    if (job.source === "web") {
+    if (job.source === "web" && !this.hasLocalDashboardJobOwner(job.job_id)) {
       const event = this.getRequired(job.source_event_id);
       const subject = JSON.parse(event.subject_json) as Record<string, unknown>;
       if (event.source !== "web" || event.reply_target_json !== null
