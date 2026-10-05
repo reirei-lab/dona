@@ -98,6 +98,7 @@ export interface UpdatePlan {
   schema_version: 1;
   plan_id: string;
   plan_hash: string;
+  signed_host_digest?: string | null;
   policy_version: string;
   current_sha: string;
   target_sha: string;
@@ -126,6 +127,7 @@ export interface UpdateRow {
   previous_sha: string | null;
   plan_id: string;
   plan_hash: string;
+  signed_host_digest?: string | null;
   policy_version: string;
   compatibility_json: string;
   transition_json?: string | null;

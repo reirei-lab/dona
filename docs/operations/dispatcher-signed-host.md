@@ -51,3 +51,13 @@ stable updaterのprepareで署名済みexact SHA bundleを作成/取得し、doc
 参照: [署名daemonのapp構造](https://developer.apple.com/documentation/Xcode/signing-a-daemon-with-a-restricted-entitlement)、[Provisioning profile](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles)、[Apple silicon JIT](https://developer.apple.com/documentation/Apple-Silicon/porting-just-in-time-compilers-to-apple-silicon)。
 
 Node根拠: [公式dist index](https://nodejs.org/dist/index.json)、[24.21.0 release](https://nodejs.org/en/blog/release/v24.21.0)、[SHA256一覧](https://nodejs.org/dist/v24.21.0/SHASUMS256.txt)。
+
+## 既存signed世代の通常update
+
+operatorは0600 JSONで `team_id`、`access_group`、`signing_identity_sha1`（証明書fingerprint）、`provisioning_profile`（絶対path）を用意し、installerへ `DONA_SIGNED_HOST_CONFIG` として明示する。既存policyの `signed_host` はconfig指定省略時も保持する。profile/identityの発行・書換はinstallerが行わない。
+
+stable updaterはconfigとprofile bytesのdigestをplan hashへ結び、applyと各lease境界で再照合する。profilepath/identityを対外planへ出さない。source archiveと固定host buildはcontrol-rootの専用cacheに保持し、pin/host sourceが同じ更新では再buildせず新payloadを署名する。buildは毎回固有の一時directoryを使い、完成時だけcacheへpublishする。中断した一時名は次のbuildを妨げず、完成cacheのprovenance不一致は自動上書きしない。新runtime/host sourceでは新cache keyになる。
+
+署名はprepare段階でだけ行い、native署名・manifest更新・bundle署名・doctor後にreleaseをpublishする。quiesceより前に失敗でき、旧workerを操作しない。restart/rollbackでもcurrent artifactとlaunchdのexact host引数を確認する。DB/Task schemaの既存rollback条件を緩和しない。
+
+この段階の通常経路はsigned→signed更新を対象とする。初回unsigned→signedは専用cutoverが未接続のため、`--upgrade-control` と `--bootstrap` は現在releaseが未署名ならservice停止前に拒否する。旧Nodeへ暗黙fallbackしない。stable updaterの管理DBはplan digest保持のためschema8へ移行し、schema7以前のbinaryへ管理DBを戻して起動しない。

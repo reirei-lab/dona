@@ -53,16 +53,33 @@ if (transitionFile.schema_version !== 1 || !Array.isArray(transitionFile.transit
   throw new Error("Unsupported compatibility transition schema");
 }
 
+let signedHost;
+const hostInput=process.argv[6];
+const existingPolicy=path.join(values.CONTROL_ROOT,"policy.json");
+if(hostInput || fs.existsSync(existingPolicy)) {
+  const file=hostInput || existingPolicy, info=fs.lstatSync(file);
+  if(!path.isAbsolute(file)||!info.isFile()||info.isSymbolicLink()||info.uid!==process.getuid())throw Error("signed_host_config_not_private");
+  const input=JSON.parse(fs.readFileSync(file,"utf8"));signedHost=hostInput?input:input.signed_host;
+  if((hostInput&&!signedHost)||((hostInput||signedHost)&&(info.mode&0o077)!==0))throw Error("signed_host_config_not_private");
+  if(signedHost && (Object.keys(signedHost).sort().join(',')!=='access_group,provisioning_profile,signing_identity_sha1,team_id'||
+    !/^[A-Z0-9]{10}$/.test(signedHost.team_id)||!(/^[A-Z0-9]{10}\.dev\.dona\.approval$/).test(signedHost.access_group)||
+    !/^[a-fA-F0-9]{40}$/.test(signedHost.signing_identity_sha1)||!path.isAbsolute(signedHost.provisioning_profile)))throw Error("signed_host_config_invalid");
+}
 const xml = (value) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
 fs.mkdirSync(destination, { recursive: true, mode: 0o700 });
 for (const name of ["dev.dona.updater", "dev.dona.dispatcher", "dev.dona.slack-adapter"]) {
   let body = fs.readFileSync(path.join(repository, "launchd", `${name}.plist.in`), "utf8");
   for (const [key, value] of Object.entries(values)) body = body.replaceAll(`__${key}__`, xml(value));
+  if(name==="dev.dona.dispatcher" && signedHost) body=body.replace(
+    `<string>${xml(values.NODE)}</string>\n    <string>${xml(values.RUNTIME_ROOT)}/current/dispatcher/dist/cli.js</string>`,
+    `<string>${xml(values.RUNTIME_ROOT)}/current/signed-host/DonaDispatcher.app/Contents/MacOS/DonaDispatcher</string>`);
   if (/__[A-Z_]+__/.test(body)) throw new Error(`Unresolved template token in ${name}`);
   fs.writeFileSync(path.join(destination, `${name}.plist`), body, { mode: 0o600 });
 }
 
+if(signedHost)fs.writeFileSync(path.join(destination,"signed-host.json"),JSON.stringify(signedHost),{mode:0o600});
 const policy = {
+  ...(signedHost ? {signed_host:signedHost} : {}),
   schema_version: 1,
   policy_version: "2026-09-03.2",
   repository: "hiragram/dona",

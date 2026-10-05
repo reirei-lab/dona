@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import {randomUUID} from "node:crypto";
 import fsSync from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -290,6 +291,28 @@ export class CanonicalBuild implements BuildPort {
     private readonly runner = new ProcessRunner(),
     private readonly diagnostics?: DiagnosticLogStore,
   ) {}
+
+  async prepareSignedHost(checkoutPath: string, manifest: import("./types.js").ReleaseManifest): Promise<void> {
+    const host = this.policy.signed_host; if (!host) return;
+    const config = path.join(this.policy.control_root, `signed-host-build-${randomUUID()}.json`);
+    await fs.writeFile(config, JSON.stringify(host), {flag:"wx",mode:0o600});
+    try {
+      await fs.writeFile(path.join(checkoutPath,"release-manifest.json"),JSON.stringify(manifest),{flag:"wx",mode:0o600});
+      requireSuccess("signed host prepare",await this.runner.run(this.policy.executables.node,
+        [path.join(checkoutPath,"scripts/prepare-signed-dispatcher-host.mjs"),checkoutPath,config,path.join(this.policy.control_root,"host-build-cache")],
+        {timeoutMs:this.policy.timeouts.command_ms,outputLimitBytes:this.policy.output_limit_bytes,env:minimalEnvironment({HOME:os.homedir()})}));
+      await this.verifySignedHost(checkoutPath,manifest);
+    } finally { await fs.unlink(config); }
+  }
+  async verifySignedHost(releasePath: string, manifest: import("./types.js").ReleaseManifest): Promise<void> {
+    const h = this.policy.signed_host; if (!h) return;
+    const contract=JSON.parse(await fs.readFile(path.join(releasePath,"signed-host/DonaDispatcher.app/Contents/Resources/host-contract.json"),"utf8"));
+    if(contract.release_sha!==manifest.sha)throw new Error("signed_host_release_mismatch");
+    const output=requireSuccess("signed host doctor",await this.runner.run(this.policy.executables.node,
+      [path.join(releasePath,"scripts/doctor-dispatcher-host.mjs"),path.join(releasePath,"signed-host/DonaDispatcher.app"),h.team_id,h.access_group],
+      {timeoutMs:this.policy.timeouts.health_ms,outputLimitBytes:this.policy.output_limit_bytes,env:minimalEnvironment({HOME:os.homedir()})}));
+    if(JSON.parse(output).activation_allowed!==true)throw new Error("signed_host_unverified");
+  }
 
   async toolchain(): Promise<{ node_version: string; npm_version: string }> {
     const npmVersion = requireSuccess("npm --version", await this.runner.run(this.policy.executables.npm, ["--version"], {
@@ -734,6 +757,16 @@ export class RealRuntime implements RuntimePort {
   }
 
   async startDispatcher(): Promise<CommandResult> {
+    if(this.policy.signed_host){
+      const current=await fs.realpath(this.policy.current_pointer);
+      const manifest=JSON.parse(await fs.readFile(path.join(current,"release-manifest.json"),"utf8"));
+      await new CanonicalBuild(this.policy,this.runner).verifySignedHost(current,manifest);
+      const installed=requireSuccess("signed host launchd contract",await this.runner.run("/usr/bin/plutil",
+        ["-extract","ProgramArguments","json","-o","-",path.join(os.homedir(),"Library/LaunchAgents/dev.dona.dispatcher.plist")],
+        {timeoutMs:this.policy.timeouts.health_ms,outputLimitBytes:this.policy.output_limit_bytes}));
+      if(JSON.stringify(JSON.parse(installed))!==JSON.stringify([path.join(this.policy.current_pointer,"signed-host/DonaDispatcher.app/Contents/MacOS/DonaDispatcher"),"serve"]))throw new Error("signed_host_launchd_mismatch");
+    }
+
     if (await this.dispatcherRegistered()) {
       return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.dispatcher_label)]);
     }

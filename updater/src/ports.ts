@@ -34,6 +34,8 @@ export interface GitPort {
 }
 
 export interface BuildPort {
+  prepareSignedHost?(checkoutPath: string, manifest: ReleaseManifest): Promise<void>;
+  verifySignedHost?(releasePath: string, manifest: ReleaseManifest): Promise<void>;
   toolchain(): Promise<{ node_version: string; npm_version: string }>;
   buildRelease(checkoutPath: string, diagnostic?: Omit<DiagnosticLogIdentity, "step">): Promise<{
     lock_hashes: Record<string, string>;

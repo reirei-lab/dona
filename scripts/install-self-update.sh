@@ -189,7 +189,7 @@ cleanup_temp() {
 }
 trap cleanup_temp EXIT
 
-$NODE_PATH "$SCRIPT_DIR/render-self-update-templates.mjs" "$INSTALL_TMP/rendered" "$INSTALL_SHA" "$BASE_DIR" "${TARGET_ROOT:+generation}"
+$NODE_PATH "$SCRIPT_DIR/render-self-update-templates.mjs" "$INSTALL_TMP/rendered" "$INSTALL_SHA" "$BASE_DIR" "${TARGET_ROOT:+generation}" "${DONA_SIGNED_HOST_CONFIG:-}"
 if [[ -n "$TARGET_ROOT" ]]; then
   EXPECTED_OLD_UPDATER_SHA=$(/usr/bin/python3 "$SCRIPT_DIR/validate-generation-install-target.py" "$BASE_DIR" "$INSTALL_TMP/rendered" "$LAUNCH_AGENTS_DIR" "$MODE")
 fi
@@ -201,6 +201,10 @@ $NODE_PATH -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8
 if [[ "$MODE" == "--check" ]]; then
   print "self-update policyと3つのLaunchAgent templateは有効です。実環境は変更していません。"
   exit 0
+fi
+
+if [[ -f "$INSTALL_TMP/rendered/signed-host.json" && ( "$MODE" == "--bootstrap" || "$MODE" == "--upgrade-control" ) ]]; then
+  $NODE_PATH "$SCRIPT_DIR/verify-signed-dispatcher-release.mjs" "$RUNTIME_ROOT/current" "$INSTALL_TMP/rendered/signed-host.json"
 fi
 
 if [[ "$MODE" == "--bootstrap" ]]; then
@@ -305,6 +309,9 @@ for component in dispatcher sources/slack sources/web updater; do
 done
 NPM_VERSION=$($NPM_PATH --version)
 $NODE_PATH "$SCRIPT_DIR/write-release-manifest.mjs" "$STAGING_DIR" "$INSTALL_SHA" "$NPM_VERSION" "2026-09-03.2"
+if [[ -f "$INSTALL_TMP/rendered/signed-host.json" ]]; then
+  $NODE_PATH "$STAGING_DIR/scripts/prepare-signed-dispatcher-host.mjs" "$STAGING_DIR" "$INSTALL_TMP/rendered/signed-host.json" "$CONTROL_ROOT/host-build-cache"
+fi
 FINAL_RELEASE="$RELEASE_ROOT/$INSTALL_SHA"
 if [[ -e "$FINAL_RELEASE" ]]; then
   if [[ "$MODE" != "--upgrade-control" && "$MODE" != "--stage-recovery" ]] || \

@@ -1,10 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
+import {createHash} from "node:crypto";
 
 import type { Compatibility, CompatibilityTransition } from "./types.js";
 import { fullSha, ValidationError } from "./validation.js";
 
 export interface UpdatePolicy {
+  signed_host?: { team_id: string; access_group: string; signing_identity_sha1: string; provisioning_profile: string };
   schema_version: 1;
   policy_version: string;
   repository: "hiragram/dona";
@@ -109,7 +111,7 @@ export function parsePolicy(input: unknown): UpdatePolicy {
     "output_limit_bytes", "diagnostic_log_limit_bytes", "diagnostic_aggregate_limit_bytes", "diagnostic_retention_days",
     "disk_floor_bytes", "retain_successful", "required_checks", "require_verified_signature", "compatibility",
   ];
-  const extras = Object.keys(value).filter((key) => ![...policyKeys, "compatibility_transitions"].includes(key));
+  const extras = Object.keys(value).filter((key) => ![...policyKeys, "compatibility_transitions", "signed_host"].includes(key));
   const missing = policyKeys.filter((key) => !(key in value));
   if (extras.length || missing.length) throw new ValidationError("policy fields do not match schema");
   if (value.schema_version !== 1 || value.repository !== "hiragram/dona" || value.default_branch !== "main") {
@@ -204,7 +206,19 @@ export function parsePolicy(input: unknown): UpdatePolicy {
   if (diagnosticAggregateLimitBytes < diagnosticLogLimitBytes * 2) {
     throw new ValidationError("diagnostic_aggregate_limit_bytes must cover both command and observation logs");
   }
+  let signedHost: UpdatePolicy["signed_host"];
+  if (value.signed_host !== undefined) {
+    const h = record(value.signed_host, "signed_host");
+    exact(h, ["team_id", "access_group", "signing_identity_sha1", "provisioning_profile"], "signed_host");
+    if (typeof h.team_id !== "string" || !/^[A-Z0-9]{10}$/.test(h.team_id) ||
+        typeof h.access_group !== "string" || !/^[A-Z0-9]{10}\.dev\.dona\.approval$/.test(h.access_group) ||
+        typeof h.signing_identity_sha1 !== "string" || !/^[a-fA-F0-9]{40}$/.test(h.signing_identity_sha1))
+      throw new ValidationError("signed_host identity is invalid");
+    signedHost = {team_id:h.team_id,access_group:h.access_group,signing_identity_sha1:h.signing_identity_sha1,
+      provisioning_profile:absolute(h.provisioning_profile,"signed_host.provisioning_profile")};
+  }
   return {
+    ...(signedHost ? { signed_host: signedHost } : {}),
     schema_version: 1,
     policy_version: value.policy_version,
     repository: "hiragram/dona",
@@ -261,4 +275,12 @@ export function loadPolicy(policyPath: string): UpdatePolicy {
 
 export function assertExactSha(value: string): void {
   fullSha(value);
+}
+
+export function signedHostPolicyDigest(policy: UpdatePolicy): string | null {
+  if (!policy.signed_host) return null;
+  const fd=fs.openSync(policy.signed_host.provisioning_profile,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
+  try {const s=fs.fstatSync(fd);if(!s.isFile()||s.size>1024*1024)throw new Error("signed_host_profile_invalid");
+    return createHash("sha256").update(JSON.stringify(policy.signed_host)).update(fs.readFileSync(fd)).digest("hex");
+  } finally {fs.closeSync(fd);}
 }

@@ -2956,3 +2956,36 @@ describe("UpdateController isolated end-to-end", () => {
     f.database.close();
   });
 });
+
+async function signedFixture() {
+  const f=await fixture();const profile=path.join(f.policy.control_root,'test.provisionprofile');await fs.writeFile(profile,'profile-original',{mode:0o600});
+  f.policy.signed_host={team_id:'ABCDEFGHIJ',access_group:'ABCDEFGHIJ.dev.dona.approval',signing_identity_sha1:'a'.repeat(40),provisioning_profile:profile};
+  return {...f,profile};
+}
+test('署名profile driftはapply前に拒否してplanへprivate設定を公開しない',async()=>{
+ const f=await signedFixture();try{
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string;signed_host_digest:string};
+ assert.match(plan.signed_host_digest,/^[a-f0-9]{64}$/);assert.equal(JSON.stringify(response).includes(f.profile),false);assert.equal(JSON.stringify(response).includes('ABCDEFGHIJ'),false);
+ await fs.writeFile(f.profile,'profile-replaced');
+ assert.throws(()=>f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,plan_id:plan.plan_id,plan_hash:plan.plan_hash,approval_id:'signed-host-approval'}),/signed_host_plan_drift/);
+ assert.equal(f.runtime.calls.includes('quiesceDispatcher'),false);
+ }finally{f.database.close();}
+});
+test('署名設定は承認後prepare直前にも照合して停止操作を始めない',async()=>{
+ const f=await signedFixture();try{
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string};
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'signed-host-approval'});f.dispatcher.terminal=true;
+ f.policy.signed_host!.signing_identity_sha1='b'.repeat(40);await f.controller.processNext();
+ assert.equal(f.database.get(response.request_id as string)?.state,'failed');assert.equal(f.runtime.calls.includes('quiesceDispatcher'),false);assert.equal(f.runtime.calls.includes('stopDispatcher'),false);
+ }finally{f.database.close();}
+});
+test('署名済みrelease更新はprepareとrollback元検証を経て通常activationを完了する',async()=>{
+ const f=await signedFixture();try{
+ const checks:string[]=[];
+ Object.assign(f.build,{prepareSignedHost:async(_p:string,m:{sha:string})=>{checks.push('prepare:'+m.sha);},verifySignedHost:async(_p:string,m:{sha:string})=>{checks.push('verify:'+m.sha);}});
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string};
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'signed-host-approval'});f.dispatcher.terminal=true;await f.controller.processNext();
+ assert.ok(checks.includes('verify:'+currentSha));assert.ok(checks.includes('prepare:'+targetSha));
+ assert.equal(f.database.get(response.request_id as string)?.state,'succeeded');
+ }finally{f.database.close();}
+});

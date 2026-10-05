@@ -2,7 +2,7 @@ import { ulid } from "ulid";
 import path from "node:path";
 
 import type { UpdateDatabase } from "./database.js";
-import type { UpdatePolicy } from "./policy.js";
+import { signedHostPolicyDigest, type UpdatePolicy } from "./policy.js";
 import type { BuildPort, Clock, DispatcherPort, GitPort, Logger, ReleaseStorePort, RuntimePort } from "./ports.js";
 import { redactText } from "./redaction.js";
 import { DiagnosticLogStore } from "./diagnostic-log.js";
@@ -164,6 +164,7 @@ export class UpdateController {
       }
     }
     const result = this.database.createPlan(request, {
+      signed_host_digest:signedHostPolicyDigest(this.policy),
       current_sha: current.sha,
       target_sha: git.target_sha,
       previous_sha: previous?.sha ?? null,
@@ -178,6 +179,7 @@ export class UpdateController {
       duplicate: result.duplicate,
       plan: result.plan,
       preflight: {
+        signed_host: {enabled:!!this.policy.signed_host, artifact_verified:false},
         storage, toolchain, ci_trusted: git.ci_trusted, fast_forward: git.target_reachable,
         ...(controlPlane ? {
           control_plane_capability: transition?.required_control_plane_capability ?? git.target_rollout.required_control_plane_capability,
@@ -188,6 +190,8 @@ export class UpdateController {
   }
 
   apply(request: ApplyRequest): Record<string, unknown> {
+    const plan = this.database.getPlan(request.plan_id);
+    if(!plan || (plan.signed_host_digest ?? null)!==signedHostPolicyDigest(this.policy))throw new Error("signed_host_plan_drift");
     const result = this.database.approve(request, this.clock.now());
     return {
       schema_version: 1,
@@ -482,8 +486,11 @@ export class UpdateController {
       return;
     }
     if (row.state === "preparing") {
+      if((row.signed_host_digest ?? null)!==signedHostPolicyDigest(this.policy))throw new Error("signed_host_plan_drift");
+      if(this.policy.signed_host && (!this.build.prepareSignedHost || !this.build.verifySignedHost))throw new Error("signed_host_build_unavailable");
       const activeManifest = await this.releases.readCurrentManifest();
       this.assertLease(row);
+      if(this.policy.signed_host)await this.build.verifySignedHost!(path.join(this.policy.release_root,row.current_sha),activeManifest);
       if (activeManifest.sha !== row.current_sha) {
         throw new Error("planned_current_release_is_no_longer_active");
       }
@@ -501,6 +508,7 @@ export class UpdateController {
           canonicalJson(existingRelease.compatibility) !== canonicalJson(JSON.parse(row.compatibility_json))) {
           throw new Error("existing_immutable_release_does_not_match_approved_plan");
         }
+        if(this.policy.signed_host)await this.build.verifySignedHost!(path.join(this.policy.release_root,row.target_sha),existingRelease);
       } else {
         const stagingPath = await this.releases.prepareStaging(row.request_id, row.fence);
         await this.git.stage(row.target_sha, stagingPath);
@@ -521,6 +529,10 @@ export class UpdateController {
           built_at: this.clock.now().toISOString(),
           compatibility: JSON.parse(row.compatibility_json) as ReleaseManifest["compatibility"],
         };
+        if(this.policy.signed_host){
+          await this.build.prepareSignedHost!(stagingPath,manifest);
+          if(row.signed_host_digest!==signedHostPolicyDigest(this.policy))throw new Error("signed_host_plan_drift");
+        }
         await this.releases.publish(stagingPath, manifest);
         this.assertLease(row);
       }
@@ -2237,6 +2249,7 @@ export class UpdateController {
   }
 
   private assertLease(row: UpdateRow): void {
+    if((row.signed_host_digest ?? null)!==signedHostPolicyDigest(this.policy))throw new Error("signed_host_plan_drift");
     this.database.assertLease(row.request_id, row.fence, this.owner, this.clock.now());
   }
 
