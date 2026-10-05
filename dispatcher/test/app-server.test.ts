@@ -271,3 +271,23 @@ test("外部draftはmemoryだけに保持しRuntime再起動で失効する",asy
   queue.expireRestart();assert.equal(queue.get(other.request_id)?.state,"expired");assert.equal(queue.get(row.request_id)?.text,"");assert.equal(queue.get(row.request_id)?.state,"expired");assert.throws(()=>queue.resolve(row.request_id,{request_id:null,state:"pending"}),/expired/);
  }finally{store.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+for(const [label,params]of [
+ ['未知tool',{tool:'unknown_external_tool'}],
+ ['typed余分field',{arguments:{operation_slot:'slot',text:'draft',owner_id:'forged'}}],
+ ['本文上限超過',{arguments:{operation_slot:'slot',text:'x'.repeat(3001)}}],
+ ['thread差替え',{threadId:'wrong-thread'}],
+] as const)test(`実App Server request入口で${label}を拒否し要求を保存しない`,async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'dona-external-wire-deny-')),script=path.join(root,'fake.mjs'),response=path.join(root,'response.json');
+ const request={id:'question-1',method:'item/tool/call',params:{threadId:'thread-test',turnId:'turn-test',callId:'call',namespace:null,tool:'dona_request_thread_reply',arguments:{operation_slot:'slot',text:'draft'},...params}};
+ const code=fake.replace("import readline from 'node:readline';","import readline from 'node:readline';import fs from 'node:fs';")
+  .replace("send({id:'question-1',method:'item/tool/requestUserInput',params:{threadId:'thread-test',turnId:'turn-test',itemId:'item-test',questions:[{id:'choice',question:'どちら？',isSecret:false,options:null}]}});",`send(${JSON.stringify(request)});`)
+  .replace("if(r.id==='question-1'&&r.result){",`if(r.id==='question-1'&&(r.result||r.error)){fs.writeFileSync(${JSON.stringify(response)},JSON.stringify(r));`);
+ await fs.writeFile(script,code);const store=new RuntimeStore(path.join(root,'runtime.db')),manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));
+ try{
+  manager.external.availability(true);const agent=await manager.start({name:'main-denial',role:'main',cwd:root,release:root,args:[],threadConfig:{}});
+  await manager.prompt(agent.name,'evt_'+'0'.repeat(26),'request');await until(()=>manager.status(agent.name)?.state==='idle');
+  const denied=JSON.parse(await fs.readFile(response,'utf8'));assert.ok(denied.error||denied.result?.success===false);
+  assert.equal(store.db.prepare('SELECT COUNT(*) FROM external_tool_requests').pluck().get(),0);assert.deepEqual(store.questions(agent.name),[]);
+ }finally{const row=store.agent('main-denial');if(row&&row.state!=='stopped')await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
+});
