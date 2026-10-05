@@ -2,12 +2,35 @@ import { z } from "zod";
 import type { DispatcherDatabase } from "../database.js";
 import { OperatorAuthError } from "./operator-auth.js";
 import type { RegistrationResponseJSON } from "@simplewebauthn/server";
+import { operatorCommand, operatorQuestions, type OperatorCommandPaths } from "./operator-commands.js";
+import type { QuestionRecord } from "../app-server/store.js";
+import { operatorNativeRequest } from "./operator-native.js";
+
+export interface OperatorApiContext extends OperatorCommandPaths {
+  readQuestions(agent:string):Promise<QuestionRecord[]>;
+  wake():void;
+}
 
 const tokenSchema = z.strictObject({token:z.string().regex(/^[A-Za-z0-9_-]{43}$/)});
 /** Only Dispatcher private UDS calls this router. Admin routes are never
  * forwarded from the browser-facing HTTP server. */
-export async function operatorRequest(database:DispatcherDatabase, route:string, input:unknown):Promise<unknown> {
+export async function operatorRequest(database:DispatcherDatabase, route:string, input:unknown,context?:OperatorApiContext):Promise<unknown> {
   const auth=database.operatorAuth;
+  if(route.startsWith('native/')) {
+    if(!context)throw new OperatorAuthError('denied');
+    return operatorNativeRequest(database,context,route.slice('native/'.length),input);
+  }
+  if(route.startsWith('commands/')) {
+    if(!context)throw new OperatorAuthError('denied');
+    const body=z.strictObject({token:z.string().max(128),input:z.unknown()}).parse(input);
+    const result=operatorCommand(database,context,{...body,operation:route.slice('commands/'.length)});
+    if(route!=='commands/receipt')context.wake();
+    return result;
+  }
+  if(route==='questions') {
+    if(!context)throw new OperatorAuthError('denied');
+    return operatorQuestions(database,input,agent=>context.readQuestions(agent));
+  }
   switch(route) {
     case "admin/reset": database.configureOperatorOrigin(z.strictObject({origin:z.string().max(2048)}).parse(input).origin); return {ok:true};
     case "admin/status": z.strictObject({}).parse(input); return auth.status();

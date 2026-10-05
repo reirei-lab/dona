@@ -112,9 +112,10 @@ export class OperatorAuthRegistry {
     return !!session && !!internal && internal.enrollmentDeadline>this.monotonic()
       && session.capabilities.some(value=>value==="approvals:native"||value==="approvals:external");
   }
-  authorize(authority:OperatorAuthority):boolean {
-    const row=this.sql.prepare("SELECT active,revision FROM dashboard_operator_devices WHERE device_id=?").get(authority.device_id) as {active:number;revision:number}|undefined;
-    return authority.instance_id===this.instance_id&&authority.owner_id===this.owner_id&&row?.active===1&&row.revision===authority.grant_revision;
+  authorize(authority:OperatorAuthority,capability?:OperatorCapability):boolean {
+    const row=this.sql.prepare("SELECT * FROM dashboard_operator_devices WHERE device_id=?").get(authority.device_id) as DeviceRow|undefined;
+    if(authority.instance_id!==this.instance_id||authority.owner_id!==this.owner_id||row?.active!==1||row.revision!==authority.grant_revision)return false;
+    try{return !capability||capabilitiesSchema.parse(JSON.parse(row.capabilities_json)).includes(capability);}catch{return false;}
   }
   resetSessions(): void { this.sessions.clear(); this.pairing = undefined; }
   revoke(deviceId?: string): void {

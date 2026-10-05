@@ -102,7 +102,7 @@ test('main専用grantを制御socketで発行しpublic adminと未許可Taskを�
   assert.equal((await request(port,null,'/api/tasks',{cookie})).status,403);
   assert.equal((await request(port,null,'/api/conversations/main',{cookie})).status,200);
   assert.equal((await request(port,null,'/api/conversations/main/dona_main/generation',{cookie})).status,200);
-  assert.equal((await request(port,null,'/v1/dashboard/admin/revoke',{method:'POST',origin:'https://observer.example',body:{},cookie})).status,404);
+  assert.equal((await request(port,null,'/v1/dashboard/admin/revoke',{method:'POST',origin:'https://observer.example',body:{},cookie,csrf:JSON.parse(paired.body).csrf})).status,404);
   assert.equal(backend.sessions.size,1);
  }finally{await server.close();await fs.rm(root,{recursive:true,force:true});}
 });

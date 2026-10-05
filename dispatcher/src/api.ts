@@ -1,6 +1,8 @@
 import { taskRequestSchema, taskIdSchema } from "./task-execution.js";
 import { operatorRequest } from "./dashboard/operator-api.js";
 import { OperatorAuthError } from "./dashboard/operator-auth.js";
+import { RuntimeClient } from "./app-server/client.js";
+import { runtimeSocket } from "./app-server/adapters.js";
 import { githubQuery, verifyTaskIssue } from "./task-github.js";
 import fs from "node:fs/promises";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
@@ -241,7 +243,11 @@ export class DispatcherApi {
       if(url.pathname.startsWith("/v1/dashboard/")) {
         if(this.shuttingDown)throw new ApiRequestError(503,"shutting_down","Dispatcher is shutting down");
         if(request.method!=="POST"||url.search)throw new ApiRequestError(400,"invalid_request","Invalid dashboard request");
-        const result=await operatorRequest(this.database,url.pathname.slice("/v1/dashboard/".length),await this.readJson(request));
+        const result=await operatorRequest(this.database,url.pathname.slice("/v1/dashboard/".length),await this.readJson(request),{
+          jobsWorkspaceRoot:this.config.jobsWorkspaceRoot,jobResultsDir:this.config.jobResultsDir,
+          readQuestions:agent=>new RuntimeClient(runtimeSocket(this.config),5000).questions(agent),
+          wake:()=>{this.jobs.wake();this.worker.wake();},
+        });
         sendJson(response,200,result);return;
       }
       if (request.method === "GET" && url.pathname === "/health/live") {

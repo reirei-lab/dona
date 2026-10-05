@@ -55,9 +55,9 @@ export class DashboardServer {
   private async body(req:http.IncomingMessage):Promise<Record<string,unknown>> {
     if(req.headers["content-type"]!=="application/json" || req.headers["transfer-encoding"]!==undefined)throw Error("body_invalid");
     const length=req.headers["content-length"];
-    if(!length||!/^\d{1,4}$/.test(length)||Number(length)>1024)throw Error("body_invalid");
+    if(!length||!/^\d{1,6}$/.test(length)||Number(length)>524288)throw Error("body_invalid");
     const chunks:Buffer[]=[];let bytes=0;
-    for await(const part of req){const chunk=Buffer.from(part);bytes+=chunk.length;if(bytes>1024)throw Error("body_invalid");chunks.push(chunk);}
+    for await(const part of req){const chunk=Buffer.from(part);bytes+=chunk.length;if(bytes>524288)throw Error("body_invalid");chunks.push(chunk);}
     if(bytes!==Number(length))throw Error("body_invalid");
     const result=JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(Buffer.concat(chunks))) as unknown;
     if(!result||typeof result!=="object"||Array.isArray(result))throw Error("body_invalid");return result as Record<string,unknown>;
@@ -87,6 +87,9 @@ export class DashboardServer {
       }
       const token=this.token(req),session=token?await this.session(token):null;
       if(!token||!session){this.reply(res,401,{error:"session_invalid"});return;}
+      if(req.method!=="GET"&&(typeof req.headers["x-csrf-token"]!=="string"||!equal(req.headers["x-csrf-token"],session.csrf))){
+        this.reply(res,403,{error:"csrf_invalid"});return;
+      }
       if(req.method==="GET"&&target==="/api/session"){this.reply(res,200,session);return;}
       if(req.method==="POST"&&target==="/api/logout"){
         if(typeof req.headers["x-csrf-token"]!=="string"||!equal(req.headers["x-csrf-token"],session.csrf)){this.reply(res,403,{error:"csrf_invalid"});return;}
@@ -99,6 +102,46 @@ export class DashboardServer {
         if(!current||JSON.stringify(current)!==JSON.stringify(session)){this.reply(res,401,{error:"session_invalid"});return false;}return true;
       };
       const url=new URL(target,this.origin);
+      const native=/^\/api\/native\/(options|decide)$/.exec(url.pathname);
+      if(native&&req.method==='POST'&&!url.search){
+        const body=await this.body(req);
+        if(Object.keys(body).some(key=>!(native[1]==='options'?['input']:['ceremony_id','response']).includes(key)))throw Error('body_invalid');
+        const result=await this.options.backend.call('native/'+native[1],{...body,token});
+        if(!await recheck())return;this.reply(res,200,result);return;
+      }
+      const credential=/^\/api\/credential(?:\/(options|register))?$/.exec(url.pathname);
+      if(credential&&!url.search&&((!credential[1]&&req.method==='GET')||(credential[1]&&req.method==='POST'))){
+        const body=req.method==='POST'?await this.body(req):{};
+        const route=credential[1]??'status';
+        if(Object.keys(body).some(key=>!(['register'].includes(route)?['ceremony_id','response']:[]).includes(key)))throw Error('body_invalid');
+        const result=await this.options.backend.call('credential/'+route,{...body,token});
+        if(!await recheck())return;this.reply(res,200,result);return;
+      }
+      if(req.method==='POST'&&url.pathname==='/api/tasks'&&!url.search){
+        const input=await this.body(req);
+        const result=await this.options.backend.call('commands/create',{token,input});
+        if(!await recheck())return;this.reply(res,200,result);return;
+      }
+      const command=/^\/api\/tasks\/([A-Za-z0-9_-]{1,128})\/(cancel|questions\/([A-Za-z0-9_-]{1,128})\/reply)$/.exec(url.pathname);
+      if(command&&req.method==='POST'&&!url.search){
+        const input=await this.body(req);
+        if('task_id' in input||'question_id' in input)throw Error('body_invalid');
+        const operation=command[2]==='cancel'?'cancel':'question_reply';
+        const result=await this.options.backend.call('commands/'+operation,{token,input:{...input,task_id:command[1],...(command[3]?{question_id:command[3]}:{})}});
+        if(!await recheck())return;this.reply(res,200,result);return;
+      }
+      const receipt=/^\/api\/commands\/([A-Za-z0-9_-]{1,128})$/.exec(url.pathname);
+      if(req.method==='GET'&&receipt){
+        if([...url.searchParams.keys()].length!==1||!['create','cancel','question_reply','native_approval'].includes(url.searchParams.get('operation')??''))throw Error('query_invalid');
+        const result=await this.options.backend.call('commands/receipt',{token,input:{request_id:receipt[1],operation:url.searchParams.get('operation')}});
+        if(!await recheck())return;this.reply(res,200,result);return;
+      }
+      const questions=/^\/api\/tasks\/([A-Za-z0-9_-]{1,128})\/questions$/.exec(url.pathname);
+      if(req.method==='GET'&&questions){
+        const keys=[...url.searchParams.keys()];if(keys.length>1||keys.some(key=>key!=='kind')||!['question','approval'].includes(url.searchParams.get('kind')??'question'))throw Error('query_invalid');
+        const result=await this.options.backend.call('questions',{token,task_id:questions[1],kind:url.searchParams.get('kind')??'question'});
+        if(!await recheck())return;this.reply(res,200,result);return;
+      }
       if(req.method==="GET"&&url.pathname==="/api/tasks"){
         const keys=[...url.searchParams.keys()];if(keys.some(k=>k!=="after")||keys.length>1)throw Error("query_invalid");
         if(!has("tasks:read")){this.reply(res,403,{error:"scope_denied"});return;}

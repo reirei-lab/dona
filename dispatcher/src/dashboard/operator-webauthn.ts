@@ -4,6 +4,7 @@ import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthen
   verifyAuthenticationResponse, type RegistrationResponseJSON, type AuthenticationResponseJSON,
   type WebAuthnCredential } from "@simplewebauthn/server";
 import { OperatorAuthError, type OperatorAuthRegistry, type OperatorAuthority, type OperatorSession } from "./operator-auth.js";
+import { stableStringify } from "../validation.js";
 
 export interface ApprovalIntent {
   request_id:string; decision:"approve"|"reject"; presentation_digest:string; expires_at:string;
@@ -29,6 +30,10 @@ export class OperatorWebAuthn {
     sql.exec(`CREATE TABLE IF NOT EXISTS dashboard_operator_credentials (
       device_id TEXT PRIMARY KEY REFERENCES dashboard_operator_devices(device_id),credential_id TEXT NOT NULL UNIQUE,
       public_key BLOB NOT NULL,counter INTEGER NOT NULL CHECK(counter>=0),origin TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS dashboard_operator_stepup_receipts (
+      receipt_id TEXT PRIMARY KEY, device_id TEXT NOT NULL, payload_json TEXT NOT NULL,
+      proof_json TEXT NOT NULL, created_at TEXT NOT NULL
     ) STRICT;`);
   }
   status(token:string):{registered:boolean;can_enroll:boolean} {
@@ -85,6 +90,10 @@ export class OperatorWebAuthn {
       const expires_at=new Date(Math.min(Date.parse(ceremony.intent!.expires_at),this.wall()+Math.max(0,ceremony.deadline-this.monotonic()))).toISOString();
       const value:OperatorStepUp={receipt_id:randomUUID(),instance_id:session.instance_id,owner_id:session.owner_id,
         device_id:session.device_id,grant_revision:session.grant_revision,...ceremony.intent!,expires_at};
+      // Retain the signed evidence for audit; restored SQL evidence alone never
+      // recreates the process-bound authority held in receipts below.
+      this.sql.prepare("INSERT INTO dashboard_operator_stepup_receipts VALUES(?,?,?,?,?)")
+        .run(value.receipt_id,value.device_id,stableStringify(value),stableStringify(response),new Date(this.wall()).toISOString());
       this.receipts.set(value.receipt_id,{value,token,capability:ceremony.capability!,deadline:ceremony.deadline});
       this.ceremonies.delete(id);
       return value;
@@ -94,7 +103,7 @@ export class OperatorWebAuthn {
     this.prune();
     const stored=this.receipts.get(receipt.receipt_id);
     if(!Number.isFinite(Date.parse(expected.expires_at))||Date.parse(expected.expires_at)<=this.wall()
-      ||!stored||stored.capability!==capability||JSON.stringify(stored.value)!==JSON.stringify(receipt)
+      ||!stored||stored.capability!==capability||stableStringify(stored.value)!==stableStringify(receipt)
       ||stored.value.request_id!==expected.request_id||stored.value.decision!==expected.decision
       ||stored.value.presentation_digest!==expected.presentation_digest||Date.parse(stored.value.expires_at)>Date.parse(expected.expires_at))return false;
     const session=this.auth.session(stored.token);

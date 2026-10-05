@@ -10,13 +10,13 @@ export interface OperatorBackend { call<T>(route:string,body:Record<string,unkno
 export class DashboardOperatorClient implements OperatorBackend {
  constructor(private readonly socket:string) {}
  async call<T>(route:string,body:Record<string,unknown>):Promise<T> {
-  if(!/^(admin\/(reset|status|pair|revoke)|pair|session|logout)$/.test(route))throw Error('dashboard_operator_route_invalid');
+  if(!/^(admin\/(reset|status|pair|revoke)|pair|session|logout|credential\/(status|options|register)|commands\/(create|cancel|question_reply|receipt)|questions|native\/(options|decide))$/.test(route))throw Error('dashboard_operator_route_invalid');
   const uid=process.getuid?.(),parent=path.dirname(this.socket);
   if(uid===undefined||!path.isAbsolute(this.socket)||Buffer.byteLength(this.socket)>100||fs.realpathSync(parent)!==parent)throw Error('dashboard_operator_socket_invalid');
   const dir=fs.lstatSync(parent),before=fs.lstatSync(this.socket);
   if(!dir.isDirectory()||dir.uid!==uid||(dir.mode&0o077)!==0||!before.isSocket()||before.uid!==uid||(before.mode&0o077)!==0)throw Error('dashboard_operator_socket_invalid');
   const encoded=JSON.stringify(body);
-  if(Buffer.byteLength(encoded)>8192)throw Error('dashboard_operator_request_limit');
+  if(Buffer.byteLength(encoded)>524288)throw Error('dashboard_operator_request_limit');
   return new Promise<T>((resolve,reject)=>{
    let timer:ReturnType<typeof setTimeout>|undefined;
    const fail=(error:Error)=>{clearTimeout(timer);reject(error);};
