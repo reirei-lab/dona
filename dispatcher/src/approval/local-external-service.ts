@@ -1,3 +1,4 @@
+import {invalidateLocalApprovals} from "./local-invalidation.js";
 import type {VerifiedAuditState} from "../audit/codec.js";
 import {stableStringify} from "../validation.js";
 import {createHash,randomUUID} from "node:crypto";
@@ -155,6 +156,11 @@ export class LocalExternalApprovalService {
   },v=>this.keys.content(v),v=>this.keys.wrappingVersion(v),v=>this.keys.notificationVersion(v));
   return broker.decide(tx(),{request_handle:receipt.request_id,authority_ref:receipt.receipt_id,action:receipt.decision,expected_revision:card.row.request_revision,presentation_revision:card.row.presentation_revision});
  }
+ sourceUnavailable(source:ExternalApprovalSource,requestId:string){
+  const r=this.requestRecord(requestId);if(this.binding(source)!==r.row.binding_id||this.binding(this.context(r))!==r.row.binding_id)throw Error("external_approval_scope_mismatch");
+  invalidateLocalApprovals(this.db,this.providers,this.scope,source.owner_id,requestId);
+  return {state:this.requestRecord(requestId).row.state,execution:this.executionSummary(requestId)};
+ }
  sourceStatus(source:ExternalApprovalSource,requestId:string){
   if(!this.sourceAllowed(source))throw Error("external_approval_unauthorized");
   const r=this.requestRecord(requestId);if(this.binding(source)!==r.row.binding_id)throw Error("external_approval_scope_mismatch");
@@ -197,18 +203,22 @@ export class LocalExternalApprovalService {
     authz_revision:this.snapshot(request).preconditions.requester_authorization_revision},...(plan?{resource_commitments:plan.resource_commitments}:{resource_digest:null}),mutation:()=>{plan?.mutation();return null;}};
   });
  }
- private expirePending(){
-  const page=this.audit.readVerifiedState(state=>this.records.readListPageInState(state,{record_kind:"request",membership:"all"},this.expiryCursor,20));this.expiryCursor=page.next_after;
+ private expirePending(deadline:number){
+  const page=this.audit.readVerifiedState(state=>this.records.readListPageInState(state,{record_kind:"request",membership:"all"},this.expiryCursor,20));
   const now=this.now();const broker=new ApprovalDecisionBroker(this.db,this.providers,this.scope,()=>denied,v=>this.keys.content(v),v=>this.keys.wrappingVersion(v),v=>this.keys.notificationVersion(v));
-  for(const r of page.records)if(r.kind==="request"&&r.row.model_version==="local_operator_v1"&&(["requested","delivery_pending","delivery_unknown","sent"].includes(r.row.state)&&r.row.expires_at<=now.effective_utc||r.row.state==="approved"&&r.row.consume_expires_at!<=now.effective_utc))broker.expire(tx(),r.row.request_id);
+  let processed=0;for(const r of page.records){if(performance.now()>=deadline)break;processed++;if(r.kind==="request")this.expiryCursor=r.row.request_id;if(r.kind==="request"&&r.row.model_version==="local_operator_v1"&&(["requested","delivery_pending","delivery_unknown","sent"].includes(r.row.state)&&r.row.expires_at<=now.effective_utc||r.row.state==="approved"&&r.row.consume_expires_at!<=now.effective_utc))broker.expire(tx(),r.row.request_id);}
+  if(processed===page.records.length&&!page.has_more)this.expiryCursor=null;
  }
  /** 保存済みdecision eventだけをconsume。開始fence後の復旧はread-only照合に限定する。 */
- async executePending(){
-  this.expirePending();
+ async executePending(deadline=performance.now()+5000){
+  this.expirePending(Math.min(deadline,performance.now()+1000));
   const pending=this.audit.readVerifiedState(state=>this.records.readListPageInState(state,{record_kind:"event",membership:"all"},this.executionCursor,20));
-  this.executionCursor=pending.next_after;
+
   const results:Array<{request_id:string;state:string}>=[];
+  let processed=0;
   for(const event of pending.records){
+   if(performance.now()>=deadline)break;
+   processed++;if(event.kind=== "event")this.executionCursor=event.row.event_id;
    if(event.kind!=="event"||event.row.state!=="pending")continue;
    const decision=this.records.readAlias({name:"decision_id",decision_id:event.row.decision_id});if(decision?.kind!=="decision")continue;
    let request:Request;try{request=this.requestRecord(decision.row.request_id);}catch{continue;}
@@ -251,7 +261,8 @@ export class LocalExternalApprovalService {
    if(["succeeded","failed","needs_review"].includes(final.row.state))this.settleEvent(event.row.event_id);
    results.push({request_id:request.row.request_id,state:final.row.state});
   }
-  return {items:results,truncated:pending.has_more};
+  if(processed===pending.records.length&&!pending.has_more)this.executionCursor=null;
+  return {items:results,truncated:pending.has_more||processed<pending.records.length};
  }
 
 }

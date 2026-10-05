@@ -344,7 +344,11 @@ export class JobSupervisor {
       if(!(error instanceof JobResultNotFoundError)) {this.database.tasks.wait(task,"result_conflict");return;}
     }
     if(job.last_error_code==="runtime_external_approval_pending"&&task.desired_state==="running"&&task.stop_state==="none"){
-      this.database.tasks.wait(task,"external_approval",30_000);return;
+      if(!this.runtime.observeWorker){this.database.tasks.wait(task,"observation_unknown");return;}
+      const observed=await this.observeWorker(job);
+      if(observed.state==="waiting"||observed.state==="working"){this.database.tasks.wait(task,"external_approval",30_000);return;}
+      if(observed.state==="unknown"){this.database.tasks.wait(task,"observation_unknown");return;}
+      // 消失したtool callを人間待ちと偽らない。下の停止確認を経て通常のAttempt回復へ進む。
     }
     if(job.last_error_code==="runtime_question_pending"&&task.desired_state==="running"&&task.stop_state==="none"&&this.runtime.questions) {
       const pending=await this.runtime.questions(job.agent_name);
@@ -369,7 +373,7 @@ export class JobSupervisor {
     if(task.stop_state==="stopped") {this.database.tasks.replaceStopped(task.task_id,this.config.jobResultsDir);this.wake();return;}
     if(task.desired_state==="running"&&task.stop_state==="none") {
       const reason=taskRecoveryReason(job);
-      if(reason!=="observation_unknown"&&job.last_error_code!=="runtime_question_pending"&&task.wait_reason!=="resume_requested"&&!capacityWait) {this.database.tasks.wait(task,reason);return;}
+      if(reason!=="observation_unknown"&&job.last_error_code!=="runtime_question_pending"&&job.last_error_code!=="runtime_external_approval_pending"&&task.wait_reason!=="resume_requested"&&!capacityWait) {this.database.tasks.wait(task,reason);return;}
     }
     if(!this.runtime.observeWorker||!this.runtime.retireWorker||!this.runtime.workerRetired){this.database.tasks.wait(task,"observation_unknown");return;}
     if(task.stop_state==="none"||task.stop_state==="not_sent") {

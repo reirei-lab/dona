@@ -82,7 +82,9 @@ export class NativeLocalApprovalConnection {
  }
  doctor(){try{new AuditRepository(this.db,this.providers.auditAnchors,this.providers.auditKeys).verify();const mark=this.providers.clockMarks.read(),observation=this.providers.clock.observe();
    advanceClockMark(mark,observation,"doctor_"+randomUUID().replaceAll("-",""),this.providers.maximumClockDriftMs);
-   for(const key of [this.keys.content(null),this.keys.wrapping(),this.keys.notification(),this.keys.execution(null)])if(key.state!=="active"||key.signing_expires_at<=observation.wall_utc)throw Error();return {ready:true as const,instance_id:this.config.scope.instance_id,workspace_id:this.config.scope.workspace_id};
+   const keys=[this.keys.content(null),this.keys.wrapping(),this.keys.notification(),this.keys.execution(null),this.providers.auditKeys(this.config.key_version)];
+   for(const key of keys)if(!key||key.state!=="active"||key.signing_expires_at<=observation.wall_utc)throw Error();
+   const expires=keys.map(key=>key!.signing_expires_at).sort()[0]!;return {ready:true as const,instance_id:this.config.scope.instance_id,workspace_id:this.config.scope.workspace_id,key_expires_at:expires,rotation_due:Date.parse(expires)-Date.parse(observation.wall_utc)<=14*86400000};
   }catch{return {ready:false as const,reason:"protected_state_unverified"};}}
  close(){this.nodesDb.close();this.native.close();}
 }

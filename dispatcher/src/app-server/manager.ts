@@ -97,6 +97,7 @@ export class AppServerManager {
       rpc.on("disconnect",()=>{
         if(!this.store.db.open||this.store.agent(row.name)?.generation!==row.generation)return;
         this.store.db.prepare("UPDATE questions SET state='expired' WHERE agent=? AND generation=? AND state IN ('pending','answering')").run(row.name,row.generation);
+        this.external.expireAgent(row.name,row.generation);
         this.store.observe(row.name,row.generation,{kind:"gap"});
         if(this.store.agent(row.name)?.state!=="stopped")this.store.change(row.name,row.generation,{state:"unknown"});
       });
@@ -316,6 +317,7 @@ export class AppServerManager {
     this.store.db.transaction(()=>{
       this.store.db.prepare("UPDATE stops SET state='stopped' WHERE agent=? AND generation=?").run(name,generation);
       this.store.db.prepare("UPDATE questions SET state='expired' WHERE agent=? AND generation=? AND state IN ('pending','answering')").run(name,generation);
+      this.external.expireAgent(name,generation);
       this.store.change(name,generation,{state:"stopped",turn_id:null});
     }).immediate();
     this.connections.delete(name);return this.store.agent(name)!;

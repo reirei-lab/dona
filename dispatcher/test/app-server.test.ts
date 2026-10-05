@@ -250,7 +250,7 @@ test("外部reply dynamic toolは実turnへ束縛しnative質問と分離する"
   const agent=await manager.start({name:"main-external",role:"main",cwd:root,release:root,args:[],threadConfig:{}});
   const eventId="evt_01m3e2ht7qs79vf480z5qefeat";
   await manager.prompt(agent.name,eventId,"承認を要求");await until(()=>manager.external.pending().length===1);
-  const row=manager.externalRequests()[0]!;assert.equal(row.source_event_id,eventId);assert.equal(row.attempt_id,null);assert.equal(row.text,"確認した本文");assert.equal(store.questions(agent.name).length,0);
+  const row=manager.externalRequests()[0]!;assert.equal(row.source_event_id,eventId);assert.equal(row.attempt_id,null);assert.equal(row.text,"確認した本文");assert.notEqual((store.db.prepare("SELECT text FROM external_tool_requests WHERE request_id=?").get(row.request_id) as {text:string}).text,row.text);assert.equal(store.questions(agent.name).length,0);
   manager.external.availability(false);
   assert.equal(manager.external.pending().length,1);
   assert.throws(()=>manager.external.accept({} as never,{} as never),/runtime_external_unavailable/);
@@ -259,4 +259,15 @@ test("外部reply dynamic toolは実turnへ束縛しnative質問と分離する"
   assert.equal(manager.resolveExternal(agent.name,row.request_id,{request_id:"approval",state:"pending"}).state,"resolved");
   assert.throws(()=>manager.resolveExternal(agent.name,row.request_id,{request_id:"other",state:"pending"}),/conflict/);
  }finally{const row=store.agent("main-external");if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("外部draftはmemoryだけに保持しRuntime再起動で失効する",async()=>{
+ const {ExternalToolQueue}=await import("../src/app-server/external-tools.js"),root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-external-memory-")),store=new RuntimeStore(path.join(root,"runtime.db"));
+ try{const queue=new ExternalToolQueue(store);queue.availability(true);
+  const row=queue.accept({name:"main",generation:"g",thread_id:"t",turn_id:"turn",role:"main",config_json:"{}"} as any,{id:1,method:"item/tool/call",params:{threadId:"t",turnId:"turn",callId:"call",tool:"dona_request_thread_reply",arguments:{operation_slot:"slot",text:"private draft"}}});
+  assert.equal(queue.get(row.request_id)?.text,"private draft");const persisted=JSON.stringify(store.db.prepare("SELECT * FROM external_tool_requests").all());assert.ok(!persisted.includes("private draft"));
+  const other=queue.accept({name:"main",generation:"g2",thread_id:"t2",turn_id:"turn2",role:"main",config_json:"{}"} as any,{id:2,method:"item/tool/call",params:{threadId:"t2",turnId:"turn2",callId:"call",tool:"dona_request_thread_reply",arguments:{operation_slot:"slot",text:"next draft"}}});
+  queue.expireAgent("main","g");assert.equal(queue.get(row.request_id)?.state,"expired");assert.equal(queue.get(other.request_id)?.text,"next draft");
+  queue.expireRestart();assert.equal(queue.get(other.request_id)?.state,"expired");assert.equal(queue.get(row.request_id)?.text,"");assert.equal(queue.get(row.request_id)?.state,"expired");assert.throws(()=>queue.resolve(row.request_id,{request_id:null,state:"pending"}),/expired/);
+ }finally{store.close();await fs.rm(root,{recursive:true,force:true});}
 });

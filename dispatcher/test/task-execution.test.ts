@@ -779,3 +779,12 @@ for(const status of ["failed","needs_review","blocked"] as const)test(`旧attent
   }
  }finally{await f.dispose();}
 });
+
+test("外部承認待ちはRuntime停止を再照合し停止確認後だけ次Attemptへ進む",async()=>{
+ const f=await fixture();try{
+  f.start();f.db.markJobNeedsReview(f.task.current_attempt_id,"runtime_external_approval_pending","external");
+  f.setObserved({state:"waiting"});await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)?.wait_reason,"external_approval");assert.equal(f.sends(),0);
+  f.setObserved({state:"unknown"});f.due();await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)?.attempt_number,1);assert.equal(f.sends(),0);
+  f.setObserved({state:"inactive"});f.due();await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)?.attempt_number,2);assert.equal(f.sends(),1);
+ }finally{await f.dispose();}
+});

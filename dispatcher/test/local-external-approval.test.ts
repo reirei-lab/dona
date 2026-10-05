@@ -163,3 +163,50 @@ test("operator復旧は旧承認と不明実行をneeds_reviewへ固定しpayloa
   await f.service.executePending();assert.equal(f.counts().sends,beforeSends);
  }
 });
+
+test("Runtime再起動で失われた外部callは監査付きneeds_reviewとなりTaskを偽再開しない",async t=>{
+ const {DispatcherDatabase}=await import("../src/database.js"),{taskRequestSchema}=await import("../src/task-execution.js");
+ const f=setup(t),dispatcher=new DispatcherDatabase(f.filename);t.after(()=>dispatcher.close());
+ const event=dispatcher.enqueue({schema_version:1,source:"slack",external_event_id:"worker_source",type:"app_mention",occurred_at:start,subject:{workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts,actor_id:"U123"},payload:{},reply_target:{kind:"slack_thread",workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts}}).row;
+ const task=dispatcher.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:"external",objective:"承認された投稿を行う",workspace:{kind:"scratch"}}),f.filename+"-work",f.filename+"-results").task;
+ const job=dispatcher.getJob(task.current_attempt_id)!;dispatcher.beginJobPreparation(job.job_id);dispatcher.setJobRuntime(job.job_id,job.agent_name,job.agent_name,JSON.stringify(["generation","thread"]));dispatcher.beginJobDispatch(job.job_id);dispatcher.markJobRunning(job.job_id);
+ const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_worker",agent:job.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"worker",attempt_id:job.job_id,source_event_id:null,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
+ let lost=true;
+ const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:job.agent_name,generation:"generation",thread_id:"thread"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{row.state="resolved";row.result_json=JSON.stringify(result);row.text="";if(lost){lost=false;throw Error("response lost");}return {state:"resolved"};}};
+ const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source));
+ await ingress.tick();assert.equal(dispatcher.tasks.get(task.task_id)?.wait_reason,"external_approval");assert.equal(row.state,"pending");
+ const requestId=(f.db.prepare("SELECT request_id FROM local_external_ingress").get() as {request_id:string}).request_id;
+ row.state="expired";row.text="";await ingress.tick();
+ assert.equal(f.service.status(actor,requestId).state,"needs_review");assert.equal(f.counts().sends,0);
+ assert.equal((f.db.prepare("SELECT state FROM task_external_approval_checkpoints").get() as {state:string}).state,"needs_review");
+ assert.equal(dispatcher.getJob(job.job_id)?.last_error_code,"runtime_external_approval_pending");
+ assert.equal(dispatcher.tasks.get(task.task_id)?.attempt_number,1);
+ assert.equal((f.db.prepare("SELECT state FROM local_external_ingress").get() as {state:string}).state,"source_lost");
+ await ingress.tick();assert.equal(f.counts().sends,0);
+});
+
+test("executor時間budgetで未開始の後続を次回へ公平に残す",async t=>{
+ const f=setup(t);await approved(f);
+ const created=await f.service.request(actor,{...intent,idempotency_key:"second"});if(created.status==="denied")throw Error();
+ const view=await f.service.present(actor,created.request_handle);await f.service.decide(actor,{...actor,receipt_id:"second",request_id:created.request_handle,decision:"approve",presentation_digest:view.presentation_digest,expires_at:"2026-09-19T00:01:00.000Z"});
+ const slack=(f.service as any).slack,observe=slack.observe.bind(slack);let now=100,calls=0;
+ const clock=t.mock.method(performance,"now",()=>now);
+ slack.observe=async(...args:any[])=>{calls++;if(calls===1){now+=6000;throw Error("unavailable");}return observe(...args);};
+ try{const first=await f.service.executePending();assert.equal(first.truncated,true);assert.equal(calls,1);assert.equal(f.counts().sends,0);
+  await f.service.executePending();assert.equal(calls,2);assert.equal(f.counts().sends,1);
+ }finally{clock.mock.restore();}
+});
+
+test("遅い新規要求が連続しても巡回phaseはexecutorを永久に飛ばさない",async t=>{
+ const {DispatcherDatabase}=await import("../src/database.js");
+ const f=setup(t),dispatcher=new DispatcherDatabase(f.filename);t.after(()=>dispatcher.close());
+ const event=dispatcher.enqueue({schema_version:1,source:"slack",external_event_id:"external_source",type:"app_mention",occurred_at:start,subject:{workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts,actor_id:"U123"},payload:{},reply_target:{kind:"slack_thread",workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts}}).row;
+ f.db.prepare("UPDATE events SET status='dispatching' WHERE event_id=?").run(event.event_id);
+ const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_source",agent:"main",generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"main",attempt_id:null,source_event_id:event.event_id,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
+ const results:any[]=[];
+ const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:"main",generation:"generation",thread_id:"thread"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{results.push(result);row.state="resolved";row.result_json=JSON.stringify(result);row.text="";return {};}};
+ let now=100,executions=0,requests=0;const clock=t.mock.method(performance,"now",()=>now);
+ const service={requestFromSource:async()=>{requests++;now+=6000;throw Error("observe timeout");},executePending:async()=>{executions++;}} as any;
+ const ingress=dispatcher.createExternalApprovalIngress(runtime,service,{...scope,owner_id:actor.owner_id,main_agent:"main"});
+ try{await ingress.tick();assert.equal(requests,1);assert.equal(executions,0);await ingress.tick();assert.equal(requests,2);assert.equal(executions,1);}finally{clock.mock.restore();}
+});
