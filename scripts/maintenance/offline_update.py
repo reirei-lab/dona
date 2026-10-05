@@ -442,7 +442,7 @@ def prepare(run, repository, fresh_generation=False):
         tar.extractall(release)
     archive.unlink()
     common.verify_trust(sha, dict(inv['policy'], required_checks=common.target_required_checks(release)))
-    for component in ('dispatcher', 'sources/slack', 'updater'):
+    for component in ('dispatcher', 'sources/slack', 'sources/web', 'updater'):
         progress(component + ' の依存関係・テスト・型検査・ビルドを確認しています。')
         for args in (['ci'], ['test'], ['run', 'typecheck'], ['run', 'build']):
             common.staging_space(g, inv['policy'])

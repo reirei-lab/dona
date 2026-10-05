@@ -19,6 +19,7 @@ const manifest = {
   lock_hashes: {
     dispatcher: hash(path.join(releaseRoot, "dispatcher", "package-lock.json")),
     "sources/slack": hash(path.join(releaseRoot, "sources", "slack", "package-lock.json")),
+    "sources/web": hash(path.join(releaseRoot, "sources", "web", "package-lock.json")),
     updater: hash(path.join(releaseRoot, "updater", "package-lock.json")),
   },
   node_version: process.versions.node,
