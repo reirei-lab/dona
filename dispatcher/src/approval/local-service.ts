@@ -1,3 +1,5 @@
+import {LocalApprovalOperations} from './local-operations.js';
+import {stableStringify} from '../validation.js';
 import {localApprovalCredential} from './local-credential.js';
 import {createHmac} from 'node:crypto';
 import type {DispatcherDatabase} from '../database.js';
@@ -37,10 +39,19 @@ export async function openLocalApprovalService(database:DispatcherDatabase,confi
    authorizeSource:s=>ingress?.authorizeSource(s)===true,
    verifyStepUp:r=>database.operatorWebAuthn?.verifyReceipt(r,r,'approvals:external')===true,
   },slack);
+  const operations=new LocalApprovalOperations(sql,native.providers,nativeConfig.scope,native.keys,{
+   owner_id:nativeConfig.owner_id,authorize:()=>{try{
+    native!.maintenance.requireReady(nativeConfig.key_version);
+    const current=sql.prepare('SELECT instance_id,owner_id FROM dashboard_operator_identity WHERE singleton=1').get() as {instance_id:string;owner_id:string}|undefined;
+    return typeof process.getuid==='function'&&process.getuid()===process.geteuid?.()&&current?.instance_id===nativeConfig.scope.instance_id&&current.owner_id===nativeConfig.owner_id&&stableStringify(readLocalApprovalNativeConfig(config.localApprovalConfigPath!))===stableStringify(nativeConfig);
+   }catch{return false;}},
+  },{reconcile:(...args)=>slack.reconcile(...args)});
   const runtime=new RuntimeClient(runtimeSocket(config));
   ingress=database.createExternalApprovalIngress(runtime,service,{...nativeConfig.scope,owner_id:nativeConfig.owner_id,main_agent:config.agentName},wake);
   const loop=approvalLoop(async()=>{
-   const ready=native!.doctor().ready;await runtime.externalAvailability(ready);
+   const ready=native!.doctor().ready;
+   if(ready)operations.sweep(performance.now()+500);
+   await runtime.externalAvailability(ready);
    if(ready)await ingress.tick();
   },failure);
   const stop=async()=>{await loop.stop();await runtime.externalAvailability(false).catch(()=>{});};

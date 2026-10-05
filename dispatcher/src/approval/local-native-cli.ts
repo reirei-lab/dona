@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {localOperationsMain} from './local-operations-cli.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import {randomUUID} from 'node:crypto';
@@ -28,6 +29,7 @@ export function replaceNativeApprovalConfig(file:string,expected:LocalApprovalNa
  }finally{if(fd!==undefined)fs.closeSync(fd);try{fs.unlinkSync(temporary);}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}}
 }
 export async function nativeApprovalMain(args:string[]){
+ if(args[0]==='operations')return localOperationsMain(args.slice(1));
  const input=parseNativeApprovalArguments(args);let config=readLocalApprovalNativeConfig(input.config);
  const db=openSecurityDatabase(input.database);
  try{

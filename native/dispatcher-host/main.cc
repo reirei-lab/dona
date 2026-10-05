@@ -8,6 +8,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <set>
 #include <cstdlib>
 #include <unistd.h>
 #include <crt_externs.h>
@@ -44,16 +45,34 @@ static bool signedBundle(const std::string& bundle) {
   if (url) CFRelease(url);
   return valid;
 }
+static bool operationsArguments(int argc, char** argv) {
+  if (argc < 8 || argc > 26 || argc % 2 != 0 ||
+      std::string(argv[2]) != "--config" || !std::filesystem::path(argv[3]).is_absolute() ||
+      std::string(argv[4]) != "--database" || !std::filesystem::path(argv[5]).is_absolute()) return false;
+  const std::set<std::string> flags{"--operation", "--handle", "--owner-kind", "--reason", "--cursor", "--limit", "--destination", "--candidate", "--apply"};
+  const std::set<std::string> operations{"health", "list", "sweep", "retention", "reconcile", "backup", "restore-check", "restore"};
+  std::set<std::string> seen;
+  for (int i = 6; i < argc; i += 2) {
+    const std::string key(argv[i]), value(argv[i + 1]);
+    if (!flags.count(key) || !seen.insert(key).second || value.empty()) return false;
+    if (key == "--operation" && !operations.count(value)) return false;
+    if (key == "--apply" && value != "yes") return false;
+    if ((key == "--candidate" || key == "--destination") && !std::filesystem::path(value).is_absolute()) return false;
+  }
+  return seen.count("--operation");
+}
 int main(int argc, char** argv) {
   // No option is passed to Node's generic CLI parser.
   const std::string mode = argc > 1 ? argv[1] : "";
   const bool native_doctor = mode == "host-native-doctor";
   const bool validator = mode == "validate-job-result";
-  const bool approval = mode == "approval-doctor" || mode == "approval-provision" ||
+  const bool operations = mode == "approval-operations";
+  const bool approval = operations || mode == "approval-doctor" || mode == "approval-provision" ||
     mode == "approval-rotate" || mode == "approval-recover";
   if ((!approval && !validator && (argc != 2 || (mode != "serve" && mode != "host-doctor" && !native_doctor))) ||
       (validator && argc != 4) ||
-      (approval && (argc != (mode == "approval-rotate" ? 8 : 6) ||
+      (operations && !operationsArguments(argc, argv)) ||
+      (approval && !operations && (argc != (mode == "approval-rotate" ? 8 : 6) ||
         std::string(argv[2]) != "--config" || !std::filesystem::path(argv[3]).is_absolute() ||
         std::string(argv[4]) != "--database" || !std::filesystem::path(argv[5]).is_absolute() ||
         (argc == 8 && std::string(argv[6]) != "--next-version")))) {

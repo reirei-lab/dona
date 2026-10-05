@@ -42,6 +42,8 @@ stageはDispatcherのdist/native source/node_modulesとSlack adapterのdist/node
 
 hostは `serve`、`host-doctor`、`host-native-doctor`、`validate-job-result <candidate> <job_id>`、`approval-doctor|approval-provision|approval-rotate|approval-recover --config <path> --database <path>` のみを認める。rotateだけ末尾 `--next-version <version>` を要求する。approval entryが配備されていないreleaseではそのmodeは失敗する。
 
+`approval-operations --config <path> --database <path> --operation <operation>` は固定された保守entryだけを実行する。health/list/sweep/retention/reconcile/backup/restore-check/restore以外は拒否し、追加flagの組合せとwrite時のTTY確認は保守CLIでも検証する。実行順序・安全な復旧範囲は[外部承認の運用手順](local-external-approval.md)を参照する。
+
 NodeのCLI option parsing、NODE_OPTIONS、global module paths、Inspector/SIGUSR1を無効にし、NODE_/DYLD_ hook、OpenSSL/ICU overrideを除去する。任意JS引数、`-e`、loader指定はない。JSロード前にbundleの署名/封印resources/Hardened Runtimeを検証する。worker Result validatorは固定modeを使い、汎用Node CLIへ戻さない。
 
 macOS credential accessの境界は署名されたhost/payloadである。同一operatorが署名identityや配備ファイルを書き換えられる脅威を完全に排除するsandboxではない。署名検証だけで全OS/Keychain rollback耐性を主張しない。承認のgenesis作成/rotation/recoveryは専用CLIのTTY確認を省略しない。
