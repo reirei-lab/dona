@@ -30,7 +30,8 @@ test("観測readerは非公開Taskを除いてからpageを作り、実行DBを�
     const snapshot = reader.snapshot(ids[1]!)!;
     assert.equal(snapshot.attempts.length,1);
     assert.equal(snapshot.attempts[0]!.attempt_id,snapshot.task.current_attempt_id);
-    assert.equal(JSON.stringify(snapshot).includes("secret objective"),false);
+    assert.equal(snapshot.request,"secret objective /private/path token");
+    assert.equal(JSON.stringify(first).includes("secret objective"),false);
     assert.equal(JSON.stringify(snapshot).includes(config.jobsWorkspaceRoot),false);
     assert.deepEqual(ids.map(id=>db.tasks.get(id)),before);
     assert.throws(()=>reader!.list(()=>true,null,51),/query_invalid/);
@@ -70,7 +71,9 @@ test("会話取得中の失効・Attempt変更は古い本文を返さず、切�
     assert.equal(offline!.runtime.status,"unavailable");
     assert.equal(offline!.snapshot.task.state,"waiting");
     authority={revision:"3",task:()=>true,conversation:()=>false};
-    assert.equal((await observer.detail(task.task_id,()=>authority))!.runtime.status,"forbidden");
+    const forbidden=await observer.detail(task.task_id,()=>authority);
+    assert.equal(forbidden!.runtime.status,"forbidden");
+    assert.equal(forbidden!.snapshot.request,undefined);
   } finally {reader?.close();db.close();await fs.rm(root,{recursive:true,force:true});}
 });
 
@@ -158,6 +161,20 @@ test('Dona本体の履歴は別grantを要求しrole/threadの一致とI/O中失
   assert.equal(await observer.mainList(auth),null);grant=true;
   assert.deepEqual((await observer.mainList(auth))!.items.map(row=>row.generation),['current','old']);
   assert.equal((await observer.mainDetail('dona_main','old',auth))!.status,'observed');
+  const {projectItem}=await import('../src/app-server/observation.js');
+  main.items=[projectItem({id:'command',type:'commandExecution',command:'npm test',aggregatedOutput:'3 tests passed\nAuthorization: Bearer hidden_token',exitCode:0,durationMs:123,status:'completed'},'turn')!,
+    projectItem({id:'request',type:'userMessage',content:[{type:'text',text:'テストを実行して'}]},'turn')!];
+  const details=await observer.mainDetail('dona_main','current',auth);
+  assert.ok(details);
+  assert.equal(details.status,'observed');
+  if(details.status==='observed'){
+    assert.equal(details.conversation.items[0]!.command,'npm test');
+    assert.equal(details.conversation.items[0]!.duration_ms,123);
+    assert.match(details.conversation.items[0]!.output!,/3 tests passed/);
+    assert.equal(details.conversation.items[1]!.text,'テストを実行して');
+    assert.equal(JSON.stringify(details).includes('hidden_token'),false);
+  }
+
   assert.equal((await observer.mainDetail('other','old',auth))!.status,'unavailable');
   change=()=>{grant=false;};assert.equal(await observer.mainDetail('dona_main','old',auth),null);
  }finally{reader.close();db.close();await fs.rm(root,{recursive:true,force:true});}

@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
-import type {ObservationEvent,ConversationItem} from "./observation.js";
+import {sanitizeConversationItem,type ObservationEvent,type ConversationItem} from "./observation.js";
 
 export interface AgentRecord {
   name:string; generation:string; role:"main"|"worker"; cwd:string; release:string;
@@ -100,7 +100,7 @@ export class RuntimeStore {
   }
   cachedItems(agent:string,generation:string):ConversationItem[] {
     this.db.prepare("DELETE FROM observation_items WHERE observed_at<?").run(new Date(Date.now()-86400_000).toISOString());
-    return (this.db.prepare("SELECT item_json FROM observation_items WHERE agent=? AND generation=? ORDER BY sequence").all(agent,generation) as {item_json:string}[]).map(r=>JSON.parse(r.item_json) as ConversationItem);
+    return (this.db.prepare("SELECT item_json FROM observation_items WHERE agent=? AND generation=? ORDER BY sequence").all(agent,generation) as {item_json:string}[]).flatMap(r=>{const item=sanitizeConversationItem(JSON.parse(r.item_json));return item?[item]:[];});
   }
   observe(agent:string,generation:string,event:Omit<ObservationEvent,"sequence"|"observed_at">):void {
     this.db.transaction(()=>{

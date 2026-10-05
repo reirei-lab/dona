@@ -5,33 +5,88 @@ export interface ConversationIdentity {
   archived?:boolean;
   state:AgentRecord["state"];connected:boolean;observed_at:string;
 }
-export interface ConversationItem {id:string;turn_id:string;kind:"assistant_message"|"tool_progress";text?:string;status?:string;tool_type?:string;truncated?:boolean}
+export interface ConversationFile {path:string;change:"add"|"delete"|"update";additions?:number;deletions?:number}
+export interface ConversationItem {id:string;turn_id:string;kind:"user_message"|"assistant_message"|"tool_progress";text?:string;status?:string;tool_type?:string;tool_name?:string;command?:string;input?:string;output?:string;error?:string;files?:ConversationFile[];duration_ms?:number;exit_code?:number;truncated?:boolean}
 export interface ObservationEvent {sequence:number;kind:string;turn_id?:string;item_id?:string;text?:string;observed_at:string}
 export interface ConversationSnapshot extends ConversationIdentity {
   items:ConversationItem[];events:ObservationEvent[];cursor:number;oldest_sequence:number;gap:boolean;truncated:boolean;
 }
 export const record=(x:unknown):Record<string,unknown>=>x!==null&&typeof x==="object"&&!Array.isArray(x)?x as Record<string,unknown>:{};
 const identifier=(x:unknown):string|undefined=>typeof x==="string"&&/^[a-zA-Z0-9_-]{1,160}$/.test(x)?x:undefined;
-/** ユーザー項目にはDONA_JOB・イベント契約が入るため、全文を除外する。toolの入力・出力も保存しない。 */
+const credentialField=/\b(?:[A-Za-z_]*(?:token|password|secret)|api[_ -]?key|authorization|cookie|credential)\b["']?\s*[:=]/gi;
+function decodedObservationText(value:string):string {
+  let text=value;for(let i=0;i<2;i++){try{text=decodeURIComponent(text);}catch{text=text.replace(/%([0-9a-f]{2})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16)));}text=text.replace(/\\u([0-9a-f]{4})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16))).replace(/\\\//g,"/");}return text;
+}
+/** 表示専用。既知credential/control pathを削除する。未知の秘密を完全検出する保証ではない。 */
+export function sanitizeObservationText(value:string,limit=8192):string {
+  if(value.length>131072)return "[上限を超える内容を省略]";
+  let text=value.replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|$))/g,"").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g,"");
+  const decodedText=decodedObservationText(text);
+  for(const match of decodedText.matchAll(credentialField)){const rest=decodedText.slice(match.index!+match[0].length);if(/^[ \t]*(?:\r?\n|[\[{])/.test(rest))return "[機密情報を含む内容を省略]";}
+  if(/-----BEGIN [^-]*PRIVATE KEY|DONA_(?:JOB|EVENT)_(?:BEGIN|END)/i.test(decodedText))return "[保護された内容を省略]";
+  text=text.split("\n").map(line=>{
+    const decoded=decodedObservationText(line);
+    if(decoded!==line&&/(?:^|[\s"']|\/)(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains|\.env(?:\.[\w-]+)?|auth\.json|credentials(?:\.json)?)(?:\/|$|[\s"'])/i.test(decoded))return "[保護されたパスを含む行を省略]";
+    if(/(?:xox[a-z]-|xapp-|gh[pousr]_|github_pat_|sk-(?:proj-)?[A-Za-z0-9_-]{8}|\b(?:AKIA|ASIA)[A-Z0-9]{16}|\b(?:[A-Za-z_]*(?:token|password|secret)|api[_ -]?key|authorization|cookie|credential)\b\s*["']?\s*[:=]|--(?:token|password|secret|api-key|header)\s+\S+|\b(?:Bearer|Basic)\s+\S+|https?:\/\/[^\s/]+@|(?:files|hooks)\.slack\.com|[?&](?:signature|sig|token|key|x-amz-[\w-]+)=|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/i.test(decoded))return "[機密情報を含む行を省略]";
+    return line.replace(/(?:~|\/[^\s"'<>]*)\/(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains)(?:\/[^\s"'<>]*)?/g,"[保護されたパス]").replace(/(^|[\s"'<>])(?:[^\s"'<>]*\/)?(?:\.env(?:\.[\w-]+)?|auth\.json|credentials(?:\.json)?)(?=\s|$|["'<>])/g,"$1[保護されたパス]").replace(/\/(?:Users|home)\/[^/\s]+/g,"~");
+  }).join("\n");
+  return text.slice(0,limit);
+}
+/** projected DTOを再検証する公開境界。未知fieldやraw payloadを通さない。 */
+export function sanitizeConversationItem(value:unknown):ConversationItem|undefined {
+  const v=record(value),id=identifier(v.id),turn=identifier(v.turn_id);if(!id||!turn||!["user_message","assistant_message","tool_progress"].includes(String(v.kind)))return;
+  const out:ConversationItem={id,turn_id:turn,kind:v.kind as ConversationItem["kind"]};
+  for(const field of ["text","tool_name","command","input","output","error"] as const)if((field==="text"?out.kind!=="tool_progress":out.kind==="tool_progress")&&typeof v[field]==="string"){
+    const limit=field==="tool_name"?200:field==="input"?4096:8192;out[field]=sanitizeObservationText(v[field],limit);if(v[field].length>limit)out.truncated=true;
+  }
+  if(out.kind==="tool_progress"&&["inProgress","completed","failed","declined","interrupted"].includes(String(v.status)))out.status=String(v.status);
+  if(out.kind==="tool_progress"&&["commandExecution","fileChange","mcpToolCall","dynamicToolCall","webSearch","imageView"].includes(String(v.tool_type)))out.tool_type=String(v.tool_type);
+  if(out.kind==="tool_progress"&&Number.isFinite(v.duration_ms)&&Number(v.duration_ms)>=0)out.duration_ms=Number(v.duration_ms);
+  if(out.kind==="tool_progress"&&Number.isSafeInteger(v.exit_code))out.exit_code=Number(v.exit_code);
+  if(out.kind==="tool_progress"&&Array.isArray(v.files)){out.files=[];if(v.files.length>20)out.truncated=true;for(const raw of v.files.slice(0,20)){const f=record(raw);if(typeof f.path!=="string"||!["add","delete","update"].includes(String(f.change)))continue;const file:ConversationFile={path:sanitizeObservationText(f.path,1024),change:f.change as ConversationFile["change"]};for(const k of ["additions","deletions"] as const)if(Number.isSafeInteger(f[k])&&Number(f[k])>=0)file[k]=Number(f[k]);out.files.push(file);}}
+  if(v.truncated===true)out.truncated=true;return out;
+}
+function requestText(text:string):string|undefined {
+  if(text.startsWith("[DONA_JOB_BEGIN]\njob_json:\n")){try{const end=text.indexOf("\n[DONA_JOB_END]");if(end<0)return;const job=record(JSON.parse(text.slice("[DONA_JOB_BEGIN]\njob_json:\n".length,end)));return typeof job.objective==="string"?job.objective:undefined;}catch{return;}}
+  if(text.startsWith("[DONA_EVENT_BEGIN]\n")){try{const begin=text.indexOf("\nevent_json:\n"),end=text.indexOf("\n[DONA_EVENT_END]");if(begin<0||end<begin)return;const event=record(JSON.parse(text.slice(begin+"\nevent_json:\n".length,end))),payload=record(event.payload);return ["slack","web"].includes(String(event.source))&&typeof payload.text==="string"?payload.text:undefined;}catch{return;}}
+  if(/DONA_(?:JOB|EVENT)|<system|<developer|<environment_context|<INSTRUCTIONS>/i.test(text))return;
+  return text;
+}
+/** Codex 0.160.0 generate-ts v2/ThreadItemの既知fieldだけを採用する。reasoning/args全体は非公開。 */
 export function projectItem(value:unknown,turnId:string):ConversationItem|undefined {
   const item=record(value),id=identifier(item.id);if(!id)return;
-  if(item.type==="agentMessage"&&typeof item.text==="string")return {id,turn_id:turnId,kind:"assistant_message",text:item.text.slice(0,8192),...(item.text.length>8192?{truncated:true}:{})};
-  if(["commandExecution","fileChange","mcpToolCall","dynamicToolCall","webSearch","imageView"].includes(String(item.type)))return {id,turn_id:turnId,kind:"tool_progress",tool_type:String(item.type),...(["inProgress","completed","failed","declined"].includes(String(item.status))?{status:String(item.status)}:{})};
+  const out:ConversationItem={id,turn_id:turnId,kind:"tool_progress"};
+  if(item.type==="userMessage"){
+    const chunks=Array.isArray(item.content)?item.content.filter(x=>record(x).type==="text").map(x=>record(x).text).filter((x):x is string=>typeof x==="string"):[];
+    const summaries=chunks.map(requestText).filter((x):x is string=>x!==undefined);if(!summaries.length)return;out.kind="user_message";out.text=summaries.join("\n");
+  }else if(item.type==="agentMessage"&&typeof item.text==="string"){out.kind="assistant_message";out.text=item.text;}
+  else if(["commandExecution","fileChange","mcpToolCall","dynamicToolCall","webSearch","imageView"].includes(String(item.type))){
+    out.tool_type=String(item.type);if(typeof item.status==="string")out.status=item.status;
+    if(typeof item.durationMs==="number")out.duration_ms=item.durationMs;
+    if(item.type==="commandExecution"){if(typeof item.command==="string")out.command=item.command;if(typeof item.aggregatedOutput==="string")out.output=item.aggregatedOutput;if(typeof item.exitCode==="number")out.exit_code=item.exitCode;}
+    if(item.type==="fileChange"&&Array.isArray(item.changes)){out.files=item.changes.slice(0,20).flatMap(raw=>{const f=record(raw),kind=record(f.kind);if(typeof f.path!=="string"||!["add","delete","update"].includes(String(kind.type)))return [];if(typeof f.diff==="string"&&f.diff.length>131072)out.truncated=true;const lines=typeof f.diff==="string"&&f.diff.length<=131072?f.diff.split("\n"):[];return [{path:f.path,change:kind.type as ConversationFile["change"],...(lines.length?{additions:lines.filter(s=>s.startsWith("+")&&!s.startsWith("+++")).length,deletions:lines.filter(s=>s.startsWith("-")&&!s.startsWith("---")).length}:{})}];});if(item.changes.length>20)out.truncated=true;}
+    if(item.type==="mcpToolCall"||item.type==="dynamicToolCall"){
+      out.tool_name=[item.server??item.namespace,item.tool].filter(x=>typeof x==="string").join(".");
+      let args=record(item.arguments);if(typeof item.arguments==="string"&&item.arguments.length<=32768){try{args=record(JSON.parse(item.arguments));}catch{}}
+      const inputs=[];for(const key of ["command","code","query","path"]){if(typeof args[key]==="string")inputs.push(`${key}: ${args[key]}`);}if(inputs.length)out.input=inputs.join("\n");
+      const content=item.type==="mcpToolCall"?record(item.result).content:item.contentItems;
+      if(Array.isArray(content)&&content.length>20)out.truncated=true;
+      if(Array.isArray(content))out.output=content.slice(0,20).filter(x=>["text","inputText"].includes(String(record(x).type))).map(x=>record(x).text).filter(x=>typeof x==="string").join("\n");
+      if(typeof record(item.error).message==="string")out.error=record(item.error).message as string;
+    }
+    if(item.type==="webSearch"&&typeof item.query==="string")out.input=item.query;
+  }else return;
+  return sanitizeConversationItem(out);
 }
 export function projectHistory(value:unknown):{threadId:string|undefined;items:ConversationItem[];truncated:boolean} {
-  const thread=record(record(value).thread),turns=Array.isArray(thread.turns)?thread.turns:[],items:ConversationItem[]=[];
-  let truncated=turns.length>100;
-  for(const raw of turns.slice(-100)){
-    const turn=record(raw),id=identifier(turn.id);if(!id)continue;
-    const source=Array.isArray(turn.items)?turn.items:[];if(source.length>200)truncated=true;
-    for(const item of source.slice(-200)){const projected=projectItem(item,id);if(projected){items.push(projected);if(projected.truncated)truncated=true;}}
-  }
-  const bounded:ConversationItem[]=[];let bytes=0;
-  for(const item of items.slice(-200).reverse()){const size=Buffer.byteLength(JSON.stringify(item));if(bytes+size>524288){truncated=true;break;}bytes+=size;bounded.unshift(item);}
+  const thread=record(record(value).thread),turns=Array.isArray(thread.turns)?thread.turns:[],items:ConversationItem[]=[];let truncated=turns.length>100;
+  for(const raw of turns.slice(-100)){const turn=record(raw),id=identifier(turn.id);if(!id)continue;const source=Array.isArray(turn.items)?turn.items:[];if(source.length>200)truncated=true;for(const item of source.slice(-200)){const projected=projectItem(item,id);if(projected){items.push(projected);if(projected.truncated)truncated=true;}}}
+  const bounded:ConversationItem[]=[];let bytes=0;for(const item of items.slice(-200).reverse()){const size=Buffer.byteLength(JSON.stringify(item));if(bytes+size>524288){truncated=true;break;}bytes+=size;bounded.unshift(item);}
   return {threadId:typeof thread.id==="string"?thread.id:undefined,items:bounded,truncated:truncated||items.length>200};
 }
 export function projectNotification(method:string|undefined,value:unknown):Omit<ObservationEvent,"sequence"|"observed_at">|undefined {
   const p=record(value),turn=record(p.turn),turnId=identifier(p.turnId)??identifier(turn.id),itemId=identifier(p.itemId)??identifier(record(p.item).id);
   if(["turn/started","turn/completed","item/started","item/completed","serverRequest/resolved"].includes(method??""))return {kind:method!,...(turnId?{turn_id:turnId}:{}),...(itemId?{item_id:itemId}:{})};
-  if(method==="item/agentMessage/delta"&&typeof p.delta==="string"&&turnId&&itemId)return Buffer.byteLength(p.delta)>512?{kind:"gap"}:{kind:method,turn_id:turnId,item_id:itemId,text:p.delta};
+  // deltaは途中でcredentialが分割され得る。本文は完成済みitem/historyからだけ投影する。
+  if(method==="item/agentMessage/delta"&&turnId&&itemId)return {kind:method,turn_id:turnId,item_id:itemId};
 }

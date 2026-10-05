@@ -209,7 +209,7 @@ export class AppServerManager {
     }
     if(p.threadId!==row.thread_id)return;
     const observation=projectNotification(message.method,p);if(observation)this.store.observe(row.name,row.generation,observation);
-    if(message.method==="item/completed"&&typeof p.turnId==="string"){const item=projectItem(p.item,p.turnId);if(item)this.store.cacheItem(row.name,row.generation,item);}
+    if(["item/started","item/completed"].includes(message.method??"")&&typeof p.turnId==="string"){const item=projectItem(p.item,p.turnId);if(item)this.store.cacheItem(row.name,row.generation,item);}
     if(message.method==="turn/started") {
       const turn=object(p.turn);if(typeof turn.id==="string"){
         this.store.db.prepare("DELETE FROM turn_outcomes WHERE agent=? AND generation=?").run(agent.name,agent.generation);
