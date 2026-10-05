@@ -1,3 +1,4 @@
+import {DispatcherHostTransition} from '../src/dispatcher-host-transition.js';
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -3078,5 +3079,45 @@ test('実schema4 target開始の応答不明は再送せずneeds_reviewでread-o
  f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'forward-unknown-start'});f.dispatcher.terminal=true;await f.controller.processNext();
  assert.equal(f.database.get(response.request_id as string)?.state,'needs_review');assert.equal(starts,1);assert.equal((await f.store.observe()).current_sha,targetSha);
  await f.controller.reconcile(response.request_id as string);assert.equal(starts,1);assert.equal(f.database.get(response.request_id as string)?.state,'needs_review');
+ }finally{f.database.close();}
+});
+
+for(const failure of ['before_pointer','after_pointer','unknown_pointer'] as const)test(`初回signed host activation失敗をpointer照合する: ${failure}`,async()=>{
+ const f=await taskGenerationFixture();try{
+ f.runtime.rotateMainAgentSessionOnStart=true;
+ const directions:string[]=[];const health=f.runtime.dispatcherHealth.bind(f.runtime);
+ f.runtime.dispatcherHealth=async()=>{const h=await health();return {...h,runtime_host:h.build_sha===targetSha?'signed-v1':'node'};};
+ Object.assign(f.runtime,{planDispatcherHostTransition:async()=>'f'.repeat(64),verifyDispatcherHostOriginal:async()=>{},applyDispatcherHostTransition:async(_t:unknown,d:string)=>{assert.equal(await f.runtime.dispatcherRegistered(),false);directions.push(d);}});
+ const activate=f.store.activate.bind(f.store),observe=f.store.observe.bind(f.store);let calls=0,failed=false;
+ f.store.activate=async(...args)=>{calls++;if(failure==='after_pointer')await activate(...args);failed=true;throw Error('injected_activation_failure');};
+ f.store.observe=async()=>{if(failed&&failure==='unknown_pointer')throw Error('injected_pointer_unavailable');return observe();};
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string};
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'host-activation-failure'});f.dispatcher.terminal=true;await f.controller.processNext();
+ const id=response.request_id as string,row=f.database.get(id)!;assert.equal(calls,1);assert.equal(directions[0],'target');
+ assert.equal(f.database.runtimeOperation(id,'start_target_dispatcher'),undefined);
+ if(failure==='before_pointer'){
+  assert.equal(row.state,'failed');assert.equal(row.last_error_code,'host_activation_failed_current_preserved');assert.ok(directions.includes('original'));assert.equal((await observe()).current_sha,currentSha);assert.equal(f.database.runtimeOperation(id,'restart_current_dispatcher')?.phase,'observed');assert.equal((await f.runtime.dispatcherHealth()).build_sha,currentSha);
+ }else{assert.equal(row.state,'needs_review');assert.equal(directions.includes('original'),false);assert.equal(f.database.runtimeOperation(id,'restart_current_dispatcher'),undefined);assert.equal((await observe()).current_sha,failure==='after_pointer'?targetSha:currentSha);}
+ }finally{f.database.close();}
+});
+
+test('plist変更後pointer前のprocess中断は次bootのreconcileでexact旧plistとruntimeを復元する',async()=>{
+ const f=await taskGenerationFixture();try{
+ const file=path.join(path.dirname(f.policy.release_root),'crash-dispatcher.plist');
+ const old=Buffer.from(JSON.stringify({Label:'dev.dona.dispatcher',ProgramArguments:[f.policy.executables.node,path.join(f.policy.current_pointer,'dispatcher/dist/cli.js'),'serve'],EnvironmentVariables:{DONA_LOCAL_APPROVAL_CONFIG:'/private/approval.json'}}));
+ await fs.writeFile(file,old,{mode:0o600});
+ const transition=new DispatcherHostTransition(f.policy,file,{decode:b=>JSON.parse(b.toString()),encode:v=>Buffer.from(JSON.stringify(v))});
+ Object.assign(f.runtime,{planDispatcherHostTransition:async()=>transition.plan(currentSha,targetSha),verifyDispatcherHostOriginal:async(t:Parameters<typeof transition.verifyOriginal>[0])=>transition.verifyOriginal(t),applyDispatcherHostTransition:async(t:Parameters<typeof transition.apply>[0],direction:'target'|'original')=>transition.apply(t,direction,await f.runtime.dispatcherRegistered())});
+ const health=f.runtime.dispatcherHealth.bind(f.runtime);f.runtime.dispatcherHealth=async()=>({...await health(),runtime_host:'node'});
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string};
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'host-crash'});
+ let row=f.database.claim(response.request_id as string,'controller-test',f.policy.timeouts.lease_ms,new Date('2026-09-02T00:00:00.000Z'))!;
+ for(const state of ['staged','quiescing','activating'] as const)row=f.database.transition(row.request_id,row.fence,state,'crash_fixture');
+ for(const [kind,ref,sha,session] of [['stop_main_agent','w1:p1',currentSha,`session-${currentSha}`],['stop_slack','slack_adapter',null,null],['stop_dispatcher','dispatcher',null,null]] as const){f.database.prepareRuntimeOperation(row.request_id,row.fence,kind,ref,sha,session);f.database.recordRuntimeOperation(row.request_id,row.fence,kind,'observed',null,{});}
+ f.runtime.simulateStoppedRuntime();f.runtime.rotateMainAgentSessionOnStart=true;
+ transition.apply({digest:row.signed_host_transition!,from_sha:currentSha,to_sha:targetSha},'target',false);
+ assert.notDeepEqual(await fs.readFile(file),old);
+ f.advance(f.policy.timeouts.lease_ms+1);await f.controller.processNext();
+ assert.deepEqual(await fs.readFile(file),old);assert.equal(f.database.get(row.request_id)?.state,'failed');assert.equal(f.database.get(row.request_id)?.last_error_code,'pre_activation_stop_recovery');assert.equal((await f.store.observe()).current_sha,currentSha);assert.equal(f.database.runtimeOperation(row.request_id,'start_target_dispatcher'),undefined);
  }finally{f.database.close();}
 });

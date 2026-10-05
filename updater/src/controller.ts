@@ -907,9 +907,28 @@ export class UpdateController {
       }
       if(row.activation_mode==="forward_only"){await this.verifyTaskDatabase();this.assertLease(row);}
       const releasePath = `${this.policy.release_root}/${row.target_sha}`;
-      if(row.signed_host_transition)await this.runtime.applyDispatcherHostTransition!(this.hostTransition(row)!,"target");
-      this.assertLease(row);
-      const receipt = await this.releases.activate(row, releasePath);
+      let receipt: Awaited<ReturnType<ReleaseStorePort["activate"]>>;
+      try {
+        if(row.signed_host_transition)await this.runtime.applyDispatcherHostTransition!(this.hostTransition(row)!,"target");
+        this.assertLease(row);
+        receipt = await this.releases.activate(row, releasePath);
+      } catch (error) {
+        if(!row.signed_host_transition)throw error;
+        this.assertLease(row);
+        // activation may have changed current before throwing. Never infer its outcome
+        // from the exception or reissue the pointer write.
+        let observed: Awaited<ReturnType<ReleaseStorePort["observe"]>>;
+        try { observed=await this.releases.observe(); }
+        catch { this.assertLease(row);this.needsReview(row,"host_activation_pointer_unverified");return; }
+        this.assertLease(row);
+        if(observed.current_sha!==row.current_sha){
+          this.needsReview(row,"host_activation_pointer_changed");return;
+        }
+        // Rechecks pointer/schema and persists restart intent. startDispatcherFor
+        // restores only this plan's exact old plist while launchd is unregistered.
+        await this.restoreQuiescedServices(row,"host_activation_failed_current_preserved");
+        return;
+      }
       this.assertLease(row);
       this.database.recordActivationGeneration(row.request_id, row.fence, receipt.generation, this.clock.now());
       row = this.database.transition(row.request_id, row.fence, "restarting", "pointer_activated", {
