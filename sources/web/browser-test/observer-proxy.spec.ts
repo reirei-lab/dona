@@ -45,7 +45,7 @@ test('実HTTPS proxyとSecure cookieで観測し、別Originと失効後の閲�
   });await new Promise<void>(r=>proxy!.listen(publicPort,'127.0.0.1',r));
   const page=await context.newPage(),errors:string[]=[];page.on('pageerror',error=>errors.push(error.message));
   await page.goto(origin);await expect(page.locator('#pairing')).toBeVisible();await expect(page.locator('#tasks')).toBeEmpty();
-  const issued=await control(socket,'/pair');await page.getByLabel('接続コード').fill(String(issued.code));await page.getByRole('button',{name:'閲覧用に接続する'}).click();
+  const issued=await control(socket,'/pair');await page.getByLabel('接続コード').fill(String(issued.code));await page.getByRole('button',{name:'この端末を接続する'}).click();
   await page.getByRole('button',{name:/browser-observation/}).click();await expect(page.locator('#detail')).toContainText('HTTPS経由のワーカー進捗');
   await expect(page.locator('#detail img')).toHaveCount(0);expect(runtimeCalls).toEqual(['conversation']);
   const cookies=await context.cookies(origin);expect(cookies).toHaveLength(1);expect(cookies[0]).toMatchObject({name:'__Host-dona-observer',secure:true,httpOnly:true,sameSite:'Strict'});

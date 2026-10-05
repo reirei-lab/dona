@@ -6,7 +6,7 @@ const script = String.raw`(() => {
 'use strict';
 const byId = id => document.getElementById(id);
 const list = byId('tasks'), detail = byId('detail'), connection = byId('connection');
-let csrf=null, authEpoch=0;
+let csrf=null, authEpoch=0, credentialReady=false;
 let pending=(()=>{try{return JSON.parse(sessionStorage.getItem("dona.pending-command")||"null");}catch{return null;}})();
 let selected = null, selectedAttempt = null, selectedMain = null, capabilities = [], generation = 0, pageAfter = null, next = null, stopped = false, polling = false;
 const labels = {preparing:'実行準備中',dispatching:'起動処理中',blocked:'入力・承認待ち',needs_review:'確認が必要',cancelling:'取消処理中',inProgress:'進行中',declined:'拒否済み',active:'実行中',capacity_wait:'実行枠の空き待ち',rate_limit_wait:'利用上限の回復待ち',retry_exhausted:'再試行上限',running:'実行中',waiting:'待機中',queued:'実行待ち',paused:'一時停止',completed:'完了',failed:'失敗',cancelled:'取消済み',human_input:'質問への回答待ち',rate_limit:'利用上限の回復待ち',retry_limit:'再試行上限',retry_wait:'再試行待ち',unknown:'状態未確認'};
@@ -14,7 +14,7 @@ const label = value => labels[value] || String(value || '未確認');
 const node = (tag, text, className) => { const n = document.createElement(tag); if(text !== undefined) n.textContent = String(text); if(className) n.className = className; return n; };
 const validId = id => typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id);
 function clearPrivate(message, auth) {
-  generation++; authEpoch++; byId("objective").value=""; byId("repository").value=""; byId("base-ref").value=""; csrf=null; capabilities=[]; byId("credential-panel").hidden=true; byId("submit-panel").hidden=true; byId("task-panel").hidden=true; byId("command-status").textContent=""; byId('main-conversations').replaceChildren(); byId('main-panel').hidden=true; list.replaceChildren(); detail.replaceChildren(node('p',message)); next = null; byId('next').disabled = true;
+  generation++; authEpoch++; credentialReady=false; byId("objective").value=""; byId("repository").value=""; byId("base-ref").value=""; csrf=null; capabilities=[]; byId("credential-panel").hidden=true; byId("submit-panel").hidden=true; byId("task-panel").hidden=true; byId("command-status").textContent=""; byId('main-conversations').replaceChildren(); byId('main-panel').hidden=true; list.replaceChildren(); detail.replaceChildren(node('p',message)); next = null; byId('next').disabled = true;
   connection.textContent = message; connection.dataset.state = 'disconnected';
   if(auth) { stopped = true; byId('pairing').hidden = false;byId('logout').hidden=true; }
 }
@@ -39,6 +39,7 @@ function renderDetail(value) {
   }
   const questions=node('section');questions.dataset.questions=task.task_id;content.append(questions);
   if(capabilities.includes('tasks:submit') && task.desired_state==='running')void loadQuestions(task.task_id,questions);
+  if(capabilities.includes('approvals:native') && task.desired_state==='running') {const approvals=node('section');content.append(approvals);void loadNativeApprovals(task.task_id,approvals);}
   content.append(node('h3','実行履歴'));
   const attempts = node('ol');
   for(const attempt of value.snapshot.attempts) {
@@ -132,11 +133,12 @@ const toBase64=value=>btoa(String.fromCharCode(...new Uint8Array(value))).replac
 async function credentialStatus() {
   const allowed=capabilities.includes('approvals:native')||capabilities.includes('approvals:external');byId('credential-panel').hidden=!allowed;if(!allowed)return;
   const epoch=authEpoch;
-  try {const state=await read('/api/credential');if(epoch!==authEpoch)return;byId('credential-status').textContent=state.registered?'この端末の承認用パスキーは登録済みです。':state.can_enroll?'承認操作には、この端末のパスキー登録が必要です。':'登録可能な時間を過ぎました。Macで新しい接続コードを発行してください。';byId('credential-register').hidden=state.registered||!state.can_enroll;}
-  catch {if(epoch===authEpoch){byId('credential-status').textContent='パスキー登録状態を確認できません。';byId('credential-register').hidden=true;}}
+  try {const state=await read('/api/credential');if(epoch!==authEpoch)return;credentialReady=state.registered===true;byId('credential-status').textContent=state.registered?'この端末の承認用パスキーは登録済みです。':state.can_enroll?'承認操作には、この端末のパスキー登録が必要です。':'登録可能な時間を過ぎました。Macで新しい接続コードを発行してください。';byId('credential-register').hidden=state.registered||!state.can_enroll;}
+  catch {if(epoch===authEpoch){credentialReady=false;byId('credential-status').textContent='パスキー登録状態を確認できません。';byId('credential-register').hidden=true;}}
 }
 async function credentialPost(url,body) {
-  if(!csrf)throw Error();const response=await fetch(url,{method:'POST',credentials:'same-origin',redirect:'error',headers:{'content-type':'application/json','x-csrf-token':csrf},body:JSON.stringify(body)});if(!response.ok)throw Error();return response.json();
+  if(!csrf)throw Error();const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);
+  try{const response=await fetch(url,{method:'POST',credentials:'same-origin',redirect:'error',signal:controller.signal,headers:{'content-type':'application/json','x-csrf-token':csrf},body:JSON.stringify(body)});if(!response.ok)throw Error();return await response.json();}finally{clearTimeout(timer);}
 }
 byId('credential-register').addEventListener('click',async()=>{const button=byId('credential-register'),epoch=authEpoch;button.disabled=true;
   try {const ceremony=await credentialPost('/api/credential/options',{});if(epoch!==authEpoch)return;const json=ceremony.options;
@@ -151,7 +153,7 @@ function savePending(value) {pending=value;try{if(value)sessionStorage.setItem('
 function showPending() {byId('reconcile').hidden=!pending;byId('submit-task').disabled=!!pending;if(pending)byId('command-status').textContent='受付を照合する操作があります。自動で再送しません。受付ID: '+pending.request_id;}
 function accepted(value) {
   if(!value?.receipt || !pending || value.receipt.request_id!==pending.request_id || value.receipt.operation!==pending.operation)throw Error();
-  const receipt=value.receipt;savePending(null);byId('command-status').textContent=(receipt.operation==='cancel'?'取消を受け付けました。停止完了はTaskの状態で確認してください。':receipt.operation==='question_reply'?'回答を受け付けました。Donaがワーカーへ届けます。':'依頼を受け付けました。')+' Task: '+receipt.task_id;
+  const receipt=value.receipt;savePending(null);byId('command-status').textContent=(receipt.operation==='cancel'?'取消を受け付けました。停止完了はTaskの状態で確認してください。':receipt.operation==='question_reply'?'回答を受け付けました。Donaがワーカーへ届けます。':receipt.operation==='native_approval'?'承認判断を受け付けました。ワーカーへの反映はTaskの状態で確認してください。':'依頼を受け付けました。')+' Task: '+receipt.task_id;
   if(capabilities.includes('tasks:read')){selected=receipt.task_id;selectedAttempt=null;selectedMain=null;void detailRead();}
 }
 async function reconcile() {
@@ -187,6 +189,48 @@ async function loadQuestions(taskId,target) {
       form.addEventListener('submit',event=>{event.preventDefault();const answers={};for(const entry of fields)answers[entry.id]={answers:[entry.field.value]};void command('/api/tasks/'+encodeURIComponent(taskId)+'/questions/'+encodeURIComponent(q.question_id)+'/reply','question_reply',{attempt_id:value.current_attempt_id,revision:value.revision,kind:'question',answers},button);});target.append(form);
     }
   }catch(error){if(epoch===authEpoch&&target.isConnected){if(error.auth)target.replaceChildren(node('p','このTaskの質問を取得する権限がありません。'));else target.replaceChildren(node('p','質問を取得できません。次の更新で再確認します。'));}}
+}
+async function loadNativeApprovals(taskId,target) {
+  const epoch=authEpoch;
+  try {const value=await read('/api/tasks/'+encodeURIComponent(taskId)+'/questions?kind=approval');if(epoch!==authEpoch||selected!==taskId||!target.isConnected)return;
+    if(value.task_id!==taskId||!validId(value.current_attempt_id)||!Number.isSafeInteger(value.revision)||!Array.isArray(value.questions)||value.questions.length>100)throw Error();
+    for(const q of value.questions) {
+      if(q.kind!=='approval'||q.state!=='pending'||!validId(q.question_id)||!q.request||typeof q.request!=='object')continue;
+      const panel=node('section');panel.append(node('h3','ワーカーの実行承認'),node('p','現在のAttempt: '+value.current_attempt_id,'muted'));
+      const request=q.request,known=['item/commandExecution/requestApproval','item/fileChange/requestApproval'].includes(request.method);
+      const visible=Object.fromEntries(Object.entries(request).filter(([key])=>!['threadId','turnId','itemId'].includes(key)));
+      const literal=JSON.stringify(visible,null,2),complete=typeof literal==='string'&&new TextEncoder().encode(literal).length<=65536;
+      panel.append(node('pre',complete?literal:'要求が表示上限を超えています。Mac側で確認してください。'));
+      if(request.method==='item/fileChange/requestApproval'&&!request.changes&&!request.diff)panel.append(node('p','この要求には変更内容の差分が含まれていません。提示された変更許可の範囲を確認してください。','notice'));
+      if(!known)panel.append(node('p','未対応の承認形式です。Mac側で確認してください。','notice'));
+      if(!credentialReady)panel.append(node('p','判断を送る前に、この端末の承認用パスキーを登録してください。','notice'));
+      const buttons=node('div',undefined,'controls');
+      for(const [accepted,label] of [[true,'この要求を許可'],[false,'この要求を拒否']]) {
+        const button=node('button',label);button.type='button';button.disabled=!!pending||!complete||!known||!credentialReady;
+        button.addEventListener('click',()=>void nativeApproval({task_id:taskId,attempt_id:value.current_attempt_id,revision:value.revision,question_id:q.question_id,kind:'approval',accepted},buttons));buttons.append(button);
+      }
+      panel.append(buttons);target.append(panel);
+    }
+  }catch(error){if(epoch===authEpoch&&target.isConnected)target.replaceChildren(node('p',error.auth?'このTaskの承認要求を取得する権限がありません。':'承認要求を取得できません。次の更新で再確認します。'));}
+}
+async function nativeApproval(input,buttons) {
+  if(pending||!csrf||!credentialReady||!capabilities.includes('approvals:native'))return;
+  const epoch=authEpoch,taskId=selected,attempt=selectedAttempt,request_id=crypto.randomUUID();savePending({request_id,operation:'native_approval'});
+  for(const button of buttons.querySelectorAll('button'))button.disabled=true;
+  let decideStarted=false;
+  try {
+    const ceremony=await credentialPost('/api/native/options',{input:{...input,request_id}});
+    if(epoch!==authEpoch||selected!==taskId||selectedAttempt!==attempt)return;
+    const json=ceremony.options,publicKey=typeof PublicKeyCredential.parseRequestOptionsFromJSON==='function'?PublicKeyCredential.parseRequestOptionsFromJSON(json):{...json,challenge:fromBase64(json.challenge),allowCredentials:(json.allowCredentials||[]).map(c=>({...c,id:fromBase64(c.id)}))};
+    const credential=await navigator.credentials.get({publicKey});
+    if(epoch!==authEpoch||selected!==taskId||selectedAttempt!==attempt||!credential)return;
+    const response=typeof credential.toJSON==='function'?credential.toJSON():{id:credential.id,rawId:toBase64(credential.rawId),type:credential.type,clientExtensionResults:credential.getClientExtensionResults(),authenticatorAttachment:credential.authenticatorAttachment,response:{clientDataJSON:toBase64(credential.response.clientDataJSON),authenticatorData:toBase64(credential.response.authenticatorData),signature:toBase64(credential.response.signature),userHandle:credential.response.userHandle?toBase64(credential.response.userHandle):null}};
+    decideStarted=true;const value=await credentialPost('/api/native/decide',{ceremony_id:ceremony.ceremony_id,response});if(epoch===authEpoch)accepted(value);
+  }catch(error){
+    if(epoch!==authEpoch)return;
+    if(!decideStarted&&error.name==='NotAllowedError'){savePending(null);byId('command-status').textContent='パスキー確認が取り消されたため、判断は送信していません。';}
+    else await reconcile();
+  }finally{for(const button of buttons.querySelectorAll('button'))button.disabled=!!pending;}
 }
 byId('submit-form').addEventListener('submit',event=>{event.preventDefault();const repository=byId('repository').value.trim(),base=byId('base-ref').value.trim();const workspace=repository?{kind:'github',repository,...(base?{base_ref:base}:{})}:{kind:'scratch'};void command('/api/tasks','create',{objective:byId('objective').value,workspace},byId('submit-task'));});
 byId('reconcile').addEventListener('click',()=>{void reconcile();});
