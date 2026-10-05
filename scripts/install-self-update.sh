@@ -320,9 +320,6 @@ else
   /bin/mv "$STAGING_DIR" "$FINAL_RELEASE"
   STAGING_DIR=
 fi
-find "$FINAL_RELEASE" -type f -exec chmod 400 {} +
-find "$FINAL_RELEASE" -type d -exec chmod 500 {} +
-
 "$NODE_PATH" "$FINAL_RELEASE/updater/dist/release-permissions.js" "$FINAL_RELEASE"
 
 if [[ "$MODE" == "--stage-recovery" ]]; then
