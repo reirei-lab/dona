@@ -19,7 +19,7 @@ function credentialFields(text:string):RegExpMatchArray[] {
     .filter(match=>/(?:token|password|secret|apikey|authorization|cookie|credential|accesskey|privatekey)/i.test(match[1]!.replace(/[_ -]/g,"")));
 }
 function decodedObservationText(value:string):string {
-  let text=value;for(let i=0;i<2;i++){try{text=decodeURIComponent(text);}catch{text=text.replace(/%([0-9a-f]{2})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16)));}text=text.replace(/\\u([0-9a-f]{4})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16))).replace(/\\\//g,"/");}return text;
+  let text=value;for(let i=0;i<2;i++){try{text=decodeURIComponent(text);}catch{text=text.replace(/%([0-9a-f]{2})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16)));}text=text.replace(/\\u([0-9a-f]{4})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16))).replace(/\\\//g,"/").replace(/\\+(["'])/g,"$1");}return text;
 }
 /** 表示専用。既知credential/control pathを削除する。未知の秘密を完全検出する保証ではない。 */
 export function sanitizeObservationText(value:string,limit=8192):string {
@@ -44,7 +44,7 @@ export function sanitizeConversationItem(value:unknown):ConversationItem|undefin
     const limit=field==="tool_name"?200:field==="input"?4096:8192;out[field]=sanitizeObservationText(v[field],limit);if(v[field].length>limit)out.truncated=true;
   }
   if(out.kind==="tool_progress"&&["inProgress","completed","failed","declined","interrupted"].includes(String(v.status)))out.status=String(v.status);
-  if(out.kind==="tool_progress"&&["commandExecution","fileChange","mcpToolCall","dynamicToolCall","webSearch","imageView"].includes(String(v.tool_type)))out.tool_type=String(v.tool_type);
+  if(out.kind==="tool_progress"&&["commandExecution","fileChange","mcpToolCall","dynamicToolCall","collabAgentToolCall","webSearch","imageView"].includes(String(v.tool_type)))out.tool_type=String(v.tool_type);
   if(out.kind==="tool_progress"&&Number.isFinite(v.duration_ms)&&Number(v.duration_ms)>=0)out.duration_ms=Number(v.duration_ms);
   if(out.kind==="tool_progress"&&Number.isSafeInteger(v.exit_code))out.exit_code=Number(v.exit_code);
   if(out.kind==="tool_progress"&&Array.isArray(v.files)){out.files=[];if(v.files.length>20)out.truncated=true;for(const raw of v.files.slice(0,20)){const f=record(raw);if(typeof f.path!=="string"||!["add","delete","update"].includes(String(f.change)))continue;const file:ConversationFile={path:sanitizeObservationText(f.path,1024),change:f.change as ConversationFile["change"]};for(const k of ["additions","deletions"] as const)if(Number.isSafeInteger(f[k])&&Number(f[k])>=0)file[k]=Number(f[k]);out.files.push(file);}}
@@ -64,11 +64,33 @@ export function projectItem(value:unknown,turnId:string):ConversationItem|undefi
     const chunks=Array.isArray(item.content)?item.content.filter(x=>record(x).type==="text").map(x=>record(x).text).filter((x):x is string=>typeof x==="string"):[];
     const summaries=chunks.map(requestText).filter((x):x is string=>x!==undefined);if(!summaries.length)return;out.kind="user_message";out.text=summaries.join("\n");
   }else if(item.type==="agentMessage"&&typeof item.text==="string"){out.kind="assistant_message";out.text=item.text;}
-  else if(["commandExecution","fileChange","mcpToolCall","dynamicToolCall","webSearch","imageView"].includes(String(item.type))){
+  else if(["commandExecution","fileChange","mcpToolCall","dynamicToolCall","collabAgentToolCall","webSearch","imageView"].includes(String(item.type))){
     out.tool_type=String(item.type);if(typeof item.status==="string")out.status=item.status;
     if(typeof item.durationMs==="number")out.duration_ms=item.durationMs;
     if(item.type==="commandExecution"){if(typeof item.command==="string")out.command=item.command;if(typeof item.aggregatedOutput==="string")out.output=item.aggregatedOutput;if(typeof item.exitCode==="number")out.exit_code=item.exitCode;}
-    if(item.type==="fileChange"&&Array.isArray(item.changes)){out.files=item.changes.slice(0,20).flatMap(raw=>{const f=record(raw),kind=record(f.kind);if(typeof f.path!=="string"||!["add","delete","update"].includes(String(kind.type)))return [];if(typeof f.diff==="string"&&f.diff.length>131072)out.truncated=true;const lines=typeof f.diff==="string"&&f.diff.length<=131072?f.diff.split("\n"):[];return [{path:f.path,change:kind.type as ConversationFile["change"],...(lines.length?{additions:lines.filter(s=>s.startsWith("+")&&!s.startsWith("+++")).length,deletions:lines.filter(s=>s.startsWith("-")&&!s.startsWith("---")).length}:{})}];});if(item.changes.length>20)out.truncated=true;}
+    if(item.type==="fileChange"&&Array.isArray(item.changes)){
+      out.files=item.changes.slice(0,20).flatMap(raw=>{
+        const f=record(raw),kind=record(f.kind);if(typeof f.path!=="string"||!["add","delete","update"].includes(String(kind.type)))return [];
+        if(typeof f.diff!=="string")return [{path:f.path,change:kind.type as ConversationFile["change"]}];
+        if(f.diff.length>131072){out.truncated=true;return [{path:f.path,change:kind.type as ConversationFile["change"]}];}
+        let additions=0,deletions=0,inHunk=false;
+        for(const line of f.diff.split("\n")){
+          if(line.startsWith("diff --git ")){inHunk=false;continue;}
+          if(line.startsWith("@@")){inHunk=true;continue;}
+          if(!inHunk&&/^(?:---|\+\+\+) /.test(line))continue;
+          if(line.startsWith("+"))additions++;else if(line.startsWith("-"))deletions++;
+        }
+        return [{path:f.path,change:kind.type as ConversationFile["change"],additions,deletions}];
+      });if(item.changes.length>20)out.truncated=true;
+    }
+    if(item.type==="collabAgentToolCall"){
+      const tools=["spawnAgent","sendInput","resumeAgent","wait","closeAgent","sendMessage","followupTask","interruptAgent","listAgents"];
+      if(tools.includes(String(item.tool)))out.tool_name=String(item.tool);
+      if(typeof item.prompt==="string"){const summary=requestText(item.prompt);if(summary!==undefined)out.input=summary;}
+      const states=Object.values(record(item.agentsStates));if(states.length>20)out.truncated=true;
+      const lines=states.slice(0,20).map(raw=>{const state=record(raw);const status=["pendingInit","running","interrupted","completed","errored","shutdown","notFound"].includes(String(state.status))?String(state.status):"";const message=typeof state.message==="string"?state.message:"";return [status,message].filter(Boolean).join(": ");}).filter(Boolean);
+      if(lines.length)out.output=lines.join("\n");
+    }
     if(item.type==="mcpToolCall"||item.type==="dynamicToolCall"){
       out.tool_name=[item.server??item.namespace,item.tool].filter(x=>typeof x==="string").join(".");
       let args=record(item.arguments);if(typeof item.arguments==="string"&&item.arguments.length<=32768){try{args=record(JSON.parse(item.arguments));}catch{}}

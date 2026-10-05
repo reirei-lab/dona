@@ -93,7 +93,7 @@ export class RuntimeStore {
   cacheItem(agent:string,generation:string,item:ConversationItem):void {
     this.db.transaction(()=>{
       const sequence=(this.db.prepare("UPDATE observation_item_sequence SET sequence=sequence+1 WHERE singleton=1 RETURNING sequence").get() as {sequence:number}).sequence;
-      this.db.prepare("INSERT INTO observation_items(agent,generation,item_id,item_json,observed_at,sequence) VALUES(?,?,?,?,?,?) ON CONFLICT(agent,generation,item_id) DO UPDATE SET item_json=excluded.item_json,observed_at=excluded.observed_at,sequence=excluded.sequence").run(agent,generation,`${item.turn_id}:${item.id}`,JSON.stringify(item),new Date().toISOString(),sequence);
+      this.db.prepare("INSERT INTO observation_items(agent,generation,item_id,item_json,observed_at,sequence) VALUES(?,?,?,?,?,?) ON CONFLICT(agent,generation,item_id) DO UPDATE SET item_json=excluded.item_json,observed_at=excluded.observed_at").run(agent,generation,`${item.turn_id}:${item.id}`,JSON.stringify(item),new Date().toISOString(),sequence);
       const rows=this.db.prepare("SELECT item_id,length(CAST(item_json AS BLOB)) AS bytes FROM observation_items WHERE agent=? AND generation=? ORDER BY sequence DESC").all(agent,generation) as {item_id:string;bytes:number}[];
       let bytes=0;for(let i=0;i<rows.length;i++){bytes+=rows[i]!.bytes;if(i>=200||bytes>524288)this.db.prepare("DELETE FROM observation_items WHERE agent=? AND generation=? AND item_id=?").run(agent,generation,rows[i]!.item_id);}
     }).immediate();

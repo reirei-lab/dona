@@ -140,6 +140,11 @@ test("全世代retention・cache受信順・長文と通知byte上限を保持�
   store.db.prepare("UPDATE observation_events SET observed_at='2000-01-01T00:00:00Z'").run();store.db.prepare("UPDATE observation_items SET observed_at='2000-01-01T00:00:00Z'").run();store.close();store=new RuntimeStore(file);
   assert.equal((store.db.prepare("SELECT COUNT(*) AS n FROM observation_events").get() as {n:number}).n,0);assert.equal(store.cachedItems("old","old-generation").length,0);assert.equal(store.observations("old","old-generation",0).gap,true);
   store.cacheItem("current","g",{id:"z",turn_id:"turn",kind:"tool_progress"});store.cacheItem("current","g",{id:"a",turn_id:"turn",kind:"assistant_message",text:"after"});store.db.prepare("UPDATE observation_items SET observed_at=?").run(new Date().toISOString());assert.deepEqual(store.cachedItems("current","g").map(x=>x.id),['z','a']);
+  store.cacheItem("current","g",{id:"a",turn_id:"turn",kind:"assistant_message",text:"after complete"});
+  store.cacheItem("current","g",{id:"z",turn_id:"turn",kind:"tool_progress",status:"completed",command:"npm test"});
+  assert.deepEqual(store.cachedItems("current","g").map(x=>x.id),['z','a']);
+  assert.equal(store.cachedItems("current","g")[0]!.status,'completed');
+
   assert.equal(projectHistory({thread:{id:"t",turns:[{id:"turn",items:[{id:"long",type:"agentMessage",text:"x".repeat(9000)}]}]}}).truncated,true);
   for(let i=0;i<1000;i++)store.observe("current","g",{kind:"item/agentMessage/delta",text:"x".repeat(512)});
   const bounded=store.observations("current","g",0);assert.ok(Buffer.byteLength(JSON.stringify(bounded.events))<265000);assert.equal(bounded.gap,true);assert.ok(bounded.cursor<1001);assert.ok(store.observations("current","g",bounded.cursor).events.length>0);

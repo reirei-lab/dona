@@ -90,7 +90,7 @@ function appendConversation(content,runtime) {
     }
     const messages = node('div',undefined,'messages');
     const open=new Set(Array.from(detail.querySelectorAll('details[open][data-item-detail]')).map(n=>n.dataset.itemDetail));
-    const toolLabels={commandExecution:'コマンド実行',fileChange:'ファイル変更',mcpToolCall:'MCPツール',dynamicToolCall:'ツール実行',webSearch:'Web検索',imageView:'画像の確認'};
+    const toolLabels={collabAgentToolCall:'サブエージェント操作',commandExecution:'コマンド実行',fileChange:'ファイル変更',mcpToolCall:'MCPツール',dynamicToolCall:'ツール実行',webSearch:'Web検索',imageView:'画像の確認'};
     for(const item of visible) {
       const entry = node('article');entry.dataset.item=item.id;
       entry.append(node('h4',item.kind==='assistant_message'?'Codex':item.kind==='user_message'?'ユーザー・依頼入力':item.tool_name||toolLabels[item.tool_type]||'ツールの進捗'));

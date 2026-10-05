@@ -56,3 +56,20 @@ test("provider prefixとsuffixを持つcredential識別子を単行・JSON・複
  }
  assert.equal(sanitizeObservationText("NODE_ENV=production\nEXIT_CODE=0"),"NODE_ENV=production\nEXIT_CODE=0");
 });
+
+test("escaped JSON credential keyを復号して値を除外する",()=>{
+ for(const key of ["AWS_SECRET_ACCESS_KEY","OPENAI_API_KEY"]){
+  const raw=JSON.stringify({[key]:"sensitive-placeholder"});
+  for(const escaped of [raw.replaceAll('"',String.raw`\"`),JSON.stringify(raw),JSON.stringify(JSON.stringify(raw))]){
+   assert.ok(!sanitizeObservationText(escaped).includes("sensitive-placeholder"));
+   assert.ok(!JSON.stringify(projectItem({id:"m",type:"mcpToolCall",tool:"inspect",result:{content:[{type:"text",text:escaped}]}},turn)).includes("sensitive-placeholder"));
+  }
+ }
+});
+test("固定Codexのcollab toolは名前・状態・安全な作業内容を表示しthread metadataを出さない",()=>{
+ for(const tool of ["spawnAgent","wait","sendMessage"]){const item=projectItem({id:"collab",type:"collabAgentToolCall",tool,status:"completed",prompt:"テストを確認",senderThreadId:"private-thread",receiverThreadIds:["private-thread"],agentsStates:{"private-thread":{status:"completed",message:"3 tests passed"}},reasoning:"private-reasoning"},turn)!;assert.equal(item.tool_type,"collabAgentToolCall");assert.equal(item.tool_name,tool);assert.equal(item.status,"completed");assert.equal(item.input,"テストを確認");assert.equal(item.output,"completed: 3 tests passed");assert.ok(!JSON.stringify(item).includes("private"));}
+});
+test("diff headerとhunk本文を区別しplus/minusで始まるコード行も数える",()=>{
+ const diff="--- a/file.ts\n+++ b/file.ts\n@@ -1,3 +1,3 @@\n+++counter;\n---counter;\n+++ userText\n--- userText\n context\ndiff --git a/next b/next\n--- a/next\n+++ b/next\n@@ -1 +1 @@\n+new\n-old";
+ const item=projectItem({id:"f",type:"fileChange",changes:[{path:"src/file.ts",kind:{type:"update"},diff}]},turn)!;assert.equal(item.files?.[0]?.additions,3);assert.equal(item.files?.[0]?.deletions,3);
+});
