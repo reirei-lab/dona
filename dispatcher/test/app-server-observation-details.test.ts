@@ -182,3 +182,32 @@ test("既知control itemは実metadataだけを投影しraw本文・image・thre
  }
  for(const type of ["plan","hookPrompt","reasoning"])assert.equal(projectItem({id:"hidden",type,text:"private",summary:["private"]},turn),undefined);
 });
+
+test("netrcの空白区切りcredentialをsingle/multiline/quoted/continuationで省略する",()=>{
+ const snippets=[
+  "machine api.example login alice password sensitive-placeholder",
+  'machine "api.example" login "alice" password "sensitive-placeholder"',
+  'machine "api.example" login sensitive-placeholder',
+  'machine api.example\n login "alice"\n password "sensitive-placeholder"\n account "billing"',
+  "default login alice account sensitive-placeholder",
+  "machine api.example \\\n login alice \\\n password sensitive-placeholder",
+  "password sensitive-placeholder", "password\n sensitive-placeholder", "account sensitive-placeholder",'login "sensitive-placeholder"',
+  ".netrc output:\nlogin sensitive-placeholder",
+ ];
+ for(const snippet of snippets)for(const text of [snippet,JSON.stringify(snippet),JSON.stringify({output:snippet}),encodeURIComponent(snippet)]){
+  assert.ok(!sanitizeObservationText(text).includes("sensitive-placeholder"));
+  assert.ok(!JSON.stringify(projectItem({id:"c",type:"commandExecution",command:"cat ~/.netrc",aggregatedOutput:text},turn)).includes("sensitive-placeholder"));
+ }
+ for(const path of ['cat /Users/alice/.netrc',encodeURIComponent('/Users/alice/.netrc')])assert.ok(!sanitizeObservationText(path).includes('.netrc'));
+ assert.equal(sanitizeObservationText("Fix the login screen"),"Fix the login screen");assert.equal(sanitizeObservationText("login screen"),"login screen");
+});
+
+test("canonical pgpass/Redis config/htpasswd形式はcredential fileとして省略する",()=>{
+ const lines=["db.example:5432:app:alice:sensitive-placeholder","localhost:*:*:alice:sensitive-placeholder",String.raw`db:5432:app:alice:sensitive\:placeholder`,"requirepass sensitive-placeholder",'masterauth "sensitive-placeholder"',"alice:$apr1$salt$sensitive-placeholder","alice:$2y$10$sensitive-placeholder","alice:{SHA}AAAAAAAAAAAAAAAAAAAAAAAAAAA="];
+ for(const line of lines)for(const text of [line,JSON.stringify({output:line}),JSON.stringify(`header\n${line}\nfooter`),encodeURIComponent(line)]){
+  assert.equal(sanitizeObservationText(text),"[認証ファイル形式の内容を省略]");
+  assert.ok(!JSON.stringify(projectItem({id:"c",type:"commandExecution",aggregatedOutput:text},turn)).includes("sensitive"));
+ }
+ for(const value of ["src/main.ts:12:4: error: expected value","name:value","https://example.com:5432/path","npm test: 42 passed"])assert.equal(sanitizeObservationText(value),value);
+ for(const file of [".pgpass",".htpasswd"])for(const text of [`cat /Users/alice/${file}`,encodeURIComponent(`/Users/alice/${file}`)])assert.ok(!sanitizeObservationText(text).includes(file));
+});

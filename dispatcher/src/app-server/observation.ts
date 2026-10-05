@@ -39,6 +39,26 @@ function hasCredentialCli(text:string):boolean {
   }
   return false;
 }
+/** netrcの空白区切りcredentialはassignment検査とは別に扱う。値は解析・公開しない。 */
+function hasNetrcCredentials(value:string):boolean {
+  const text=value.replace(/\\+\r?\n/g,"").replace(/\\+[nrt]/g,"\n");
+  const stanza=/(?:^|[\s"'])(?:machine[ \t\r\n]+(?:"[^"\n]+"|'[^'\n]+'|[^\s"']+)|default)(?=[\s"'])/i.test(text);
+  const field=/(?:^|[\s"'])(?:login|password|account)[ \t\r\n]+\S/i.test(text);
+  if(stanza&&field)return true;
+  if(/(?:^|[\n"'])[ \t]*(?:password|account)[ \t\r\n]+\S/i.test(text))return true;
+  return /(?:^|[\n"'])[ \t]*login[ \t]+["']\S/i.test(text)||(/\.netrc\b/i.test(text)&&field);
+}
+/** 曖昧な一般proseではなく、既知認証ファイルの行形式だけを検査する。 */
+function hasCredentialFileFormat(value:string):boolean {
+  const text=value.replace(/\\+\r?\n/g,"").replace(/\\+[nrt]/g,"\n");
+  if(/(?:^|[\n"'])[ \t]*(?:requirepass|masterauth)[ \t]+\S/i.test(text))return true;
+  // .pgpass: host:port:database:user:password。port数値/ワイルドカードと5fieldを要求する。
+  for(const match of text.matchAll(/(?:^|[\n"'])[ \t]*([A-Za-z0-9_.*-]+):(\*|[0-9]{1,5}):((?:\\+.|[^:\s"'\\])+):((?:\\+.|[^:\s"'\\])+):((?:\\+.|[^:\r\n"'\\])+)(?=$|[\n"'])/g)){
+    if(match[2]==="*"||(Number(match[2])>0&&Number(match[2])<=65535))return true;
+  }
+  // htpasswdの明示的hash scheme。任意user:valueや一般colon区切りをcredentialと断定しない。
+  return /(?:^|[\n"'])[ \t]*[^:\s"']+:(?:\$(?:apr1|1|2[aby]|5|6)\$[^\s"']+|\{SHA\}[A-Za-z0-9+/]{27}=)(?=$|[\n"'])/.test(text);
+}
 function unescapeObservationText(value:string):string {
   return value.replace(/\\+u([0-9a-f]{4})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16))).replace(/\\\//g,"/").replace(/\\+(["'])/g,"$1");
 }
@@ -58,8 +78,10 @@ function decodedObservationText(value:string,inspect?:(stage:string)=>void):stri
 export function sanitizeObservationText(value:string,limit=8192):string {
   if(value.length>131072)return "[上限を超える内容を省略]";
   let text=value.replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|$))/g,"").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g,"");
-  let credentialCli=false;
-  const decodedText=decodedObservationText(text,stage=>{if(hasCredentialCli(stage))credentialCli=true;});
+  let credentialCli=false,netrc=false,credentialFile=false;
+  const decodedText=decodedObservationText(text,stage=>{if(hasCredentialCli(stage))credentialCli=true;if(hasNetrcCredentials(stage))netrc=true;if(hasCredentialFileFormat(stage))credentialFile=true;});
+  if(credentialFile)return "[認証ファイル形式の内容を省略]";
+  if(netrc)return "[netrc認証情報を含む内容を省略]";
   if(credentialCli)return "[認証optionを含む内容を省略]";
   if(/\\+(?:u[0-9a-f]{4}|["'/])|%[0-9a-f]{2}/i.test(decodedText))return "[多重encodeされた内容を省略]";
   // YAML tag/anchor/commentや複数行scalarも含め、既知credential assignmentがあるfield全体を省略する。
@@ -69,9 +91,9 @@ export function sanitizeObservationText(value:string,limit=8192):string {
     let credentialUri=false;
     const decoded=decodedObservationText(line,stage=>{if(/(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s/]+@/i.test(stage))credentialUri=true;});
     if(credentialUri)return "[機密情報を含む行を省略]";
-    if(decoded!==line&&/(?:^|[\s"']|\/)(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains|\.env(?:\.[\w-]+)?|auth\.json|credentials(?:\.json)?)(?:\/|$|[\s"'])/i.test(decoded))return "[保護されたパスを含む行を省略]";
+    if(decoded!==line&&/(?:^|[\s"']|\/)(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains|\.env(?:\.[\w-]+)?|\.netrc|\.pgpass|\.htpasswd|auth\.json|credentials(?:\.json)?)(?:\/|$|[\s"'])/i.test(decoded))return "[保護されたパスを含む行を省略]";
     if(/(?:xox[a-z]-|xapp-|gh[pousr]_|github_pat_|sk-(?:proj-)?[A-Za-z0-9_-]{8}|\b(?:AKIA|ASIA)[A-Z0-9]{16}|--(?:token|password|secret|api-key|header)\s+\S+|\b(?:Bearer|Basic)\s+\S+|(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s/]+@|(?:files|hooks)\.slack\.com|[?&](?:signature|sig|token|key|x-amz-[\w-]+)=|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/i.test(decoded))return "[機密情報を含む行を省略]";
-    return line.replace(/(?:~|\/[^\s"'<>]*)\/(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains)(?:\/[^\s"'<>]*)?/g,"[保護されたパス]").replace(/(^|[\s"'<>])(?:[^\s"'<>]*\/)?(?:\.env(?:\.[\w-]+)?|auth\.json|credentials(?:\.json)?)(?=\s|$|["'<>])/g,"$1[保護されたパス]").replace(/\/(?:Users|home)\/[^/\s]+/g,"~");
+    return line.replace(/(?:~|\/[^\s"'<>]*)\/(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains)(?:\/[^\s"'<>]*)?/g,"[保護されたパス]").replace(/(^|[\s"'<>])(?:[^\s"'<>]*\/)?(?:\.env(?:\.[\w-]+)?|\.netrc|\.pgpass|\.htpasswd|auth\.json|credentials(?:\.json)?)(?=\s|$|["'<>])/g,"$1[保護されたパス]").replace(/\/(?:Users|home)\/[^/\s]+/g,"~");
   }).join("\n");
   return text.slice(0,limit);
 }

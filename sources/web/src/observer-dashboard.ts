@@ -150,10 +150,18 @@ async function refresh() {
     if(selected&&!capabilities.includes('tasks:read')){selected=null;selectedAttempt=null;rememberSelection();}
     if(selectedMain&&!capabilities.includes('conversations:main:read')){selectedMain=null;rememberSelection();}
     byId('submit-panel').hidden=!capabilities.includes('tasks:submit');byId('task-panel').hidden=!capabilities.includes('tasks:read');byId('control-hint').hidden=capabilities.includes('tasks:read')||!capabilities.includes('tasks:cancel');
-    byId('task-layout').hidden=!capabilities.includes('tasks:read')&&!capabilities.includes('conversations:main:read');byId('submit-task').disabled=!!pending;showPending();await credentialStatus();await mainList();await externalRefresh();
+    byId('task-layout').hidden=!capabilities.includes('tasks:read')&&!capabilities.includes('conversations:main:read');byId('submit-task').disabled=!!pending;showPending();await credentialStatus();
+    let mainAvailable=true;
+    try {await mainList();}catch(error){
+      if(token!==generation||stopped)return;
+      if(error.auth)throw error;
+      mainAvailable=false;byId('main-conversations').replaceChildren(node('p','Dona本体の会話一覧を現在取得できません。','notice'));
+      if(selectedMain){stream=null;deferredDetail=null;detail.replaceChildren(node('p','Dona本体の会話を現在取得できません。','notice'));}
+    }
+    if(token!==generation||stopped)return;await externalRefresh();
     if(capabilities.includes('tasks:read')) {const value=await read('/api/tasks'+(pageAfter?'?after='+encodeURIComponent(pageAfter):''));if(token!==generation || stopped)return;renderList(value);}
     if(token!==generation || stopped)return; connection.textContent='接続中 · 5秒ごとに更新';connection.dataset.state='connected';emptyDetail();selectionState();
-    if(stream)await streamRead();else if(selectedMain)await mainRead();else if(capabilities.includes('tasks:read'))await detailRead();
+    if(stream)await streamRead();else if(selectedMain){if(mainAvailable)await mainRead();}else if(capabilities.includes('tasks:read'))await detailRead();
   } catch(error) {if(token===generation && !stopped)clearPrivate(error.auth?'接続の認証が必要です。':'接続が切れています。表示を消去しました。',error.auth);}
   finally {polling=false;}
 }
@@ -174,7 +182,7 @@ async function mainRead() {
   if(!selectedMain||stopped)return;const target=selectedMain,token=++generation;
   try {const value=await read('/api/conversations/main/'+encodeURIComponent(target.name)+'/'+encodeURIComponent(target.generation));if(token!==generation||selectedMain!==target||stopped)return;
     const content=document.createDocumentFragment();content.append(node('h2','Dona本体の会話'),node('p','このDona全体にまたがる発言です。特定のTaskの会話ではありません。','notice'));appendConversation(content,value);detail.replaceChildren(content);rememberStream(value,mainPath());
-  }catch(error){if(token===generation&&!stopped)clearPrivate(error.auth?'接続の認証が必要です。':'接続が切れています。表示を消去しました。',error.auth);}
+  }catch(error){if(token===generation&&!stopped){if(error.auth)clearPrivate('接続の認証が必要です。',true);else {stream=null;deferredDetail=null;detail.replaceChildren(node('p','Dona本体の会話を現在取得できません。','notice'));}}}
 }
 function taskPath() {return '/api/tasks/'+encodeURIComponent(selected)+(selectedAttempt?'?attempt='+encodeURIComponent(selectedAttempt):'');}
 function mainPath() {return '/api/conversations/main/'+encodeURIComponent(selectedMain.name)+'/'+encodeURIComponent(selectedMain.generation);}
@@ -209,7 +217,7 @@ async function streamRead() {
       stream=null;if(selectedMain)await mainRead();else await detailRead();
       if(events[0]==='event: reset'&&epoch===authEpoch&&!stopped){connection.textContent='履歴の連続性を再確認しました。最新の状態を取得しました。';}
     }
-  }catch(error){if(epoch===authEpoch&&token===generation&&stream===current&&!stopped)clearPrivate(error.auth?'接続の認証が必要です。':'更新の接続が切れました。最新状態から再接続します。',error.auth);}
+  }catch(error){if(epoch===authEpoch&&token===generation&&stream===current&&!stopped){if(!error.auth&&selectedMain&&current.path===mainPath()){stream=null;deferredDetail=null;detail.replaceChildren(node('p','Dona本体の会話を現在取得できません。','notice'));}else clearPrivate(error.auth?'接続の認証が必要です。':'更新の接続が切れました。最新状態から再接続します。',error.auth);}}
   finally{clearTimeout(timer);streamBusy=false;}
 }
 detail.addEventListener('focusout',()=>setTimeout(()=>{const value=deferredDetail;if(value&&!stopped&&!document.activeElement?.closest('[data-question-form]')){deferredDetail=null;renderDetail(value);}},0));
