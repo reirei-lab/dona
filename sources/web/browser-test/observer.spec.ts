@@ -42,3 +42,9 @@ test('mobileとkeyboardで閲覧できpoll後も選択buttonのfocusを維持す
   await page.clock.install();await page.clock.fastForward(5001);await expect(button).toBeFocused();
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBeTruthy();
 });
+test('bfcache復帰時は表示を消して接続を再検証する',async({page})=>{
+  let deny=false;await setup(page,{deny:()=>deny});await page.getByRole('button',{name:'task_a · 待機中'}).click();await expect(page.locator('#detail')).toContainText('task_a');
+  await page.evaluate(()=>window.dispatchEvent(new PageTransitionEvent('pagehide',{persisted:true})));deny=true;
+  await page.evaluate(()=>window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:true})));
+  await expect(page.locator('#pairing')).toBeVisible();await expect(page.locator('#detail')).not.toContainText('task_a');
+});
