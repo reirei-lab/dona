@@ -20,7 +20,7 @@ export interface DashboardAuthority {
   conversation(id: string): boolean;
 }
 export interface ObservedTask {
-  snapshot: DashboardTaskSnapshot;
+  snapshot: Omit<DashboardTaskSnapshot,"runtime_binding">;
   runtime: {status: "observed"; conversation: ConversationContent} | {status: "unavailable" | "not_started" | "forbidden"};
 }
 /** The authority callback is evaluated again after runtime I/O. A revoked
@@ -36,6 +36,8 @@ export class DashboardObserver {
     if (authority.conversation(id)) {
       observed = {status: "not_started"};
       try {
+        if(!before.runtime_binding) return {snapshot:publicSnapshot(before),runtime:{status:"not_started"}};
+        const binding=before.runtime_binding;
         const expectedAgent = before.attempts.find(row => row.attempt_id === before.task.current_attempt_id)?.agent_name;
         if (!expectedAgent) throw Error("observation_attempt_missing");
         const started = performance.now();
@@ -50,7 +52,7 @@ export class DashboardObserver {
           const matches = result.items.filter(row => row.role === "worker" && row.attempt_id === before.task.current_attempt_id);
           if (matches.length > 1) throw Error("observation_identity_ambiguous");
           const match = matches[0];
-          if (match && match.name !== expectedAgent) throw Error("observation_identity_changed");
+          if (match && (match.name !== expectedAgent || match.name!==binding.agent_name || match.generation!==binding.generation || match.thread_id!==binding.thread_id)) throw Error("observation_identity_changed");
           if (match) {
             const content = await withinDeadline(this.runtime.conversation(match.name,match.generation,afterSequence), started);
             if (performance.now() - started > 5000 || content.name !== match.name || content.generation !== match.generation || content.role !== "worker"
@@ -67,9 +69,9 @@ export class DashboardObserver {
     if (!current || current.revision !== authority.revision || !current.task(id)) return null;
     const after = this.tasks.snapshot(id);
     if (!after) return null;
-    if (after.fingerprint !== before.fingerprint) return {snapshot: after, runtime: {status: "unavailable"}};
+    if (after.fingerprint !== before.fingerprint) return {snapshot: publicSnapshot(after), runtime: {status: "unavailable"}};
     if (!current.conversation(id)) observed = {status: "forbidden"};
-    return {snapshot: after, runtime: observed};
+    return {snapshot: publicSnapshot(after), runtime: observed};
   }
 }
 
@@ -110,4 +112,8 @@ function publicConversation(value: ConversationContent): ConversationContent {
     items,events,cursor:value.cursor,oldest_sequence:value.oldest_sequence,gap:value.gap,truncated:value.truncated};
   if(Buffer.byteLength(JSON.stringify(result))>1_048_576)throw Error("observation_projection_limit");
   return result;
+}
+
+function publicSnapshot(value:DashboardTaskSnapshot):Omit<DashboardTaskSnapshot,"runtime_binding"> {
+  return {task:value.task,attempts:value.attempts,fingerprint:value.fingerprint};
 }

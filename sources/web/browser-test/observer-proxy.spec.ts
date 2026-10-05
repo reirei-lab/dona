@@ -25,7 +25,9 @@ test('実HTTPS proxyとSecure cookieで観測し、別Originと失効後の閲�
  try{
   const event=db.enqueue(eventEnvelope('browser-proxy-observation')).row;
   const task=db.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:'browser-observation',objective:'private objective',workspace:{kind:'scratch'}}),path.join(root,'work'),path.join(root,'results')).task;
-  const before=JSON.stringify(db.tasks.get(task.task_id)),name=db.getJob(task.current_attempt_id)!.agent_name;
+  const name=db.getJob(task.current_attempt_id)!.agent_name;
+  db.beginJobPreparation(task.current_attempt_id);db.setJobRuntime(task.current_attempt_id,'workspace','pane',JSON.stringify(['fixture_generation','thread_one']));
+  const before=JSON.stringify(db.tasks.get(task.task_id));
   reader=new DashboardTaskReader(database);
   const runtimeCalls:string[]=[],record:ObservedConversation={name,generation:'fixture_generation',role:'worker',thread_id:'thread_one',attempt_id:task.current_attempt_id,connected:true,observed_at:new Date().toISOString(),state:'working'};
   const observer=new DashboardObserver(reader,{conversations:async()=>{runtimeCalls.push('conversations');return{items:[record],next:null};},conversation:async()=>{runtimeCalls.push('conversation');return{...record,items:[{id:'item_one',turn_id:'turn_one',kind:'assistant_message',text:'HTTPS経由のワーカー進捗 <img src=x onerror=alert(1)>'}],events:[],cursor:0,oldest_sequence:0,gap:false,truncated:false};}});
