@@ -291,3 +291,23 @@ for(const [label,params]of [
   assert.equal(store.db.prepare('SELECT COUNT(*) FROM external_tool_requests').pluck().get(),0);assert.deepEqual(store.questions(agent.name),[]);
  }finally{const row=store.agent('main-denial');if(row&&row.state!=='stopped')await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+test("worker外部callは同じturn内でも発生時のoperationを保持し未確定steer中は拒否する",async()=>{
+ const {ExternalToolQueue}=await import("../src/app-server/external-tools.js"),root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-external-provenance-")),store=new RuntimeStore(path.join(root,"runtime.db"));
+ try{const queue=new ExternalToolQueue(store);queue.availability(true);
+  const agent={name:"worker",generation:"g",thread_id:"t",turn_id:"turn",role:"worker",config_json:JSON.stringify({attemptId:"job_fixture"})} as any;
+  const message=(call:string)=>({id:call,method:"item/tool/call",params:{threadId:"t",turnId:"turn",callId:call,tool:"dona_request_thread_reply",arguments:{operation_slot:call,text:"draft"}}});
+  assert.throws(()=>queue.accept(agent,message("missing")),/source_unavailable/);
+  const receipt=JSON.stringify({generation:"g",threadId:"t",turnId:"turn"});
+  store.db.prepare("INSERT INTO operations VALUES(?,?,'fixture','accepted',?)").run("worker","attempt:job_fixture",receipt);
+  const old=queue.accept(agent,message("before"));assert.equal(old.operation_key,"attempt:job_fixture");
+  store.db.prepare("INSERT INTO operations VALUES(?,?,'fixture','sending',NULL)").run("worker","steer:evt_fixture");
+  assert.throws(()=>queue.accept(agent,message("during")),/source_unavailable/);
+  store.db.prepare("UPDATE operations SET state='unknown' WHERE operation_key=?").run("steer:evt_fixture");
+  assert.throws(()=>queue.accept(agent,message("unknown")),/source_unavailable/);
+  store.db.prepare("UPDATE operations SET state='accepted',result_json=? WHERE operation_key=?").run(receipt,"steer:evt_fixture");
+  const next=queue.accept(agent,message("after"));assert.equal(next.operation_key,"steer:evt_fixture");
+  assert.equal(queue.source(queue.get(old.request_id)!).operation_key,"attempt:job_fixture");
+  queue.expireRestart();assert.equal(queue.get(old.request_id)?.state,"expired");assert.equal(queue.get(next.request_id)?.state,"expired");
+ }finally{store.close();await fs.rm(root,{recursive:true,force:true});}
+});

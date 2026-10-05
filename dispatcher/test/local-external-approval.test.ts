@@ -139,7 +139,7 @@ test("workerの外部承認checkpointは同じAttempt/callに保持し応答喪�
  const event=dispatcher.enqueue({schema_version:1,source:"slack",external_event_id:"worker_source",type:"app_mention",occurred_at:start,subject:{workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts,actor_id:"U123"},payload:{},reply_target:{kind:"slack_thread",workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts}}).row;
  const task=dispatcher.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:"external",objective:"承認された投稿を行う",workspace:{kind:"scratch"}}),f.filename+"-work",f.filename+"-results").task;
  const job=dispatcher.getJob(task.current_attempt_id)!;dispatcher.beginJobPreparation(job.job_id);dispatcher.setJobRuntime(job.job_id,job.agent_name,job.agent_name,JSON.stringify(["generation","thread"]));dispatcher.beginJobDispatch(job.job_id);dispatcher.markJobRunning(job.job_id);
- const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_worker",agent:job.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"worker",attempt_id:job.job_id,source_event_id:null,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
+ const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_worker",operation_key:`attempt:${job.job_id}`,agent:job.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"worker",attempt_id:job.job_id,source_event_id:null,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
  let lost=true;
  const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:job.agent_name,generation:"generation",thread_id:"thread"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{row.state="resolved";row.result_json=JSON.stringify(result);row.text="";if(lost){lost=false;throw Error("response lost");}return {state:"resolved"};}};
  const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source));
@@ -184,7 +184,7 @@ test("Runtime再起動で失われた外部callは監査付きneeds_reviewとな
  const event=dispatcher.enqueue({schema_version:1,source:"slack",external_event_id:"worker_source",type:"app_mention",occurred_at:start,subject:{workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts,actor_id:"U123"},payload:{},reply_target:{kind:"slack_thread",workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts}}).row;
  const task=dispatcher.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:"external",objective:"承認された投稿を行う",workspace:{kind:"scratch"}}),f.filename+"-work",f.filename+"-results").task;
  const job=dispatcher.getJob(task.current_attempt_id)!;dispatcher.beginJobPreparation(job.job_id);dispatcher.setJobRuntime(job.job_id,job.agent_name,job.agent_name,JSON.stringify(["generation","thread"]));dispatcher.beginJobDispatch(job.job_id);dispatcher.markJobRunning(job.job_id);
- const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_worker",agent:job.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"worker",attempt_id:job.job_id,source_event_id:null,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
+ const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_worker",operation_key:`attempt:${job.job_id}`,agent:job.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"worker",attempt_id:job.job_id,source_event_id:null,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
  let lost=true;
  const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:job.agent_name,generation:"generation",thread_id:"thread"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{row.state="resolved";row.result_json=JSON.stringify(result);row.text="";if(lost){lost=false;throw Error("response lost");}return {state:"resolved"};}};
  const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source));
@@ -232,4 +232,103 @@ test("期限切れ署名はdecision前の確定拒否となり台帳を変更し
  await assert.rejects(f.service.decide(actor,{...actor,receipt_id:"expired",request_id:created.request_handle,decision:"approve",presentation_digest:view.presentation_digest,expires_at:start}),ExternalApprovalPrecommitError);
  assert.equal(f.service.status(actor,created.request_handle).decision,null);
  assert.equal((f.db.prepare("SELECT total_changes() n").get() as {n:number}).n,before);
+});
+
+async function workerApprovalFixture(t:{after(fn:()=>void):void},queuedSteer=false){
+ const {DispatcherDatabase}=await import("../src/database.js"),{taskRequestSchema}=await import("../src/task-execution.js");
+ const f=setup(t),dispatcher=new DispatcherDatabase(f.filename);t.after(()=>dispatcher.close());
+ const enqueue=(id:string)=>dispatcher.enqueue({schema_version:1,source:"slack",external_event_id:id,type:"app_mention",occurred_at:start,subject:{workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts,actor_id:"U123"},payload:{},reply_target:{kind:"slack_thread",workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts}}).row;
+ const event=enqueue("checkpoint_source"),task=dispatcher.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:"external",objective:"承認された投稿を行う",workspace:{kind:"scratch"}}),f.filename+"-work",f.filename+"-results").task;
+ const job=dispatcher.getJob(task.current_attempt_id)!;
+ if(queuedSteer){const follow=enqueue("queued_follow");dispatcher.tasks.prepareSteer(task.task_id,follow.event_id,task.revision,"起動前の追加指示");dispatcher.appendQueuedJobInstruction(job.job_id,follow.event_id,"起動前の追加指示");dispatcher.tasks.finishSteer(task.task_id,follow.event_id);}
+ dispatcher.beginJobPreparation(job.job_id);dispatcher.setJobRuntime(job.job_id,job.agent_name,job.agent_name,JSON.stringify(["generation","thread"]));dispatcher.beginJobDispatch(job.job_id);dispatcher.markJobRunning(job.job_id);
+ let row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_checkpoint",operation_key:`attempt:${job.job_id}`,agent:job.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"worker",attempt_id:job.job_id,source_event_id:null,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
+ let beforeResolve=()=>{};
+ const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async(id:string)=>id===row.request_id?{...row}:null,status:async()=>({name:job.agent_name,generation:"generation",thread_id:"thread"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{beforeResolve();row.state="resolved";row.result_json=JSON.stringify(result);row.text="";return {state:"resolved"};}};
+ const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source));
+ const requestId=()=> (f.db.prepare("SELECT request_id FROM local_external_ingress WHERE runtime_request_id=?").get(row.request_id) as {request_id:string}).request_id;
+ const approve=async()=>{const id=requestId(),p=await f.service.present(actor,id);await f.service.decide(actor,{...actor,receipt_id:"decision_"+row.request_id,request_id:id,decision:"approve",presentation_digest:p.presentation_digest,expires_at:"2026-09-19T00:01:00.000Z"});return id;};
+ return {...f,dispatcher,enqueue,event,task,job,ingress,runtime,requestId,approve,row:()=>row,beforeResolve:(fn:()=>void)=>{beforeResolve=fn;},newCall:(operation:string)=>{row={...row,request_id:"ext_after",call_id:"after",operation_slot:"after",operation_key:operation,state:"pending",result_json:null,text:"新しい目的の本文"};}};
+}
+
+for(const timing of ["before_ingress","during_request"] as const)test(`steer競合(${timing})は旧draftを失効させ正常steer後の新要求だけ許可する`,async t=>{
+ const f=await workerApprovalFixture(t),follow=f.enqueue("steer_followup");
+ const begin=()=>{const task=f.dispatcher.tasks.get(f.task.task_id)!;assert.ok(f.dispatcher.tasks.prepareSteer(task.task_id,follow.event_id,task.revision,"投稿内容を変更する"));f.dispatcher.beginJobSteer(f.job.job_id,follow.event_id);};
+ const complete=()=>{f.dispatcher.markJobSteerAccepted(f.job.job_id,follow.event_id);f.dispatcher.tasks.finishSteer(f.task.task_id,follow.event_id);};
+ if(timing==="before_ingress"){begin();complete();await f.ingress.tick();assert.equal(f.row().state,"resolved");assert.equal(f.db.prepare("SELECT COUNT(*) FROM local_external_ingress").pluck().get(),0);}
+ else {
+  const original=f.service.requestFromSource.bind(f.service);f.service.requestFromSource=async(...args)=>{const result=await original(...args);begin();return result;};
+  await f.ingress.tick();assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.wait_reason,"steer_acceptance_unknown");assert.equal(f.dispatcher.tasks.pendingSteer(f.job.job_id,follow.event_id),true);
+  const old=f.requestId();await f.ingress.tick();assert.equal(f.service.status(actor,old).state,"needs_review");assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.wait_reason,"steer_acceptance_unknown");
+  f.db.prepare("UPDATE jobs SET status='blocked',last_error_code='runtime_external_approval_pending' WHERE job_id=?").run(f.job.job_id);
+  f.dispatcher.tasks.wait(f.dispatcher.tasks.get(f.task.task_id)!,"steer_acceptance_unknown",-1);
+  const {JobSupervisor}=await import("../src/job-supervisor.js");const supervisor=new JobSupervisor(f.dispatcher,{observeWorker:async()=>{throw Error("must preserve steer gate");}} as never,{} as never,{debug(){},info(){},warn(){},error(){}},()=>{});
+  await supervisor.reconcileTasks();assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.wait_reason,"steer_acceptance_unknown");
+  complete();f.service.requestFromSource=original;
+ }
+ assert.equal(f.counts().sends,0);f.newCall(`steer:${follow.event_id}`);await f.ingress.tick();assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.wait_reason,"external_approval");
+ await f.approve();await f.ingress.tick();assert.equal(f.counts().sends,1);assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.state,"active");assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.steer_pending_event_id,null);
+});
+
+for(const action of ["cancel","replace","legacy_provenance"] as const)test(`外部承認後の${action}は旧call送信とTaskの偽復帰を拒否する`,async t=>{
+ const f=await workerApprovalFixture(t);await f.ingress.tick();const id=await f.approve();
+ if(action==="cancel"){const control=f.enqueue(action);const task=f.dispatcher.tasks.get(f.task.task_id)!;f.dispatcher.tasks.control(task.task_id,control.event_id,task.revision,action);}
+ else if(action==="legacy_provenance"){delete f.row().operation_key;}
+ else {const old=f.dispatcher.tasks.get(f.task.task_id)!;assert.throws(()=>f.dispatcher.tasks.replaceStopped(old.task_id,f.filename+"-results"),/task_stop_required/);
+  const evidence={state:"stopped" as const,reason:"verified_fixture_stop",observed_at:new Date().toISOString(),process_ids:[],process_groups:[]};const stopping=f.dispatcher.tasks.claimStop(old,evidence);f.dispatcher.tasks.stopped(stopping,evidence);f.dispatcher.tasks.replaceStopped(old.task_id,f.filename+"-results");}
+ const before=f.dispatcher.tasks.get(f.task.task_id)!;await f.ingress.tick();await f.ingress.tick();const after=f.dispatcher.tasks.get(f.task.task_id)!;
+ assert.equal(f.counts().sends,0);assert.equal(after.current_attempt_id,before.current_attempt_id);assert.equal(after.desired_state,before.desired_state);assert.equal(after.attempt_number,action==="replace"?2:1);assert.equal(f.service.status(actor,id).state,"needs_review");
+ assert.equal(f.db.prepare("SELECT state FROM task_external_approval_checkpoints WHERE attempt_id=?").pluck().get(f.job.job_id),"needs_review");
+});
+
+test("外部要求expiryは同一callへexpiredを返し新Attemptや送信を作らない",async t=>{
+ const f=await workerApprovalFixture(t);await f.ingress.tick();const id=f.requestId();f.setNow("2026-09-19T00:16:00.000Z");await f.ingress.tick();
+ assert.equal(f.service.status(actor,id).state,"expired");assert.equal(JSON.parse(f.row().result_json!).state,"expired");assert.equal(f.counts().sends,0);assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.attempt_number,1);assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.state,"active");
+});
+
+for(const held of [false,true])test(`pause(${held?"承認待ち後":"hold前"})は既存Task制御契約を保ち外部投稿しない`,async t=>{
+ const f=await workerApprovalFixture(t),control=f.enqueue("pause");if(held)await f.ingress.tick();const task=f.dispatcher.tasks.get(f.task.task_id)!;
+ if(held){assert.throws(()=>f.dispatcher.tasks.control(task.task_id,control.event_id,task.revision,"pause"),/task_human_input_pending/);assert.deepEqual(f.dispatcher.tasks.get(task.task_id),task);}
+ else {f.dispatcher.tasks.control(task.task_id,control.event_id,task.revision,"pause");await f.ingress.tick();assert.equal(f.dispatcher.tasks.get(task.task_id)?.desired_state,"paused");assert.equal(f.db.prepare("SELECT COUNT(*) FROM local_external_ingress").pluck().get(),0);}
+ assert.equal(f.counts().sends,0);
+});
+
+for(const action of ["pause","cancel"] as const)test(`hold直前の${action}競合で作成済み要求を失効し復帰しない`,async t=>{
+ const f=await workerApprovalFixture(t),control=f.enqueue(action),original=f.service.requestFromSource.bind(f.service);
+ f.service.requestFromSource=async(...args)=>{const created=await original(...args),task=f.dispatcher.tasks.get(f.task.task_id)!;f.dispatcher.tasks.control(task.task_id,control.event_id,task.revision,action);return created;};
+ await f.ingress.tick();const id=f.requestId();await f.ingress.tick();assert.equal(f.counts().sends,0);assert.equal(f.service.status(actor,id).state,"needs_review");assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.desired_state,action==="pause"?"paused":"cancelled");
+});
+
+// 実providerの送信直前callbackを通す。cancel受付と外部POST開始の間を曖昧にしない。
+test("外部送信直前のTask cancelはprovider callを止めpending承認を後継へ渡さない",async t=>{
+ const f=await workerApprovalFixture(t);await f.ingress.tick();const id=await f.approve(),control=f.enqueue("cancel_before_send");
+ f.beforeSend(()=>{const task=f.dispatcher.tasks.get(f.task.task_id)!;f.dispatcher.tasks.control(task.task_id,control.event_id,task.revision,"cancel");});
+ await f.ingress.tick();await f.ingress.tick();assert.equal(f.counts().sends,0);assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.desired_state,"cancelled");assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.attempt_number,1);assert.equal(f.service.status(actor,id).execution?.state,"needs_review");
+});
+
+test("tool受領待ちにTask cancelされてもfinishは取消をactiveへ戻さない",async t=>{
+ const f=await workerApprovalFixture(t);await f.ingress.tick();await f.approve();const control=f.enqueue("cancel_during_resolve");
+ f.beforeResolve(()=>{const task=f.dispatcher.tasks.get(f.task.task_id)!;f.dispatcher.tasks.control(task.task_id,control.event_id,task.revision,"cancel");});
+ await f.ingress.tick();assert.equal(f.counts().sends,1);assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.desired_state,"cancelled");assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.wait_reason,"cancel_requested");assert.equal(f.db.prepare("SELECT state FROM task_external_approval_checkpoints").pluck().get(),"succeeded");
+ await f.ingress.tick();assert.equal(f.counts().sends,1);
+});
+
+test("外部承認待ちのTask groupはsibling完了で最終化せずcall解決後のResultで終端になる",async t=>{
+ const f=await workerApprovalFixture(t),{taskRequestSchema}=await import("../src/task-execution.js");
+ const sibling=f.dispatcher.tasks.create(taskRequestSchema.parse({source_event_id:f.event.event_id,task_key:"sibling",objective:"別の調査",workspace:{kind:"scratch"}}),f.filename+"-work",f.filename+"-results").task;
+ const second=f.dispatcher.getJob(sibling.current_attempt_id)!;f.dispatcher.beginJobPreparation(second.job_id);f.dispatcher.setJobRuntime(second.job_id,"sibling","sibling");f.dispatcher.beginJobDispatch(second.job_id);f.dispatcher.markJobRunning(second.job_id);
+ f.dispatcher.beginDispatch(f.event.event_id,f.filename+"-source-result");f.dispatcher.markWaiting(f.event.event_id);
+ f.dispatcher.saveCompleted(f.event.event_id,{schema_version:1,event_id:f.event.event_id,status:"completed",summary:"delegated",completed_at:start},f.filename+"-source-result");
+ await f.ingress.tick();assert.equal(f.dispatcher.tasks.mayNotify(f.dispatcher.getJob(f.job.job_id)!),false);assert.equal(f.dispatcher.getJobGroup(f.event.event_id)?.all_terminal_event_id,null);
+ f.dispatcher.saveJobResult(second.job_id,{schema_version:1,job_id:second.job_id,status:"completed",summary:"sibling done",completed_at:start},second.result_path);
+ const progress=f.dispatcher.enqueueJobNotification(second.job_id).row;assert.equal(JSON.parse(progress.payload_json).group.transition,"progress");assert.equal(f.dispatcher.getJobGroup(f.event.event_id)?.all_terminal_event_id,null);
+ f.setNow("2026-09-19T00:16:00.000Z");await f.ingress.tick();assert.equal(JSON.parse(f.row().result_json!).state,"expired");assert.equal(f.dispatcher.getJobGroup(f.event.event_id)?.all_terminal_event_id,null);
+ f.dispatcher.saveJobResult(f.job.job_id,{schema_version:1,job_id:f.job.job_id,status:"completed",summary:"期限切れを報告、投稿なし",completed_at:"2026-09-19T00:16:00.000Z"},f.job.result_path);
+ const terminal=f.dispatcher.enqueueJobNotification(f.job.job_id).row;assert.equal(JSON.parse(terminal.payload_json).group.transition,"all_terminal");assert.equal(JSON.parse(terminal.payload_json).group.attention_resolution_state,"not_required");assert.deepEqual(JSON.parse(terminal.reply_target_json!),JSON.parse(f.event.reply_target_json!));assert.equal(f.counts().sends,0);
+ const {buildEventPrompt,envelopeFromRow}=await import("../src/prompt.js");const prompt=buildEventPrompt(terminal.event_id,f.filename+"-final",envelopeFromRow(terminal));assert.match(prompt,/progress.*Slackへ投稿せず/);assert.match(prompt,/unresolved.*active遷移を行わず/);
+});
+
+
+test("起動前queued steerを含む初回attemptの新しい外部要求は許可する",async t=>{
+ const f=await workerApprovalFixture(t,true);await f.ingress.tick();await f.approve();await f.ingress.tick();assert.equal(f.counts().sends,1);assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.state,"active");
 });

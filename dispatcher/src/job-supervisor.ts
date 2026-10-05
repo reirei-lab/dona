@@ -343,6 +343,8 @@ export class JobSupervisor {
     } catch(error) {
       if(!(error instanceof JobResultNotFoundError)) {this.database.tasks.wait(task,"result_conflict");return;}
     }
+    // 外部tool待機が未確定steerのreceipt待ちを上書きしてはいけない。
+    if(task.desired_state==="running"&&(task.steer_pending_event_id||task.wait_reason==="steer_acceptance_unknown"||job.steer_state==="dispatching")) {this.database.tasks.wait(task,"steer_acceptance_unknown",60_000);return;}
     if(job.last_error_code==="runtime_external_approval_pending"&&task.desired_state==="running"&&task.stop_state==="none"){
       if(!this.runtime.observeWorker){this.database.tasks.wait(task,"observation_unknown");return;}
       const observed=await this.observeWorker(job);

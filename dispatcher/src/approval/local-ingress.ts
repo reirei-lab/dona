@@ -1,3 +1,4 @@
+import {createHash} from "node:crypto";
 import type Database from "better-sqlite3";
 import {stableStringify} from "../validation.js";
 import type {DispatcherDatabase} from "../database.js";
@@ -5,6 +6,7 @@ import type {RuntimeClient} from "../app-server/client.js";
 import type {ExternalToolRequest} from "../app-server/external-tools.js";
 import type {LocalExternalApprovalService} from "./local-external-service.js";
 import type {ExternalApprovalSource} from "./local-external-types.js";
+const objectiveDigest=(objective:string)=>createHash("sha256").update(objective).digest("hex");
 const terminal=new Set(["succeeded","failed","cancelled","rejected","expired","execution_cancelled","consume_expired","delivery_failed","needs_review"]);
 /** private Runtime socketからのみtyped intentを受理。HTTP/MCPの自由入力sourceを認可しない。 */
 export class LocalExternalApprovalIngress {
@@ -22,6 +24,11 @@ export class LocalExternalApprovalIngress {
   if(source.source_job_id){
    const job=this.dispatcher.getJob(source.source_job_id),task=this.dispatcher.tasks.forAttempt(source.source_job_id);
    if(!job||!task||task.current_attempt_id!==job.job_id||task.desired_state!=="running"||task.stop_state!=="none"||!["running","blocked"].includes(job.status)||job.source_event_id!==event.event_id||job.actor_id!==source.requester_id||job.workspace_id!==source.workspace_id||job.channel_id!==source.channel_id||job.thread_ts!==source.thread_ts||job.agent_name!==source.agent)return false;
+   // Task revisionはwait/receiptでも変わる。本文の目的だけを固定し、steer完了後も旧要求を復活させない。
+   if(task.steer_pending_event_id||task.wait_reason==="steer_acceptance_unknown"||job.steer_state==="dispatching"||source.task_objective_sha256!==objectiveDigest(task.objective))return false;
+   const queuedSteer=job.steer_event_id&&this.sql.prepare("SELECT 1 FROM job_queued_steer_receipts WHERE job_id=? AND source_event_id=?").get(job.job_id,job.steer_event_id);
+   const operation=job.steer_event_id&&job.steer_state==="accepted"&&!queuedSteer?`steer:${job.steer_event_id}`:`attempt:${job.job_id}`;
+   if(source.runtime_operation_key!==operation)return false;
    const binding=this.dispatcher.getJobRuntimeBinding(job.job_id,source.generation);if(!binding||binding.thread_id!==source.thread_id||binding.agent_name!==source.agent)return false;
   }else if(source.agent!==this.config.main_agent||!["dispatching","waiting_agent","completed"].includes(event.status))return false;
   return true;
@@ -31,7 +38,7 @@ export class LocalExternalApprovalIngress {
   const job=row.attempt_id?this.dispatcher.getJob(row.attempt_id):undefined,eventId=row.role==="worker"?job?.source_event_id:row.source_event_id;
   const event=eventId?this.dispatcher.get(eventId):undefined;if(!event||event.source!=="slack"||row.role==="worker"&&!job)throw Error("external_approval_source_unavailable");
   const subject=JSON.parse(event.subject_json),target=event.reply_target_json?JSON.parse(event.reply_target_json):{};
-  const source:ExternalApprovalSource={kind:"slack",instance_id:this.config.instance_id,owner_id:this.config.owner_id,requester_id:subject.actor_id,source_event_id:event.event_id,source_job_id:job?.job_id??null,runtime_request_id:row.request_id,agent:row.agent,generation:row.generation,thread_id:row.thread_id,turn_id:row.turn_id,workspace_id:subject.workspace_id,channel_id:target.channel_id,thread_ts:target.thread_ts};
+  const source:ExternalApprovalSource={kind:"slack",instance_id:this.config.instance_id,owner_id:this.config.owner_id,requester_id:subject.actor_id,source_event_id:event.event_id,source_job_id:job?.job_id??null,runtime_operation_key:row.operation_key??null,task_objective_sha256:job?objectiveDigest(this.dispatcher.tasks.forAttempt(job.job_id)?.objective??""):null,runtime_request_id:row.request_id,agent:row.agent,generation:row.generation,thread_id:row.thread_id,turn_id:row.turn_id,workspace_id:subject.workspace_id,channel_id:target.channel_id,thread_ts:target.thread_ts};
   if(!this.durable(source))throw Error("external_approval_source_unavailable");return source;
  }
  private hold(source:ExternalApprovalSource,requestId:string){if(!source.source_job_id)return;
@@ -50,7 +57,7 @@ export class LocalExternalApprovalIngress {
     this.sql.prepare("UPDATE task_external_approval_checkpoints SET state=? WHERE attempt_id=? AND runtime_request_id=?").run(state,source.source_job_id,source.runtime_request_id);
     const other=this.sql.prepare("SELECT 1 FROM task_external_approval_checkpoints WHERE attempt_id=? AND state='pending' LIMIT 1").get(source.source_job_id);
     const task=this.dispatcher.tasks.forAttempt(source.source_job_id);
-    if(!other&&task?.current_attempt_id===source.source_job_id&&task.desired_state==="running"&&task.stop_state==="none"){
+    if(!other&&task?.current_attempt_id===source.source_job_id&&this.durable(source)){
      this.sql.prepare("UPDATE jobs SET status='running',last_error_code=NULL,last_error_message=NULL WHERE job_id=? AND last_error_code='runtime_external_approval_pending'").run(source.source_job_id);
      this.sql.prepare("UPDATE tasks SET state='active',wait_reason=NULL,next_check_at=NULL,revision=revision+1 WHERE task_id=? AND wait_reason='external_approval'").run(task.task_id);
     }
@@ -69,7 +76,7 @@ export class LocalExternalApprovalIngress {
    for(const row of pending){if(performance.now()>=deadline)break;this.live.delete(row.request_id);try{const source=this.source(row),agent=await this.runtime.status(row.agent);if(!agent||agent.generation!==row.generation||agent.thread_id!==row.thread_id)throw Error("external_approval_source_unavailable");this.live.set(row.request_id,{source,until:Date.now()+30000});}catch{this.pendingCursor=row.request_id;await this.runtime.resolveExternal(row.agent,row.request_id,{request_id:null,state:"source_denied"}).catch(()=>{});}}
    // mainへpending handleを返した後も、元のDona世代とsaved sourceを照合する。
    for(const row of rows){if(performance.now()>=deadline)break;this.rowCursor=row.runtime_request_id;this.live.delete(row.runtime_request_id);const source=JSON.parse(row.source_json) as ExternalApprovalSource;
-    const record=await this.runtime.externalRequest(source.runtime_request_id),agent=await this.runtime.status(source.agent);if(!record||record.state==="expired"||record.agent!==source.agent||record.generation!==source.generation||record.thread_id!==source.thread_id||record.turn_id!==source.turn_id||!agent||agent.generation!==source.generation||agent.thread_id!==source.thread_id||!this.durable(source)){
+    const record=await this.runtime.externalRequest(source.runtime_request_id),agent=await this.runtime.status(source.agent);if(!record||record.state==="expired"||record.agent!==source.agent||record.generation!==source.generation||record.thread_id!==source.thread_id||record.turn_id!==source.turn_id||(source.source_job_id&&(record.operation_key??null)!==source.runtime_operation_key)||!agent||agent.generation!==source.generation||agent.thread_id!==source.thread_id||!this.durable(source)){
      this.live.delete(source.runtime_request_id);
      const lost=row.request_id?this.service.sourceUnavailable(source,row.request_id):null;
      this.sql.transaction(()=>{this.sql.prepare("UPDATE local_external_ingress SET state='source_lost' WHERE runtime_request_id=?").run(row.runtime_request_id);this.sql.prepare("UPDATE task_external_approval_checkpoints SET state='needs_review' WHERE runtime_request_id=? AND state='pending'").run(row.runtime_request_id);}).immediate();if(row.request_id&&!source.source_job_id)this.finish(source,row.request_id,lost?.execution?.state??lost?.state??"needs_review");this.wake();continue;

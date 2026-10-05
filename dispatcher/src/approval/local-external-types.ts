@@ -11,6 +11,8 @@ export const externalStepUpSchema=externalAuthoritySchema.extend({receipt_id:id,
  presentation_digest:z.string().regex(/^[a-f0-9]{64}$/),expires_at:z.iso.datetime()}).strict();
 export type ExternalApprovalStepUp=z.infer<typeof externalStepUpSchema>;
 export const externalSourceSchema=z.strictObject({kind:z.literal("slack"),instance_id:id,owner_id:id,requester_id:z.string().regex(/^[UW][A-Z0-9]+$/),
+ runtime_operation_key:z.string().max(256).nullable().optional(),
+ task_objective_sha256:z.string().regex(/^[a-f0-9]{64}$/).nullable().optional(),
  source_event_id:id,source_job_id:id.nullable(),runtime_request_id:id,agent:id,generation:z.string().max(128),thread_id:z.string().max(128),turn_id:z.string().max(128),
  workspace_id:id,channel_id:id,thread_ts:z.string().regex(/^\d{10}\.\d{6}$/)});
 export type ExternalApprovalSource=z.infer<typeof externalSourceSchema>;
