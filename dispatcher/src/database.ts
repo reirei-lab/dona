@@ -1629,10 +1629,10 @@ export class DispatcherDatabase {
   }
 
   hasWorkerApprovalReply(jobId:string,questionId:string,eventId:string,accepted?:boolean):boolean {
-    if(this.hasLocalDashboardJobOwner(jobId)){
+    if(this.get(eventId)?.source==="web"){
       const event=this.get(eventId);if(!event||event.source!=="web"||event.event_type!=="worker_question_reply")return false;
       const payload=JSON.parse(event.payload_json);
-      try{this.tasks.assertOwner(payload.task_id,eventId,true);}catch{return false;}
+      try{this.assertTaskApprovalOwner(payload.task_id,eventId);}catch{return false;}
       return typeof accepted==="boolean"&&this.localDashboard.matchesRecordedReply(eventId,jobId,questionId,"approval",accepted);
     }
     // Dispatcherの永続sequenceを使い、Slack/host間の時計差を認可に用いない。
@@ -1693,6 +1693,20 @@ export class DispatcherDatabase {
   }
   enqueueLocalDashboardQuestionReply(authority:LocalDashboardAuthority,input:LocalDashboardQuestionReply) {
     return this.localDashboard.reply(authority,input);
+  }
+  getDashboardNativeApprovalTask(authority:LocalDashboardAuthority,taskId:string) {
+    const result=this.localDashboard.nativeApprovalTask(authority,taskId);
+    return {...result,session_identity:this.getJobLiveSessionIdentity(result.row.job_id)?.herdr_agent_session_id??null};
+  }
+  /** operatorの承認receiptは元Task ownerを変更せず、この要求だけに権限を与える。 */
+  assertTaskApprovalOwner(taskId:string,eventId:string,sameThread=false) {
+    const event=this.get(eventId);
+    if(event?.source==="web"&&event.event_type==="worker_question_reply") {
+      const payload=JSON.parse(event.payload_json),task=this.tasks.get(taskId);
+      if(task&&payload.task_id===taskId&&task.current_attempt_id===payload.attempt_id&&payload.request_kind==="approval"&&
+        this.localDashboard.matchesRecordedReply(eventId,task.current_attempt_id,payload.question_id,"approval",payload.accepted))return task;
+    }
+    return this.tasks.assertOwner(taskId,eventId,sameThread);
   }
   getLocalDashboardTask(authority:LocalDashboardAuthority,taskId:string) {
     const result=this.localDashboard.task(authority,taskId);

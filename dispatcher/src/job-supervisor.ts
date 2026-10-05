@@ -225,19 +225,20 @@ export class JobSupervisor {
     } catch {this.logger.warn("Worker question reconciliation deferred",{error_code:"runtime_questions_unavailable"});}
   }
   async taskQuestions(id:string,eventId:string):Promise<unknown> {
-    const task=this.database.tasks.assertOwner(id,eventId),job=this.database.getJob(task.current_attempt_id)!;
+    const task=this.database.assertTaskApprovalOwner(id,eventId),job=this.database.getJob(task.current_attempt_id)!;
     if(!this.runtime.questions)throw Error("task_questions_unavailable");
     const questions=await this.runtime.questions(job.agent_name,true);
-    const fresh=this.database.tasks.assertOwner(id,eventId);
+    const fresh=this.database.assertTaskApprovalOwner(id,eventId);
     if(fresh.current_attempt_id!==job.job_id)throw Error("task_revision_conflict");
-    return {task_id:id,revision:fresh.revision,questions:questions.filter(q=>JSON.stringify([q.generation,q.thread_id])===this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id).map(q=>({question_id:q.question_id,kind:q.kind,state:q.state,request:JSON.parse(q.payload_json)}))};
+    const source=this.database.get(eventId)!,operatorApproval=source.source==="web"&&source.event_type==="worker_question_reply"&&JSON.parse(source.payload_json).request_kind==="approval"?JSON.parse(source.payload_json).question_id:undefined;
+    return {task_id:id,revision:fresh.revision,questions:questions.filter(q=>(!operatorApproval||(q.kind==="approval"&&q.question_id===operatorApproval))&&JSON.stringify([q.generation,q.thread_id])===this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id).map(q=>({question_id:q.question_id,kind:q.kind,state:q.state,request:JSON.parse(q.payload_json)}))};
   }
   async approveTaskRequest(id:string,eventId:string,revision:number,questionId:string,accepted:boolean):Promise<unknown> {
-    const initial=this.database.tasks.assertOwner(id,eventId,true);
+    const initial=this.database.assertTaskApprovalOwner(id,eventId,true);
     return this.serialized(initial.current_attempt_id,async()=>{
       if(!this.runtime.questions||!this.runtime.approveRequest)throw Error("task_approval_unavailable");
       const job=this.database.getJob(initial.current_attempt_id)!,request=(await this.runtime.questions(job.agent_name,true)).find(q=>q.question_id===questionId);
-      const task=this.database.tasks.assertOwner(id,eventId,true);
+      const task=this.database.assertTaskApprovalOwner(id,eventId,true);
       if(!request||request.kind!=="approval"||JSON.stringify([request.generation,request.thread_id])!==this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id||task.current_attempt_id!==job.job_id)throw Error("task_approval_not_current");
       if(!this.database.hasWorkerApprovalReply(job.job_id,questionId,eventId,accepted))throw Error("task_approval_requires_user_reply");
       if(request.answer_hash===createHash("sha256").update(stableStringify({accepted})).digest("hex")&&["answering","resolved"].includes(request.state))return {task_id:id,question_id:questionId,state:request.state};

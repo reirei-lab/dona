@@ -39,6 +39,14 @@ export class LocalDashboardCommands {
     if(!task)throw Error("local_dashboard_owner_mismatch");
     this.assertOwner(authority,task.current_attempt_id);return {task,row:this.dispatcher.getJob(task.current_attempt_id)!};
   }
+  nativeApprovalTask(authority:LocalDashboardAuthority,taskId:string) {
+    authoritySchema.parse(authority);const task=this.dispatcher.tasks.get(taskId);
+    if(!task)throw Error("task_approval_not_current");
+    const row=this.dispatcher.getJob(task.current_attempt_id)!,binding=readEventJobBinding(this.sql,row.source_event_id);
+    if(!binding||!["slack_thread","local_dashboard"].includes(binding.owner.kind))throw Error("task_approval_not_current");
+    this.dispatcher.assertJobSourceMatchesThread(row.job_id,row.source_event_id);
+    return {task,row};
+  }
   isLocalJob(jobId:string):boolean {
     const job=this.dispatcher.getJob(jobId);if(job?.source!=="web")return false;
     const binding=readEventJobBinding(this.sql,job.source_event_id);
@@ -53,7 +61,8 @@ export class LocalDashboardCommands {
     if(event?.source!=="web"||event.event_type!=="worker_question_reply")return false;
     const payload=JSON.parse(event.payload_json);
     const receipt=this.sql.prepare("SELECT * FROM local_dashboard_command_receipts WHERE event_id=? AND operation=? AND attempt_id=?").get(eventId,kind==="approval"?"native_approval":"question_reply",jobId) as LocalDashboardReceipt|undefined;
-    if(!receipt||payload.task_id!==receipt.task_id||payload.attempt_id!==jobId||payload.question_id!==questionId||payload.request_kind!==kind)return false;
+    const binding=readEventJobBinding(this.sql,eventId);
+    if(!receipt||binding?.owner.kind!=="local_dashboard"||binding.owner.instance_id!==receipt.instance_id||binding.owner.owner_id!==receipt.owner_id||payload.task_id!==receipt.task_id||payload.attempt_id!==jobId||payload.question_id!==questionId||payload.request_kind!==kind)return false;
     return receipt.canonical_sha256===digest({task_id:receipt.task_id,attempt_id:jobId,revision:receipt.task_revision,question_id:questionId,kind,...(kind==="approval"?{accepted:response}:{answers:response})});
   }
   private assertOwner(authority:LocalDashboardAuthority,attemptId:string):void {
@@ -101,18 +110,19 @@ export class LocalDashboardCommands {
     const operation=input.kind==="approval"?"native_approval" as const:"question_reply" as const;
     const canonical=digest({task_id:input.task_id,attempt_id:input.attempt_id,revision:input.revision,question_id:input.question_id,kind:input.kind,...response});
     return this.sql.transaction(()=>{
-      this.assertOwner(authority,input.attempt_id);
+      if(input.kind!=="approval")this.assertOwner(authority,input.attempt_id);
       const prior=this.replay(authority,input.request_id,operation,canonical);if(prior)return prior;
+      if(input.kind==="approval"&&this.nativeApprovalTask(authority,input.task_id).row.job_id!==input.attempt_id)throw Error("task_approval_not_current");
       const task=this.dispatcher.tasks.get(input.task_id);
       if(!task||task.current_attempt_id!==input.attempt_id||task.revision!==input.revision||task.desired_state!=="running"||task.stop_state!=="none"||!["active","waiting"].includes(task.state))throw Error("task_question_not_current");
-      const notification=this.sql.prepare(`SELECT event_id FROM events WHERE source='web' AND event_type='worker_question'
+      const notification=this.sql.prepare(`SELECT event_id FROM events WHERE source IN ('web','dona_job') AND event_type='worker_question'
         AND external_event_id=? AND json_extract(subject_json,'$.job_id')=? AND json_extract(payload_json,'$.task_id')=?
         AND json_extract(payload_json,'$.request_kind')=?`).get(`question:${input.question_id}`,input.attempt_id,input.task_id,input.kind) as {event_id:string}|undefined;
       if(!notification)throw Error("task_question_not_current");
       // 1つのnative requestに相反する利用者回答をqueueしない。再送は上のreceiptで照合する。
       if(this.sql.prepare(`SELECT 1 FROM events WHERE source='web' AND event_type='worker_question_reply'
         AND json_extract(subject_json,'$.job_id')=? AND json_extract(payload_json,'$.question_id')=?`).get(input.attempt_id,input.question_id))throw Error("local_dashboard_question_already_answered");
-      const binding=readEventJobBinding(this.sql,notification.event_id)!;
+      const binding={owner:{kind:"local_dashboard" as const,instance_id:authority.instance_id,owner_id:authority.owner_id},destination:{kind:"none" as const}};
       const event=this.dispatcher.enqueue({schema_version:1,source:"web",type:"worker_question_reply",external_event_id:`local-reply:${key}`,occurred_at:new Date().toISOString(),
         subject:{instance_id:authority.instance_id,owner_id:authority.owner_id,job_id:input.attempt_id,source_event_id:task.source_event_id},
         payload:{task_id:task.task_id,attempt_id:input.attempt_id,revision:input.revision,question_id:input.question_id,request_kind:input.kind,...response},reply_target:null});
