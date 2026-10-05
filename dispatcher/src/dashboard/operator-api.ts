@@ -11,6 +11,7 @@ import { operatorExternalRequest } from "./operator-external.js";
 export interface OperatorApiContext extends OperatorCommandPaths {
   readQuestions(agent:string):Promise<QuestionRecord[]>;
   wake():void;
+  health?():Promise<unknown>;
   external?:LocalExternalApprovalService;
 }
 
@@ -39,6 +40,7 @@ export async function operatorRequest(database:DispatcherDatabase, route:string,
     return operatorQuestions(database,input,agent=>context.readQuestions(agent));
   }
   switch(route) {
+    case "admin/health": z.strictObject({}).parse(input); if(!context?.health)throw new OperatorAuthError("denied");return context.health();
     case "admin/reset": database.configureOperatorOrigin(z.strictObject({origin:z.string().max(2048)}).parse(input).origin); return {ok:true};
     case "admin/status": z.strictObject({}).parse(input); return auth.status();
     case "admin/pair": return auth.issueCode(z.strictObject({capabilities:z.unknown()}).parse(input).capabilities);

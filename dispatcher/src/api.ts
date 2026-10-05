@@ -149,6 +149,8 @@ export interface ApiJobProgressResolver {
 
 export class DispatcherApi {
   private externalApproval:LocalExternalApprovalService|undefined;
+  private externalHealth:()=>{configured:boolean;ready:boolean;reason?:string}=()=>({configured:false,ready:false,reason:"setup_required"});
+  setExternalHealth(check:()=>{configured:boolean;ready:boolean;reason?:string}):void {this.externalHealth=check;}
   setExternalApproval(service:LocalExternalApprovalService|undefined):void {this.externalApproval=service;}
   private server: http.Server | undefined;
   private shuttingDown = false;
@@ -250,6 +252,13 @@ export class DispatcherApi {
           jobsWorkspaceRoot:this.config.jobsWorkspaceRoot,jobResultsDir:this.config.jobResultsDir,
           readQuestions:agent=>new RuntimeClient(runtimeSocket(this.config),5000).questions(agent),
           wake:()=>{this.jobs.wake();this.worker.wake();},
+          health:async()=>{
+            let database:"ready"|"unavailable"="ready",runtime:"ready"|"unavailable"="ready";
+            try{this.database.operatorAuth.status();}catch{database="unavailable";}
+            try{await new RuntimeClient(runtimeSocket(this.config),3000).list();}catch{runtime="unavailable";}
+            let external;try{external=this.externalHealth();}catch{external={configured:true,ready:false,reason:"protected_state_unverified"};}
+            return {database,runtime,operator:database,external};
+          },
           ...(this.externalApproval?{external:this.externalApproval}:{}),
         });
         sendJson(response,200,result);return;
