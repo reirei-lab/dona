@@ -751,6 +751,9 @@ export function migrateDispatcherDatabase(
     const webProjectionInstalled = db.prepare(`
       SELECT 1 FROM sqlite_master WHERE type='table' AND name='web_job_projection_events'
     `).get() !== undefined;
+    // The jobs rebuild temporarily removes the table referenced by this Task trigger.
+    // Restore it with the other Web projection triggers inside the same migration transaction.
+    if(webProjectionInstalled)db.exec("DROP TRIGGER IF EXISTS web_task_projection_update");
     const hasLegacyStopMarkers = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_job_agents_to_stop'").get() !== undefined;
     db.exec("CREATE TEMP TABLE legacy_job_stop_markers_v3(job_id TEXT PRIMARY KEY, stopped_at TEXT)");
     if (hasLegacyStopMarkers) db.exec("INSERT INTO legacy_job_stop_markers_v3 SELECT job_id, stopped_at FROM legacy_job_agents_to_stop");
