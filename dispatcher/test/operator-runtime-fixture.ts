@@ -17,7 +17,7 @@ import {tempConfig} from './helpers.js';
 const logger={debug(){},info(){},warn(){},error(){}};
 async function freePort(){const s=net.createServer();await new Promise<void>(r=>s.listen(0,'127.0.0.1',r));const port=(s.address() as net.AddressInfo).port;await new Promise<void>(r=>s.close(()=>r()));return port;}
 /** Codexだけを独立JSON-RPC processへ置換。DBとruntimeのmethod/stateは実装を通す。 */
-export async function operatorRuntimeFixture(origin:string,page:{status:number;headers:Record<string,string>;body:string}){
+export async function operatorRuntimeFixture(origin:string,page:{status:number;headers:Record<string,string>;body:string},options:{socketPermissionDelayMs?:number}={}){
  if(process.env.DONA_APP_SERVER_SOCKET)throw Error('fixture_requires_unset_runtime_socket');
  const temporary=await tempConfig(),root=await fs.realpath(temporary.root),config=temporary.config;
  const cleanups:Array<()=>Promise<void>>=[()=>fs.rm(root,{recursive:true,force:true})];
@@ -27,6 +27,8 @@ export async function operatorRuntimeFixture(origin:string,page:{status:number;h
  const finish=path.join(root,'finish'),calls=path.join(root,'rpc-calls'),script=path.join(root,'codex-fixture.mjs');config.codexPath=script;
  await fs.writeFile(script,`#!${process.execPath}
 import fs from 'node:fs';import path from 'node:path';import http from 'node:http';import {WebSocketServer} from ${JSON.stringify(new URL('../node_modules/ws/wrapper.mjs',import.meta.url).href)};
+// Publish the Unix socket owner-only at bind time; chmod in the listen callback is too late.
+process.umask(0o077);
 if(process.argv.includes('mcp')){process.stdout.write('[]');process.exit(0);}
 const root=${JSON.stringify(root)},finish=${JSON.stringify(finish)},calls=${JSON.stringify(calls)},thread='thread_'+process.pid;let turn=0,items=[],working=false;
 const atomic=(file,value)=>{fs.mkdirSync(path.dirname(file),{recursive:true});if(!path.join(fs.realpathSync(path.dirname(file)),path.basename(file)).startsWith(root+path.sep))throw Error('outside_fixture');if(fs.existsSync(file))throw Error('result_exists');fs.writeFileSync(file+'.tmp',JSON.stringify(value),{mode:0o600});fs.renameSync(file+'.tmp',file);};
@@ -44,7 +46,7 @@ ws.on('connection',client=>client.on('message',raw=>{const r=JSON.parse(raw),sen
    const timer=setInterval(()=>{if(!fs.existsSync(finish))return;clearInterval(timer);atomic(j.result_path,{schema_version:1,job_id:j.job_id,status:'completed',summary:'隔離ワーカーが完了しました',output:{format:'markdown',text:'保存された最終成果'},artifacts:[],actions:[],completed_at:new Date().toISOString()});items=[{id:'result',type:'agentMessage',text:'隔離ワーカーが完了しました'}];send({method:'item/completed',params:{threadId:thread,turnId,item:items[0]}});done();},20);
   }else{const id=text.match(/event_id: ([^\\n]+)/)?.[1],file=text.match(/result_path: ([^\\n]+)/)?.[1];if(id&&file)atomic(file,{schema_version:1,event_id:id,status:'completed',summary:'隔離通知を処理しました',actions:[],memory_candidates:[],completed_at:new Date().toISOString()});done();}
  }
-}));server.listen(socket,()=>fs.chmodSync(socket,0o600));
+}));server.listen(socket,()=>{fs.appendFileSync(calls,JSON.stringify({method:'fixture/socketPublished',pid:process.pid,mode:fs.statSync(socket).mode&0o777})+'\\n');const secure=()=>fs.chmodSync(socket,0o600);const delay=${JSON.stringify(options.socketPermissionDelayMs??0)};if(delay)setTimeout(secure,delay);else secure();});
 `,{mode:0o700});
  const host=await serveRuntime({socket:runtimeSocket(config),database:path.join(root,'runtime.db'),codex:script,buildSha:'fixture'}),client=new RuntimeClient(runtimeSocket(config));
  cleanups.push(async()=>{for(const agent of await client.list())if(agent.state!=='stopped')await client.stop(agent.name,agent.generation);host.closeAllConnections();await new Promise<void>(r=>host.close(()=>r()));});
@@ -59,6 +61,6 @@ ws.on('connection',client=>client.on('message',raw=>{const r=JSON.parse(raw),sen
  const port=await freePort(),control=path.join(root,'b.sock'),backend=new DashboardOperatorClient(config.socketPath);
  const observer=new DashboardObserver(reader,{conversations:after=>client.conversations(after),conversationHistory:(name,after)=>client.conversationHistory(name,after),conversation:(name,generation,after)=>client.conversation(name,generation,after)});
  const bff=new DashboardServer({backend,origin,port,controlSocket:control,version:'fixture',reader,observer,page});await bff.start();cleanups.push(()=>bff.close());
- return {db,config,port,client,worker,supervisor,async pairCode(){const v=await backend.call<{code:string}>('admin/pair',{capabilities:['tasks:read','conversations:worker:read','conversations:main:read','tasks:submit','tasks:cancel']});return v.code;},async finish(){await fs.writeFile(finish,'finish');},async calls(){return (await fs.readFile(calls,'utf8')).trim().split('\n').map(v=>JSON.parse(v) as {method:string;pid:number});},close:cleanup};
+ return {db,config,port,client,worker,supervisor,async pairCode(){const v=await backend.call<{code:string}>('admin/pair',{capabilities:['tasks:read','conversations:worker:read','conversations:main:read','tasks:submit','tasks:cancel']});return v.code;},async finish(){await fs.writeFile(finish,'finish');},async calls(){return (await fs.readFile(calls,'utf8')).trim().split('\n').map(v=>JSON.parse(v) as {method:string;pid:number;mode?:number});},close:cleanup};
  }catch(error){await cleanup();throw error;}
 }

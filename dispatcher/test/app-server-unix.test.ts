@@ -55,6 +55,7 @@ test("固定Codex 0.160.0でUnix WebSocketのinitialize・履歴・通知を隔�
 });
 
 const fakeUnix=`import http from 'node:http';import fs from 'node:fs';import {WebSocketServer} from ${JSON.stringify(new URL('../node_modules/ws/wrapper.mjs',import.meta.url).href)};
+process.umask(0o077);
 const socket=process.argv[process.argv.indexOf('--listen')+1].slice(7);const server=http.createServer();const ws=new WebSocketServer({server});
 ws.on('connection',client=>client.on('message',bytes=>{const r=JSON.parse(bytes);fs.appendFileSync('calls',r.method+'\\n');const send=value=>client.send(JSON.stringify(value));
  if(r.method==='initialize')send({id:r.id,result:{}});
