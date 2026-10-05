@@ -251,8 +251,10 @@ async function externalRefresh() {
   if(!box.childNodes.length)box.append(node('p','外部操作の承認要求はありません。'));byId('external-items').replaceChildren(box);
   if(focused)Array.from(byId('external-items').querySelectorAll('button')).find(b=>b.dataset.external===focused)?.focus({preventScroll:true});
   externalNext=value.next;byId('external-next').disabled=!externalNext;byId('external-reconcile').hidden=!externalPending;
-  if(externalSelected){await externalRead(false);if(externalView&&externalTracked===externalSelected)await externalStatus(externalTracked);}
+  if(externalSelected){if(externalTracked===externalSelected||externalPending===externalSelected)await externalStatus(externalSelected);else await externalRead(false);}
 }
+function localExpiry(value) {const date=new Date(value);if(!Number.isFinite(date.getTime()))return '日時未確認';try{return new Intl.DateTimeFormat(undefined,{year:'numeric',month:'long',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',timeZoneName:'long'}).format(date);}catch{return '日時を表示できません';}}
+function targetName(name,id) {return typeof name==='string'&&name.length>0&&name.length<=256?name+'（'+id+'）':id;}
 function validPresentation(value,id) {
   return value&&value.request_id===id&&value.operation==='slack.post_thread_reply.v1'&&typeof value.exact_draft==='string'&&new TextEncoder().encode(value.exact_draft).length<=65536
     &&['workspace_id','channel_id','thread_ts','expires_at','presentation_digest'].every(key=>typeof value[key]==='string'&&value[key].length<=256)
@@ -267,7 +269,7 @@ async function externalRead(render) {
     if(!validPresentation(value,id))throw Error();
     if(!render){if(!externalView||!samePresentation(externalView,value))disableExternal('表示後に承認内容またはrevisionが変わりました。一覧から選び直して確認してください。');else if(Date.parse(value.expires_at)<=Date.now())disableExternal('この承認要求は期限切れです。');return;}
     externalView=value;const box=document.createDocumentFragment();box.append(node('h3','Donaの外部操作: Slackスレッドへの返信'),node('p','承認すると以下の内容を指定先へ送信できます。許可と送信成功は別の状態です。','notice'));
-    box.append(node('p','Workspace: '+value.workspace_id),node('p','Channel: '+value.channel_id),node('p','Thread: '+value.thread_ts),node('p','通知するユーザー: '+(value.notified_user_ids.join(', ')||'なし')),node('p','有効期限: '+value.expires_at),node('h4','送信する本文（そのまま）'),node('pre',value.exact_draft));
+    box.append(node('p','ワークスペース: '+targetName(value.workspace_name,value.workspace_id)),node('p','チャンネル: '+targetName(value.channel_name,value.channel_id)),node('p','スレッド: '+value.thread_ts),node('p','通知するユーザー: '+(value.notified_user_ids.join(', ')||'なし')),node('p','有効期限: '+localExpiry(value.expires_at)),node('h4','送信する本文（そのまま）'),node('pre',value.exact_draft));
     for(const [decision,title] of [['approve','この外部操作を許可'],['reject','この外部操作を拒否']]){const button=node('button',title);button.type='button';button.disabled=!!externalPending||!credentialReady||Date.parse(value.expires_at)<=Date.now();button.addEventListener('click',()=>void externalDecide(decision));box.append(button);}
     if(!credentialReady)box.append(node('p','先にこの端末の承認用パスキーを登録してください。','notice'));
     byId('external-detail').replaceChildren(box);byId('external-status').textContent=externalPending?'判断結果の照合が必要です。自動で再送しません。':'';
@@ -295,6 +297,7 @@ async function externalDecide(decision) {
     const credential=await navigator.credentials.get({publicKey});if(epoch!==authEpoch||selection!==externalEpoch||!credential)return;
     const response=typeof credential.toJSON==='function'?credential.toJSON():{id:credential.id,rawId:toBase64(credential.rawId),type:credential.type,clientExtensionResults:credential.getClientExtensionResults(),response:{clientDataJSON:toBase64(credential.response.clientDataJSON),authenticatorData:toBase64(credential.response.authenticatorData),signature:toBase64(credential.response.signature),userHandle:credential.response.userHandle?toBase64(credential.response.userHandle):null}};
     sent=true;const result=await credentialPost('/api/approvals/decide',{ceremony_id:ceremony.ceremony_id,response});if(epoch!==authEpoch)return;
+    if(['decided','reused'].includes(result.status))externalTracked=id;
     byId('external-status').textContent=['decided','reused'].includes(result.status)?'判断を受け付けました。外部操作の実行成功はまだ確認していません。':'判断の受理を確認できません。';await externalStatus();
   }catch(error){if(epoch!==authEpoch)return;if(!sent&&error.name==='NotAllowedError'){externalSavePending(null);byId('external-status').textContent='パスキー確認が取り消されたため、判断は送信していません。';}else await externalStatus();}
 }
