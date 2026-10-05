@@ -24,6 +24,22 @@ control socketの親とlog directoryはowner所有・mode `0700`、socket path�
 
 Tailscale Serve等のreverse proxy側は、設定したexact HTTPS originからこのloopback portだけへ転送する。proxyはHostを設定originへ一致させる必要がある。HTTP直アクセスや任意Hostは利用対象外。forwarded user/headerを認証には使わない。Tailnet ACLで閲覧対象端末を限定し、インターネット公開・Funnelは使わない。proxy設定の変更・実ネットワーク接続は別途その環境で検証する。
 
+## Tailscaleの設定手順
+
+1. Macと閲覧端末の両方でTailscaleにログインする。未導入なら[Tailscale公式のインストール手順](https://tailscale.com/download)を使う。
+2. Macの `tailscale status` で接続状態と名前を確認し、`tailscale serve status` で既存の公開先を確認する。すでに同じHTTPS port/pathが使われている場合は上書きせず、空いているportを選んで設定の `origin` にもそのportを含める。
+3. observerを起動・status確認後、未使用のHTTPS portに転送を設定する。以下は443が未使用でbackendが4318の場合の例。環境の既存設定を確認してから実行する。
+
+   ```sh
+   tailscale serve --bg --https=443 http://127.0.0.1:4318
+   tailscale serve status
+   ```
+
+4. 表示されたHTTPS URLと設定の `origin` を完全一致させる。HTTPSが未有効ならCLIが案内するtailnetの設定画面で有効にする。FunnelではなくServeを使う。
+5. 閲覧端末からそのURLを開き、次のペアリング手順で登録する。未登録端末ではTaskが表示されないこと、登録後にTaskを取得できることを確認する。
+
+macOSアプリ版で `tailscale` がPATHにない場合は `/Applications/Tailscale.app/Contents/MacOS/Tailscale` を使用できる。上記のServe設定は既存Dona installerが自動変更するものではない。[Serveの公式手順](https://tailscale.com/docs/features/tailscale-serve)、[CLI reference](https://tailscale.com/docs/reference/tailscale-cli/serve)
+
 ## 端末の接続と解除
 
 Macのterminalで `node <release>/dispatcher/dist/dashboard/cli.js pair <config.json>` を実行する。5分で失効する一回限りコードを、設定originへアクセスした端末の接続フォームに入力する。新コード発行は前コードを無効化する。コードはURL、設定、ログへ保存しない。CLIは非TTYへのcode出力を拒否する。
