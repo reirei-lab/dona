@@ -108,9 +108,21 @@ export class AppServerManager {
     const sample=this.processSample();
     return {items:rows.slice(0,100).map(row=>this.observationIdentity(row,sample)),next:rows.length>100?rows[99]!.name:null};
   }
+  conversationHistory(name:string,afterGeneration="") {
+    if(name.length>160||afterGeneration.length>160)throw Error("runtime_conversation_cursor_invalid");
+    return this.store.conversationHistory(name,afterGeneration);
+  }
   async conversation(name:string,generation:string,afterSequence?:number):Promise<ConversationSnapshot> {
     if(afterSequence!==undefined&&(!Number.isSafeInteger(afterSequence)||afterSequence<0))throw Error("runtime_conversation_cursor_invalid");
-    const row=this.store.agent(name);if(!row||row.generation!==generation)throw Error("runtime_conversation_not_current");
+    const row=this.store.agent(name);
+    if(!row||row.generation!==generation){
+      const archived=this.store.archivedConversation(name,generation);if(!archived)throw Error("runtime_conversation_not_current");
+      // 過去generationはDonaが観測済みの投影だけ。現workerや個人Codexへ接続しない。
+      this.store.expireObservations();
+      return {name:archived.name,generation:archived.generation,role:archived.role,thread_id:archived.thread_id,
+        attempt_id:archived.attempt_id,state:"unknown",connected:false,archived:true,observed_at:new Date().toISOString(),
+        ...this.store.observations(name,generation,afterSequence),items:this.store.cachedItems(name,generation),gap:true,truncated:true};
+    }
     // watermarkを履歴要求前に固定する。履歴と通知の重なりはあり得るが、要求中の通知を飛ばさない。
     const observations=this.store.observations(name,generation,afterSequence),rpc=this.connections.get(name);
     let history:{items:ConversationSnapshot["items"];truncated:boolean}={items:this.store.cachedItems(name,generation),truncated:true},gap=observations.gap;

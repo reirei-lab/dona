@@ -102,6 +102,8 @@ test("runtime host再起動後も同じworkerへ接続し内部read APIを提供
  try{
   agent=await client.start({name:"worker",role:"worker",attemptId:"job-host",cwd:root,release:root,args:[],threadConfig:{}});
   assert.equal((await client.conversations()).items[0]?.attempt_id,"job-host");
+  assert.equal((await client.conversationHistory(agent.name)).items[0]?.generation,agent.generation);
+  assert.deepEqual((await client.conversationHistory("unregistered")).items,[]);
   assert.equal((await client.conversation(agent.name,agent.generation)).items[0]?.text,"進捗");
   await new Promise<void>((r,j)=>host.close(e=>e?j(e):r()));host=await serveRuntime(config);
   let snapshot=await client.conversation(agent.name,agent.generation);
