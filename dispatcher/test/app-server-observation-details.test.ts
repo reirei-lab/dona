@@ -161,3 +161,24 @@ test("既知CLIの認証optionはshort/cluster/long/JSON形式を保守的に省
  }
  for(const command of ["npm test","git diff --stat","curl -sS https://example.com","curl -XGET https://example.com","mysql --version","redis-cli -p 6379 PING"])assert.equal(sanitizeObservationText(command),command);
 });
+
+test("Kubernetes client-key-dataとclient-keyはcredential assignmentとして省略する",()=>{
+ for(const key of ["client-key-data","client_key_data","client-key"]){for(const text of [`${key}: c2Vuc2l0aXZlLXBsYWNlaG9sZGVy`,JSON.stringify({[key]:"c2Vuc2l0aXZlLXBsYWNlaG9sZGVy"}),`${key}: | # base64\n  c2Vuc2l0aXZlLXBsYWNlaG9sZGVy`]){
+  assert.equal(sanitizeObservationText(text),"[機密情報を含む内容を省略]");assert.ok(!JSON.stringify(projectItem({id:"c",type:"commandExecution",aggregatedOutput:text},turn)).includes("c2Vuc2l0aXZl"));
+ }}
+});
+test("固定Codex imageGenerationはbegin/terminal/failureの状態だけを表示する",()=>{
+ for(const [status,failure,expected] of [["",null,"inProgress"],["completed",null,"completed"],["failed",null,"failed"],["completed",{type:"usageLimitExceeded",limitId:"private",resetsAt:123},"failed"]] as const){
+  const item=projectItem({id:"image",type:"imageGeneration",status,failure,result:"private-image-bytes",savedPath:"/private/image.png",revisedPrompt:"private prompt"},turn)!;
+  assert.deepEqual(item,{id:"image",turn_id:turn,kind:"tool_progress",tool_type:"imageGeneration",status:expected});
+  assert.ok(!JSON.stringify(sanitizeConversationItem({...item,output:"private-image-bytes",files:[{path:"/private/image.png",change:"add"}]})).includes("private"));
+ }
+});
+test("既知control itemは実metadataだけを投影しraw本文・image・thread/pathを出さない",()=>{
+ for(const type of ["sleep","contextCompaction","enteredReviewMode","exitedReviewMode","subAgentActivity","functionCallOutput"]){
+  const item=projectItem({id:"control",type,status:"completed",durationMs:25,name:"exec_command",output:"private-output",review:"private-review",agentThreadId:"private-thread",agentPath:"private-path",result:"private-image",text:"private-text"},turn)!;
+  assert.equal(item.tool_type,type);assert.equal(item.kind,"tool_progress");assert.equal(item.status,undefined);assert.ok(!JSON.stringify(item).includes("private"));
+  assert.equal(item.duration_ms,type==="sleep"?25:undefined);assert.equal(item.tool_name,type==="functionCallOutput"?"exec_command":undefined);
+ }
+ for(const type of ["plan","hookPrompt","reasoning"])assert.equal(projectItem({id:"hidden",type,text:"private",summary:["private"]},turn),undefined);
+});

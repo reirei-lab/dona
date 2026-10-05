@@ -16,7 +16,7 @@ const identifier=(x:unknown):string|undefined=>typeof x==="string"&&/^[a-zA-Z0-9
 /** 識別子全体を採り、provider prefix/version suffixを含む既知credential名を共通判定する。 */
 function credentialFields(text:string):RegExpMatchArray[] {
   return [...text.matchAll(/\b([A-Za-z_][A-Za-z0-9_-]*(?:[ ]+key)?)\b["']?\s*[:=]/gi)]
-    .filter(match=>{const key=match[1]!.replace(/[_ -]/g,"").toLowerCase();return /(?:token|password|passwd|passphrase|secret|apikey|authorization|cookie|credential|accesskey|privatekey)/.test(key)||key==="auth"||key==="rediscliauth"||key==="npmconfigauth"||key==="sshpass"||key.endsWith("pwd");});
+    .filter(match=>{const key=match[1]!.replace(/[_ -]/g,"").toLowerCase();return /(?:token|password|passwd|passphrase|secret|apikey|authorization|cookie|credential|accesskey|privatekey)/.test(key)||key==="auth"||key==="rediscliauth"||key==="npmconfigauth"||key==="clientkeydata"||key==="clientkey"||key==="sshpass"||key.endsWith("pwd");});
 }
 /** 既知CLIの認証optionを検出する表示用検査。shellとして評価せず、該当fieldを保守的に省略する。 */
 function hasCredentialCli(text:string):boolean {
@@ -79,14 +79,15 @@ export function sanitizeObservationText(value:string,limit=8192):string {
 export function sanitizeConversationItem(value:unknown):ConversationItem|undefined {
   const v=record(value),id=identifier(v.id),turn=identifier(v.turn_id);if(!id||!turn||!["user_message","assistant_message","tool_progress"].includes(String(v.kind)))return;
   const out:ConversationItem={id,turn_id:turn,kind:v.kind as ConversationItem["kind"]};
-  for(const field of ["text","tool_name","command","input","output","error"] as const)if((field==="text"?out.kind!=="tool_progress":out.kind==="tool_progress")&&typeof v[field]==="string"){
+  const metadataOnly=["imageGeneration","sleep","contextCompaction","enteredReviewMode","exitedReviewMode","subAgentActivity","functionCallOutput"].includes(String(v.tool_type));
+  for(const field of ["text","tool_name","command","input","output","error"] as const)if((field==="text"?out.kind!=="tool_progress":out.kind==="tool_progress")&&(!metadataOnly||(field==="tool_name"&&v.tool_type==="functionCallOutput"))&&typeof v[field]==="string"){
     const limit=field==="tool_name"?200:field==="input"?4096:8192;out[field]=sanitizeObservationText(v[field],limit);if(v[field].length>limit)out.truncated=true;
   }
-  if(out.kind==="tool_progress"&&["inProgress","completed","failed","declined","interrupted"].includes(String(v.status)))out.status=String(v.status);
-  if(out.kind==="tool_progress"&&["commandExecution","fileChange","mcpToolCall","dynamicToolCall","collabAgentToolCall","webSearch","imageView"].includes(String(v.tool_type)))out.tool_type=String(v.tool_type);
-  if(out.kind==="tool_progress"&&Number.isFinite(v.duration_ms)&&Number(v.duration_ms)>=0)out.duration_ms=Number(v.duration_ms);
-  if(out.kind==="tool_progress"&&Number.isSafeInteger(v.exit_code))out.exit_code=Number(v.exit_code);
-  if(out.kind==="tool_progress"&&Array.isArray(v.files)){out.files=[];if(v.files.length>20)out.truncated=true;for(const raw of v.files.slice(0,20)){const f=record(raw);if(typeof f.path!=="string"||!["add","delete","update"].includes(String(f.change)))continue;const file:ConversationFile={path:sanitizeObservationText(f.path,1024),change:f.change as ConversationFile["change"]};for(const k of ["additions","deletions"] as const)if(Number.isSafeInteger(f[k])&&Number(f[k])>=0)file[k]=Number(f[k]);out.files.push(file);}}
+  if(out.kind==="tool_progress"&&(!metadataOnly||v.tool_type==="imageGeneration")&&["inProgress","completed","failed","declined","interrupted"].includes(String(v.status)))out.status=String(v.status);
+  if(out.kind==="tool_progress"&&["commandExecution","fileChange","mcpToolCall","dynamicToolCall","collabAgentToolCall","webSearch","imageView","imageGeneration","sleep","contextCompaction","enteredReviewMode","exitedReviewMode","subAgentActivity","functionCallOutput"].includes(String(v.tool_type)))out.tool_type=String(v.tool_type);
+  if(out.kind==="tool_progress"&&(!metadataOnly||v.tool_type==="sleep")&&Number.isFinite(v.duration_ms)&&Number(v.duration_ms)>=0)out.duration_ms=Number(v.duration_ms);
+  if(out.kind==="tool_progress"&&!metadataOnly&&Number.isSafeInteger(v.exit_code))out.exit_code=Number(v.exit_code);
+  if(out.kind==="tool_progress"&&!metadataOnly&&Array.isArray(v.files)){out.files=[];if(v.files.length>20)out.truncated=true;for(const raw of v.files.slice(0,20)){const f=record(raw);if(typeof f.path!=="string"||!["add","delete","update"].includes(String(f.change)))continue;const file:ConversationFile={path:sanitizeObservationText(f.path,1024),change:f.change as ConversationFile["change"]};for(const k of ["additions","deletions"] as const)if(Number.isSafeInteger(f[k])&&Number(f[k])>=0)file[k]=Number(f[k]);out.files.push(file);}}
   if(v.truncated===true)out.truncated=true;return out;
 }
 function requestText(text:string):string|undefined {
@@ -103,9 +104,15 @@ export function projectItem(value:unknown,turnId:string):ConversationItem|undefi
     const chunks=Array.isArray(item.content)?item.content.filter(x=>record(x).type==="text").map(x=>record(x).text).filter((x):x is string=>typeof x==="string"):[];
     const summaries=chunks.map(requestText).filter((x):x is string=>x!==undefined);if(!summaries.length)return;out.kind="user_message";out.text=summaries.join("\n");
   }else if(item.type==="agentMessage"&&typeof item.text==="string"){out.kind="assistant_message";out.text=item.text;}
-  else if(["commandExecution","fileChange","mcpToolCall","dynamicToolCall","collabAgentToolCall","webSearch","imageView"].includes(String(item.type))){
-    out.tool_type=String(item.type);if(typeof item.status==="string")out.status=item.status;
+  else if(["commandExecution","fileChange","mcpToolCall","dynamicToolCall","collabAgentToolCall","webSearch","imageView","imageGeneration","sleep","contextCompaction","enteredReviewMode","exitedReviewMode","subAgentActivity","functionCallOutput"].includes(String(item.type))){
+    out.tool_type=String(item.type);if(typeof item.status==="string"&&!["sleep","contextCompaction","enteredReviewMode","exitedReviewMode","subAgentActivity","functionCallOutput"].includes(String(item.type)))out.status=item.status;
     if(typeof item.durationMs==="number")out.duration_ms=item.durationMs;
+    if(item.type==="imageGeneration"){
+      // 固定CodexのImageGenerationBeginは空status。endのfailureはcompletedより優先する。
+      if(item.failure!==null&&typeof item.failure==="object")out.status="failed";
+      else if(item.status==="")out.status="inProgress";
+    }
+    if(item.type==="functionCallOutput"&&typeof item.name==="string")out.tool_name=item.name;
     if(item.type==="commandExecution"){if(typeof item.command==="string")out.command=item.command;if(typeof item.aggregatedOutput==="string")out.output=item.aggregatedOutput;if(typeof item.exitCode==="number")out.exit_code=item.exitCode;}
     if(item.type==="fileChange"&&Array.isArray(item.changes)){
       out.files=item.changes.slice(0,20).flatMap(raw=>{

@@ -34,3 +34,46 @@ test('user・command・結果・error・filesをplain textで表示し省略と�
  const input=page.locator('[data-item="mcp"] details');await input.locator('summary').click();await expect(input.locator('pre')).toHaveText('query: issue details '+malicious);
  await page.getByRole('button',{name:'更新',exact:true}).click();await expect(output).toHaveAttribute('open','');await expect(input).toHaveAttribute('open','');
 });
+
+test('画像生成は既知の状態だけを表示し画像データと保存先を描画しない',async({page})=>{
+ const secret='private-image-sentinel',image='data:image/png;base64,c2VjcmV0';
+ const statuses=[['inProgress','進行中'],['completed','完了'],['failed','失敗'],['interrupted','中断']];
+ const items=statuses.map(([status])=>({id:'image_'+status,kind:'tool_progress',tool_type:'imageGeneration',status,
+  // 投影外のfieldが届いても画像項目では汎用tool詳細として表示しない。
+  tool_name:secret,text:secret,command:secret,input:secret,output:image,error:secret,
+  files:[{path:'/private/'+secret+'.png',change:'add'}],result:image,revisedPrompt:secret,path:'/private/'+secret+'.png'}));
+ await page.route('https://observer.test/**',async route=>{
+  const p=new URL(route.request().url()).pathname;if(p==='/'){await route.fulfill(observerDashboardPage());return;}
+  const value=p==='/api/session'?{csrf:'csrf',capabilities:['conversations:main:read']}:p==='/api/conversations/main'?{items:[{name:'main',generation:'g',connected:true,state:'working',observed_at:at}]}:{status:'observed',conversation:{name:'main',generation:'g',connected:true,state:'working',observed_at:at,items,events:[],gap:false,truncated:false}};
+  await route.fulfill({contentType:'application/json',body:JSON.stringify(value)});
+ });
+ await page.goto('https://observer.test/');await page.locator('[data-main="main:g"]').click();
+ for(const [status,translated] of statuses){
+  const card=page.locator('[data-item="image_'+status+'"]');
+  await expect(card.locator('h4')).toHaveText('画像生成');await expect(card.locator('.state')).toHaveText(translated!);
+  await expect(card.locator('details, pre, img')).toHaveCount(0);
+ }
+ await expect(page.locator('#detail')).not.toContainText(secret);await expect(page.locator('#detail')).not.toContainText(image);
+});
+
+test('制御項目は種類と許可されたmetadataだけを表示し状態を補わない',async({page})=>{
+ const types=[['sleep','待機'],['contextCompaction','会話の要約'],['enteredReviewMode','レビュー開始'],['exitedReviewMode','レビュー終了'],['subAgentActivity','サブエージェントの活動'],['functionCallOutput','ツールの応答']];
+ const secret='private-control-payload';
+ const items=types.map(([type])=>({id:type,turn_id:'turn',kind:'tool_progress',tool_type:type,
+  ...(type==='sleep'?{duration_ms:1250}:{}),...(type==='functionCallOutput'?{tool_name:'functions.exec'}:{}),
+  text:secret,input:secret,output:secret,command:secret,error:secret,files:[{path:secret,change:'add'}],review:secret,thread_id:secret}));
+ await page.route('https://observer.test/**',async route=>{
+  const p=new URL(route.request().url()).pathname;if(p==='/'){await route.fulfill(observerDashboardPage());return;}
+  const value=p==='/api/session'?{csrf:'csrf',capabilities:['conversations:main:read']}:p==='/api/conversations/main'?{items:[{name:'main',generation:'g',connected:true,state:'working',observed_at:at}]}:{status:'observed',conversation:{name:'main',generation:'g',connected:true,state:'working',observed_at:at,items,events:[{kind:'item/started',item_id:'sleep',turn_id:'turn',observed_at:at}],gap:false,truncated:false}};
+  await route.fulfill({contentType:'application/json',body:JSON.stringify(value)});
+ });
+ await page.goto('https://observer.test/');await page.locator('[data-main="main:g"]').click();
+ for(const [type,title] of types){
+  const card=page.locator('[data-item="'+type+'"]');await expect(card.locator('h4')).toHaveText(title!);
+  await expect(card.locator('.state, details, pre, img')).toHaveCount(0);
+ }
+ await expect(page.locator('[data-item="sleep"]')).toContainText('所要時間 1.25 秒');
+ await expect(page.locator('[data-item="sleep"]')).toContainText('開始を観測:');
+ await expect(page.locator('[data-item="functionCallOutput"]')).toContainText('functions.exec');
+ await expect(page.locator('#detail')).not.toContainText(secret);
+});
