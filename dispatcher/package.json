@@ -17,7 +17,7 @@
     "start": "node dist/cli.js serve",
     "test": "node ../scripts/run-scheduler-integration-gate.mjs && node test/run-tests.mjs",
     "typecheck": "tsc --noEmit",
-    "pretest": "node scripts/build-job-result-validator.mjs"
+    "pretest": "node scripts/build-security-native.mjs && node scripts/build-job-result-validator.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
