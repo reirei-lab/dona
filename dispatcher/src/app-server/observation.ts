@@ -21,12 +21,15 @@ function credentialFields(text:string):RegExpMatchArray[] {
 function unescapeObservationText(value:string):string {
   return value.replace(/\\+u([0-9a-f]{4})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16))).replace(/\\\//g,"/").replace(/\\+(["'])/g,"$1");
 }
-function decodedObservationText(value:string):string {
+function decodedObservationText(value:string,inspect?:(stage:string)=>void):string {
   let text=value;
   // 検査専用の保守的正規化。多重JSONのbackslash runをUnicode文字の前に残さない。
   for(let i=0;i<8;i++){
-    const previous=text;try{text=decodeURIComponent(text);}catch{text=text.replace(/%([0-9a-f]{2})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16)));}
-    text=unescapeObservationText(text);if(text===previous)break;
+    const previous=text;inspect?.(text);
+    // JSONを先に剥がしてURI authorityを検査し、percent decodeで区切りが変わる前も観測する。
+    text=unescapeObservationText(text);inspect?.(text);
+    try{text=decodeURIComponent(text);}catch{text=text.replace(/%([0-9a-f]{2})/gi,(_,h:string)=>String.fromCharCode(parseInt(h,16)));}
+    inspect?.(text);if(text===previous)break;
   }
   return text;
 }
@@ -40,10 +43,9 @@ export function sanitizeObservationText(value:string,limit=8192):string {
   if(credentialFields(decodedText).length>0)return "[機密情報を含む内容を省略]";
   if(/-----BEGIN [^-]*PRIVATE KEY|DONA_(?:JOB|EVENT)_(?:BEGIN|END)/i.test(decodedText))return "[保護された内容を省略]";
   text=text.split("\n").map(line=>{
-    const decoded=decodedObservationText(line);
-    // URI userinfoのpercent-encoded '/'や空白はdecodeすると区切りに見える。
-    // 元表記も検査し、実際のauthority境界を失う前に伏せる。
-    if(/(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s/]+@/i.test(unescapeObservationText(line)))return "[機密情報を含む行を省略]";
+    let credentialUri=false;
+    const decoded=decodedObservationText(line,stage=>{if(/(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s/]+@/i.test(stage))credentialUri=true;});
+    if(credentialUri)return "[機密情報を含む行を省略]";
     if(decoded!==line&&/(?:^|[\s"']|\/)(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains|\.env(?:\.[\w-]+)?|auth\.json|credentials(?:\.json)?)(?:\/|$|[\s"'])/i.test(decoded))return "[保護されたパスを含む行を省略]";
     if(/(?:xox[a-z]-|xapp-|gh[pousr]_|github_pat_|sk-(?:proj-)?[A-Za-z0-9_-]{8}|\b(?:AKIA|ASIA)[A-Z0-9]{16}|--(?:token|password|secret|api-key|header)\s+\S+|\b(?:Bearer|Basic)\s+\S+|(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s/]+@|(?:files|hooks)\.slack\.com|[?&](?:signature|sig|token|key|x-amz-[\w-]+)=|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/i.test(decoded))return "[機密情報を含む行を省略]";
     return line.replace(/(?:~|\/[^\s"'<>]*)\/(?:\.dona|\.codex|\.ssh|\.aws|\.config|Library\/Keychains)(?:\/[^\s"'<>]*)?/g,"[保護されたパス]").replace(/(^|[\s"'<>])(?:[^\s"'<>]*\/)?(?:\.env(?:\.[\w-]+)?|auth\.json|credentials(?:\.json)?)(?=\s|$|["'<>])/g,"$1[保護されたパス]").replace(/\/(?:Users|home)\/[^/\s]+/g,"~");

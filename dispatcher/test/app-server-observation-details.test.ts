@@ -130,3 +130,16 @@ test("履歴byte上限到達後は古い高負荷itemを投影しない",()=>{
  const result=projectHistory({thread:{id:"thread",turns:[{id:turn,items}]}});
  assert.equal(result.truncated,true);assert.ok(result.items.length<70);assert.ok(inspected<210);assert.equal(result.items.at(-1)?.id,"i199");assert.ok(Buffer.byteLength(JSON.stringify(result.items))<525000);
 });
+
+test("URI userinfoはJSON/percent各層の区切り変化前に検査する",()=>{
+ for(const separator of ["%2F","%20","%09","%0A","%3F","%23","%40","%252F"]){
+  const uri=`postgres://alice:sensitive-placeholder${separator}tail@db.internal/app`;
+  const wrapped=[encodeURIComponent(uri),JSON.stringify(encodeURIComponent(uri)),encodeURIComponent(JSON.stringify(uri)),encodeURIComponent(String.raw`postgres:\/\/alice:sensitive-placeholder${separator}tail@db.internal/app`),encodeURIComponent(String.raw`postgres:\u002f\u002falice:sensitive-placeholder${separator}tail@db.internal/app`)];
+  for(let text of wrapped){for(let depth=0;depth<3;depth++){
+   assert.equal(sanitizeObservationText(text),"[機密情報を含む行を省略]");
+   assert.ok(!JSON.stringify(projectItem({id:"m",type:"mcpToolCall",tool:"query",result:{content:[{type:"text",text}]}},turn)).includes("sensitive-placeholder"));
+   text=depth%2===0?JSON.stringify(text):encodeURIComponent(text);
+  }}
+ }
+ const publicUri=encodeURIComponent('postgres://db.internal/app');assert.equal(sanitizeObservationText(publicUri),publicUri);
+});
