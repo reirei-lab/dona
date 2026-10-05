@@ -49,8 +49,13 @@ export async function openLocalApprovalService(database:DispatcherDatabase,confi
    authorizeSource:s=>ingress?.authorizeSource(s)===true,
    verifyStepUp:r=>database.operatorWebAuthn?.verifyReceipt(r,r,'approvals:external')===true,
   },slack);
-  ingress=database.createExternalApprovalIngress(new RuntimeClient(runtimeSocket(config)),service,{...nativeConfig.scope,owner_id:nativeConfig.owner_id,main_agent:config.agentName},wake);
-  const loop=approvalLoop(()=>ingress.tick(),failure);
-  return {service,start:()=>loop.start(),stop:()=>loop.stop(),health:()=>native!.doctor(),async close(){await loop.stop();native!.close();sql.close();}};
+  const runtime=new RuntimeClient(runtimeSocket(config));
+  ingress=database.createExternalApprovalIngress(runtime,service,{...nativeConfig.scope,owner_id:nativeConfig.owner_id,main_agent:config.agentName},wake);
+  const loop=approvalLoop(async()=>{
+   const ready=native!.doctor().ready;await runtime.externalAvailability(ready);
+   if(ready)await ingress.tick();
+  },failure);
+  const stop=async()=>{await loop.stop();await runtime.externalAvailability(false).catch(()=>{});};
+  return {service,async start(){await runtime.externalAvailability(native!.doctor().ready);loop.start();},stop,health:()=>native!.doctor(),async close(){await stop();native!.close();sql.close();}};
  }catch(error){native?.close();sql.close();throw error;}
 }

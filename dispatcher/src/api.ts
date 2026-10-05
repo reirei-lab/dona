@@ -284,6 +284,7 @@ export class DispatcherApi {
           schema_version: 1,
           status: health.ready ? "ready" : "not_ready",
           service: "dispatcher",
+          runtime_host: (process as NodeJS.Process & {donaHost?:string}).donaHost==='signed-v1'?'signed-v1':'node',
           build_sha: this.config.buildSha,
           protocol: 1,
           app_schema: appSchema.actual,

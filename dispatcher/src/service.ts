@@ -1,3 +1,4 @@
+import {RuntimeClient} from "./app-server/client.js";
 import {openLocalApprovalService} from "./approval/local-service.js";
 import { assertTaskGenerationFile } from "./task-execution.js";
 import type { DispatcherConfig } from "./config.js";
@@ -129,7 +130,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       api.disableJobProgress();
       }
     }
-    external?.start();
+    if(external)await external.start();
+    else await new RuntimeClient(runtimeSocket(config),5000).externalAvailability(false).catch(()=>{});
     worker.start();
     scheduler.start();
     reminderPublisher.start();

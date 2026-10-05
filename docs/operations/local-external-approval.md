@@ -59,3 +59,13 @@ manifest更新後に設定JSONの保存だけが失敗した場合は、同じ�
 `recoverNativeLocalApproval` はboot identity変更を確認し、UTCを後退させず保護clockのCAS headを新bootへ移す。旧expiry、使用済みID、監査rootは保持し、旧未完了権限を失効してから受付を再開する。clock rollbackや監査anchor不一致を無条件resetで回避しない。key期限切れとboot変更が同時なら `rotate` が新keyで同じ復旧を行う。DB復元や不明な監査commitの一般的な修復手段ではない。
 
 Runtimeの外部tool受付は常駐approval laneが `externalAvailability(true)` で更新する30秒のheartbeatを必要とする。未設定、停止、切断、heartbeat失効時の新規callは即時に利用不可として返す。`false` は新規だけを止め、既存pending要求や承認済み操作を勝手に拒否・再実行しない。
+
+## 鍵の更新とMac再起動後の復旧
+
+署名hostの `approval-doctor --config /absolute/config.json --database /absolute/dispatcher.sqlite` で保護状態を確認する。profile・署名・native providerが揃っていない場合はreadyを報告しない。
+
+`approval-rotate --config ... --database ... --next-version N` はMacのTTYで対象instance/workspace/operatorと次versionを確認する。DB外のmaintenance状態で新規承認を止め、旧未完了要求を失効させ、監査を記録し、古い鍵を検証専用として保持してから次versionへ進める。設定ファイルは旧内容・inodeを照合して原子的に保存する。保護状態の更新後に設定保存が失敗した場合は同じ旧設定と同じ次versionで結果を照合でき、別versionへの盲目的な再実行を行わない。
+
+Macのboot identityが変わった場合は `approval-recover --config ... --database ...` を使う。無条件にclockやgenesisを作り直さず、旧要求の無効化と監査を済ませ、UTC high-water・使用済みIDを保持して新bootへ移る。途中失敗はmaintenanceのまま通常受付を止め、同じ操作の状態を確認する。鍵期限切れとboot変更が重なったときは正規rotationが双方を処理する。
+
+正常なproviderだけがRuntimeへ30秒のavailabilityを通知する。Dispatcher停止・設定不足・保護状態の不一致では新しい外部承認要求を受理せず、既存pendingを自動拒否や再送へ変換しない。通常のTask閲覧は継続できる。設定ファイルを更新した後は署名Dispatcherを再起動し、doctorと稼働releaseを照合する。
