@@ -55,6 +55,7 @@ test("service再起動でcookieを失効し、実Taskの継続とsnapshotを維�
   const socket=path.join(parent,"c.sock"),port=await freePort();
   const event=db.enqueue(eventEnvelope("observer-service")).row;
   const task=db.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:"service-observation",objective:"observe",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  db.beginJobPreparation(task.current_attempt_id);db.setJobRuntime(task.current_attempt_id,"workspace","pane",JSON.stringify(["g1","thread"]));
   const reader=new DashboardTaskReader(config.databasePath);const before=db.tasks.get(task.task_id);
   let runtimeReads=0;
   const runtime={async conversations(){runtimeReads++;return {items:[],next:null};},async conversation(){throw Error("unexpected history");}};

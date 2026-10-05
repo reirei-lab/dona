@@ -32,8 +32,10 @@ test('実CLIはpairing・観測・SIGKILL回復・preserve更新・rollbackでwo
  try{
   const event=db.enqueue(eventEnvelope('observer-service-cli')).row;
   const created=db.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:'cli-observation',objective:'private objective',workspace:{kind:'scratch'}}),path.join(root,'work'),path.join(root,'results'));
-  const before=JSON.stringify(db.tasks.get(created.task.task_id)),attempt=created.task.current_attempt_id;
+  const attempt=created.task.current_attempt_id;
   const agent=db.getJob(attempt)!.agent_name;
+  db.beginJobPreparation(attempt);db.setJobRuntime(attempt,'workspace','pane',JSON.stringify(['g1','thread-1']));
+  const before=JSON.stringify(db.tasks.get(created.task.task_id));
   const a='a'.repeat(40),b='b'.repeat(40),runtimeRoot=path.join(root,'runtime'),releaseA=path.join(runtimeRoot,'releases',a),releaseB=path.join(runtimeRoot,'releases',b),pointer=path.join(runtimeRoot,'current');
   await fs.mkdir(releaseA,{recursive:true,mode:0o700});await fs.chmod(runtimeRoot,0o700);
   await run(globalThis.process.execPath,[path.join(repo,'dispatcher/node_modules/typescript/bin/tsc'),'-p',path.join(repo,'dispatcher/tsconfig.build.json'),'--outDir',path.join(releaseA,'dispatcher/dist')],{timeout:30000,maxBuffer:1024*1024});

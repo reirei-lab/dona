@@ -13,6 +13,8 @@ export interface DashboardTask {
 }
 export interface DashboardTaskSnapshot {
   task: DashboardTask; attempts: DashboardAttempt[]; fingerprint: string;
+  /** Internal read-only identity evidence; never project this field to the browser. */
+  runtime_binding: {agent_name:string;generation:string;thread_id:string} | null;
 }
 /** This reader never instantiates DispatcherDatabase: starting an observer must
  * not run migrations, recovery or supervisor actions against the active DB. */
@@ -24,6 +26,7 @@ export class DashboardTaskReader {
       this.sql.pragma("query_only = ON");
       this.sql.pragma("busy_timeout = 1000");
       this.sql.prepare(`${projection} LIMIT 0`).all();
+      this.sql.prepare("SELECT identity_version,herdr_agent_session_id,agent_name,recorded_at,generation_nonce FROM job_live_session_identities LIMIT 0").all();
       this.sql.prepare("SELECT a.attempt_id,a.number,a.outcome,a.created_at,a.ended_at,j.agent_name FROM task_attempts a JOIN jobs j ON j.job_id=a.attempt_id LIMIT 0").all();
     } catch(error) { this.sql.close(); throw error; }
   }
@@ -52,8 +55,21 @@ export class DashboardTaskReader {
       const attempts = this.sql.prepare(`SELECT a.attempt_id,a.number,j.status,a.outcome,a.created_at,a.ended_at,j.agent_name
         FROM task_attempts a JOIN jobs j ON j.job_id=a.attempt_id WHERE a.task_id=? ORDER BY a.number`).all(id) as DashboardAttempt[];
       if (attempts.length > 100) throw Error("dashboard_attempt_limit");
-      const fingerprint = createHash("sha256").update(JSON.stringify({task, attempts})).digest("hex");
-      return {task, attempts, fingerprint};
+      const identity = this.sql.prepare(`SELECT identity_version,herdr_agent_session_id,agent_name,recorded_at,generation_nonce
+        FROM job_live_session_identities WHERE job_id=?`).get(task.current_attempt_id) as {
+          identity_version:number;herdr_agent_session_id:string;agent_name:string;recorded_at:string;generation_nonce:string;
+        } | undefined;
+      let runtime_binding: DashboardTaskSnapshot["runtime_binding"] = null;
+      if (identity?.identity_version === 1 && identity.agent_name === attempts.find(attempt=>attempt.attempt_id===task.current_attempt_id)?.agent_name) {
+        try {
+          if(typeof identity.herdr_agent_session_id!=="string"||identity.herdr_agent_session_id.length>512)throw Error();
+          const tuple:unknown = JSON.parse(identity.herdr_agent_session_id);
+          if(Array.isArray(tuple)&&tuple.length===2&&tuple.every(value=>typeof value==="string"&&/^[A-Za-z0-9_-]{1,160}$/.test(value)))
+            runtime_binding={agent_name:identity.agent_name,generation:tuple[0] as string,thread_id:tuple[1] as string};
+        } catch { /* Missing/legacy/malformed identities never authorize a history read. */ }
+      }
+      const fingerprint = createHash("sha256").update(JSON.stringify({task, attempts, identity:identity??null})).digest("hex");
+      return {task, attempts, fingerprint, runtime_binding};
     })();
   }
 }
