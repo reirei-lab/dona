@@ -24,6 +24,10 @@ function setup(t:{after(fn:()=>void):void}){
 async function approved(f:ReturnType<typeof setup>){
  const created=await f.service.request(actor,intent);if(created.status==="denied")throw Error("unexpected_denial");
  const presentation=await f.service.present(actor,created.request_handle);
+ assert.deepEqual(presentation.requester,{kind:"local_operator",label:"このMacのoperator"});
+ assert.equal(presentation.risk,"external_message");assert.match(presentation.display_fingerprint,/^[A-F0-9]{16}$/);
+ assert.ok(Number.isFinite(Date.parse(presentation.created_at)));assert.ok(presentation.operation_summary.length>0);
+ assert.doesNotMatch(JSON.stringify(presentation),/semantic_hash|binding_id|source_event_id|source_job_id/);
  const receipt:ExternalApprovalStepUp={...actor,receipt_id:"receipt",request_id:created.request_handle,decision:"approve",presentation_digest:presentation.presentation_digest,expires_at:"2026-09-19T00:01:00.000Z"};
  const result=await f.service.decide(actor,receipt);assert.equal(result.status,"decided");return {created,presentation,receipt};
 }

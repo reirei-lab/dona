@@ -34,7 +34,7 @@ export interface ExternalApprovalKeys extends ApprovalCreateKeyLookup {
  execution(version:number|null):ApprovalExecutionMarkerKey;
 }
 export interface ExternalApprovalPresentation {request_id:string;operation:"slack.post_thread_reply.v1";workspace_id:string;channel_id:string;thread_ts:string;workspace_name:string;channel_name:string;
- exact_draft:string;notified_user_ids:string[];expires_at:string;request_revision:number;presentation_revision:number;presentation_digest:string}
+ requester:{kind:"slack"|"local_operator";label:string};risk:"external_message";operation_summary:string;display_fingerprint:string;created_at:string;exact_draft:string;notified_user_ids:string[];expires_at:string;request_revision:number;presentation_revision:number;presentation_digest:string}
 /** Mac grantの追加transport。既存coreの暗号化payload、監査root、clock、decision、
  * consume、execution markerをそのまま使い、別の承認ledgerを作らない。 */
 export class LocalExternalApprovalService {
@@ -58,7 +58,8 @@ export class LocalExternalApprovalService {
  private context(request:Request){const row=this.db.prepare("SELECT authority_json FROM local_external_contexts WHERE request_id=?").get(request.row.request_id) as {authority_json:string}|undefined;
   if(!row)throw Error("external_approval_context_unavailable");const raw=JSON.parse(row.authority_json),a=raw.kind==="slack"?externalSourceSchema.parse(raw):externalAuthoritySchema.parse(raw);
   if(this.binding(a)!==request.row.binding_id||("kind" in a?a.requester_id:a.owner_id)!==this.snapshot(request).request_source.owner_id)throw Error("external_approval_context_unverified");return a;}
- private permitted(request:Request,actor:ExternalApprovalAuthority){const source=this.context(request);return source.instance_id===actor.instance_id&&source.owner_id===actor.owner_id&&this.sourceAllowed(source)&&this.auth.authorize(actor)===true;}
+ private readable(request:Request,actor:ExternalApprovalAuthority){const source=this.context(request);return source.instance_id===actor.instance_id&&source.owner_id===actor.owner_id&&this.auth.authorize(actor)===true;}
+ private permitted(request:Request,actor:ExternalApprovalAuthority){return this.readable(request,actor)&&this.sourceAllowed(this.context(request));}
  private sourceAllowed(source:ExternalApprovalAuthority|ExternalApprovalSource){return "kind" in source?this.auth.authorizeSource?.(source)===true:this.auth.authorize(source)===true;}
  private observe(request:Request){const source=this.context(request);return this.slack.observe({workspace_id:this.scope.workspace_id,...this.snapshot(request).target},"kind" in source?source.requester_id:undefined);}
  private approverCurrent(request:Request,state?:VerifiedAuditState){
@@ -114,8 +115,12 @@ export class LocalExternalApprovalService {
   const actor=this.checked(authority),request=this.requestRecord(requestId);if(!this.permitted(request,actor))throw Error("external_approval_unauthorized");
   const snapshot=this.snapshot(request),observation=await this.observe(request);
   if(!this.permitted(request,actor)||this.grant(request,observation,this.now())?.stale_reason!==null)throw Error("external_approval_snapshot_changed");
+  const source=this.context(request);
   const exact=this.text(request),card=this.card(request),base={request_id:requestId,operation:"slack.post_thread_reply.v1" as const,workspace_id:this.scope.workspace_id,...snapshot.target,
-   workspace_name:observation.workspace_name,channel_name:observation.channel_name,exact_draft:exact,notified_user_ids:[...snapshot.policy.allowed_user_mentions],expires_at:request.row.expires_at,request_revision:card.row.request_revision,presentation_revision:card.row.presentation_revision};
+   workspace_name:observation.workspace_name,channel_name:observation.channel_name,
+   requester:{kind:"kind" in source?"slack" as const:"local_operator" as const,label:"kind" in source?source.requester_id:"このMacのoperator"},
+   risk:"external_message" as const,operation_summary:"指定されたSlackスレッドに表示中の本文を1回投稿する",
+   display_fingerprint:hash(["public-approval-reference-v1",requestId]).slice(0,16).toUpperCase(),created_at:request.row.created_at,exact_draft:exact,notified_user_ids:[...snapshot.policy.allowed_user_mentions],expires_at:request.row.expires_at,request_revision:card.row.request_revision,presentation_revision:card.row.presentation_revision};
   if(Date.parse(base.expires_at)<=Date.parse(this.now().effective_utc))throw Error("external_approval_expired");
   const presentation={...base,presentation_digest:hash(base)},reference="web_"+presentation.presentation_digest;
   // Webへの配送証拠は、同じcanonical表示を再構成できるdurable opaque ref。
@@ -159,7 +164,7 @@ export class LocalExternalApprovalService {
   const actor=this.checked(authority);
   return this.audit.readVerifiedState(state=>{
    const r=this.records.readInState(state,"request",requestId);
-   if(!r||r.row.model_version!=="local_operator_v1"||!this.permitted(r,actor))throw Error("external_approval_not_found");
+   if(!r||r.row.model_version!=="local_operator_v1"||!this.readable(r,actor))throw Error("external_approval_not_found");
    const d=this.records.readInState(state,"decision",requestId),e=this.records.readAliasInState(state,{name:"execution_request",request_id:requestId});
    this.checked(actor);
    return {request_id:requestId,operation:"slack.post_thread_reply.v1" as const,state:r.row.state,created_at:r.row.created_at,expires_at:r.row.expires_at,
@@ -171,7 +176,7 @@ export class LocalExternalApprovalService {
   const actor=this.checked(authority);
   return this.audit.readVerifiedState(state=>{
    const page=this.records.readListPageInState(state,{record_kind:"request",membership:"all"},after,50);
-   const items=page.records.filter((r):r is Request=>r.kind==="request"&&r.row.model_version==="local_operator_v1").filter(r=>this.permitted(r,actor))
+   const items=page.records.filter((r):r is Request=>r.kind==="request"&&r.row.model_version==="local_operator_v1").filter(r=>this.readable(r,actor))
     .map(r=>({request_id:r.row.request_id,operation:"slack.post_thread_reply.v1" as const,state:r.row.state,created_at:r.row.created_at,expires_at:r.row.expires_at,
      execution:(()=>{const e=this.records.readAliasInState(state,{name:"execution_request",request_id:r.row.request_id});return e?.kind==="execution"?{attempt_id:e.row.attempt_id,state:e.row.state,receipt_ref:e.row.receipt_ref}:null;})()}));
    this.checked(actor);return {items,next:page.next_after};
