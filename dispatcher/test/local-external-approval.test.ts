@@ -113,6 +113,10 @@ test("main要求はpending受付で解放しterminalを新しい固定threadイ�
  await ingress.tick();assert.equal(f.counts().sends,1);
  const notification=dispatcher.getByExternalId("dona_approval",`external:${requestId}:terminal`);assert.ok(notification);assert.deepEqual(JSON.parse(notification.reply_target_json!),{kind:"slack_thread",workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts});assert.equal(JSON.parse(notification.payload_json).state,"succeeded");
  await ingress.tick();assert.equal(f.counts().sends,1);assert.equal(results.length,1);
+ f.setSourceAuthorizer(()=>false);
+ assert.equal(f.service.status(actor,requestId).execution?.state,"succeeded");
+ assert.ok(f.service.list(actor).items.some(item=>item.request_id===requestId));
+ await assert.rejects(f.service.present(actor,requestId),/unauthorized/);
 });
 
 test("workerの外部承認checkpointは同じAttempt/callに保持し応答喪失後も再送しない",async t=>{
