@@ -223,3 +223,31 @@ test('通常操作UIのowner hintはsource名でなく現在Attemptの永続owne
   assert.equal(JSON.stringify(reader.snapshot(local.task_id)).includes('owner_json'),false);
  }finally{reader?.close();db.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+
+test('本体詳細は一覧と履歴で消費した時間を会話取得の期限へ引き継ぐ',async t=>{
+ const main:ConversationContent={name:'dona_main',generation:'current',role:'main',thread_id:'thread',attempt_id:null,connected:true,observed_at:new Date().toISOString(),state:'working',items:[],events:[],cursor:0,oldest_sequence:0,gap:false,truncated:false};
+ let now=0,reads=0;
+ t.mock.method(performance,'now',()=>now);
+ t.mock.timers.enable({apis:['setTimeout']});
+ let begun!:()=>void;
+ const conversationStarted=new Promise<void>(resolve=>{begun=resolve;});
+ const observer=new DashboardObserver(null as unknown as DashboardTaskReader,{
+  async conversations(){reads++;now+=2000;return{items:[main],next:null};},
+  async conversationHistory(){reads++;now+=2500;return{items:[],next:null};},
+  async conversation(){reads++;begun();return new Promise<ConversationContent>(()=>{});},
+ });
+ const auth=()=>({revision:'1',task:()=>false,conversation:()=>false,mainConversation:()=>true});
+ assert.equal(await observer.mainDetail('dona_main','current',()=>null),null);
+ assert.equal(reads,0);
+ let settled=false;
+ const detail=observer.mainDetail('dona_main','current',auth).then(result=>{settled=true;return result;});
+ await conversationStarted;
+ now=4999;t.mock.timers.tick(499);await Promise.resolve();await Promise.resolve();
+ assert.equal(settled,false);
+ now=5000;t.mock.timers.tick(1);
+ for(let i=0;i<6;i++)await Promise.resolve();
+ assert.equal(settled,true,'一覧取得後に新たな5秒期限を開始しない');
+ assert.deepEqual(await detail,{status:'unavailable'});
+ assert.equal(reads,3);
+});

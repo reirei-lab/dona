@@ -60,8 +60,11 @@ export class DashboardObserver {
     return {snapshot: publicSnapshot(after, current.conversation(id)), runtime: observed};
   }
   async mainList(authorize:()=>DashboardAuthority|null):Promise<{items:ObservedConversation[];next:null}|null> {
+    return this.mainListWithinDeadline(authorize,performance.now());
+  }
+  private async mainListWithinDeadline(authorize:()=>DashboardAuthority|null,started:number):Promise<{items:ObservedConversation[];next:null}|null> {
     const authority=authorize(); if(!authority?.mainConversation?.())return null;
-    const started=performance.now(),items:ObservedConversation[]=[];let cursor:string|undefined;const seen=new Set<string>();
+    const items:ObservedConversation[]=[];let cursor:string|undefined;const seen=new Set<string>();
     for(let page=0;page<100;page++) {
       const result=await withinDeadline(this.runtime.conversations(cursor),started);
       if(!sameMainAuthority(authorize(),authority))return null;
@@ -92,13 +95,13 @@ export class DashboardObserver {
     return {items,next:null};
   }
   async mainDetail(name:string,generation:string,authorize:()=>DashboardAuthority|null,afterSequence?:number):Promise<ObservedTask["runtime"]|null> {
-    const authority=authorize();if(!authority?.mainConversation?.())return null;
+    const started=performance.now(),authority=authorize();if(!authority?.mainConversation?.())return null;
     try {
-      const inventory=await this.mainList(authorize);
+      const inventory=await this.mainListWithinDeadline(authorize,started);
       if(!inventory||!sameMainAuthority(authorize(),authority))return null;
       const match=inventory.items.find(row=>row.name===name&&row.generation===generation);
       if(!match)return {status:"unavailable"};
-      const content=await withinDeadline(this.runtime.conversation(name,generation,afterSequence),performance.now());
+      const content=await withinDeadline(this.runtime.conversation(name,generation,afterSequence),started);
       if(!sameMainAuthority(authorize(),authority))return null;
       if(content.name!==name||content.generation!==generation||content.role!=="main"||content.attempt_id!==null||content.thread_id!==match.thread_id)throw Error("observation_identity_changed");
       return {status:"observed",conversation:publicConversation(content)};

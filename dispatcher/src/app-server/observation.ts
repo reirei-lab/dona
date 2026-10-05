@@ -16,7 +16,7 @@ const identifier=(x:unknown):string|undefined=>typeof x==="string"&&/^[a-zA-Z0-9
 /** 識別子全体を採り、provider prefix/version suffixを含む既知credential名を共通判定する。 */
 function credentialFields(text:string):RegExpMatchArray[] {
   return [...text.matchAll(/\b([A-Za-z_][A-Za-z0-9_-]*(?:[ ]+key)?)\b["']?\s*[:=]/gi)]
-    .filter(match=>{const key=match[1]!.replace(/[_ -]/g,"").toLowerCase();return /(?:token|password|passwd|passphrase|secret|apikey|authorization|cookie|credential|accesskey|privatekey)/.test(key)||key==="auth"||key==="rediscliauth"||key==="npmconfigauth"||key==="clientkeydata"||key==="clientkey"||key==="sshpass"||key.endsWith("pwd");});
+    .filter(match=>{const key=match[1]!.replace(/[_ -]/g,"").toLowerCase();return /(?:token|password|passwd|passphrase|secret|apikey|authorization|cookie|credential|accesskey|privatekey)/.test(key)||key==="accountkey"||key==="sharedaccesssignature"||key==="auth"||key==="rediscliauth"||key==="npmconfigauth"||key==="clientkeydata"||key==="clientkey"||key==="sshpass"||key.endsWith("pwd");});
 }
 /** 既知CLIの認証optionを検出する表示用検査。shellとして評価せず、該当fieldを保守的に省略する。 */
 function hasCredentialCli(text:string):boolean {

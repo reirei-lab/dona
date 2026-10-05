@@ -211,3 +211,16 @@ test("canonical pgpass/Redis config/htpasswd形式はcredential fileとして省
  for(const value of ["src/main.ts:12:4: error: expected value","name:value","https://example.com:5432/path","npm test: 42 passed"])assert.equal(sanitizeObservationText(value),value);
  for(const file of [".pgpass",".htpasswd"])for(const text of [`cat /Users/alice/${file}`,encodeURIComponent(`/Users/alice/${file}`)])assert.ok(!sanitizeObservationText(text).includes(file));
 });
+
+
+test("Azure接続文字列のAccountKeyと標準SASは既知credentialとして省略する",()=>{
+ const secret="c2Vuc2l0aXZlLXBsYWNlaG9sZGVy";
+ for(const key of ["AccountKey","account_key","ACCOUNT_KEY","SharedAccessSignature","SharedAccessKey","AzureSharedAccessKey","ClientSecret"]){
+  const connection=`DefaultEndpointsProtocol=https;AccountName=foo;${key}=${secret};EndpointSuffix=core.windows.net`;
+  for(const text of [connection,JSON.stringify({connection}),`${key}: | # credential\n  ${secret}`]){
+   assert.equal(sanitizeObservationText(text),"[機密情報を含む内容を省略]");
+   assert.ok(!JSON.stringify(projectItem({id:"command",type:"commandExecution",command:"show configuration",aggregatedOutput:text},turn)).includes(secret));
+  }
+ }
+ for(const ordinary of ["Key=display-name;AccountName=foo","KeyVaultKey=public-key-name","DefaultEndpointsProtocol=https;AccountName=foo;EndpointSuffix=core.windows.net"])assert.equal(sanitizeObservationText(ordinary),ordinary);
+});
