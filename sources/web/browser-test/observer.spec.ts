@@ -10,7 +10,7 @@ async function setup(page:Page,options:{pauseA?:Promise<void>;deny?:()=>boolean}
     if(path==='/'){await route.fulfill(observerDashboardPage());return;}
     if(options.deny?.()){await route.fulfill({status:401,contentType:'application/json',body:'{}'});return;}
     let value:unknown;
-    if(path==='/api/session')value={csrf:'fixture',capabilities:[]};
+    if(path==='/api/session')value={csrf:'fixture',capabilities:['tasks:read']};
     else if(path==='/api/tasks')value={items:[task('task_a'),task('task_b')],next:null};
     else if(path==='/api/tasks/task_a'){if(options.pauseA)await options.pauseA;value=detail('task_a');}
     else if(path==='/api/tasks/task_b')value=detail('task_b');
@@ -35,7 +35,7 @@ test('認証失効でprivate表示を消去し接続scopeを示す',async({page}
   let deny=false;await setup(page,{deny:()=>deny});await page.getByRole('button',{name:'task_a · 待機中'}).click();
   await expect(page.locator('#detail')).toContainText('task_a');deny=true;await page.getByRole('button',{name:'更新',exact:true}).click();
   await expect(page.locator('#tasks')).toBeEmpty();await expect(page.locator('#detail')).not.toContainText('task_a');
-  await expect(page.locator('#pairing')).toBeVisible();await expect(page.locator('#pairing')).toContainText('すべてのTask');
+  await expect(page.locator('#pairing')).toBeVisible();await expect(page.locator('#pairing')).toContainText('付与された範囲');
 });
 test('mobileとkeyboardで閲覧できpoll後も選択buttonのfocusを維持する',async({page})=>{
   await page.setViewportSize({width:375,height:800});await setup(page);const button=page.getByRole('button',{name:'task_b · 待機中'});
@@ -55,7 +55,7 @@ test('過去AttemptのResultをplain text表示しmainは独立capabilityから�
   const url=new URL(route.request().url());requests.push(url.pathname+url.search);
   if(url.pathname==='/'){await route.fulfill(observerDashboardPage());return;}
   let value:unknown;
-  if(url.pathname==='/api/session')value={csrf:'test',capabilities:['conversations:main:read']};
+  if(url.pathname==='/api/session')value={csrf:'test',capabilities:['conversations:main:read','tasks:read']};
   else if(url.pathname==='/api/conversations/main')value={items:[{name:'dona_main',generation:'old_main',connected:false}],next:null};
   else if(url.pathname.startsWith('/api/conversations/main/'))value=detail('main').runtime;
   else if(url.pathname==='/api/tasks')value={items:[task('task_a')],next:null};

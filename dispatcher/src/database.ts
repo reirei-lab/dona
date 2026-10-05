@@ -1694,6 +1694,10 @@ export class DispatcherDatabase {
   enqueueLocalDashboardQuestionReply(authority:LocalDashboardAuthority,input:LocalDashboardQuestionReply) {
     return this.localDashboard.reply(authority,input);
   }
+  getLocalDashboardTask(authority:LocalDashboardAuthority,taskId:string) {
+    const result=this.localDashboard.task(authority,taskId);
+    return {...result,session_identity:this.getJobLiveSessionIdentity(result.row.job_id)?.herdr_agent_session_id??null};
+  }
   getLocalDashboardReceipt(authority:LocalDashboardAuthority,requestId:string) {
     return this.localDashboard.receipt(authority,requestId);
   }

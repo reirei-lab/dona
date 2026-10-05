@@ -34,6 +34,11 @@ export class LocalDashboardCommands {
   receipt(authority:LocalDashboardAuthority,requestId:string):LocalDashboardReceipt|undefined {
     return this.sql.prepare("SELECT * FROM local_dashboard_command_receipts WHERE receipt_id=?").get(this.key(authority,requestId)) as LocalDashboardReceipt|undefined;
   }
+  task(authority:LocalDashboardAuthority,taskId:string) {
+    authoritySchema.parse(authority);const task=this.dispatcher.tasks.get(taskId);
+    if(!task)throw Error("local_dashboard_owner_mismatch");
+    this.assertOwner(authority,task.current_attempt_id);return {task,row:this.dispatcher.getJob(task.current_attempt_id)!};
+  }
   isLocalJob(jobId:string):boolean {
     const job=this.dispatcher.getJob(jobId);if(job?.source!=="web")return false;
     const binding=readEventJobBinding(this.sql,job.source_event_id);
