@@ -275,7 +275,7 @@ for(const action of ["cancel","replace","legacy_provenance"] as const)test(`外�
  if(action==="cancel"){const control=f.enqueue(action);const task=f.dispatcher.tasks.get(f.task.task_id)!;f.dispatcher.tasks.control(task.task_id,control.event_id,task.revision,action);}
  else if(action==="legacy_provenance"){delete f.row().operation_key;}
  else {const old=f.dispatcher.tasks.get(f.task.task_id)!;assert.throws(()=>f.dispatcher.tasks.replaceStopped(old.task_id,f.filename+"-results"),/task_stop_required/);
-  const evidence={state:"stopped" as const,reason:"verified_fixture_stop",observed_at:new Date().toISOString(),process_ids:[],process_groups:[]};const stopping=f.dispatcher.tasks.claimStop(old,evidence);f.dispatcher.tasks.stopped(stopping,evidence);f.dispatcher.tasks.replaceStopped(old.task_id,f.filename+"-results");}
+  const evidence={state:"stopped" as const,reason:"verified_fixture_stop",observed_at:new Date().toISOString(),process_ids:[],process_groups:[]};const stopping=f.dispatcher.tasks.claimStop(old,evidence);f.dispatcher.tasks.stopped(stopping,evidence);assert.throws(()=>f.dispatcher.tasks.replaceStopped(old.task_id,f.filename+"-results"),/external_effect_reconciliation/);await f.ingress.tick();f.dispatcher.tasks.replaceStopped(old.task_id,f.filename+"-results");}
  const before=f.dispatcher.tasks.get(f.task.task_id)!;await f.ingress.tick();await f.ingress.tick();const after=f.dispatcher.tasks.get(f.task.task_id)!;
  assert.equal(f.counts().sends,0);assert.equal(after.current_attempt_id,before.current_attempt_id);assert.equal(after.desired_state,before.desired_state);assert.equal(after.attempt_number,action==="replace"?2:1);assert.equal(f.service.status(actor,id).state,"needs_review");
  assert.equal(f.db.prepare("SELECT state FROM task_external_approval_checkpoints WHERE attempt_id=?").pluck().get(f.job.job_id),"needs_review");
@@ -331,4 +331,36 @@ test("外部承認待ちのTask groupはsibling完了で最終化せずcall解�
 
 test("起動前queued steerを含む初回attemptの新しい外部要求は許可する",async t=>{
  const f=await workerApprovalFixture(t,true);await f.ingress.tick();await f.approve();await f.ingress.tick();assert.equal(f.counts().sends,1);assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.state,"active");
+});
+
+for(const effect of ["not_sent","accepted","unknown"] as const)test(`Runtime消失の${effect}を監査coreから分類し停止確認後のTask復旧を分ける`,async t=>{
+ const f=await workerApprovalFixture(t);await f.ingress.tick();const id=f.requestId();
+ if(effect!=="not_sent"){await f.approve();f.setSend(effect==="accepted"?{outcome:"accepted",receipt_ref:"known_external_receipt"}:{outcome:"unknown"});f.beforeResolve(()=>{throw Error("tool response lost");});await f.ingress.tick();assert.equal(f.counts().sends,1);}
+ f.row().state="expired";f.row().text="";
+ // ingressが消失を分類する前にsupervisorが先行しても停止・後継作成へ進めない。
+ let observes=0;const {JobSupervisor}=await import("../src/job-supervisor.js"),supervisor=new JobSupervisor(f.dispatcher,{observeWorker:async()=>{observes++;return {state:"stopped",reason:"fixture",observed_at:new Date().toISOString(),process_ids:[],process_groups:[]};}} as never,{} as never,{debug(){},info(){},warn(){},error(){}},()=>{});
+ f.dispatcher.tasks.wait(f.dispatcher.tasks.get(f.task.task_id)!,"external_approval",-1);await supervisor.reconcileTasks();assert.equal(observes,0);assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.attempt_number,1);
+ await f.ingress.tick();const classified=f.dispatcher.tasks.externalApprovalRecovery(f.job.job_id);assert.equal(classified.state,effect==="unknown"?"unknown":"ready");assert.equal(classified.accepted.length,effect==="accepted"?1:0);
+ const task=f.dispatcher.tasks.get(f.task.task_id)!,evidence={state:"stopped" as const,reason:"verified_fixture_stop",observed_at:new Date().toISOString(),process_ids:[],process_groups:[]};const stopping=f.dispatcher.tasks.claimStop(task,evidence);f.dispatcher.tasks.stopped(stopping,evidence);
+ if(effect==="unknown"){
+  f.db.prepare("UPDATE task_external_approval_checkpoints SET state='failed',recovery_json=? WHERE attempt_id=?").run(JSON.stringify({effect:"not_sent",request_id:id,attempt_id:null,receipt_ref:null}),f.job.job_id);
+  assert.equal(f.dispatcher.tasks.externalApprovalRecovery(f.job.job_id).state,"unknown");assert.throws(()=>f.dispatcher.tasks.replaceStopped(task.task_id,f.filename+"-results"),/external_effect_reconciliation/);assert.equal(f.dispatcher.tasks.get(task.task_id)?.attempt_number,1);
+ }else {const next=f.dispatcher.tasks.replaceStopped(task.task_id,f.filename+"-results")!;assert.notEqual(next.job_id,f.job.job_id);assert.equal(f.dispatcher.tasks.get(task.task_id)?.attempt_number,2);
+  if(effect==="accepted"){assert.match(next.objective,/既に実行済み/);assert.ok(next.objective.includes(id));assert.ok(next.objective.includes("known_external_receipt"));assert.ok(f.dispatcher.tasks.get(task.task_id)?.objective.includes("known_external_receipt"));}else assert.doesNotMatch(next.objective,/既に実行済み/);
+ }
+ assert.equal(f.counts().sends,effect==="not_sent"?0:1);
+});
+
+
+test("unknownのTaskはMacで監査済み受理を確定してから同じ投稿を再送せず回復する",async t=>{
+ const f=await workerApprovalFixture(t);await f.ingress.tick();const id=await f.approve();f.setSend({outcome:"unknown"});f.beforeResolve(()=>{throw Error("response lost");});await f.ingress.tick();
+ f.row().state="expired";await f.ingress.tick();assert.equal(f.dispatcher.tasks.externalApprovalRecovery(f.job.job_id).state,"unknown");
+ const task=f.dispatcher.tasks.get(f.task.task_id)!,evidence={state:"stopped" as const,reason:"verified_fixture_stop",observed_at:new Date().toISOString(),process_ids:[],process_groups:[]};f.dispatcher.tasks.stopped(f.dispatcher.tasks.claimStop(task,evidence),evidence);
+ assert.throws(()=>f.dispatcher.tasks.replaceStopped(task.task_id,f.filename+"-results"),/external_effect_reconciliation/);
+ const {LocalApprovalOperations,installLocalOperationsSchema}=await import("../src/approval/local-operations.js");installLocalOperationsSchema(f.db);
+ const keys={content:()=>content,wrapping:()=>wrapping,notification:()=>notification,wrappingVersion:()=>wrapping,notificationVersion:()=>notification,execution:()=>executionKey};
+ const ops=new LocalApprovalOperations(f.db,f.providers,scope,keys,{owner_id:actor.owner_id,authorize:()=>true},{reconcile:async()=>({outcome:"accepted",receipt_ref:"manual_verified_receipt"})});
+ const preview=await ops.previewReconcile(id,"固定markerの実投稿を照合しました");assert.equal(f.dispatcher.tasks.externalApprovalRecovery(f.job.job_id).state,"unknown");ops.applyReconcile(preview.confirmation);
+ // raw cacheを更新していなくても、後継作成transactionの現在のcore検証で解除される。
+ const next=f.dispatcher.tasks.replaceStopped(task.task_id,f.filename+"-results")!;assert.ok(next.objective.includes(id));assert.ok(next.objective.includes("manual_verified_receipt"));assert.equal(f.dispatcher.tasks.get(task.task_id)?.attempt_number,2);assert.equal(f.counts().sends,1);
 });

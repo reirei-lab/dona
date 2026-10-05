@@ -122,3 +122,13 @@ workerのDona管理下MCPは `dona_slack` / `dona_dispatcher` を無効化し、
 5. native doctor後に `DONA_LOCAL_APPROVAL_CONFIG` をinstallerへ明示して設定を保存し、Dispatcherを再起動する。機能別healthと端末のWebAuthn/承認動作を確認する。同じSHAの設定変更を新しいself-update成功と報告しない。
 
 初回の途中失敗では、空またはschema作成途中のused-node fileも保全する。既存fileがあればprovisionは拒否し、自動unlink・再初期化・Keychain削除でやり直さない。Keychain作成より前のDB初期化失敗か、key/head/audit作成途中かを、private file metadata・schemaと正規doctorで照合する。後者や結果不明ではscopeを再発行せずsafe-offのまま保全し、個別の復旧計画を作る。前者であっても手動削除をこの手順の既定にせず、保全と照合を経た別の明示操作として扱う。metadata backupをlive DBの復旧手段にしない。
+
+## 外部投稿とTaskの再開
+
+外部toolのcallは、発生時にRuntimeが受理済みの`attempt:`または`steer:` operationへ固定します。同じApp Server turn内でも指示を差し替えた後に古い本文を新しい要求として扱いません。未確定steer中の要求、provenanceを持たない旧worker要求は拒否します。取消・一時停止・世代交換で未実行の承認を後継へ移植しません。
+
+Runtimeが消失した場合、Taskの後継Attempt作成は外部checkpointの照合まで保留します。監査されたcoreが未送信と確認した要求だけは、既存のworker停止確認を経て通常のTask回復へ戻せます。実行済みの要求はrequest/receiptを後継の作業文脈へ渡し、同じ投稿を再送させません。実行結果が不明なら`external_effect_unknown`で停止し、通常のresumeやretryだけでは解除しません。保守用cacheのSQL値は解除authorityではなく、後継作成時にも現在のprotected coreを再検証します。providerや検証器が利用不能な間も安全側で保留します。
+
+承認待ちでblockedになった後のpauseは既存Task制御の`task_human_input_pending`拒否を維持します。取消は停止確認へ進めます。保守reconcileによる事実の確認と、未確定な外部操作の再送許可は別です。新たな外部投稿には新たなexact承認が必要です。
+
+結果不明の要求はMacの `operations --operation reconcile --handle ... --reason ...` で固定markerの投稿を照合し、exact confirmation後に監査へ記録できます。現在の監査と一致する受理証拠が確定した場合だけ、Taskは既実行のreceiptを保持して通常の停止確認後に回復します。previewだけ、unknown、矛盾するreceipt、改竄または検証できない証拠では解除しません。照合対象が見つからないだけで未送信とみなして再送する経路はありません。

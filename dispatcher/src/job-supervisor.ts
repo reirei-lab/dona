@@ -345,6 +345,8 @@ export class JobSupervisor {
     }
     // 外部tool待機が未確定steerのreceipt待ちを上書きしてはいけない。
     if(task.desired_state==="running"&&(task.steer_pending_event_id||task.wait_reason==="steer_acceptance_unknown"||job.steer_state==="dispatching")) {this.database.tasks.wait(task,"steer_acceptance_unknown",60_000);return;}
+    const externalRecovery=this.database.tasks.externalApprovalRecovery(job.job_id);
+    if(task.desired_state==="running"&&externalRecovery.state!=="ready") {this.database.tasks.wait(task,externalRecovery.state==="unknown"?"external_effect_unknown":"external_approval",30_000);return;}
     if(job.last_error_code==="runtime_external_approval_pending"&&task.desired_state==="running"&&task.stop_state==="none"){
       if(!this.runtime.observeWorker){this.database.tasks.wait(task,"observation_unknown");return;}
       const observed=await this.observeWorker(job);

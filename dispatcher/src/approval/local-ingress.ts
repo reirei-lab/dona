@@ -15,6 +15,14 @@ export class LocalExternalApprovalIngress {
   private readonly service:LocalExternalApprovalService,private readonly config:{instance_id:string;workspace_id:string;owner_id:string;main_agent:string},private readonly wake:()=>void=()=>{}){
   sql.exec(`CREATE TABLE IF NOT EXISTS local_external_ingress(runtime_request_id TEXT PRIMARY KEY,source_json TEXT NOT NULL,request_id TEXT,operation_slot TEXT NOT NULL,state TEXT NOT NULL,created_at TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS task_external_approval_checkpoints(attempt_id TEXT NOT NULL,runtime_request_id TEXT NOT NULL,request_id TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(attempt_id,runtime_request_id));`);
+  if(!(sql.pragma("table_info(task_external_approval_checkpoints)") as {name:string}[]).some(c=>c.name==="recovery_json"))sql.exec("ALTER TABLE task_external_approval_checkpoints ADD COLUMN recovery_json TEXT");
+  dispatcher.tasks.registerExternalApprovalRecoveryVerifier(identity=>{
+   const row=sql.prepare("SELECT source_json,request_id FROM local_external_ingress WHERE runtime_request_id=?").get(identity.runtime_request_id) as {source_json:string;request_id:string|null}|undefined;
+   if(!row||row.request_id!==identity.request_id)throw Error("external_approval_recovery_unverified");
+   const source=JSON.parse(row.source_json) as ExternalApprovalSource;
+   if(source.source_job_id!==identity.attempt_id||source.runtime_request_id!==identity.runtime_request_id)throw Error("external_approval_recovery_unverified");
+   return service.recoveryEvidence(source,identity.request_id);
+  });
  }
  private durable(source:ExternalApprovalSource){
   if(source.instance_id!==this.config.instance_id||source.workspace_id!==this.config.workspace_id||source.owner_id!==this.config.owner_id)return false;
@@ -44,12 +52,18 @@ export class LocalExternalApprovalIngress {
  private hold(source:ExternalApprovalSource,requestId:string){if(!source.source_job_id)return;
   this.sql.transaction(()=>{
    if(!this.authorizeSource(source))throw Error("external_approval_source_unavailable");
-   this.sql.prepare("INSERT OR IGNORE INTO task_external_approval_checkpoints VALUES(?,?,?,'pending')").run(source.source_job_id,source.runtime_request_id,requestId);
+   this.sql.prepare("INSERT OR IGNORE INTO task_external_approval_checkpoints(attempt_id,runtime_request_id,request_id,state) VALUES(?,?,?,'pending')").run(source.source_job_id,source.runtime_request_id,requestId);
    this.sql.prepare("UPDATE jobs SET status='blocked',last_error_code='runtime_external_approval_pending',last_error_message='External action awaits operator approval' WHERE job_id=? AND status IN ('running','blocked')").run(source.source_job_id);
    const task=this.dispatcher.tasks.forAttempt(source.source_job_id!)!;this.dispatcher.tasks.wait(task,"external_approval");
   }).immediate();
  }
+ private refreshRecovery(source:ExternalApprovalSource,requestId:string){
+  if(!source.source_job_id)return;
+  const evidence=this.service.recoveryEvidence(source,requestId);
+  this.sql.prepare("UPDATE task_external_approval_checkpoints SET recovery_json=? WHERE attempt_id=? AND runtime_request_id=? AND request_id=?").run(stableStringify(evidence),source.source_job_id,source.runtime_request_id,requestId);
+ }
  private finish(source:ExternalApprovalSource,requestId:string,state:string){
+  this.refreshRecovery(source,requestId);
   this.sql.transaction(()=>{
    const event=this.dispatcher.get(source.source_event_id);if(!event?.reply_target_json)throw Error("external_approval_source_unavailable");
    if(!source.source_job_id){const result=this.dispatcher.enqueue({schema_version:1,source:"dona_approval",external_event_id:`external:${requestId}:terminal`,type:"external_approval_finished",occurred_at:new Date().toISOString(),subject:{workspace_id:source.workspace_id,channel_id:source.channel_id,thread_ts:source.thread_ts,actor_id:source.requester_id},payload:{request_id:requestId,state,source_event_id:source.source_event_id},reply_target:JSON.parse(event.reply_target_json)});if(result.payloadMismatch)throw Error("external_approval_outbox_conflict");}
@@ -57,7 +71,7 @@ export class LocalExternalApprovalIngress {
     this.sql.prepare("UPDATE task_external_approval_checkpoints SET state=? WHERE attempt_id=? AND runtime_request_id=?").run(state,source.source_job_id,source.runtime_request_id);
     const other=this.sql.prepare("SELECT 1 FROM task_external_approval_checkpoints WHERE attempt_id=? AND state='pending' LIMIT 1").get(source.source_job_id);
     const task=this.dispatcher.tasks.forAttempt(source.source_job_id);
-    if(!other&&task?.current_attempt_id===source.source_job_id&&this.durable(source)){
+    if(!other&&task?.current_attempt_id===source.source_job_id&&this.durable(source)&&this.dispatcher.tasks.externalApprovalRecovery(source.source_job_id).state==="ready"){
      this.sql.prepare("UPDATE jobs SET status='running',last_error_code=NULL,last_error_message=NULL WHERE job_id=? AND last_error_code='runtime_external_approval_pending'").run(source.source_job_id);
      this.sql.prepare("UPDATE tasks SET state='active',wait_reason=NULL,next_check_at=NULL,revision=revision+1 WHERE task_id=? AND wait_reason='external_approval'").run(task.task_id);
     }
@@ -69,16 +83,18 @@ export class LocalExternalApprovalIngress {
   try{
    const allPending=(await this.runtime.externalRequests()).sort((a,b)=>a.request_id.localeCompare(b.request_id));
    const pending=[...allPending.filter(r=>r.request_id>this.pendingCursor),...allPending.filter(r=>r.request_id<=this.pendingCursor)];
-   const rows=this.sql.prepare("SELECT * FROM local_external_ingress WHERE state='pending' AND runtime_request_id>? ORDER BY runtime_request_id LIMIT 64").all(this.rowCursor) as {runtime_request_id:string;source_json:string;request_id:string|null;operation_slot:string}[];
+   const rows=this.sql.prepare("SELECT * FROM local_external_ingress WHERE (state='pending' OR EXISTS(SELECT 1 FROM task_external_approval_checkpoints c WHERE c.runtime_request_id=local_external_ingress.runtime_request_id AND (c.recovery_json IS NULL OR json_extract(c.recovery_json,'$.effect')='unknown'))) AND runtime_request_id>? ORDER BY runtime_request_id LIMIT 64").all(this.rowCursor) as {runtime_request_id:string;source_json:string;request_id:string|null;operation_slot:string;state:string}[];
 
    for(const [id,entry] of this.live)if(entry.until<=Date.now())this.live.delete(id);
    const phases:Array<()=>Promise<void>>=[async()=>{
    for(const row of pending){if(performance.now()>=deadline)break;this.live.delete(row.request_id);try{const source=this.source(row),agent=await this.runtime.status(row.agent);if(!agent||agent.generation!==row.generation||agent.thread_id!==row.thread_id)throw Error("external_approval_source_unavailable");this.live.set(row.request_id,{source,until:Date.now()+30000});}catch{this.pendingCursor=row.request_id;await this.runtime.resolveExternal(row.agent,row.request_id,{request_id:null,state:"source_denied"}).catch(()=>{});}}
    // mainへpending handleを返した後も、元のDona世代とsaved sourceを照合する。
    for(const row of rows){if(performance.now()>=deadline)break;this.rowCursor=row.runtime_request_id;this.live.delete(row.runtime_request_id);const source=JSON.parse(row.source_json) as ExternalApprovalSource;
+    if(row.state!=="pending"){if(row.request_id)this.refreshRecovery(source,row.request_id);continue;}
     const record=await this.runtime.externalRequest(source.runtime_request_id),agent=await this.runtime.status(source.agent);if(!record||record.state==="expired"||record.agent!==source.agent||record.generation!==source.generation||record.thread_id!==source.thread_id||record.turn_id!==source.turn_id||(source.source_job_id&&(record.operation_key??null)!==source.runtime_operation_key)||!agent||agent.generation!==source.generation||agent.thread_id!==source.thread_id||!this.durable(source)){
      this.live.delete(source.runtime_request_id);
      const lost=row.request_id?this.service.sourceUnavailable(source,row.request_id):null;
+     if(row.request_id)this.refreshRecovery(source,row.request_id);
      this.sql.transaction(()=>{this.sql.prepare("UPDATE local_external_ingress SET state='source_lost' WHERE runtime_request_id=?").run(row.runtime_request_id);this.sql.prepare("UPDATE task_external_approval_checkpoints SET state='needs_review' WHERE runtime_request_id=? AND state='pending'").run(row.runtime_request_id);}).immediate();if(row.request_id&&!source.source_job_id)this.finish(source,row.request_id,lost?.execution?.state??lost?.state??"needs_review");this.wake();continue;
     }
     this.live.set(source.runtime_request_id,{source,until:Date.now()+30000});
