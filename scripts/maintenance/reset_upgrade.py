@@ -135,6 +135,9 @@ const db=new Database(source,{{readonly:true,fileMustExist:true}});
 try {{
   if(operation==='read') console.log(JSON.stringify(db.prepare(args.sql).raw().all(...args.values)));
   else {{
+    // Pin the exclusion and backup to one snapshot, including WAL history.
+    db.exec('BEGIN');
+    if(db.pragma('main.application_id',{{simple:true}})!==0 || db.prepare("SELECT 1 FROM main.sqlite_schema WHERE lower(name) IN ('approval_schema','web_auth_schema','approval_payload_secrets','web_auth_payloads') LIMIT 1").get()) throw Error('schema_full_backup_payload_store_forbidden');
     const start=Date.now();
     await db.backup(args.destination,{{progress:()=>{{if(Date.now()-start>60000)throw Error('backup_timeout');return 256;}}}});
     const snapshot=new Database(args.destination,{{readonly:true,fileMustExist:true}});

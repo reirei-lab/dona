@@ -74,3 +74,5 @@ Runtimeの要求queueは本文をprocess memoryだけに置き、SQLiteの既存
 常駐tickは5秒の新しい処理開始budgetと4段階の巡回順序を使う。新規要求、source再照合、executor、terminal通知の一部が遅くても、他段階と次のIDへ順番を渡す。各開始済みprovider callは固定deadlineまで完了を待ち、送信途中に中断して自動再送しない。executorもimmutable履歴cursorを処理したIDごとに進め、budgetで飛ばした後続を次回に残す。
 
 `doctor()` がreadyの場合、全active keyの最短期限を `key_expires_at`、残り14日以内を `rotation_due` として返す。hostの署名やprovisioning profileの期限とは別に確認する。
+
+保護payloadを導入したDBは、通常の保守reset/offline updateによる全DB snapshotの対象にできない。schema名と永続application IDを同じSQLite snapshotで検査し、payload tableをrename/drop済みでもfreelistを含む複製を拒否する。保管・照合には承認metadata専用の手順を使い、この拒否をraw file copyで回避しない。
