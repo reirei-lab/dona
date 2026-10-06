@@ -33,17 +33,20 @@ jobs:
   verify:
     name: Verify ${{ matrix.component }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - component: dispatcher
             runner: ubuntu-24.04
+            timeout: 30
           - component: sources/slack
             runner: macos-26
+            timeout: 15
           - component: updater
             runner: ubuntu-24.04
+            timeout: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,6 +61,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
         working-directory: ${{ matrix.component }}
+
+      - name: Install provider contract test dependencies
+        if: matrix.component == 'dispatcher'
+        run: npm ci --ignore-scripts
+        working-directory: sources/slack
 
       - name: Run tests
         run: npm test

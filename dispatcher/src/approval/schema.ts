@@ -322,6 +322,23 @@ CREATE TRIGGER approval_supervisor_binding_revision BEFORE UPDATE ON approval_su
 `;
 const schemaV6Sql = schemaV5Sql.replace("CHECK(version=5)", "CHECK(version=6)")
   .replace("INSERT INTO approval_schema VALUES (5)", "INSERT INTO approval_schema VALUES (6)") + supervisorBindingSql;
+const operationsSql = `
+CREATE TABLE approval_operations_policy (
+  instance_id TEXT NOT NULL, workspace_id TEXT NOT NULL,
+  policy_json TEXT NOT NULL CHECK(json_valid(policy_json) AND length(CAST(policy_json AS BLOB)) BETWEEN 1 AND 8192),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  PRIMARY KEY(instance_id,workspace_id)
+) STRICT;
+CREATE TRIGGER approval_operations_policy_no_delete BEFORE DELETE ON approval_operations_policy
+  BEGIN SELECT RAISE(ABORT,'approval_operations_policy_retained'); END;
+CREATE TRIGGER approval_operations_policy_identity BEFORE UPDATE OF instance_id,workspace_id ON approval_operations_policy
+  BEGIN SELECT RAISE(ABORT,'approval_operations_policy_identity'); END;
+CREATE TRIGGER approval_operations_policy_revision BEFORE UPDATE ON approval_operations_policy
+  WHEN NEW.revision IS NOT OLD.revision+1
+  BEGIN SELECT RAISE(ABORT,'approval_operations_policy_revision'); END;
+`;
+const schemaV7Sql = schemaV6Sql.replace("CHECK(version=6)", "CHECK(version=7)")
+  .replace("INSERT INTO approval_schema VALUES (6)", "INSERT INTO approval_schema VALUES (7)") + operationsSql;
 
 function shape(db: Database.Database): string {
   return JSON.stringify(db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE substr(lower(name),1,9)='approval_' OR substr(lower(tbl_name),1,9)='approval_' ORDER BY type,name").all());
@@ -333,7 +350,7 @@ function verifiedVersion(db: Database.Database): number {
   try {
     if (expectedShapes === undefined) {
       const computed = new Map<number, string>();
-      for (const [version, sql] of [[1, schemaSql], [2, schemaV2Sql], [3, schemaV3Sql], [4, schemaV4Sql], [5, schemaV5Sql], [6, schemaV6Sql]] as const) {
+      for (const [version, sql] of [[1, schemaSql], [2, schemaV2Sql], [3, schemaV3Sql], [4, schemaV4Sql], [5, schemaV5Sql], [6, schemaV6Sql], [7, schemaV7Sql]] as const) {
         const expected = new Database(":memory:");
         try { expected.exec(sql); computed.set(version, shape(expected)); }
         finally { expected.close(); }
@@ -530,8 +547,36 @@ export function installApprovalSupervisorBindingSchema(db: Database.Database): v
   } catch { throw new ApprovalSchemaError(); }
 }
 export function verifyApprovalSupervisorBindingSchema(db: Database.Database): void {
-  if (verifiedVersion(db) !== 6) throw new ApprovalSchemaError();
+  if (verifiedVersion(db) < 6) throw new ApprovalSchemaError();
 }
 export function approvalSupervisorBindingRequired(db: Database.Database): boolean {
-  return verifiedVersion(db) === 6;
+  return verifiedVersion(db) >= 6;
+}
+
+/** 明示的なv6->v7移行。operatorの登録・権限付与・監査root作成は行わない。 */
+export function installApprovalOperationsSchema(db: Database.Database): void {
+  try {
+    loadSecurityExtension(db);
+    if (db.inTransaction) throw new ApprovalSchemaError();
+    withSecurityTransactionLock(db, () => {
+      db.transaction(() => {
+        assertSecurityDurability(db); verifyOpenDatabaseFile(db); verifyIntegrityInside(db);
+        const version = verifiedVersion(db);
+        if (version < 6) throw new ApprovalSchemaError();
+        if (version === 6) {
+          db.exec("DROP TABLE main.approval_schema");
+          db.exec("CREATE TABLE approval_schema (version INTEGER PRIMARY KEY CHECK(version=7)) STRICT; INSERT INTO approval_schema VALUES (7)");
+          db.exec(operationsSql); verifyIntegrityInside(db);
+        }
+        verifyOpenDatabaseFile(db);
+      }).immediate();
+      verifyOpenDatabaseFile(db);
+    });
+  } catch { throw new ApprovalSchemaError(); }
+}
+export function verifyApprovalOperationsSchema(db: Database.Database): void {
+  if (verifiedVersion(db) < 7) throw new ApprovalSchemaError();
+}
+export function approvalOperationsRequired(db: Database.Database): boolean {
+  return verifiedVersion(db) >= 7;
 }

@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { assertSecurityDurability } from "../audit/durability.js";
+import { assertSecurityReadAdmission } from "../audit/durability.js";
 import { verifyOpenDatabaseFile } from "../audit/file-identity.js";
 import { assertSynchronousCallback, assertSynchronousResult, type SynchronousCallback } from "../audit/synchronous.js";
 import { verifyApprovalMetadataSchema } from "./schema.js";
@@ -45,7 +45,7 @@ export class ApprovalMetadataNodes {
   constructor(private readonly db: Database.Database) {
     guard(() => {
       if (db.inTransaction) throw new MetadataStoreError();
-      assertSecurityDurability(db); verifyOpenDatabaseFile(db); verifyApprovalMetadataSchema(db);
+      assertSecurityReadAdmission(db); verifyOpenDatabaseFile(db); verifyApprovalMetadataSchema(db);
     });
   }
   read<F extends (reader: MetadataTreeNodeReader) => unknown>(operation: SynchronousCallback<F>): ReturnType<F>;
@@ -77,7 +77,7 @@ export class ApprovalMetadataNodes {
   stage(input: readonly MetadataTreeNode[]): undefined {
     return guard(() => {
       if (!this.db.inTransaction) throw new MetadataStoreError();
-      verifyOpenDatabaseFile(this.db);
+      if (this.db.readonly) throw new Error("security_write_unavailable"); verifyOpenDatabaseFile(this.db);
       verifyApprovalMetadataSchema(this.db); assertSynchronousResult(input);
       if (!Array.isArray(input) || input.length < 1 || input.length > 257) throw new MetadataStoreError();
       const nodes = input.map(node);

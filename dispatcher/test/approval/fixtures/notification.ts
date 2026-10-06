@@ -24,7 +24,7 @@ export function notificationFixture(t: { after(fn: () => void): void }) {
   };
   const receipts:NotificationReceiptAuthority=(command,_request,notification,_mark,state)=>{
     assertCurrentAuditReadState(f.db,state);assert.equal(command.authority_ref,"fixture_notification_connection");
-    return {status:"verified",scope,notification_id:notification.row.notification_attempt_id,consumer_id:"fixture_notification_worker",delivery_fence:command.expected_fence,proof_kind:proof,receipt};
+    return {status:"verified",scope,notification_id:notification.row.notification_attempt_id,consumer_id:"fixture_notification_worker",delivery_fence:command.expected_fence,...(proof === "reconcile" ? { proof_kind: proof, operator_context_ref: "fixture_operator_context", operator_revision: 1 } : { proof_kind: proof }),receipt};
   };
   const broker=new ApprovalNotificationBroker(f.db,f.providers,scope,claim,recovery,receipts,()=>content,()=>wrapping,()=>({...markerKey,state:revoked?"revoked":"active"}));
   const command=(kind:"approval_card"|"pending_notice"="approval_card"):NotificationCommand=>{

@@ -65,11 +65,12 @@ export function bindingGenerationGenesis(scopeInput: SupervisorBindingScope): Ui
  * generation 1へだけ進め、native側のrevision/bytes一致CASを使う。 */
 export class KeychainBindingGenerations implements BindingGenerationStore {
   private readonly scope: SupervisorBindingScope;
-  private readonly nativeScope: { access_group: string; instance_id: string; purpose: "binding_generation" };
-  constructor(scopeInput: SupervisorBindingScope, accessGroup: string, private readonly transport: BindingKeychainTransport) {
+  private readonly nativeScope: { access_group: string; instance_id: string; purpose: "binding_generation" | "policy_generation" };
+  constructor(scopeInput: SupervisorBindingScope, accessGroup: string, private readonly transport: BindingKeychainTransport,
+    purpose: "binding_generation" | "policy_generation" = "binding_generation") {
     this.scope = scopeSchema.parse(scopeInput);
     this.nativeScope = { access_group: accessGroup,
-      instance_id: "ab_" + hash(this.scope).slice(0, 64), purpose: "binding_generation" };
+      instance_id: "ab_" + hash(this.scope).slice(0, 64), purpose };
     encodeKeychainCasRequest(this.nativeScope);
     assertSynchronousCallback(transport.exchange);
   }

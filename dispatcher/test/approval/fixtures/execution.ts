@@ -44,7 +44,7 @@ export function executionFixture(t: { after(fn: () => void): void }) {
   const receipts: ExecutionReceiptAuthority = (command, _request, attempt) => {
     assert.equal(command.authority_ref, "fixture_executor_connection");
     const grant: ReturnType<ExecutionReceiptAuthority> = { status: "verified", scope, attempt_id: attempt.row.attempt_id, consumer_id: "fixture_receipt_reader",
-      execution_fence: command.expected_fence, proof_kind: proof, receipt };
+      execution_fence: command.expected_fence, ...(proof === "reconcile" ? { proof_kind: proof, operator_context_ref: "fixture_operator_context", operator_revision: 1 } : { proof_kind: proof }), receipt };
     return receiptOverride ? receiptOverride(grant) : grant;
   };
   // 認証文字列や結果はfixtureのみ。実connection/proof providerを提供しない。
