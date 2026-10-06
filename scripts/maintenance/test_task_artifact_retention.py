@@ -39,7 +39,7 @@ class RetentionTests(unittest.TestCase):
             notification_state TEXT,content_delete_at TEXT,notification_event_id TEXT);
           CREATE TABLE job_groups(source_event_id TEXT,notification_mode TEXT,sealed_at TEXT,all_terminal_event_id TEXT);
           CREATE TABLE events(event_id TEXT PRIMARY KEY,status TEXT,completed_at TEXT DEFAULT '2026-09-01T00:00:00Z',
-            source TEXT,subject_json TEXT,reply_target_json TEXT,result_json TEXT);
+            source TEXT,subject_json TEXT,reply_target_json TEXT,result_json TEXT,event_type TEXT,payload_json TEXT);
           CREATE TABLE job_owner_bindings(job_id TEXT PRIMARY KEY,source_event_id TEXT,owner_json TEXT,destination_json TEXT);
         """)
         self.engine = Retention(self.db, str(self.workspace), str(self.results), Policy(7, 0))
@@ -81,6 +81,9 @@ class RetentionTests(unittest.TestCase):
         ]}
         self.db.execute("INSERT INTO events(event_id,status,source,subject_json,reply_target_json,result_json) VALUES(?,?,'dona_job',?,?,?)",
             (report, status, json.dumps({"job_id": job, "source_event_id": "event-" + job}), json.dumps(destination), json.dumps(result)))
+        job_status = self.db.execute("SELECT status FROM jobs WHERE job_id=?", (job,)).fetchone()[0]
+        self.db.execute("UPDATE events SET event_type=?,payload_json=? WHERE event_id=?",
+            ("job_" + job_status, json.dumps({"job_id": job, "job_status": job_status}), report))
 
     def tomb(self, kind="worktree", job=JOB):
         parent = self.results if kind == "result" else self.workspace / "scratch"
@@ -213,6 +216,7 @@ class RetentionTests(unittest.TestCase):
         report = "report-" + JOB
         self.db.execute("UPDATE jobs SET status='failed' WHERE job_id=?", (JOB,))
         self.db.execute("UPDATE tasks SET state='failed'")
+        self.db.execute("UPDATE events SET event_type='job_failed',payload_json=?", (json.dumps({"job_id": JOB, "job_status": "failed"}),))
         self.db.execute("UPDATE job_completion_results SET job_status='failed'")
         saved = json.loads(self.db.execute("SELECT result_json FROM events WHERE event_id=?", (report,)).fetchone()[0])
         saved["actions"][1]["status"] = "suspended"
@@ -220,6 +224,7 @@ class RetentionTests(unittest.TestCase):
         self.db.commit()
         self.assertTrue(self.engine.inventory(JOB, NOW)["size_is_complete"])
         self.db.execute("INSERT INTO job_groups VALUES(?,'grouped',?,?)", ("event-" + JOB, OLD, report))
+        self.db.execute("UPDATE events SET payload_json=? WHERE event_id=?", (json.dumps({"group": {"source_event_id": "event-" + JOB, "transition": "all_terminal", "attention_resolution_state": "not_required"}}), report))
         self.db.commit()
         self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
         saved["actions"][1]["status"] = "active"
@@ -231,12 +236,17 @@ class RetentionTests(unittest.TestCase):
         report = "report-" + JOB
         self.db.execute("UPDATE jobs SET status='cancelled'")
         self.db.execute("UPDATE tasks SET state='cancelled'")
+        self.db.execute("UPDATE events SET event_type='job_cancelled',payload_json=?", (json.dumps({"job_id": JOB, "job_status": "cancelled"}),))
         self.db.execute("DELETE FROM job_completion_results")
         result = json.loads(self.db.execute("SELECT result_json FROM events WHERE event_id=?", (report,)).fetchone()[0])
         result["actions"] = result["actions"][1:]
         self.db.execute("UPDATE events SET result_json=? WHERE event_id=?", (json.dumps(result), report))
         self.db.commit()
         self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
+        # Record the explicit decision promptly, without waiting out retention.
+        # Cleanup still waits for both notification and decision expiration.
+        self.db.execute("UPDATE events SET completed_at='2026-10-05T00:00:00Z' WHERE event_id=?", (report,))
+        self.db.commit()
         self.engine.record_cancel_no_post(JOB, NOW)
         self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["retention_not_expired"])
         later = NOW + 8 * 86400
@@ -341,6 +351,42 @@ class RetentionTests(unittest.TestCase):
         self.db.commit()
         self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
         self.db.execute("UPDATE events SET status='completed'")
+        self.db.execute("UPDATE events SET payload_json=? WHERE event_id='report'", (json.dumps({"group": {"source_event_id": "event-" + JOB, "transition": "all_terminal", "attention_resolution_state": "not_required"}}),))
+        self.db.commit()
+        self.assertTrue(self.engine.inventory(JOB, NOW)["size_is_complete"])
+
+    def test_group_payload_requires_final_transition_and_resolved_attention(self):
+        report = "report-" + JOB
+        self.db.execute("INSERT INTO job_groups VALUES(?,'grouped',?,?)", ("event-" + JOB, OLD, report))
+        valid = {"source_event_id": "event-" + JOB, "transition": "all_terminal", "attention_resolution_state": "not_required"}
+        for snapshot in (None, {}, {**valid, "transition": "progress"}, {**valid, "transition": "attention"},
+                         {**valid, "attention_resolution_state": "unresolved"}, {**valid, "attention_resolution_state": None},
+                         {**valid, "source_event_id": "other"}):
+            self.db.execute("UPDATE events SET payload_json=? WHERE event_id=?", (json.dumps({"group": snapshot}), report))
+            self.db.commit()
+            self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
+            with self.assertRaisesRegex(Protected, "notification_unsettled"):
+                self.engine.cleanup(JOB, "result", NOW)
+        for resolution in ("not_required", "resolved"):
+            self.db.execute("UPDATE events SET payload_json=? WHERE event_id=?", (json.dumps({"group": {**valid, "attention_resolution_state": resolution}}), report))
+            self.db.commit()
+            self.assertTrue(self.engine.inventory(JOB, NOW)["size_is_complete"])
+
+    def test_legacy_notification_is_bound_to_current_terminal_status(self):
+        report = "report-" + JOB
+        self.db.execute("UPDATE jobs SET status='failed'")
+        self.db.execute("UPDATE tasks SET state='failed'")
+        result = json.loads(self.db.execute("SELECT result_json FROM events WHERE event_id=?", (report,)).fetchone()[0])
+        result["actions"][1]["status"] = "suspended"
+        self.db.execute("UPDATE events SET result_json=? WHERE event_id=?", (json.dumps(result), report))
+        for event_type, payload in (("job_blocked", {"job_id": JOB, "job_status": "blocked"}),
+                                   ("job_needs_review", {"job_id": JOB, "job_status": "needs_review"}),
+                                   ("job_failed", {"job_id": JOB, "job_status": "completed"}),
+                                   ("job_failed", {"job_id": "other", "job_status": "failed"})):
+            self.db.execute("UPDATE events SET event_type=?,payload_json=? WHERE event_id=?", (event_type, json.dumps(payload), report))
+            self.db.commit()
+            self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
+        self.db.execute("UPDATE events SET event_type='job_failed',payload_json=? WHERE event_id=?", (json.dumps({"job_id": JOB, "job_status": "failed"}), report))
         self.db.commit()
         self.assertTrue(self.engine.inventory(JOB, NOW)["size_is_complete"])
 

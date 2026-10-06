@@ -123,6 +123,16 @@ item=engine.inventory(sys.argv[4],1791244800)
 assert item.get('size_is_complete'),item
 event=db.execute('SELECT all_terminal_event_id FROM job_groups WHERE source_event_id=(SELECT source_event_id FROM jobs WHERE job_id=?)',(sys.argv[4],)).fetchone()[0]
 saved=db.execute('SELECT result_json FROM events WHERE event_id=?',(event,)).fetchone()[0]
+saved_payload=db.execute('SELECT payload_json FROM events WHERE event_id=?',(event,)).fetchone()[0]
+# The real Dispatcher snapshot is required, not just an event pointer.
+for key,value in (('transition','attention'),('attention_resolution_state','unresolved'),('attention_resolution_state',None)):
+    broken=json.loads(saved_payload)
+    broken['group'][key]=value
+    db.execute('UPDATE events SET payload_json=? WHERE event_id=?',(json.dumps(broken),event))
+    db.commit()
+    assert engine.inventory(sys.argv[4],1791244800)['protection_reasons']==['notification_unsettled']
+db.execute('UPDATE events SET payload_json=? WHERE event_id=?',(saved_payload,event))
+db.commit()
 # Incomplete historical action records cannot establish delivery or session success.
 for index in (0,1):
     broken=json.loads(saved)

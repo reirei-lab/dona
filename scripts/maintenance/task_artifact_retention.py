@@ -447,6 +447,13 @@ class Retention:
         subject = object_json(event["subject_json"])
         if subject.get("source_event_id") != row["source_event_id"] or (not grouped and subject.get("job_id") != row["job_id"]):
             raise Protected("notification_binding_mismatch")
+        payload = object_json(event["payload_json"])
+        if grouped:
+            snapshot = payload.get("group")
+            if not isinstance(snapshot, dict) or snapshot.get("source_event_id") != row["source_event_id"] or snapshot.get("transition") != "all_terminal" or snapshot.get("attention_resolution_state") not in ("not_required", "resolved"):
+                raise Protected("notification_unsettled")
+        elif event["event_type"] != "job_" + row["status"] or payload.get("job_status") != row["status"] or payload.get("job_id") != row["job_id"] or payload.get("group") is not None:
+            raise Protected("notification_unsettled")
         result = object_json(event["result_json"])
         if not isinstance(result, dict) or result.get("event_id") != event_id or result.get("status") != "completed":
             raise Protected("notification_unsettled")
@@ -475,7 +482,8 @@ class Retention:
             raise Protected("no_post_decision_unsupported")
         if (not posted and not no_post) or not sessions or not succeeded(sessions[-1]) or sessions[-1].get("status") not in settled_statuses:
             raise Protected("notification_unsettled")
-        if timestamp(event["completed_at"]) + self.policy.retention_days * 86400 > now:
+        notified_at = timestamp(event["completed_at"])
+        if not explicit_no_post and notified_at + self.policy.retention_days * 86400 > now:
             raise Protected("retention_not_expired")
         return digest
 

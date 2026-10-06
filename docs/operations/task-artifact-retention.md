@@ -14,6 +14,8 @@ rootの同一性・包含関係と同じinodeのaliasを拒否する。artifact�
 
 単独legacyのcancelledで通知投稿が不要な場合は、呼出元が`record_cancel_no_post(job_id, now)`で明示する。固定owner/宛先/通知eventと成功した最後のactive session actionを検証し、投稿actionがない正常な通知Resultのdigest・決定時刻を保存する。決定自体の保持期限も満たし、元証拠が変わらない場合だけ決着可能にする。空action、未確認session、group通知、failed/completedへ拡張しない。自動推定やruntime接続は追加していない。
 
+group通知は保存済みpayloadのsource event、`transition: all_terminal`、`attention_resolution_state: not_required/resolved`を要求する。単独legacy通知は`event_type: job_<現在のterminal status>`とpayloadのJob ID・statusを照合する。古いblocked/needs_review通知の成功postやsuspended actionを、現在のfailure通知へ読み替えない。
+
 候補は`jobs` → `task_attempts` → `tasks`のbindingで確認する。Taskと対象Attemptがterminal、他Attemptがnonterminalではない、steer/待機理由が残らない、App Serverの`state: stopped` receiptがあり、created/terminal/stop時刻の最大値から保持期限を経過していることを要求する。古いterminal時刻が新規Attemptの保持を短縮しない。terminal worker cleanupのagent名不在だけでは不足。`needs_review`、active、旧Herdr receipt、共有handoff workspaceは保護する。
 
 対象Taskにcompletion行がある場合は全行の通知が`accepted`、または固定destinationが`none`であることを確認する。通常Taskはcompletion行を生成しないため、`job_owner_bindings`の固定threadとgroup/通知eventのResultにある成功したpostおよび最後の`active`遷移を照合する。曖昧actionや宛先違いを拒否し、通知終了後もpolicyの保持期間を置く。groupのall-terminal eventの`completed`を要求し、未完了siblingも拒否する。期限・停止・通知はpurge前と再開後のwriter transaction内で再確認する。
