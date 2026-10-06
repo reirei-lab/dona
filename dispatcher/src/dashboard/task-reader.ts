@@ -74,7 +74,7 @@ export class DashboardTaskReader {
       // Do not parse delimiters or hide earlier accepted additions while awaiting proof.
       const pending = current && effective.steer_pending_event_id !== null &&
         !(resultRow.steer_event_id === effective.steer_pending_event_id && resultRow.steer_state === "accepted");
-      const request=(pending?"追加指示のワーカー受理は未確認です。\n\n":"")+sanitizeObservationText(objective)+(objective.length>8192?"\n[長い依頼内容の末尾を省略]":"");
+      const request=(pending?"追加指示のワーカー受理は未確認です。\n\n":"")+sanitizeObservationText(objective);
       let result: DashboardTaskSnapshot["result"] = null;
       if (["completed","failed","cancelled"].includes(selected.status) && resultRow.result_json && resultRow.result_json.length <= 1_048_576) try {
         const value:unknown=JSON.parse(resultRow.result_json);

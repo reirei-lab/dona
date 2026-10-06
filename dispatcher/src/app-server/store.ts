@@ -94,8 +94,8 @@ export class RuntimeStore {
     this.db.transaction(()=>{
       const sequence=(this.db.prepare("UPDATE observation_item_sequence SET sequence=sequence+1 WHERE singleton=1 RETURNING sequence").get() as {sequence:number}).sequence;
       this.db.prepare("INSERT INTO observation_items(agent,generation,item_id,item_json,observed_at,sequence) VALUES(?,?,?,?,?,?) ON CONFLICT(agent,generation,item_id) DO UPDATE SET item_json=excluded.item_json,observed_at=excluded.observed_at").run(agent,generation,`${item.turn_id}:${item.id}`,JSON.stringify(item),new Date().toISOString(),sequence);
-      const rows=this.db.prepare("SELECT item_id,length(CAST(item_json AS BLOB)) AS bytes FROM observation_items WHERE agent=? AND generation=? ORDER BY sequence DESC").all(agent,generation) as {item_id:string;bytes:number}[];
-      let bytes=0;for(let i=0;i<rows.length;i++){bytes+=rows[i]!.bytes;if(i>=200||bytes>524288)this.db.prepare("DELETE FROM observation_items WHERE agent=? AND generation=? AND item_id=?").run(agent,generation,rows[i]!.item_id);}
+      // 件数で履歴を保持し、個々の本文を内容・サイズで伏字化や切り詰めしない。
+      this.db.prepare("DELETE FROM observation_items WHERE agent=? AND generation=? AND item_id NOT IN (SELECT item_id FROM observation_items WHERE agent=? AND generation=? ORDER BY sequence DESC LIMIT 200)").run(agent,generation,agent,generation);
     }).immediate();
   }
   cachedItems(agent:string,generation:string):ConversationItem[] {

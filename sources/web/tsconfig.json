@@ -18,6 +18,7 @@
     "src/**/*.ts",
     "test/**/*.ts",
     "browser-test/**/*.ts",
-    "playwright.config.ts"
+    "playwright.config.ts",
+    "scripts/**/*.ts"
   ]
 }
