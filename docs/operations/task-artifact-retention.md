@@ -20,6 +20,8 @@ local dashboardの固定`destination: none`にはSlack通知を要求しない�
 
 owner bindingを常に要求し、local dashboardのreceipt照合はcompletion行があっても省略しない。completionの宛先も固定bindingと比較する。
 
+matching completion行がある場合も、各通知eventとgroup最終eventの完了後にpolicyの保持期間を要求する。通知が遅れて届いても、jobの古いterminal時刻だけで直後に削除しない。
+
 Git worktreeは登録解除契約が未確定なので、関連progress/Resultも含め候補全体を保護する。handoff markerだけでなく同じworkspace pathへの全Job参照も照合し、markerのないpredecessorからも共有workspaceを削除しない。この版の削除対象は独立scratch workspace、そのprogress directory、Attempt専用Result directoryだけ。
 
 ## purge、隔離、再開
@@ -28,7 +30,7 @@ Git worktreeは登録解除契約が未確定なので、関連progress/Result�
 
 通常名を削除せず、同じparent directory handle内で専用tombstoneへ`renameatx_np(RENAME_EXCL)`する。既存tombstoneを上書きしない。全祖先を`O_NOFOLLOW`で開き、owner/type/書込modeを確認する。rename前のdev/inode/birthtime/ctimeと、削除直前のroot/parent/実体identityを再確認する。隔離後はfd相対の走査とunlink/rmdirだけを使い、symlink、hardlink、special fileを拒否する。単一candidateのunsafeはquarantinedにし、残り候補を進める。
 
-writer transactionをboundedなfilesystem処理まで保持し、別SQLite connectionのstatus/receipt更新と削除の間に窓を作らない。process crash、response loss、entry budget到達後は`purged`の同じtombstoneだけを照合し、新しい通常名は触らない。別identityはquarantined。最終unlink後・DB commit前に失敗して実体が見えない場合は、削除完了を推測せず`purged_identity_missing`として隔離する。
+purged commitは最初のwriter lockを解放するため、削除用lock取得後に保持条件だけでなく候補契約・共有workspace参照も再照合する。そのwriter transactionをboundedなfilesystem処理まで保持し、別SQLite connectionのstatus/receipt更新と削除の間に窓を作らない。process crash、response loss、entry budget到達後は`purged`の同じtombstoneだけを照合し、新しい通常名は触らない。別identityはquarantined。最終unlink後・DB commit前に失敗して実体が見えない場合は、削除完了を推測せず`purged_identity_missing`として隔離する。
 
 再開時にもroot・祖先の保存identityを要求する。同じartifact本体を別世代のrootや祖先へ移しても再束縛しない。identityの不足する旧ledgerを削除根拠に読み替えない。
 

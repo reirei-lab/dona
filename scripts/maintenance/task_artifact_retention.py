@@ -302,9 +302,7 @@ class Retention:
             if completion["notification_state"] not in ("none", "accepted"):
                 raise Protected("notification_unsettled")
             if completion["notification_state"] == "accepted" and completion["notification_event_id"]:
-                event = self.db.execute("SELECT status FROM events WHERE event_id=?", (completion["notification_event_id"],)).fetchone()
-                if not event or event["status"] != "completed":
-                    raise Protected("notification_unsettled")
+                self.settled_event(completion["notification_event_id"], now)
             if timestamp(completion["content_delete_at"]) > now:
                 raise Protected("retention_not_expired")
             if completion["job_status"] == row["status"]:
@@ -322,9 +320,7 @@ class Retention:
                 raise Protected("active_group_member")
             event_id = group["all_terminal_event_id"]
         if event_id:
-            event = self.db.execute("SELECT status FROM events WHERE event_id=?", (event_id,)).fetchone()
-            if not event or event["status"] != "completed":
-                raise Protected("notification_unsettled")
+            self.settled_event(event_id, now)
         elif any(object_json(item["destination_json"]) != {"kind": "none"} for item in completions):
             raise Protected("notification_unverified")
         if not matching:
@@ -332,6 +328,13 @@ class Retention:
             # notification. Validate its command receipt and retained DB Result.
             self.regular_notification(row, event_id, now)
         return row
+
+    def settled_event(self, event_id, now):
+        event = self.db.execute("SELECT status,completed_at FROM events WHERE event_id=?", (event_id,)).fetchone()
+        if not event or event["status"] != "completed":
+            raise Protected("notification_unsettled")
+        if timestamp(event["completed_at"]) + self.policy.retention_days * 86400 > now:
+            raise Protected("retention_not_expired")
 
     def regular_notification(self, row, event_id, now):
         # Ordinary Task notifications use events/job_groups, whereas schedule
@@ -563,7 +566,11 @@ class Retention:
             # lock. Keep it through the bounded filesystem step so status/receipt
             # changes cannot race deletion in another SQLite connection.
             self.db.execute("BEGIN IMMEDIATE")
-            self.eligible(job_id, now)
+            fresh = self.eligible(job_id, now)
+            # The first purge commit releases the lock. Recheck *all* candidate
+            # preconditions, including references inserted during that window.
+            if next(item for item in self.candidates(fresh) if item[0] == kind) != candidate:
+                raise Protected("artifact_contract_changed")
             saved = self.db.execute("SELECT * FROM task_artifact_retention WHERE job_id=? AND kind=?", (job_id, kind)).fetchone()
             with private_root(self.roots[root_kind]) as root:
                 scope = object_json(saved["identity_json"])

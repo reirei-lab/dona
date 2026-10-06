@@ -38,7 +38,7 @@ class RetentionTests(unittest.TestCase):
           CREATE TABLE job_completion_results(job_id TEXT,job_status TEXT,destination_json TEXT,
             notification_state TEXT,content_delete_at TEXT,notification_event_id TEXT);
           CREATE TABLE job_groups(source_event_id TEXT,notification_mode TEXT,sealed_at TEXT,all_terminal_event_id TEXT);
-          CREATE TABLE events(event_id TEXT PRIMARY KEY,status TEXT);
+          CREATE TABLE events(event_id TEXT PRIMARY KEY,status TEXT,completed_at TEXT DEFAULT '2026-09-01T00:00:00Z');
           CREATE TABLE job_owner_bindings(job_id TEXT PRIMARY KEY,source_event_id TEXT,owner_json TEXT,destination_json TEXT);
         """)
         self.engine = Retention(self.db, str(self.workspace), str(self.results), Policy(7, 0))
@@ -66,7 +66,7 @@ class RetentionTests(unittest.TestCase):
             json.dumps({"state": "stopped", "reason": "app_server_verified_empty_scope", "observed_at": OLD}), "{}"))
         owner = json.dumps({"kind": "slack_thread", "workspace_id": "fixture", "channel_id": "fixture", "thread_ts": "1.000001"})
         self.db.execute("INSERT INTO job_owner_bindings VALUES(?,?,?,?)", (job, "event-" + job, owner, owner))
-        self.db.execute("INSERT INTO events VALUES(?,'completed')", (report,))
+        self.db.execute("INSERT INTO events(event_id,status) VALUES(?,'completed')", (report,))
         self.db.execute("INSERT INTO job_completion_results VALUES(?,'completed',?,'accepted',?,?)",
                         (job, owner, OLD, report))
         self.db.commit()
@@ -91,6 +91,7 @@ class RetentionTests(unittest.TestCase):
                  ("UPDATE job_completion_results SET notification_state='pending'", "notification_unsettled"),
                  ("UPDATE job_completion_results SET content_delete_at='2027-01-01T00:00:00Z'", "retention_not_expired"),
                  ("UPDATE jobs SET created_at='2026-10-05T00:00:00Z'", "retention_not_expired"),
+                 ("UPDATE events SET completed_at='2026-10-05T00:00:00Z'", "retention_not_expired"),
                  ("UPDATE tasks SET wait_reason='human_input'", "task_attention_unsettled")]
         cases.append(("DELETE FROM job_owner_bindings", "owner_binding_unverified"))
         for sql, expected in cases:
@@ -105,7 +106,7 @@ class RetentionTests(unittest.TestCase):
         self.db.execute("INSERT INTO job_groups VALUES(?,'grouped',?,NULL)", ("event-" + JOB, OLD))
         self.db.commit()
         self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
-        self.db.execute("INSERT INTO events VALUES('report','needs_review')")
+        self.db.execute("INSERT INTO events(event_id,status) VALUES('report','needs_review')")
         self.db.execute("UPDATE job_groups SET all_terminal_event_id='report'")
         self.db.commit()
         self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
@@ -181,6 +182,24 @@ class RetentionTests(unittest.TestCase):
         for job in (JOB, successor):
             self.assertEqual(self.engine.inventory(job, NOW)["protection_reasons"], ["shared_workspace_unverified"])
         self.assertTrue((self.workspace / "scratch" / JOB / "data.json").exists())
+
+    @unittest.skipUnless(HAS_BIRTH, "macOS birthtime必須")
+    def test_new_reference_after_purge_commit_is_rechecked_under_lock(self):
+        other = "job_01m48pn0e7hkz6jy1xz6rmfeav"
+        self.add_job(other)
+        work = self.workspace / "scratch" / JOB
+        def reference(phase):
+            if phase == "purged":
+                writer = sqlite3.connect(self.database)
+                try:
+                    writer.execute("UPDATE jobs SET workspace_path=? WHERE job_id=?", (str(work), other))
+                    writer.commit()
+                finally:
+                    writer.close()
+        with self.assertRaisesRegex(Protected, "shared_workspace_unverified"):
+            self.engine.cleanup(JOB, "worktree", NOW, hook=reference)
+        self.assertEqual((work / "data.json").read_text(), "kept evidence")
+        self.assertFalse(self.tomb().exists())
 
     def test_birthtime_capability_is_not_downgraded(self):
         if HAS_BIRTH:

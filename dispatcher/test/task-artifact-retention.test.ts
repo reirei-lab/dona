@@ -90,6 +90,14 @@ db.commit()
 assert engine.inventory(sys.argv[4],1791244800)['protection_reasons']==['notification_unsettled']
 db.execute('UPDATE events SET result_json=? WHERE event_id=?',(saved,event))
 db.commit()
+db.execute('''INSERT OR IGNORE INTO job_completion_results(job_id,job_status,source_event_id,owner_json,destination_json,work_state,notification_state,materialized_at,content_delete_at,notification_event_id)
+SELECT j.job_id,j.status,j.source_event_id,b.owner_json,b.destination_json,'completed','accepted',j.completed_at,j.completed_at,?
+FROM jobs j JOIN job_owner_bindings b USING(job_id) WHERE j.job_id=?''',(event,sys.argv[4]))
+db.execute("UPDATE events SET completed_at='2026-10-05T00:00:00Z' WHERE event_id=?",(event,))
+db.commit()
+assert engine.inventory(sys.argv[4],1791244800)['protection_reasons']==['retention_not_expired']
+db.execute("UPDATE events SET completed_at='2026-09-01T00:00:00Z' WHERE event_id=?",(event,))
+db.commit()
 if sys.platform=='darwin':
     assert engine.cleanup(sys.argv[4],'result',1791244800)=='deleted'
 local=engine.inventory(sys.argv[5],1791244800)
