@@ -18,7 +18,9 @@ schedule等のcompletion行がある場合は全行の通知が`accepted`、ま�
 
 local dashboardの固定`destination: none`にはSlack通知を要求しない。現行`LocalDashboardCommands`のcreate receipt、source event、event/job owner binding、Taskとterminal Resultの一致を照合する。閲覧確認済みとは推測せず、dashboard readerが利用する`jobs.result_json`を削除後も保持し、disk上のResult参照だけをpurgedにする。DB内contentの保持期間や閲覧ackの導入はこの版では変更しない。
 
-Git worktreeは登録解除契約が未確定なので、関連progress/Resultも含め候補全体を保護する。この版の削除対象は独立scratch workspace、そのprogress directory、Attempt専用Result directoryだけ。
+owner bindingを常に要求し、local dashboardのreceipt照合はcompletion行があっても省略しない。completionの宛先も固定bindingと比較する。
+
+Git worktreeは登録解除契約が未確定なので、関連progress/Resultも含め候補全体を保護する。handoff markerだけでなく同じworkspace pathへの全Job参照も照合し、markerのないpredecessorからも共有workspaceを削除しない。この版の削除対象は独立scratch workspace、そのprogress directory、Attempt専用Result directoryだけ。
 
 ## purge、隔離、再開
 
@@ -35,6 +37,8 @@ private rootと停止確認済みsubtreeを変更する正規writerはこのmain
 ## bounded inventoryと検証
 
 `batch()`は既定dry-run、最大8 Attemptのkeyset page、共通entry budgetとmonotonic deadlineを持つ。最大10,000 entry、64段の深さ、5秒の協調deadlineで走査を止める。OSの同期I/Oを強制中断する上限ではなく、常駐化にはchild timeout/キャンセル設計が別途必要。両root別のcapacity/floor状態と最小空き容量、件数、最古created時刻、割当容量、未計測数、cleanup errorを返し、path/Result本文を投影しない。片側でも観測不能・floor未満なら全体のfloor状態はfalseにする。ledgerのpurged時容量は現在の容量と混ぜず未計測にする。
+
+scan/cleanup未完了のJobではcursorを進めず`has_more: true`を返す。最後の1 Jobでbudgetを使い切った場合も同じJobへ再開する。初回の全体scanが10,000 entryに収まらない大きなartifactはこの版では削除せず、段階的inventory/manifest契約を次工程で決める。呼出元が未完了状態を無視して無限再試行するrunnerは提供しない。
 
 ```sh
 python3 -B scripts/maintenance/test_task_artifact_retention.py -v

@@ -220,6 +220,7 @@ class Retention:
               cleanup_state TEXT NOT NULL CHECK(cleanup_state IN ('purged','deleted','quarantined')),
               allocated_bytes INTEGER NOT NULL, purged_at TEXT NOT NULL,
               cleanup_error TEXT, PRIMARY KEY(job_id,kind));
+            CREATE INDEX IF NOT EXISTS task_artifact_workspace_refs ON jobs(workspace_path,job_id);
             CREATE TRIGGER IF NOT EXISTS retention_terminal_status_guard
               BEFORE UPDATE OF status ON jobs
               WHEN NEW.status<>OLD.status AND EXISTS(
@@ -280,9 +281,22 @@ class Retention:
         if max(created, stopped, completed) + self.policy.retention_days * 86400 > now:
             raise Protected("retention_not_expired")
         completions = self.db.execute("SELECT * FROM job_completion_results WHERE job_id=?", (job_id,)).fetchall()
+        binding = self.db.execute("SELECT * FROM job_owner_bindings WHERE job_id=? AND source_event_id=?",
+                                  (row["job_id"], row["source_event_id"])).fetchone()
+        if not binding:
+            raise Protected("owner_binding_unverified")
+        if object_json(binding["owner_json"]).get("kind") not in ("slack_thread", "local_dashboard", "schedule"):
+            raise Protected("owner_binding_unverified")
+        local = binding and object_json(binding["owner_json"]).get("kind") == "local_dashboard"
+        if local:
+            if object_json(binding["destination_json"]) != {"kind": "none"}:
+                raise Protected("notification_binding_mismatch")
+            self.local_completion(row, binding)
         matching = False
         for completion in completions:
             destination = object_json(completion["destination_json"])
+            if destination != object_json(binding["destination_json"]):
+                raise Protected("notification_binding_mismatch")
             if completion["notification_state"] == "none" and destination != {"kind": "none"}:
                 raise Protected("notification_unsettled")
             if completion["notification_state"] not in ("none", "accepted"):
@@ -295,12 +309,8 @@ class Retention:
                 raise Protected("retention_not_expired")
             if completion["job_status"] == row["status"]:
                 matching = True
-        if not matching:
-            binding = self.db.execute("SELECT * FROM job_owner_bindings WHERE job_id=? AND source_event_id=?",
-                                      (row["job_id"], row["source_event_id"])).fetchone()
-            if binding and object_json(binding["destination_json"]) == {"kind": "none"}:
-                self.local_completion(row, binding)
-                return row
+        if local:
+            return row
         # Grouped delivery is not settled by a sibling's completion receipt.
         group = self.db.execute("SELECT * FROM job_groups WHERE source_event_id=?", (row["source_event_id"],)).fetchone()
         event_id = row["completion_event_id"]
@@ -389,6 +399,9 @@ class Retention:
             raise Protected("workspace_contract_unverified")
         if "_dona_handoff" in workspace:
             raise Protected("shared_workspace_unverified")
+        if self.db.execute("SELECT 1 FROM jobs WHERE workspace_path=? AND job_id<>? LIMIT 1",
+                           (row["workspace_path"], row["job_id"])).fetchone():
+            raise Protected("shared_workspace_unverified")
         job_id = row["job_id"]
         if workspace.get("kind") != "scratch":
             # Git registered worktree disposal requires a separate Git metadata
@@ -445,6 +458,7 @@ class Retention:
                                (after, limit + 1)).fetchall()
         results = []
         cursor = after
+        incomplete = False
         for row in rows[:limit]:
             job_id = row["attempt_id"]
             if budget.remaining <= 0 or time.monotonic() >= budget.deadline:
@@ -459,6 +473,7 @@ class Retention:
                 if not dry_run and not item["protection_reasons"]:
                     for artifact in item["artifacts"]:
                         if budget.remaining <= 0 or time.monotonic() >= budget.deadline:
+                            artifact.update(cleanup_state="budget_exceeded", allocated_bytes=None)
                             break
                         if artifact["cleanup_state"] not in ("eligible", "purged"):
                             continue
@@ -470,6 +485,11 @@ class Retention:
                             artifact.update(cleanup_state="quarantined", allocated_bytes=None,
                                 cleanup_error=str(error) if isinstance(error, Protected) else "filesystem_unverified")
                 results.append(item)
+                incomplete = any(artifact["cleanup_state"] in ("budget_exceeded", "purged") for artifact in item["artifacts"])
+                if incomplete:
+                    # Revisit this exact job; do not lose a partial scan/cleanup
+                    # just because it occupied the final slot of this page.
+                    break
                 cursor = job_id
             finally:
                 del self._batch_budget
@@ -486,7 +506,7 @@ class Retention:
             item["available_bytes"] is not None for item in capacities.values()) else None
         artifacts = [artifact for item in results for artifact in item["artifacts"]]
         return {"dry_run": dry_run, "jobs": results, "next_cursor": cursor,
-                "has_more": len(rows) > len(results), "available_bytes": available,
+                "has_more": incomplete or len(rows) > len(results), "available_bytes": available,
                 "root_capacities": capacities, "disk_floor_met": all(item["disk_floor_met"] for item in capacities.values()), "artifact_count": len(artifacts),
                 "measured_bytes": sum(item["allocated_bytes"] or 0 for item in artifacts),
                 "unmeasured_count": sum(item["allocated_bytes"] is None for item in artifacts),

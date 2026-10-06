@@ -39,6 +39,7 @@ class RetentionTests(unittest.TestCase):
             notification_state TEXT,content_delete_at TEXT,notification_event_id TEXT);
           CREATE TABLE job_groups(source_event_id TEXT,notification_mode TEXT,sealed_at TEXT,all_terminal_event_id TEXT);
           CREATE TABLE events(event_id TEXT PRIMARY KEY,status TEXT);
+          CREATE TABLE job_owner_bindings(job_id TEXT PRIMARY KEY,source_event_id TEXT,owner_json TEXT,destination_json TEXT);
         """)
         self.engine = Retention(self.db, str(self.workspace), str(self.results), Policy(7, 0))
         self.engine.install()
@@ -56,14 +57,18 @@ class RetentionTests(unittest.TestCase):
         for item in (work, progress, result):
             item.mkdir(parents=True, mode=0o700)
             (item / "data.json").write_text("kept evidence")
-        self.db.execute("INSERT INTO jobs(job_id,source_event_id,status,completed_at,created_at,workspace_json,workspace_path,result_path,agent_name,steer_state,result_json,completion_event_id) VALUES(?,?,'completed',?,?,?, ?,?,?,NULL,?,NULL)",
+        report = "report-" + job
+        self.db.execute("INSERT INTO jobs(job_id,source_event_id,status,completed_at,created_at,workspace_json,workspace_path,result_path,agent_name,steer_state,result_json,completion_event_id) VALUES(?,?,'completed',?,?,?, ?,?,?,NULL,?,?)",
                         (job, "event-" + job, OLD, OLD, json.dumps({"kind": "scratch"}), str(work),
-                         str(result / "result.json"), job, '{"summary":"saved"}'))
+                         str(result / "result.json"), job, '{"summary":"saved"}', report))
         self.db.execute("INSERT INTO tasks VALUES(?,'completed',?,NULL,NULL)", (task, job))
         self.db.execute("INSERT INTO task_attempts VALUES(?,?,?,?)", (job, task,
             json.dumps({"state": "stopped", "reason": "app_server_verified_empty_scope", "observed_at": OLD}), "{}"))
-        self.db.execute("INSERT INTO job_completion_results VALUES(?,'completed',?,'none',?,NULL)",
-                        (job, '{"kind":"none"}', OLD))
+        owner = json.dumps({"kind": "slack_thread", "workspace_id": "fixture", "channel_id": "fixture", "thread_ts": "1.000001"})
+        self.db.execute("INSERT INTO job_owner_bindings VALUES(?,?,?,?)", (job, "event-" + job, owner, owner))
+        self.db.execute("INSERT INTO events VALUES(?,'completed')", (report,))
+        self.db.execute("INSERT INTO job_completion_results VALUES(?,'completed',?,'accepted',?,?)",
+                        (job, owner, OLD, report))
         self.db.commit()
         return work
 
@@ -87,6 +92,7 @@ class RetentionTests(unittest.TestCase):
                  ("UPDATE job_completion_results SET content_delete_at='2027-01-01T00:00:00Z'", "retention_not_expired"),
                  ("UPDATE jobs SET created_at='2026-10-05T00:00:00Z'", "retention_not_expired"),
                  ("UPDATE tasks SET wait_reason='human_input'", "task_attention_unsettled")]
+        cases.append(("DELETE FROM job_owner_bindings", "owner_binding_unverified"))
         for sql, expected in cases:
             with self.subTest(sql=sql):
                 self.db.execute("SAVEPOINT fixture")
@@ -143,6 +149,10 @@ class RetentionTests(unittest.TestCase):
         page = self.engine.batch(NOW, entries=1)
         self.assertFalse(page["size_is_complete"])
         self.assertEqual(page["jobs"][0]["artifacts"][0]["cleanup_state"], "budget_exceeded")
+        self.assertEqual(page["next_cursor"], "")
+        self.assertTrue(page["has_more"])
+        resumed = self.engine.batch(NOW, after=page["next_cursor"])
+        self.assertEqual(resumed["jobs"][0]["job_id"], JOB)
         other = "job_01m48pn0e7hkz6jy1xz6rmfeav"
         self.add_job(other)
         page = self.engine.batch(NOW, limit=1)
@@ -160,6 +170,17 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(len(page["jobs"]), 2)
         self.assertEqual(page["jobs"][0]["protection_reasons"], ["artifact_contract_unverified"])
         self.assertTrue(page["jobs"][1]["size_is_complete"])
+
+    def test_shared_predecessor_and_successor_are_both_protected(self):
+        successor = "job_01m48pn0e7hkz6jy1xz6rmfeav"
+        self.add_job(successor)
+        original = str(self.workspace / "scratch" / JOB)
+        self.db.execute("UPDATE jobs SET workspace_path=?,workspace_json=? WHERE job_id=?",
+                        (original, json.dumps({"kind": "scratch", "_dona_handoff": {"workspace_job_id": JOB}}), successor))
+        self.db.commit()
+        for job in (JOB, successor):
+            self.assertEqual(self.engine.inventory(job, NOW)["protection_reasons"], ["shared_workspace_unverified"])
+        self.assertTrue((self.workspace / "scratch" / JOB / "data.json").exists())
 
     def test_birthtime_capability_is_not_downgraded(self):
         if HAS_BIRTH:
@@ -361,6 +382,21 @@ class RetentionTests(unittest.TestCase):
             self.engine.cleanup(JOB, "worktree", NOW, hook=crash)
         self.assertEqual(self.engine.cleanup(JOB, "worktree", NOW, entries=1), "budget_exceeded")
         self.assertEqual(self.engine.cleanup(JOB, "worktree", NOW), "deleted")
+
+    @unittest.skipUnless(HAS_BIRTH, "macOS birthtime必須")
+    def test_last_job_partial_cleanup_is_revisited_by_batch(self):
+        def crash(phase):
+            if phase == "renamed":
+                raise RuntimeError("crash")
+        with self.assertRaises(RuntimeError):
+            self.engine.cleanup(JOB, "worktree", NOW, hook=crash)
+        first = self.engine.batch(NOW, dry_run=False, entries=1)
+        self.assertEqual(first["next_cursor"], "")
+        self.assertTrue(first["has_more"])
+        resumed = self.engine.batch(NOW, after=first["next_cursor"], dry_run=False)
+        self.assertEqual(resumed["next_cursor"], JOB)
+        self.assertFalse(resumed["has_more"])
+        self.assertTrue(all(item["cleanup_state"] == "deleted" for item in resumed["jobs"][0]["artifacts"]))
 
 
 if __name__ == "__main__":

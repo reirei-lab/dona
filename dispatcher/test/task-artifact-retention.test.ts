@@ -94,6 +94,18 @@ if sys.platform=='darwin':
     assert engine.cleanup(sys.argv[4],'result',1791244800)=='deleted'
 local=engine.inventory(sys.argv[5],1791244800)
 assert local.get('size_is_complete'),local
+# The current web route normally has no completion row. Also cover a
+# materialized/legacy row so it cannot bypass the local create receipt.
+db.execute('''INSERT OR IGNORE INTO job_completion_results(job_id,job_status,source_event_id,owner_json,destination_json,work_state,notification_state,materialized_at,content_delete_at)
+SELECT j.job_id,j.status,j.source_event_id,b.owner_json,b.destination_json,'completed','none',j.completed_at,j.completed_at
+FROM jobs j JOIN job_owner_bindings b USING(job_id) WHERE j.job_id=?''',(sys.argv[5],))
+task=db.execute('SELECT task_id FROM task_attempts WHERE attempt_id=?',(sys.argv[5],)).fetchone()[0]
+db.execute("UPDATE local_dashboard_command_receipts SET operation='cancel' WHERE task_id=? AND operation='create'",(task,))
+db.commit()
+assert engine.inventory(sys.argv[5],1791244800)['protection_reasons']==['notification_binding_mismatch']
+db.execute("UPDATE local_dashboard_command_receipts SET operation='create' WHERE task_id=? AND operation='cancel'",(task,))
+db.commit()
+assert engine.inventory(sys.argv[5],1791244800).get('size_is_complete')
 if sys.platform=='darwin':
     assert engine.cleanup(sys.argv[5],'result',1791244800)=='deleted'
     retained=json.loads(db.execute('SELECT result_json FROM jobs WHERE job_id=?',(sys.argv[5],)).fetchone()[0])
