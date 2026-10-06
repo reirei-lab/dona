@@ -67,8 +67,13 @@ export function installTaskGrantSchema(db: Database.Database): void {
     verifySchema(db);
   }).immediate());
 }
-function encode(input: unknown) {
-  assertSynchronousResult(input);
+function encode(input: State) {
+  // 内部所有stateまたはJSON.parseしたDB snapshotだけが到達する。
+  // 共通同期guardの10000-node budgetをscope/各grantに適用する。
+  // 外側の1024件/4MiBと各grantの集合上限もcodecで検証する。
+  assertSynchronousResult(input.scope);
+  if (!Array.isArray(input.grants) || input.grants.length > 1024) throw Error();
+  for (const grant of input.grants) assertSynchronousResult(grant);
   const state = stateSchema.parse(input);
   state.grants.sort((a,b) => a.grant_id < b.grant_id ? -1 : a.grant_id > b.grant_id ? 1 : 0);
   const canonical = stableStringify(state);
@@ -119,8 +124,10 @@ export class TaskGrantRepository {
   private read(state: VerifiedAuditState): ReturnType<typeof encode> | null {
     assertCurrentAuditReadState(this.db,state); verifySchema(this.db);
     const bindings = state.resource_bindings.filter(b => b.resource_id === resourceId && same(b.scope,this.scope));
-    const row = this.db.prepare("SELECT state_json FROM main.task_grant_state WHERE instance_id=? AND tenant_id=?").get(this.scope.instance_id,this.scope.tenant_id) as {state_json:string}|undefined;
+    const row = this.db.prepare("SELECT CASE WHEN typeof(state_json)='text' AND length(CAST(state_json AS BLOB))<=4194304 THEN state_json ELSE NULL END AS state_json FROM main.task_grant_state WHERE instance_id=? AND tenant_id=?")
+      .get(this.scope.instance_id,this.scope.tenant_id) as {state_json:string|null}|undefined;
     if (!row) { if (bindings.length) throw Error(); return null; }
+    if (typeof row.state_json !== "string") throw Error();
     const result = encode(JSON.parse(row.state_json));
     if (row.state_json !== result.canonical || !same(result.state.scope,this.scope) || bindings.length !== 1 || bindings[0]!.resource_digest !== result.digest) throw Error();
     return result;
@@ -187,7 +194,8 @@ export class TaskGrantRepository {
               const valid = this.issuer.currentBinding(freeze(resource),freeze(grant.principal),state,freeze(grant.epic)); assertSynchronousResult(valid);
               if (valid !== true) return denied();
             }
-            if (previous) next.grants[next.grants.indexOf(previous)] = grant; else next.grants.push(grant);
+            if (previous) next.grants[next.grants.indexOf(previous)] = grant;
+            else { if (next.grants.length >= 1024) return denied(); next.grants.push(grant); }
             resultRevision=grant.revision;
           }
         }
