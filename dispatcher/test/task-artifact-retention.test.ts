@@ -149,6 +149,16 @@ db.commit()
 assert engine.inventory(sys.argv[4],1791244800)['protection_reasons']==['retention_not_expired']
 db.execute("UPDATE events SET completed_at='2026-09-01T00:00:00Z' WHERE event_id=?",(event,))
 db.commit()
+# Matching accepted metadata must not bypass the original action proof either.
+for index in (None,0,1):
+    broken=json.loads(saved)
+    if index is None:broken['actions']=[]
+    else:del broken['actions'][index]['success']
+    db.execute('UPDATE events SET result_json=? WHERE event_id=?',(json.dumps(broken),event))
+    db.commit()
+    assert engine.inventory(sys.argv[4],1791244800)['protection_reasons']==['notification_unsettled']
+db.execute('UPDATE events SET result_json=? WHERE event_id=?',(saved,event))
+db.commit()
 if sys.platform=='darwin':
     assert engine.cleanup(sys.argv[4],'result',1791244800)=='deleted'
 local=engine.inventory(sys.argv[5],1791244800)

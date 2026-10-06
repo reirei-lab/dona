@@ -38,7 +38,8 @@ class RetentionTests(unittest.TestCase):
           CREATE TABLE job_completion_results(job_id TEXT,job_status TEXT,destination_json TEXT,
             notification_state TEXT,content_delete_at TEXT,notification_event_id TEXT);
           CREATE TABLE job_groups(source_event_id TEXT,notification_mode TEXT,sealed_at TEXT,all_terminal_event_id TEXT);
-          CREATE TABLE events(event_id TEXT PRIMARY KEY,status TEXT,completed_at TEXT DEFAULT '2026-09-01T00:00:00Z');
+          CREATE TABLE events(event_id TEXT PRIMARY KEY,status TEXT,completed_at TEXT DEFAULT '2026-09-01T00:00:00Z',
+            source TEXT,subject_json TEXT,reply_target_json TEXT,result_json TEXT);
           CREATE TABLE job_owner_bindings(job_id TEXT PRIMARY KEY,source_event_id TEXT,owner_json TEXT,destination_json TEXT);
         """)
         self.engine = Retention(self.db, str(self.workspace), str(self.results), Policy(7, 0))
@@ -66,11 +67,20 @@ class RetentionTests(unittest.TestCase):
             json.dumps({"state": "stopped", "reason": "app_server_verified_empty_scope", "observed_at": OLD}), "{}"))
         owner = json.dumps({"kind": "slack_thread", "workspace_id": "fixture", "channel_id": "fixture", "thread_ts": "1.000001"})
         self.db.execute("INSERT INTO job_owner_bindings VALUES(?,?,?,?)", (job, "event-" + job, owner, owner))
-        self.db.execute("INSERT INTO events(event_id,status) VALUES(?,'completed')", (report,))
+        self.add_notification(job, report)
         self.db.execute("INSERT INTO job_completion_results VALUES(?,'completed',?,'accepted',?,?)",
                         (job, owner, OLD, report))
         self.db.commit()
         return work
+
+    def add_notification(self, job, report, state="active", status="completed"):
+        destination = json.loads(self.db.execute("SELECT destination_json FROM job_owner_bindings WHERE job_id=?", (job,)).fetchone()[0])
+        result = {"schema_version": 1, "event_id": report, "status": "completed", "actions": [
+            {"tool": "dona_slack.post_message", **destination, "message_ts": "1.000002", "reply_broadcast": False, "success": True},
+            {"tool": "dona_slack.set_agent_session_status", **destination, "status": state, "success": True},
+        ]}
+        self.db.execute("INSERT INTO events(event_id,status,source,subject_json,reply_target_json,result_json) VALUES(?,?,'dona_job',?,?,?)",
+            (report, status, json.dumps({"job_id": job, "source_event_id": "event-" + job}), json.dumps(destination), json.dumps(result)))
 
     def tomb(self, kind="worktree", job=JOB):
         parent = self.results if kind == "result" else self.workspace / "scratch"
@@ -176,6 +186,60 @@ class RetentionTests(unittest.TestCase):
             self.assertEqual(self.engine.cleanup(JOB, "worktree", NOW), "deleted")
             capacity.assert_not_called()
 
+    def test_matching_completion_cannot_replace_delivery_actions(self):
+        report = "report-" + JOB
+        saved = json.loads(self.db.execute("SELECT result_json FROM events WHERE event_id=?", (report,)).fetchone()[0])
+        for index in (None, 0, 1):
+            broken = json.loads(json.dumps(saved))
+            if index is None:
+                broken["actions"] = []
+            else:
+                del broken["actions"][index]["success"]
+            self.db.execute("UPDATE events SET result_json=? WHERE event_id=?", (json.dumps(broken), report))
+            self.db.commit()
+            self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
+        self.db.execute("UPDATE events SET result_json=? WHERE event_id=?", (json.dumps(saved), report))
+        self.db.commit()
+        self.assertTrue(self.engine.inventory(JOB, NOW)["size_is_complete"])
+        later = dict(saved["actions"][1])
+        later.pop("success")
+        later["status"] = "processing"
+        saved["actions"].append(later)
+        self.db.execute("UPDATE events SET result_json=? WHERE event_id=?", (json.dumps(saved), report))
+        self.db.commit()
+        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
+
+    def test_failed_legacy_suspended_is_settled_but_group_requires_active(self):
+        report = "report-" + JOB
+        self.db.execute("UPDATE jobs SET status='failed' WHERE job_id=?", (JOB,))
+        self.db.execute("UPDATE tasks SET state='failed'")
+        self.db.execute("UPDATE job_completion_results SET job_status='failed'")
+        saved = json.loads(self.db.execute("SELECT result_json FROM events WHERE event_id=?", (report,)).fetchone()[0])
+        saved["actions"][1]["status"] = "suspended"
+        self.db.execute("UPDATE events SET result_json=? WHERE event_id=?", (json.dumps(saved), report))
+        self.db.commit()
+        self.assertTrue(self.engine.inventory(JOB, NOW)["size_is_complete"])
+        self.db.execute("INSERT INTO job_groups VALUES(?,'grouped',?,?)", ("event-" + JOB, OLD, report))
+        self.db.commit()
+        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
+        saved["actions"][1]["status"] = "active"
+        self.db.execute("UPDATE events SET result_json=? WHERE event_id=?", (json.dumps(saved), report))
+        self.db.commit()
+        self.assertTrue(self.engine.inventory(JOB, NOW)["size_is_complete"])
+
+    def test_corrupt_ledger_does_not_block_other_candidates(self):
+        other = "job_01m48pn0e7hkz6jy1xz6rmfeav"
+        self.add_job(other)
+        self.db.execute("INSERT INTO task_artifact_retention VALUES(?,'result','result',?,'broken','','purged',0,?,NULL)", (JOB, JOB, OLD))
+        self.db.commit()
+        summary = self.engine.batch(NOW)
+        self.assertEqual(len(summary["jobs"]), 2)
+        artifact = summary["jobs"][0]["artifacts"][2]
+        self.assertEqual(artifact["cleanup_state"], "unsafe")
+        self.assertEqual(artifact["cleanup_error"], "artifact_identity_unverified")
+        self.assertIsNone(artifact["allocated_bytes"])
+        self.assertTrue(summary["jobs"][1]["size_is_complete"])
+
     def test_dry_run_measures_without_purge(self):
         inventory = self.engine.batch(NOW)
         self.assertTrue(inventory["size_is_complete"])
@@ -206,7 +270,7 @@ class RetentionTests(unittest.TestCase):
         self.db.execute("INSERT INTO job_groups VALUES(?,'grouped',?,NULL)", ("event-" + JOB, OLD))
         self.db.commit()
         self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
-        self.db.execute("INSERT INTO events(event_id,status) VALUES('report','needs_review')")
+        self.add_notification(JOB, "report", status="needs_review")
         self.db.execute("UPDATE job_groups SET all_terminal_event_id='report'")
         self.db.commit()
         self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])

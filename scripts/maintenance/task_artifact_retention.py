@@ -309,7 +309,6 @@ class Retention:
             if object_json(binding["destination_json"]) != {"kind": "none"}:
                 raise Protected("notification_binding_mismatch")
             self.local_completion(row, binding, now)
-        matching = False
         for completion in completions:
             destination = object_json(completion["destination_json"])
             if destination != object_json(binding["destination_json"]):
@@ -322,8 +321,6 @@ class Retention:
                 self.settled_event(completion["notification_event_id"], now)
             if timestamp(completion["content_delete_at"]) > now:
                 raise Protected("retention_not_expired")
-            if completion["job_status"] == row["status"]:
-                matching = True
         if local:
             return row
         # Grouped delivery is not settled by a sibling's completion receipt.
@@ -340,10 +337,9 @@ class Retention:
             self.settled_event(event_id, now)
         elif any(object_json(item["destination_json"]) != {"kind": "none"} for item in completions):
             raise Protected("notification_unverified")
-        if not matching:
-            # A fixed local destination:none intentionally has no all-terminal
-            # notification. Validate its command receipt and retained DB Result.
-            self.regular_notification(row, event_id, now)
+        # Completion metadata never substitutes for recorded delivery/session
+        # evidence, even when it happens to match the current terminal status.
+        self.regular_notification(row, event_id, now, grouped=bool(group and group["notification_mode"] == "grouped"))
         return row
 
     def settled_event(self, event_id, now):
@@ -353,7 +349,7 @@ class Retention:
         if timestamp(event["completed_at"]) + self.policy.retention_days * 86400 > now:
             raise Protected("retention_not_expired")
 
-    def regular_notification(self, row, event_id, now):
+    def regular_notification(self, row, event_id, now, grouped=False):
         # Ordinary Task notifications use events/job_groups, whereas schedule
         # completion uses job_completion_results. Do not invent schedule rows.
         binding = self.db.execute("SELECT * FROM job_owner_bindings WHERE job_id=? AND source_event_id=?",
@@ -372,7 +368,7 @@ class Retention:
         if object_json(event["reply_target_json"]) != destination:
             raise Protected("notification_binding_mismatch")
         subject = object_json(event["subject_json"])
-        if subject.get("source_event_id") != row["source_event_id"]:
+        if subject.get("source_event_id") != row["source_event_id"] or (not grouped and subject.get("job_id") != row["job_id"]):
             raise Protected("notification_binding_mismatch")
         result = object_json(event["result_json"])
         if not isinstance(result, dict) or result.get("event_id") != event_id or result.get("status") != "completed":
@@ -388,8 +384,9 @@ class Retention:
                      isinstance(action.get("message_ts"), str) and re.fullmatch(r"\d+\.\d+", action["message_ts"]) and
                      action.get("reply_broadcast") is not True and same_target(action) and succeeded(action) for action in actions)
         sessions = [action for action in actions if action.get("tool") in (
-            "dona_slack.set_agent_session_status", "mcp__dona_slack__set_agent_session_status") and same_target(action) and succeeded(action)]
-        if not posted or not sessions or sessions[-1].get("status") != "active":
+            "dona_slack.set_agent_session_status", "mcp__dona_slack__set_agent_session_status") and same_target(action)]
+        settled_statuses = {"active", "suspended"} if row["status"] == "failed" and not grouped else {"active"}
+        if not posted or not sessions or not succeeded(sessions[-1]) or sessions[-1].get("status") not in settled_statuses:
             raise Protected("notification_unsettled")
         if timestamp(event["completed_at"]) + self.policy.retention_days * 86400 > now:
             raise Protected("retention_not_expired")
@@ -463,9 +460,12 @@ class Retention:
             saved = self.db.execute("SELECT cleanup_state,allocated_bytes,cleanup_error,identity_json FROM task_artifact_retention WHERE job_id=? AND kind=?", (job_id, kind)).fetchone()
             if saved:
                 observation.update({key: saved[key] for key in ("cleanup_state", "allocated_bytes", "cleanup_error")})
-                observation["logical_only"] = object_json(saved["identity_json"]).get("logical_only") is True
-                # Size before purge is historical, not current measured capacity.
-                observation["allocated_bytes"] = 0 if saved["cleanup_state"] == "deleted" else None
+                try:
+                    observation["logical_only"] = object_json(saved["identity_json"]).get("logical_only") is True
+                    # Size before purge is historical, not current measured capacity.
+                    observation["allocated_bytes"] = 0 if saved["cleanup_state"] == "deleted" else None
+                except Protected:
+                    observation.update(cleanup_state="unsafe", allocated_bytes=None, cleanup_error="artifact_identity_unverified")
                 artifacts.append(observation)
                 continue
             try:
