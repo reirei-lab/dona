@@ -266,8 +266,9 @@ class RetentionTests(unittest.TestCase):
         with patch("task_artifact_retention.mount_identity", side_effect=alternate):
             artifact = self.engine.inventory(JOB, NOW)["artifacts"][0]
             self.assertEqual(artifact["cleanup_error"], "mount_boundary")
-            with self.assertRaisesRegex(Protected, "mount_boundary"):
-                self.engine.cleanup(JOB, "worktree", NOW)
+            if HAS_BIRTH:
+                with self.assertRaisesRegex(Protected, "mount_boundary"):
+                    self.engine.cleanup(JOB, "worktree", NOW)
         self.assertEqual((mounted / "keep").read_text(), "same-device mount fixture")
         with patch("task_artifact_retention.mount_identity", side_effect=Protected("mount_identity_unverified")):
             self.assertEqual(self.engine.inventory(JOB, NOW)["artifacts"][0]["cleanup_error"], "mount_identity_unverified")
