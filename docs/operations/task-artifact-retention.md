@@ -10,7 +10,9 @@
 
 呼出元は管理するSQLite connection、canonicalなowner-private workspace/Result root、明示的な`Policy(retention_days, disk_floor_bytes)`を渡す。production policyの既定値はない。policy未確認、disk観測不能、root不明は削除しない。7日未満のpolicyは既存completionの7日保持より短いため拒否し、個別`content_delete_at`も満たす必要がある。testの`Policy(7, 0)`はfixture値で、運用推奨値ではない。
 
-rootの同一性・包含関係と同じinodeのaliasを拒否する。artifactのtop-levelと各childはparentのdeviceと一致することを走査前に確認し、mount境界を越えない。実mountを操作するtestは行わず、device不一致を注入するfixtureで境界拒否を確認する。
+rootの同一性・包含関係と同じinodeのaliasを拒否する。artifactのtop-level・祖先・各childはparentのdeviceとFDから確認したmount identityが一致することを走査前と削除直前に確認する。DarwinはSDKの`fstatfs`によるfsidとmounted-on名、Linuxのinventoryは`fdinfo`のmount IDを使い、同じdeviceの別mountも拒否する。判定不能なら保護する。rootのmount identityもpurge ledgerへ固定し、restartで再照合する。実mount操作は行わず、device不一致・同一deviceのmount identity差・判定不能を注入するfixtureで境界拒否を確認する。
+
+単独legacyのcancelledで通知投稿が不要な場合は、呼出元が`record_cancel_no_post(job_id, now)`で明示する。固定owner/宛先/通知eventと成功した最後のactive session actionを検証し、投稿actionがない正常な通知Resultのdigest・決定時刻を保存する。決定自体の保持期限も満たし、元証拠が変わらない場合だけ決着可能にする。空action、未確認session、group通知、failed/completedへ拡張しない。自動推定やruntime接続は追加していない。
 
 候補は`jobs` → `task_attempts` → `tasks`のbindingで確認する。Taskと対象Attemptがterminal、他Attemptがnonterminalではない、steer/待機理由が残らない、App Serverの`state: stopped` receiptがあり、created/terminal/stop時刻の最大値から保持期限を経過していることを要求する。古いterminal時刻が新規Attemptの保持を短縮しない。terminal worker cleanupのagent名不在だけでは不足。`needs_review`、active、旧Herdr receipt、共有handoff workspaceは保護する。
 

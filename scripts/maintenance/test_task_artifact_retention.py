@@ -10,7 +10,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from task_artifact_retention import Retention, Protected, Policy
+from task_artifact_retention import Retention, Protected, Policy, mount_identity
 
 JOB = "job_01m48pn0e7hkz6jy1xz6rmfeat"
 OLD = "2026-09-01T00:00:00Z"
@@ -226,6 +226,71 @@ class RetentionTests(unittest.TestCase):
         self.db.execute("UPDATE events SET result_json=? WHERE event_id=?", (json.dumps(saved), report))
         self.db.commit()
         self.assertTrue(self.engine.inventory(JOB, NOW)["size_is_complete"])
+
+    def test_cancelled_no_post_requires_bound_expired_explicit_decision(self):
+        report = "report-" + JOB
+        self.db.execute("UPDATE jobs SET status='cancelled'")
+        self.db.execute("UPDATE tasks SET state='cancelled'")
+        self.db.execute("DELETE FROM job_completion_results")
+        result = json.loads(self.db.execute("SELECT result_json FROM events WHERE event_id=?", (report,)).fetchone()[0])
+        result["actions"] = result["actions"][1:]
+        self.db.execute("UPDATE events SET result_json=? WHERE event_id=?", (json.dumps(result), report))
+        self.db.commit()
+        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
+        self.engine.record_cancel_no_post(JOB, NOW)
+        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["retention_not_expired"])
+        later = NOW + 8 * 86400
+        self.assertTrue(self.engine.inventory(JOB, later)["size_is_complete"])
+        self.db.execute("INSERT INTO job_groups VALUES(?,'grouped',?,?)", ("event-" + JOB, OLD, report))
+        self.db.commit()
+        self.assertEqual(self.engine.inventory(JOB, later)["protection_reasons"], ["notification_unsettled"])
+        with self.assertRaisesRegex(Protected, "no_post_decision_unsupported"):
+            self.engine.record_cancel_no_post(JOB, later)
+        self.db.execute("DELETE FROM job_groups")
+        result["actions"][0].pop("success")
+        self.db.execute("UPDATE events SET result_json=? WHERE event_id=?", (json.dumps(result), report))
+        self.db.commit()
+        self.assertEqual(self.engine.inventory(JOB, later)["protection_reasons"], ["notification_unsettled"])
+        with self.assertRaisesRegex(Protected, "notification_unsettled"):
+            self.engine.record_cancel_no_post(JOB, later)
+
+    def test_same_device_mount_identity_boundary_and_unknown_are_protected(self):
+        work = self.workspace / "scratch" / JOB
+        mounted = work / "mounted"
+        mounted.mkdir(mode=0o700)
+        (mounted / "keep").write_text("same-device mount fixture")
+        mounted_ino = mounted.stat().st_ino
+        def alternate(fd):
+            value = mount_identity(fd)
+            return ["same-device-other-mount"] if os.fstat(fd).st_ino == mounted_ino else value
+        with patch("task_artifact_retention.mount_identity", side_effect=alternate):
+            artifact = self.engine.inventory(JOB, NOW)["artifacts"][0]
+            self.assertEqual(artifact["cleanup_error"], "mount_boundary")
+            with self.assertRaisesRegex(Protected, "mount_boundary"):
+                self.engine.cleanup(JOB, "worktree", NOW)
+        self.assertEqual((mounted / "keep").read_text(), "same-device mount fixture")
+        with patch("task_artifact_retention.mount_identity", side_effect=Protected("mount_identity_unverified")):
+            self.assertEqual(self.engine.inventory(JOB, NOW)["artifacts"][0]["cleanup_error"], "mount_identity_unverified")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM task_artifact_retention").fetchone()[0], 0)
+        # Top-level and intermediate ancestor boundaries share st_dev too.
+        for inode in (work.stat().st_ino, work.parent.stat().st_ino):
+            def boundary(fd):
+                return ["other-mount"] if os.fstat(fd).st_ino == inode else mount_identity(fd)
+            with patch("task_artifact_retention.mount_identity", side_effect=boundary):
+                self.assertEqual(self.engine.inventory(JOB, NOW)["artifacts"][0]["cleanup_error"], "mount_boundary")
+
+    @unittest.skipUnless(HAS_BIRTH, "macOS birthtime必須")
+    def test_purged_restart_keeps_root_mount_identity(self):
+        def crash(phase):
+            if phase == "purged":
+                raise RuntimeError("crash")
+        with self.assertRaisesRegex(RuntimeError, "crash"):
+            self.engine.cleanup(JOB, "worktree", NOW, hook=crash)
+        with patch("task_artifact_retention.mount_identity", return_value=["replaced-mount"]):
+            with self.assertRaisesRegex(Protected, "mount_boundary"):
+                self.engine.cleanup(JOB, "worktree", NOW)
+        self.assertTrue((self.workspace / "scratch" / JOB / "data.json").exists())
+        self.assertFalse(self.tomb().exists())
 
     def test_corrupt_ledger_does_not_block_other_candidates(self):
         other = "job_01m48pn0e7hkz6jy1xz6rmfeav"
@@ -484,7 +549,8 @@ class RetentionTests(unittest.TestCase):
                 (work / "keep").write_text("replacement")
         with self.assertRaisesRegex(Protected, "artifact_replaced"):
             self.engine.cleanup(JOB, "worktree", NOW, hook=replace)
-        self.assertEqual((self.tomb() / "keep").read_text(), "replacement")
+        self.assertEqual((work / "keep").read_text(), "replacement")
+        self.assertFalse(self.tomb().exists())
         self.assertEqual(self.engine.cleanup(JOB, "worktree", NOW), "quarantined")
 
     @unittest.skipUnless(HAS_BIRTH, "macOS birthtime必須")

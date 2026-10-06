@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 import time
 
 
@@ -23,6 +24,52 @@ class Protected(Exception):
 
 class BudgetExceeded(Exception):
     pass
+
+
+def mount_identity(descriptor):
+    """device番号とは独立した、開いたFDのmountを確認する。"""
+    if sys.platform == "darwin":
+        # Darwin SDK sys/mount.h __DARWIN_STRUCT_STATFS64 (2168 bytes).
+        class StatFS(ctypes.Structure):
+            _fields_ = [("bsize", ctypes.c_uint32), ("iosize", ctypes.c_int32),
+                        ("counts", ctypes.c_uint64 * 5), ("fsid", ctypes.c_int32 * 2),
+                        ("owner_type_flags", ctypes.c_uint32 * 4),
+                        ("fstype", ctypes.c_char * 16), ("mounted_on", ctypes.c_char * 1024),
+                        ("mounted_from", ctypes.c_char * 1024), ("reserved", ctypes.c_uint32 * 8)]
+        value = StatFS()
+        function = getattr(ctypes.CDLL(None, use_errno=True), "fstatfs", None)
+        if function is None or ctypes.sizeof(value) != 2168:
+            raise Protected("mount_identity_unverified")
+        function.argtypes = [ctypes.c_int, ctypes.POINTER(StatFS)]
+        function.restype = ctypes.c_int
+        if function(descriptor, ctypes.byref(value)) != 0 or not value.mounted_on.startswith(b"/"):
+            raise Protected("mount_identity_unverified")
+        # A remount of the same volume can share fsid, but has a different
+        # mounted-on name. Never use fsid/st_dev alone as the boundary.
+        return ["darwin", list(value.fsid), os.fsdecode(value.mounted_on)]
+    if sys.platform.startswith("linux"):
+        try:
+            with open(f"/proc/self/fdinfo/{descriptor}", encoding="ascii") as stream:
+                match = re.search(r"^mnt_id:\s*(\d+)$", stream.read(4096), re.MULTILINE)
+            if match:
+                return ["linux", int(match[1])]
+        except (OSError, UnicodeError):
+            pass
+    raise Protected("mount_identity_unverified")
+
+
+@contextlib.contextmanager
+def entry_handle(parent, name, info):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | (os.O_DIRECTORY if stat.S_ISDIR(info.st_mode) else 0)
+    child = os.open(name, flags, dir_fd=parent)
+    try:
+        if identity(os.fstat(child)) != identity(info):
+            raise Protected("artifact_replaced")
+        if mount_identity(child) != mount_identity(parent):
+            raise Protected("mount_boundary")
+        yield child
+    finally:
+        os.close(child)
 
 
 @dataclass(frozen=True)
@@ -137,19 +184,29 @@ def parent_handle(root_fd, relative):
             if identity(os.fstat(child)) != identity(info):
                 os.close(child)
                 raise Protected("ancestor_replaced")
-            chain.append((descriptor, segment, identity(info)))
+            try:
+                mounted = mount_identity(child)
+                if mounted != mount_identity(descriptor):
+                    raise Protected("mount_boundary")
+            except BaseException:
+                os.close(child)
+                raise
+            chain.append((descriptor, segment, identity(info), mounted))
             descriptor = child
         def recheck():
-            for ancestor, segment, expected in chain:
+            for ancestor, segment, expected, mounted in chain:
                 info = os.stat(segment, dir_fd=ancestor, follow_symlinks=False)
                 checked(info, True)
                 if identity(info) != expected:
                     raise Protected("ancestor_replaced")
-        recheck.snapshot = [[segment, expected] for _, segment, expected in chain]
+                with entry_handle(ancestor, segment, info) as live:
+                    if mount_identity(live) != mounted:
+                        raise Protected("mount_boundary")
+        recheck.snapshot = [[segment, expected, mounted] for _, segment, expected, mounted in chain]
         yield descriptor, parts[-1], recheck
     finally:
         os.close(descriptor)
-        for ancestor, _, _ in chain:
+        for ancestor, _, _, _ in chain:
             os.close(ancestor)
 
 
@@ -165,31 +222,28 @@ def walk(parent, name, budget, delete=False, expected=None, depth=0):
     if expected is not None and identity(info) != expected:
         raise Protected("artifact_replaced")
     allocated = info.st_blocks * 512
-    if stat.S_ISDIR(info.st_mode):
-        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
-        try:
-            if identity(os.fstat(child)) != identity(info):
-                raise Protected("artifact_replaced")
+    with entry_handle(parent, name, info) as child:
+        if stat.S_ISDIR(info.st_mode):
             # scandir is streaming: do not materialize an unbounded listdir.
             with os.scandir(child) as entries:
                 for entry in entries:
                     allocated += walk(child, entry.name, budget, delete, depth=depth + 1)
-        finally:
-            os.close(child)
-    budget.tick()
-    current = os.stat(name, dir_fd=parent, follow_symlinks=False)
-    checked(current)
-    if identity(current) != identity(info):
-        raise Protected("artifact_replaced")
-    if delete:
-        if not hasattr(current, "st_birthtime"):
-            # Portable Python lacks Linux statx birthtime. dev/ino alone cannot
-            # reject inode reuse after crash. Never downgrade this invariant.
-            raise Protected("birthtime_unavailable")
-        if stat.S_ISDIR(current.st_mode):
-            os.rmdir(name, dir_fd=parent)
-        else:
-            os.unlink(name, dir_fd=parent)
+        budget.tick()
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        checked(current)
+        if identity(current) != identity(info):
+            raise Protected("artifact_replaced")
+        # Reopen the named entry immediately before unlink/rmdir as well.
+        with entry_handle(parent, name, current):
+            if delete and not hasattr(current, "st_birthtime"):
+                # Portable Python lacks Linux statx birthtime. dev/ino alone
+                # cannot reject inode reuse after crash. Never downgrade it.
+                raise Protected("birthtime_unavailable")
+            if delete:
+                if stat.S_ISDIR(current.st_mode):
+                    os.rmdir(name, dir_fd=parent)
+                else:
+                    os.unlink(name, dir_fd=parent)
     return allocated
 
 
@@ -221,6 +275,9 @@ class Retention:
               allocated_bytes INTEGER NOT NULL, purged_at TEXT NOT NULL,
               cleanup_error TEXT, PRIMARY KEY(job_id,kind));
             CREATE INDEX IF NOT EXISTS task_artifact_workspace_refs ON jobs(workspace_path,job_id);
+            CREATE TABLE IF NOT EXISTS task_retention_no_post_decisions(
+              job_id TEXT PRIMARY KEY REFERENCES task_attempts(attempt_id),
+              event_id TEXT NOT NULL, evidence_sha256 TEXT NOT NULL, decided_at TEXT NOT NULL);
             CREATE TRIGGER IF NOT EXISTS retention_terminal_status_guard
               BEFORE UPDATE OF status ON jobs
               WHEN NEW.status<>OLD.status AND EXISTS(
@@ -349,7 +406,27 @@ class Retention:
         if timestamp(event["completed_at"]) + self.policy.retention_days * 86400 > now:
             raise Protected("retention_not_expired")
 
-    def regular_notification(self, row, event_id, now, grouped=False):
+    def record_cancel_no_post(self, job_id, now):
+        """呼出元が通知不要を明示した単独cancelのみ、検証済み証拠を保存する。"""
+        if not isinstance(now, (int, float)) or not math.isfinite(now):
+            raise Protected("timestamp_unverified")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if not row or row["status"] != "cancelled" or self.db.execute(
+                    "SELECT 1 FROM job_groups WHERE source_event_id=? AND notification_mode='grouped'",
+                    (row["source_event_id"],)).fetchone():
+                raise Protected("no_post_decision_unsupported")
+            digest = self.regular_notification(row, row["completion_event_id"], now, explicit_no_post=True)
+            self.db.execute("INSERT INTO task_retention_no_post_decisions VALUES(?,?,?,?)",
+                (job_id, row["completion_event_id"], digest,
+                 dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat().replace("+00:00", "Z")))
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+
+    def regular_notification(self, row, event_id, now, grouped=False, explicit_no_post=False):
         # Ordinary Task notifications use events/job_groups, whereas schedule
         # completion uses job_completion_results. Do not invent schedule rows.
         binding = self.db.execute("SELECT * FROM job_owner_bindings WHERE job_id=? AND source_event_id=?",
@@ -386,10 +463,21 @@ class Retention:
         sessions = [action for action in actions if action.get("tool") in (
             "dona_slack.set_agent_session_status", "mcp__dona_slack__set_agent_session_status") and same_target(action)]
         settled_statuses = {"active", "suspended"} if row["status"] == "failed" and not grouped else {"active"}
-        if not posted or not sessions or not succeeded(sessions[-1]) or sessions[-1].get("status") not in settled_statuses:
+        no_post = False
+        digest = hashlib.sha256(json.dumps([row["source_event_id"], destination, dict(event)], sort_keys=True).encode()).hexdigest()
+        decision = self.db.execute("SELECT * FROM task_retention_no_post_decisions WHERE job_id=?", (row["job_id"],)).fetchone()
+        if row["status"] == "cancelled" and not grouped and not any(action.get("tool") in (
+                "dona_slack.post_message", "mcp__dona_slack__post_message") for action in actions):
+            no_post = explicit_no_post or bool(decision and decision["event_id"] == event_id and decision["evidence_sha256"] == digest)
+            if no_post and not explicit_no_post and timestamp(decision["decided_at"]) + self.policy.retention_days * 86400 > now:
+                raise Protected("retention_not_expired")
+        if explicit_no_post and not no_post:
+            raise Protected("no_post_decision_unsupported")
+        if (not posted and not no_post) or not sessions or not succeeded(sessions[-1]) or sessions[-1].get("status") not in settled_statuses:
             raise Protected("notification_unsettled")
         if timestamp(event["completed_at"]) + self.policy.retention_days * 86400 > now:
             raise Protected("retention_not_expired")
+        return digest
 
     def local_completion(self, row, binding, now):
         owner = object_json(binding["owner_json"])
@@ -593,7 +681,7 @@ class Retention:
                             if kind != "result":
                                 raise
                             recheck()
-                            scope = {"logical_only": True, "root": identity(os.fstat(root)), "ancestors": recheck.snapshot}
+                            scope = {"logical_only": True, "root": identity(os.fstat(root)), "root_mount": mount_identity(root), "ancestors": recheck.snapshot}
                             self.db.execute("INSERT INTO task_artifact_retention VALUES(?,?,?,?,?,?,'purged',0,?,NULL)",
                                 (job_id, kind, root_kind, relative, json.dumps(scope), "",
                                  dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat().replace("+00:00", "Z")))
@@ -601,7 +689,7 @@ class Retention:
                             hook("missing_result")
                             recheck()
                             with private_root(self.roots[root_kind]) as live_root:
-                                if identity(os.fstat(live_root)) != identity(os.fstat(root)):
+                                if identity(os.fstat(live_root)) != identity(os.fstat(root)) or mount_identity(live_root) != scope["root_mount"]:
                                     raise Protected("root_replaced")
                             try:
                                 os.stat(name, dir_fd=parent, follow_symlinks=False)
@@ -623,7 +711,7 @@ class Retention:
                         current = os.stat(name, dir_fd=parent, follow_symlinks=False)
                         if identity(current) != identity(info) or current.st_ctime_ns != info.st_ctime_ns:
                             raise Protected("artifact_replaced")
-                        scope = {"artifact": identity(info), "root": identity(os.fstat(root)), "ancestors": recheck.snapshot}
+                        scope = {"artifact": identity(info), "root": identity(os.fstat(root)), "root_mount": mount_identity(root), "ancestors": recheck.snapshot}
                         self.db.execute("INSERT INTO task_artifact_retention VALUES(?,?,?,?,?,?,'purged',?,?,NULL)",
                                         (job_id, kind, root_kind, relative, json.dumps(scope), str(info.st_ctime_ns),
                                          allocated, dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat().replace("+00:00", "Z")))
@@ -650,6 +738,8 @@ class Retention:
                     raise Protected("artifact_identity_unverified")
                 if identity(os.fstat(root)) != scope.get("root"):
                     raise Protected("root_replaced")
+                if mount_identity(root) != scope.get("root_mount"):
+                    raise Protected("mount_boundary")
                 tomb = ".retention-" + hashlib.sha256((job_id + ":" + kind).encode()).hexdigest()
                 with parent_handle(root, relative) as (parent, name, recheck):
                     if recheck.snapshot != scope["ancestors"]:
@@ -667,6 +757,8 @@ class Retention:
                             raise Protected("artifact_replaced")
                         recheck()
                         hook("before_rename")
+                        with entry_handle(parent, name, info):
+                            pass
                         rename_exclusive(parent, name, tomb)
                         os.fsync(parent)
                         tomb_info = os.stat(tomb, dir_fd=parent, follow_symlinks=False)
@@ -679,7 +771,7 @@ class Retention:
                     recheck()
                     hook("before_delete")
                     with private_root(self.roots[root_kind]) as live_root:
-                        if identity(os.fstat(live_root)) != identity(os.fstat(root)):
+                        if identity(os.fstat(live_root)) != identity(os.fstat(root)) or mount_identity(live_root) != scope["root_mount"]:
                             raise Protected("root_replaced")
                     recheck()
                     walk(parent, tomb, budget, delete=True, expected=expected)
