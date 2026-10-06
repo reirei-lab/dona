@@ -308,3 +308,14 @@ test("別scopeの同じ論理keyを独立受理し、再起動後も構造化対
   try {assert.equal(reader.snapshot(a.task_id)!.task.task_key,"submit");assert.equal(reader.list(()=>true).items.find(t=>t.task_id===b.task_id)!.task_key,"submit");}finally{reader.close();}
  }finally{await f.dispose();}
 });
+
+
+test("Project付きtargetでは後続のProject省略を拒否し、指定訂正後に作成できる",async()=>{
+ const f=await fixture({projectOwner:"org"});try {
+  const input=f.child();assert.throws(()=>f.create(input),/scope_mismatch/);
+  assert.equal(f.db.tasks.continuations.lookup(input),undefined);
+  const specified={...input,project:{owner:"org",number:4,completion_status:"Merge Ready" as const}};
+  const task=f.db.tasks.create(specified,f.config.jobsWorkspaceRoot,f.config.jobResultsDir,{node_id:"I_167",repository:"org/repo",number:167,project:{completion_status:"Merge Ready"}}).task;
+  assert.equal(task.state,"active");assert.equal(JSON.parse(task.project_json!).completion_status,"Merge Ready");
+ }finally{await f.dispose();}
+});

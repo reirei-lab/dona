@@ -143,7 +143,7 @@ export class TaskContinuations {
     } else {
       const repository=input.workspace.repository;
       const allowed=scope.targets.some(target=>target.repository.toLowerCase()===repository.toLowerCase()&&target.issue_numbers.includes(input.issue_number??0)&&
-        (!input.project||!!target.project&&input.project.owner.toLowerCase()===target.project.owner.toLowerCase()&&input.project.number===target.project.number));
+        (input.project ? !!target.project&&input.project.owner.toLowerCase()===target.project.owner.toLowerCase()&&input.project.number===target.project.number : !target.project));
       if(!allowed)throw Error("task_continuation_scope_mismatch");
     }
   }
