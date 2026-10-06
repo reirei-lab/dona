@@ -110,6 +110,7 @@ export class TaskContinuations {
       const repository=input.workspace.repository;
       if(input.continuation_scope.targets.some(t=>t.repository.toLowerCase()===repository.toLowerCase()&&t.issue_numbers.includes(input.issue_number!)))throw Error("task_continuation_initial_issue_conflict");
     }
+    if(input.continuation_scope ? !input.initial_operation||!input.continuation_scope.operations.includes(input.initial_operation) : input.initial_operation!==undefined)throw Error("task_continuation_initial_operation_required");
     if(input.continuation_scope) {
       if(input.continuation||this.dispatcher.get(input.source_event_id)?.source!=="slack")throw Error("task_continuation_scope_invalid");
       if(input.policy.max_attempts>input.continuation_scope.max_attempts_per_task)throw Error("task_continuation_budget_exceeded");
@@ -128,8 +129,9 @@ export class TaskContinuations {
       if(!scope.allow_scratch||input.continuation.operation!=="read_only")throw Error("task_continuation_scope_mismatch");
     } else {
       const repository=input.workspace.repository;
-      const target=scope.targets.find(t=>t.repository.toLowerCase()===repository.toLowerCase()&&t.issue_numbers.includes(input.issue_number??0));
-      if(!target||input.project&&(!target.project||input.project.owner.toLowerCase()!==target.project.owner.toLowerCase()||input.project.number!==target.project.number)||
+      const allowed=scope.targets.some(target=>target.repository.toLowerCase()===repository.toLowerCase()&&target.issue_numbers.includes(input.issue_number??0)&&
+        (!input.project||!!target.project&&input.project.owner.toLowerCase()===target.project.owner.toLowerCase()&&input.project.number===target.project.number));
+      if(!allowed||
         input.continuation.operation==="read_only"&&input.project?.completion_status==="Merge Ready")throw Error("task_continuation_scope_mismatch");
     }
   }
@@ -140,7 +142,7 @@ export class TaskContinuations {
       this.sql.prepare("INSERT INTO task_continuation_members VALUES(?,?,?,?,?)").run(task.task_id,root,input.task_key,this.requestHash(input),input.continuation?.parent_task_id??null);
       const scope=this.scope(task.task_id)!,job=this.dispatcher.getJob(task.current_attempt_id)!;
       const workspace={...JSON.parse(job.workspace_json),_dona_continuation:{root_task_id:root,root_event_id:scope.root_event_id,
-        scope:JSON.parse(scope.scope_json),operation:input.continuation?.operation??"initial"}};
+        scope:JSON.parse(scope.scope_json),operation:input.continuation?.operation??input.initial_operation!}};
       this.sql.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(stableStringify(workspace),job.job_id);
     }
   }
@@ -148,9 +150,6 @@ export class TaskContinuations {
     const row=this.scope(id);if(!row)return;
     const members=this.sql.prepare(`SELECT m.task_id,m.task_key,m.parent_task_id,t.state,t.revision,t.max_attempts FROM task_continuation_members m JOIN tasks t USING(task_id) WHERE m.root_task_id=? ORDER BY t.created_at,m.task_id`).all(row.root_task_id);
     return {root_task_id:row.root_task_id,root_event_id:row.root_event_id,state:row.state,revision:row.revision,scope:JSON.parse(row.scope_json),members};
-  }
-  assertRetryBudget(id:string,maxAttempts:number):void {
-    const scope=this.scope(id);if(scope&&maxAttempts>JSON.parse(scope.scope_json).max_attempts_per_task)throw Error("task_continuation_budget_exceeded");
   }
   control(id:string,input:z.infer<typeof continuationControlSchema>):Record<string,unknown> {
     return this.sql.transaction(()=>{

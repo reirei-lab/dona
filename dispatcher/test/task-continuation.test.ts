@@ -8,11 +8,12 @@ import { DispatcherDatabase } from "../src/database.js";
 import { taskRequestSchema, type TaskRow } from "../src/task-execution.js";
 import { buildEventPrompt,envelopeFromRow } from "../src/prompt.js";
 import { eventEnvelope,tempConfig } from "./helpers.js";
-async function fixture(options:{projectOwner?:string;longInitial?:boolean}={}) {
+async function fixture(options:{projectOwner?:string;longInitial?:boolean;maxAttempts?:number}={}) {
   const {root,config}=await tempConfig();let db=new DispatcherDatabase(config.databasePath);
   const event=db.enqueue(eventEnvelope("request")).row;
   const request=taskRequestSchema.parse({source_event_id:event.event_id,task_key:"audit",objective:options.longInitial?"a".repeat(100000):"14件を監査し順番に進める",workspace:{kind:"scratch"},
-    continuation_scope:{objective:"監査後、Issue 167/168を並行実装してPR・review・CIまで。次にIssue 229を監査。",targets:[{repository:"org/repo",issue_numbers:[167,168,229],...(options.projectOwner?{project:{owner:options.projectOwner,number:4}}:{})}],allow_scratch:true,operations:["read_only","submit_pr"],max_tasks:4,max_attempts_per_task:3}});
+    initial_operation:"read_only",policy:{max_attempts:options.maxAttempts??3,retry_delay_ms:1000},
+    continuation_scope:{objective:"監査後、Issue 167/168を並行実装してPR・review・CIまで。次にIssue 229を監査。",targets:[{repository:"org/repo",issue_numbers:[167,168,229],...(options.projectOwner?{project:{owner:options.projectOwner,number:4}}:{})}],allow_scratch:true,operations:["read_only","submit_pr"],max_tasks:4,max_attempts_per_task:options.maxAttempts??3}});
   const task=db.tasks.create(request,config.jobsWorkspaceRoot,config.jobResultsDir).task;
   const finish=(t:TaskRow)=>{
     const job=db.getJob(t.current_attempt_id)!;
@@ -23,7 +24,7 @@ async function fixture(options:{projectOwner?:string;longInitial?:boolean}={}) {
   const notice=finish(task);
   db.manualComplete(event.event_id);
   const child=(key="issue-167",issue=167,parent=task,eventId=notice.event_id)=>taskRequestSchema.parse({source_event_id:eventId,task_key:key,objective:`Issue ${issue}の実装とPR提出`,workspace:{kind:"github",repository:"org/repo"},issue_number:issue,
-    continuation:{parent_task_id:parent.task_id,parent_revision:db.tasks.get(parent.task_id)!.revision,scope_revision:1,operation:"submit_pr"}});
+    policy:{max_attempts:options.maxAttempts??3,retry_delay_ms:1000},continuation:{parent_task_id:parent.task_id,parent_revision:db.tasks.get(parent.task_id)!.revision,scope_revision:1,operation:"submit_pr"}});
   const create=(input:ReturnType<typeof child>)=>db.tasks.create(input,config.jobsWorkspaceRoot,config.jobResultsDir,input.issue_number?{node_id:`I_${input.issue_number}`,repository:"org/repo",number:input.issue_number}:undefined).task;
   return {root,config,event,request,task,notice,child,create,finish,get db(){return db;},restart(){db.close();db=new DispatcherDatabase(config.databasePath);},async dispose(){db.close();await fs.rm(root,{recursive:true,force:true});}};
 }
@@ -158,7 +159,7 @@ for(const scopedLast of [true,false])test(`all_terminalの最後のTaskが${scop
  const f=await fixture();try {
   const event=f.db.enqueue(eventEnvelope("multi-scope")).row;
   const one=f.db.tasks.create({...f.request,source_event_id:event.event_id,task_key:"first-scope"},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).task;
-  const secondRequest={...f.request,source_event_id:event.event_id,task_key:"second-scope",...(scopedLast?{}:{continuation_scope:undefined})};
+  const secondRequest={...f.request,source_event_id:event.event_id,task_key:"second-scope",...(scopedLast?{}:{continuation_scope:undefined,initial_operation:undefined})};
   const two=f.db.tasks.create(secondRequest,f.config.jobsWorkspaceRoot,f.config.jobResultsDir).task;
   assert.equal(JSON.parse(f.finish(one).payload_json).group.transition,"progress");
   const notice=f.finish(two);assert.equal(JSON.parse(notice.payload_json).group.transition,"all_terminal");
@@ -200,5 +201,45 @@ test("将来のsubmit_prを含むscopeでも現在のread_onlyにwrite許可を�
   assert.doesNotMatch(prompt,/commit、push、PR作成まで行えます|dona_request_thread_reply/);
   const write=f.create(f.child("submit-168",168)),writePrompt=buildJobPrompt(f.db.getJob(write.current_attempt_id)!);
   assert.match(writePrompt,/commit、push、PR作成まで行えます/);
+ }finally{await f.dispose();}
+});
+
+test("初回監査の権限を将来のsubmit_prから推測せず明示する",async()=>{
+ const f=await fixture();try {
+  const prompt=buildJobPrompt(f.db.getJob(f.task.current_attempt_id)!);
+  assert.match(prompt,/現在のTaskはread-only/);assert.doesNotMatch(prompt,/commit、push、PR作成まで行えます|dona_request_thread_reply/);
+  assert.equal(taskRequestSchema.safeParse({...f.request,initial_operation:undefined}).success,false);
+  assert.equal(taskRequestSchema.safeParse({...f.request,initial_operation:"submit_pr",continuation_scope:{...f.request.continuation_scope!,operations:["read_only"]}}).success,false);
+  const event=f.db.enqueue(eventEnvelope("initial-write")).row;
+  const writer=f.db.tasks.create({...f.request,source_event_id:event.event_id,initial_operation:"submit_pr"},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).task;
+  assert.match(buildJobPrompt(f.db.getJob(writer.current_attempt_id)!),/commit、push、PR作成まで行えます/);
+ }finally{await f.dispose();}
+});
+
+test("同じIssueの複数Project targetを順序に依存せず照合する",async()=>{
+ const f=await fixture();try {
+  const event=f.db.enqueue(eventEnvelope("projects")).row;
+  const scope={...f.request.continuation_scope!,targets:[{repository:"org/repo",issue_numbers:[167],project:{owner:"org",number:1}},{repository:"org/repo",issue_numbers:[167],project:{owner:"ORG",number:2}}]};
+  const root=f.db.tasks.create({...f.request,source_event_id:event.event_id,continuation_scope:scope},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).task,notice=f.finish(root);
+  const input={...f.child("second-project",167,root,notice.event_id),project:{owner:"org",number:2,completion_status:"Merge Ready" as const}};
+  assert.equal(f.db.tasks.create(input,f.config.jobsWorkspaceRoot,f.config.jobResultsDir,{node_id:"I_167",repository:"org/repo",number:167,project:{completion_status:"Merge Ready"}}).task.state,"active");
+  assert.throws(()=>f.create({...input,task_key:"outside-project",project:{...input.project,number:3}}),/scope_mismatch/);
+ }finally{await f.dispose();}
+});
+
+test("利用者の明示的なretryは当該Taskの予算だけを増やし後続作成には波及しない",async()=>{
+ const f=await fixture({maxAttempts:1});try {
+  const task=f.create(f.child()),job=f.db.getJob(task.current_attempt_id)!;
+  f.db.beginJobPreparation(job.job_id,new Date(job.available_at));f.db.setJobRuntime(job.job_id,"w","p");f.db.beginJobDispatch(job.job_id);f.db.markJobRunning(job.job_id);
+  await fs.mkdir(job.workspace_path,{recursive:true});f.db.markJobNeedsReview(job.job_id,"result_missing","interrupted");
+  const forbidden=async():Promise<never>=>{throw Error("unexpected");};
+  const supervisor=new JobSupervisor(f.db,{prepare:forbidden,prompt:forbidden,get:forbidden,wait:forbidden,cancel:forbidden,
+   observeWorker:async()=>({state:"inactive",reason:"agent_idle",observed_at:new Date().toISOString(),process_ids:[123],process_groups:[123]}),retireWorker:async()=>{},workerRetired:async()=>true},f.config,{debug(){},info(){},warn(){},error(){}},()=>{});
+  await supervisor.reconcileTasks();const exhausted=f.db.tasks.get(task.task_id)!;assert.equal(exhausted.wait_reason,"retry_exhausted");
+  const retry=f.db.enqueue(eventEnvelope("explicit-retry")).row;
+  f.db.tasks.retry(task.task_id,retry.event_id,exhausted.revision,2);await supervisor.reconcileTasks();
+  const resumed=f.db.tasks.get(task.task_id)!;assert.equal(resumed.attempt_number,2);assert.equal(resumed.max_attempts,2);
+  const next=f.child("another",168);next.policy.max_attempts=2;
+  assert.throws(()=>f.create(next),/continuation_budget_exceeded/);
  }finally{await f.dispose();}
 });

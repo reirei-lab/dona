@@ -87,13 +87,13 @@ Codex CLIのMCP設定取得など、worker作成前の確定失敗が準備試�
 
 ## 元の依頼の範囲で後続Taskへ進む
 
-「調査後、その順番で実装まで進めて」のような依頼は、初回の`delegate_task`で`continuation_scope`を保存する。親Donaが元のSlack依頼と確認済み文脈から以下を構造化する。workerのResultにある追加提案を認可根拠にしない。
+「調査後、その順番で実装まで進めて」のような依頼は、初回の`delegate_task`で`continuation_scope`と`initial_operation`（現在の`read_only`/`submit_pr`）を保存する。将来段階の許可から初回の作業種別を推測せず、初回もscope.operationsに含まれる種別を明示する。親Donaが元のSlack依頼と確認済み文脈から以下を構造化する。workerのResultにある追加提案を認可根拠にしない。
 
 - `objective`: 依頼全体の目的と順序・完了条件。初回監査の目的とは区別する。
 - `targets`: `repository`、`issue_numbers`、任意の`project`（owner/number）。後続GitHub Taskは列挙したIssueだけを対象とする。
 - `allow_scratch`: 後続のscratch調査を許可するか。
 - `operations`: `read_only`、`submit_pr`。後者は実装・検証・commit・通常push・PR・review・CIまで。merge、本番反映、native approvalの代行は含まない。
-- `max_tasks`: 初回を含む依頼全体のTask上限（2〜32）。`max_attempts_per_task`: 各TaskのAttempt上限（1〜10）。各Taskの`policy.max_attempts`もこの範囲に収める。
+- `max_tasks`: 初回を含む依頼全体のTask上限（2〜32）。`max_attempts_per_task`: 各Taskを新規作成する時点のAttempt上限（1〜10）。各Taskの`policy.max_attempts`もこの範囲に収める。
 
 Taskの`get_task`応答と完了通知には`continuation`（元依頼ID、root Task、scope、state、revision、members）が含まれる。完了通知では最新の`get_task`/`list_tasks`と受理済みResultを照合して、次のTaskを`delegate_task`する。`source_event_id`には現在の通知を、`continuation`には`parent_task_id`、`parent_revision`、`scope_revision`、`operation`を渡す。最初のSlackイベントを作成元へ偽装しない。親は同じ依頼・完了グループの完了済みTaskから選ぶ。progress、attention、未受理Result、承認待ちからは進めない。同じ依頼者の元threadからの明示的な継続も同じ契約を利用できる。
 
@@ -106,3 +106,5 @@ Taskの`get_task`応答と完了通知には`continuation`（元依頼ID、root 
 同じ完了グループに複数のscopeがある場合、通知を発生させた最後のTaskだけでなく、そのグループの完了済みparentを各scopeの起点にできる。`list_tasks`は関係するscopeのTaskを最大100件返す。100件の場合は一覧を完全とみなさず、group内の各parentを`get_task`して確認する。
 
 Issue claimは引き続き1つのTaskが保持する。同じIssueの調査・実装・提出はそのTask内で完了させ、完了後に同じIssueへ別Taskを作り直さない。複数Issueの順序決め・準備調査はscratchの初回Taskで行い、その後のIssue Taskへ分ける。初回Task自身がclaimするIssueを`continuation_scope.targets`にも指定する設定は、作成前に`task_continuation_initial_issue_conflict`として拒否する。scope付きTaskと後続Taskでは旧通知形式を選ぶ予約key `legacy-default`も使用できない。いずれもTask作成・claim前の拒否なので、親Donaが元依頼の範囲で入力を訂正でき、新しいSlack返信は不要。
+
+`max_attempts_per_task`は自動継続で新しいTaskを作る際の上限であり、既存Taskに対する利用者の明示的な追加実行依頼を無効にしない。既存の`retry_task`は、停止確認・現在revision・依頼者のSlackイベントを検証して、そのTaskだけの予算を増やせる。他のTaskや後続作成の上限には波及しない。

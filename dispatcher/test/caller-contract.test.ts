@@ -287,7 +287,7 @@ test("元依頼の継続をmain設定・MCP・UDS・完了通知・worker prompt
   const config=await fs.readFile(new URL("../../.codex/config.toml",import.meta.url),"utf8");
   assert.match(config.split("[mcp_servers.dona_dispatcher]")[1]!,/"control_task_continuation"/);
   const first=await f.call("delegate_task",{source_event_id:f.source,task_key:"audit",objective:"監査後に実装へ進む",workspace:{kind:"scratch"},
-    continuation_scope:{objective:"監査と実装・PR提出",targets:[{repository:"org/repo",issue_numbers:[167]}],allow_scratch:true,operations:["read_only","submit_pr"],max_tasks:3,max_attempts_per_task:3}});
+    initial_operation:"read_only",continuation_scope:{objective:"監査と実装・PR提出",targets:[{repository:"org/repo",issue_numbers:[167]}],allow_scratch:true,operations:["read_only","submit_pr"],max_tasks:3,max_attempts_per_task:3}});
   assert.equal(first.error,undefined);
   const root=first.data.task,job=f.database.getJob(root.current_attempt_id)!;
   f.database.beginJobPreparation(job.job_id,new Date(job.available_at));f.database.setJobRuntime(job.job_id,"w","p");f.database.beginJobDispatch(job.job_id);f.database.markJobRunning(job.job_id);
@@ -317,7 +317,7 @@ test("元依頼の継続をmain設定・MCP・UDS・完了通知・worker prompt
 
 test("GitHub照会中に取消された継続scopeからTaskを作成しない",async()=>{
  const f=await fixture();try {
-  const first=await f.call("delegate_task",{source_event_id:f.source,task_key:"audit",objective:"調査して実装",workspace:{kind:"scratch"},continuation_scope:{objective:"Issue実装",targets:[{repository:"org/repo",issue_numbers:[167]}],allow_scratch:true,operations:["submit_pr"],max_tasks:2,max_attempts_per_task:3}});
+  const first=await f.call("delegate_task",{source_event_id:f.source,task_key:"audit",objective:"調査して実装",workspace:{kind:"scratch"},initial_operation:"read_only",continuation_scope:{objective:"Issue実装",targets:[{repository:"org/repo",issue_numbers:[167]}],allow_scratch:true,operations:["read_only","submit_pr"],max_tasks:2,max_attempts_per_task:3}});
   const parent=first.data.task,job=f.database.getJob(parent.current_attempt_id)!;
   f.database.beginJobPreparation(job.job_id,new Date(job.available_at));f.database.setJobRuntime(job.job_id,"w","p");f.database.beginJobDispatch(job.job_id);f.database.markJobRunning(job.job_id);
   f.database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},job.result_path);

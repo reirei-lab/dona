@@ -188,7 +188,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   );
 
   server.registerTool("delegate_task",{
-    description:"通常の長時間作業をTaskとして委任します。複数段階を依頼された場合は初回Slack依頼でcontinuation_scopeに依頼全体の目的・対象・許可操作・上限を保存します。完了通知からは現在のsource_event_idとcontinuation（parent_task_id・parent_revision・scope_revision・operation）を渡し、元の範囲内で後続Taskを作成します。task_keyは依頼全体で安定させます。Task IDはworkerが交代しても変わりません。同じ目的・権限での中断から自動再開します。Issueはissue_numberで明示し、Projectを同期する場合はprojectを指定します。scheduleには使いません。曖昧な応答ではlist_tasksで照合し、重複委任しません。",
+    description:"通常の長時間作業をTaskとして委任します。複数段階を依頼された場合は初回Slack依頼でinitial_operation（現在のread_only/submit_pr）を明示し、continuation_scopeに依頼全体の目的・対象・許可操作・上限を保存します。完了通知からは現在のsource_event_idとcontinuation（parent_task_id・parent_revision・scope_revision・operation）を渡し、元の範囲内で後続Taskを作成します。task_keyは依頼全体で安定させます。Task IDはworkerが交代しても変わりません。同じ目的・権限での中断から自動再開します。Issueはissue_numberで明示し、Projectを同期する場合はprojectを指定します。scheduleには使いません。曖昧な応答ではlist_tasksで照合し、重複委任しません。",
     inputSchema:taskRequestSchema,annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:true},
   },async(input)=>{try{if(!client.createTask)throw new Error("task_api_unavailable");const result=await client.createTask(input);const task=result.task as Record<string,unknown>;
       return success({...result,...(["created","reused"].includes(String(result.outcome))?{action:{tool:"delegate_task",source_event_id:input.source_event_id,task_key:input.task_key,task_id:task.task_id,attempt_id:task.current_attempt_id,outcome:result.outcome}}:{})});}catch(error){return failure(error,logger,"delegate_task");}});

@@ -37,10 +37,12 @@ export const taskRequestSchema = z.object({
   issue_number: z.number().int().positive().optional(),
   project: z.object({owner:z.string().regex(/^[\w-]+$/),number:z.number().int().positive(),completion_status:z.enum(["In Progress","Merge Ready"]).default("In Progress")}).strict().optional(),
   continuation_scope: continuationScopeSchema.optional(),
+  initial_operation: z.enum(["read_only","submit_pr"]).optional(),
   continuation: continuationSchema.optional(),
   policy: z.object({max_attempts:z.number().int().min(1).max(10).default(3),retry_delay_ms:z.number().int().min(1000).max(86_400_000).default(60_000)}).strict().default({max_attempts:3,retry_delay_ms:60_000}),
 }).strict().refine(v=>v.issue_number===undefined||v.workspace.kind==="github", "Issue requires a GitHub workspace")
   .refine(v=>v.project===undefined||v.issue_number!==undefined,"Project requires an Issue")
+  .refine(v=>v.continuation_scope ? v.initial_operation!==undefined&&v.continuation_scope.operations.includes(v.initial_operation) : v.initial_operation===undefined,"task_continuation_initial_operation_required")
   .refine(v=>!(v.continuation_scope||v.continuation)||v.task_key!=="legacy-default","task_continuation_reserved_key")
   .refine(v=>!v.continuation_scope||v.workspace.kind!=="github"||v.issue_number===undefined||
     !v.continuation_scope.targets.some(t=>v.workspace.kind==="github"&&t.repository.toLowerCase()===v.workspace.repository.toLowerCase()&&t.issue_numbers.includes(v.issue_number!)),"task_continuation_initial_issue_conflict");
@@ -367,7 +369,6 @@ export class TaskRepository {
       if(prior){if(prior.request_sha256!==digest)throw new Error("task_control_conflict");return task;}
       if(task.revision!==revision)throw new Error("task_revision_conflict");
       if(task.wait_reason!=="retry_exhausted"||task.stop_state!=="stopped"||task.desired_state!=="running")throw new Error("task_retry_requires_exhausted_stopped_attempt");
-      this.continuations.assertRetryBudget(id,maxAttempts);
       if(!Number.isSafeInteger(maxAttempts)||maxAttempts<=task.attempt_number||maxAttempts>10)throw new Error("task_retry_budget_invalid");
       this.sql.prepare("UPDATE tasks SET max_attempts=?,state='waiting',wait_reason='resume_requested',next_check_at=?,revision=revision+1 WHERE task_id=?")
         .run(maxAttempts,new Date().toISOString(),id);
@@ -389,7 +390,6 @@ export class TaskRepository {
         !["runtime_mcp_inventory_failed","runtime_start_not_sent"].includes(old.last_error_message??"")||
         old.dispatch_started_at||old.prompt_accepted_at||old.herdr_workspace_id||old.herdr_pane_id||
         old.steer_event_id||old.steer_state||this.dispatcher.getJobLiveSessionIdentity(attemptId))throw Error("task_retry_requires_preparation_failure");
-      this.continuations.assertRetryBudget(id,maxAttempts);
       if(!Number.isSafeInteger(maxAttempts)||maxAttempts<task.max_attempts||maxAttempts<=task.attempt_number||maxAttempts>10)throw Error("task_retry_budget_invalid");
       if(old.result_json)throw Error("task_result_requires_reconciliation");
       try{fs.lstatSync(old.result_path);throw Error("task_result_requires_reconciliation");}
