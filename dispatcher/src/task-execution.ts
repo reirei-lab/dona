@@ -43,6 +43,7 @@ export const taskRequestSchema = z.object({
 }).strict().refine(v=>v.issue_number===undefined||v.workspace.kind==="github", "Issue requires a GitHub workspace")
   .refine(v=>v.project===undefined||v.issue_number!==undefined,"Project requires an Issue")
   .refine(v=>v.continuation_scope ? v.initial_operation!==undefined&&v.continuation_scope.operations.includes(v.initial_operation) : v.initial_operation===undefined,"task_continuation_initial_operation_required")
+  .refine(v=>(v.continuation?.operation??v.initial_operation)!=="read_only"||v.project?.completion_status!=="Merge Ready","task_continuation_scope_mismatch")
   .refine(v=>!(v.continuation_scope||v.continuation)||v.task_key!=="legacy-default","task_continuation_reserved_key")
   .refine(v=>!v.continuation_scope||v.workspace.kind!=="github"||v.issue_number===undefined||
     !v.continuation_scope.targets.some(t=>v.workspace.kind==="github"&&t.repository.toLowerCase()===v.workspace.repository.toLowerCase()&&t.issue_numbers.includes(v.issue_number!)),"task_continuation_initial_issue_conflict");
@@ -211,7 +212,8 @@ export class TaskRepository {
       if(!event||(!parsed.continuation&&event.source!=="slack")||typeof JSON.parse(event.subject_json).actor_id!=="string")throw new Error("task_slack_owner_required");
       if(parsed.continuation){const prior=this.continuations.lookup(parsed);if(prior)return {outcome:"reused" as const,task:prior};}
       this.continuations.validate(parsed);
-      const previous=this.sql.prepare("SELECT task_id,request_sha256 FROM tasks WHERE source_event_id=? AND task_key=?").get(parsed.source_event_id,parsed.task_key) as {task_id:string;request_sha256:string}|undefined;
+      const storageKey=this.continuations.storageKey(parsed);
+      const previous=this.sql.prepare("SELECT task_id,request_sha256 FROM tasks WHERE source_event_id=? AND task_key=?").get(parsed.source_event_id,storageKey) as {task_id:string;request_sha256:string}|undefined;
       if(previous){if(previous.request_sha256!==digest)throw new Error("task_idempotency_conflict");return {outcome:"reused" as const,task:this.assertOwner(previous.task_id,parsed.source_event_id)};}
       if(parsed.issue_number!==undefined&&(!issue||issue.number!==parsed.issue_number||parsed.workspace.kind!=="github"||issue.repository.toLowerCase()!==parsed.workspace.repository.toLowerCase()))throw new Error("task_issue_identity_unverified");
       if(parsed.project&&!issue?.project)throw new Error("task_project_identity_unverified");
@@ -220,12 +222,12 @@ export class TaskRepository {
         const claimed=this.sql.prepare("SELECT task_id FROM tasks WHERE resource_id=?").get(resource) as {task_id:string}|undefined;
         if(claimed){this.assertOwner(claimed.task_id,parsed.source_event_id);throw new Error("task_resource_already_claimed");}
       }
-      const request=parseCreateJobRequest({source_event_id:parsed.source_event_id,...(parsed.task_key==="legacy-default"?{}:{job_key:parsed.task_key}),objective:parsed.objective,workspace:parsed.workspace,...(parsed.display?{display:parsed.display}:{})});
+      const request=parseCreateJobRequest({source_event_id:parsed.source_event_id,...(storageKey==="legacy-default"?{}:{job_key:storageKey}),objective:parsed.objective,workspace:parsed.workspace,...(parsed.display?{display:parsed.display}:{})});
       const created=this.dispatcher.createJob(request,workspaceRoot,resultDir);
       if(created.duplicate)throw new Error("task_attempt_identity_conflict");
       const job=created.row,id=`task_${ulid().toLowerCase()}`,now=new Date().toISOString();
       this.sql.prepare(`INSERT INTO tasks(task_id,source_event_id,task_key,request_sha256,resource_id,current_attempt_id,max_attempts,retry_delay_ms,objective,project_json,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(id,parsed.source_event_id,parsed.task_key,digest,resource,job.job_id,parsed.policy.max_attempts,parsed.policy.retry_delay_ms,request.objective,issue?.project?JSON.stringify(issue.project):null,now,now);
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(id,parsed.source_event_id,storageKey,digest,resource,job.job_id,parsed.policy.max_attempts,parsed.policy.retry_delay_ms,request.objective,issue?.project?JSON.stringify(issue.project):null,now,now);
       this.sql.prepare("INSERT INTO task_attempts(attempt_id,task_id,number,created_at) VALUES(?,?,1,?)").run(job.job_id,id,now);
       this.stampAttempt(job,id,1);
       this.continuations.attach(parsed,this.get(id)!);
@@ -282,7 +284,7 @@ export class TaskRepository {
   projection(task:TaskRow,includeResult=false):Record<string,unknown> {
     const current=this.dispatcher.getJob(task.current_attempt_id)!;
     const continuation=this.continuations.projection(task.task_id);
-    return {...(continuation?{continuation}:{}),task_id:task.task_id,task_key:task.task_key,source_event_id:task.source_event_id,revision:task.revision,progress:task.progress,state:task.state,
+    return {...(continuation?{continuation}:{}),task_id:task.task_id,task_key:this.continuations.logicalKey(task),admission:this.continuations.admission(task.task_id),source_event_id:task.source_event_id,revision:task.revision,progress:task.progress,state:task.state,
       wait_reason:task.wait_reason,next_check_at:task.next_check_at,current_attempt_id:task.current_attempt_id,
       attempt_number:task.attempt_number,max_attempts:task.max_attempts,worker_state:current.status,steer_event_id:current.steer_event_id,steer_state:current.steer_state,
       notification_target:JSON.parse(this.dispatcher.get(task.source_event_id)!.reply_target_json!),

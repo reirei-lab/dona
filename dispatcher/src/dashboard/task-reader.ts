@@ -126,7 +126,7 @@ export class DashboardTaskReader {
     })();
   }
 }
-const projection = `SELECT t.task_id,t.task_key,t.revision,t.state,t.desired_state,t.progress,t.wait_reason,t.current_attempt_id,
+const projection = `SELECT t.task_id,COALESCE(CASE WHEN json_valid(j.workspace_json) THEN json_extract(j.workspace_json,'$._dona_continuation.task_key') END,t.task_key) AS task_key,t.revision,t.state,t.desired_state,t.progress,t.wait_reason,t.current_attempt_id,
   t.attempt_number,t.created_at,t.updated_at,t.next_check_at,j.source,j.status AS worker_status,
   CASE WHEN json_valid(b.owner_json) THEN json_extract(b.owner_json,'$.kind')='local_dashboard' ELSE 0 END AS local_operator_owned
   FROM tasks t JOIN jobs j ON j.job_id=t.current_attempt_id LEFT JOIN job_owner_bindings b ON b.job_id=t.current_attempt_id`;

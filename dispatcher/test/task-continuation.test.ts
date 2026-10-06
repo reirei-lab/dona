@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import fs from "node:fs/promises";
 import Database from "better-sqlite3";
+import { DashboardTaskReader } from "../src/dashboard/task-reader.js";
 import { buildJobPrompt } from "../src/job-prompt.js";
 import { JobSupervisor } from "../src/job-supervisor.js";
 import { DispatcherDatabase } from "../src/database.js";
@@ -94,9 +95,9 @@ for(const violation of ["actor","thread","fake-notice","pending-result","missing
   if(violation==="pending-result"||violation==="missing-scope") {
    const sql=new Database(f.config.databasePath);
    if(violation==="pending-result")sql.prepare("UPDATE jobs SET result_json=NULL WHERE job_id=?").run(f.task.current_attempt_id);
-   else sql.prepare("DELETE FROM task_continuation_members").run();sql.close();
+   else {sql.prepare("DELETE FROM task_continuation_requests").run();sql.prepare("DELETE FROM task_continuation_members").run();}sql.close();
   }
-  assert.throws(()=>f.create(input),/owner_mismatch/);
+  assert.throws(()=>f.create(input),violation==="pending-result"?/parent_not_completed/:/owner_mismatch/);
  }finally{await f.dispose();}
 });
 test("独立した兄弟Taskの一時停止で依頼全体を停止しない",async()=>{
@@ -111,7 +112,7 @@ test("既存TaskのDBへ追加tableを移行しても継続権限を自動付与
   const plainEvent=f.db.enqueue(eventEnvelope("plain")).row;
   const plain=f.db.tasks.create(taskRequestSchema.parse({source_event_id:plainEvent.event_id,task_key:"plain",objective:"既存作業",workspace:{kind:"scratch"}}),f.config.jobsWorkspaceRoot,f.config.jobResultsDir).task;
   const sql=new Database(f.config.databasePath);
-  sql.exec("DROP TABLE task_continuation_controls; DROP TABLE task_continuation_members; DROP TABLE task_continuation_scopes;");sql.close();
+  sql.exec("DROP TABLE task_continuation_requests; DROP TABLE task_continuation_controls; DROP TABLE task_continuation_members; DROP TABLE task_continuation_scopes;");sql.close();
   f.restart();assert.equal(f.db.tasks.get(plain.task_id)!.current_attempt_id,plain.current_attempt_id);
   assert.equal(f.db.tasks.projection(plain).continuation,undefined);
   assert.throws(()=>f.create(f.child()),/owner_mismatch/);
@@ -241,5 +242,69 @@ test("利用者の明示的なretryは当該Taskの予算だけを増やし後�
   const resumed=f.db.tasks.get(task.task_id)!;assert.equal(resumed.attempt_number,2);assert.equal(resumed.max_attempts,2);
   const next=f.child("another",168);next.policy.max_attempts=2;
   assert.throws(()=>f.create(next),/continuation_budget_exceeded/);
+ }finally{await f.dispose();}
+});
+
+test("初回read_only TaskもProjectをMerge Readyへ進められない",async()=>{
+ const f=await fixture();try {
+  const event=f.db.enqueue(eventEnvelope("root-readonly-project")).row;
+  const input={...f.request,source_event_id:event.event_id,workspace:{kind:"github" as const,repository:"org/repo"},issue_number:999,project:{owner:"org",number:4,completion_status:"Merge Ready" as const}};
+  assert.equal(taskRequestSchema.safeParse(input).success,false);
+  assert.throws(()=>f.db.tasks.create(input,f.config.jobsWorkspaceRoot,f.config.jobResultsDir,{node_id:"I_999",repository:"org/repo",number:999,project:{completion_status:"Merge Ready"}}),/scope_mismatch/);
+  assert.equal(f.db.tasks.list(event.event_id).filter(t=>t.source_event_id===event.event_id).length,0);
+ }finally{await f.dispose();}
+});
+
+for(const terminal of ["failed","cancelled"] as const)test(`最後の通知元が${terminal}でも確定済み兄弟scopeを継続できる`,async()=>{
+ const f=await fixture();try {
+  const event=f.db.enqueue(eventEnvelope(`last-${terminal}`)).row;
+  const good=f.db.tasks.create({...f.request,source_event_id:event.event_id,task_key:"good"},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).task;
+  const bad=f.db.tasks.create({...f.request,source_event_id:event.event_id,task_key:"bad"},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).task;
+  f.finish(good);
+  const job=f.db.getJob(bad.current_attempt_id)!;
+  if(terminal==="failed") {
+   f.db.beginJobPreparation(job.job_id,new Date(job.available_at));f.db.setJobRuntime(job.job_id,"w","p");f.db.beginJobDispatch(job.job_id);f.db.markJobRunning(job.job_id);
+   f.db.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"failed",summary:"確定失敗",completed_at:new Date().toISOString()},job.result_path);
+  } else {f.db.beginJobCancellation(job.job_id,event.event_id);f.db.markJobCancelled(job.job_id,"取り消し");}
+  let notice=f.db.enqueueJobNotification(job.job_id).row;
+  if(terminal==="failed") {
+   assert.equal(JSON.parse(notice.payload_json).group.transition,"attention");
+   assert.throws(()=>f.create(f.child("not-yet",167,good,notice.event_id)),/owner_mismatch/);
+   const resultPath=`${f.config.resultsDir}/${notice.event_id}.json`;
+   f.db.beginDispatch(notice.event_id,resultPath);f.db.markWaiting(notice.event_id);
+   f.db.saveCompleted(notice.event_id,{schema_version:1,event_id:notice.event_id,status:"completed",completed_at:new Date().toISOString(),actions:[
+    {tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+    {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}
+   ]},resultPath);
+   f.db.resolveFailedJobAttention(event.event_id,job.job_id,notice.event_id,f.db.getJob(job.job_id)!.updated_at);
+   notice=f.db.get(f.db.getJobGroup(event.event_id)!.all_terminal_event_id!)!;
+  }
+  assert.equal(notice.event_type,`job_${terminal}`);
+  assert.equal(JSON.parse(notice.payload_json).group.transition,"all_terminal");
+  assert.deepEqual(f.db.tasks.list(notice.event_id).map(t=>t.task_id),[good.task_id]);
+  assert.equal(f.create(f.child("continue-good",167,good,notice.event_id)).state,"active");
+  assert.throws(()=>f.create(f.child("continue-bad",168,bad,notice.event_id)),/parent_not_completed/);
+ }finally{await f.dispose();}
+});
+
+test("別scopeの同じ論理keyを独立受理し、再起動後も構造化対象と作業種別を照合できる",async()=>{
+ const f=await fixture();try {
+  const event=f.db.enqueue(eventEnvelope("same-key-scopes")).row;
+  const one=f.db.tasks.create({...f.request,source_event_id:event.event_id,task_key:"one"},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).task;
+  const two=f.db.tasks.create({...f.request,source_event_id:event.event_id,task_key:"two"},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).task;
+  f.finish(one);const notice=f.finish(two);
+  const first=f.child("submit",167,one,notice.event_id),second=f.child("submit",168,two,notice.event_id);
+  const a=f.create(first),b=f.create(second);
+  assert.notEqual(a.task_id,b.task_id);assert.notEqual(a.task_key,b.task_key);
+  f.restart();assert.equal(f.create(first).task_id,a.task_id);assert.equal(f.create(second).task_id,b.task_id);
+  for(const [task,issue] of [[a,167],[b,168]] as const) {
+   const projected=f.db.tasks.projection(task);
+   assert.equal(projected.task_key,"submit");
+   assert.deepEqual(projected.admission,{workspace:{kind:"github",repository:"org/repo"},issue_number:issue,issue_node_id:`I_${issue}`,project:null,operation:"submit_pr"});
+   const member=(projected.continuation as any).members.find((m:any)=>m.task_id===task.task_id);
+   assert.equal(member.task_key,"submit");assert.deepEqual(member.admission,projected.admission);
+  }
+  const reader=new DashboardTaskReader(f.config.databasePath);
+  try {assert.equal(reader.snapshot(a.task_id)!.task.task_key,"submit");assert.equal(reader.list(()=>true).items.find(t=>t.task_id===b.task_id)!.task_key,"submit");}finally{reader.close();}
  }finally{await f.dispose();}
 });

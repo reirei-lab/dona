@@ -44,7 +44,9 @@ export class TaskContinuations {
       task_key TEXT NOT NULL,request_sha256 TEXT NOT NULL,parent_task_id TEXT REFERENCES tasks(task_id),UNIQUE(root_task_id,task_key));
       CREATE TABLE IF NOT EXISTS task_continuation_controls(
       root_task_id TEXT NOT NULL REFERENCES task_continuation_scopes(root_task_id),event_id TEXT NOT NULL REFERENCES events(event_id),
-      request_sha256 TEXT NOT NULL,PRIMARY KEY(root_task_id,event_id));`);
+      request_sha256 TEXT NOT NULL,PRIMARY KEY(root_task_id,event_id));
+      CREATE TABLE IF NOT EXISTS task_continuation_requests(
+      task_id TEXT PRIMARY KEY REFERENCES task_continuation_members(task_id),request_json TEXT NOT NULL);`);
   }
   private member(id:string):Member|undefined {return this.sql.prepare("SELECT * FROM task_continuation_members WHERE task_id=?").get(id) as Member|undefined;}
   private scope(id:string):ScopeRow|undefined {
@@ -52,19 +54,21 @@ export class TaskContinuations {
   }
   private notificationTask(eventId:string):TaskRow|undefined {
     const event=this.dispatcher.get(eventId);
-    if(event?.source!=="dona_job"||event.event_type!=="job_completed")return;
+    if(event?.source!=="dona_job"||!["job_completed","job_failed","job_cancelled"].includes(event.event_type))return;
     const subject=JSON.parse(event.subject_json),job=this.dispatcher.getJob(subject.job_id);
-    if(!job||job.source_event_id!==subject.source_event_id)return;
+    if(!job||job.source_event_id!==subject.source_event_id||event.event_type!==`job_${job.status}`)return;
     const group=this.sql.prepare("SELECT all_terminal_event_id FROM job_groups WHERE source_event_id=?").get(job.source_event_id) as {all_terminal_event_id:string|null}|undefined;
     if(group?.all_terminal_event_id!==eventId)return;
+    const snapshot=JSON.parse(event.payload_json).group;
+    if(snapshot?.transition!=="all_terminal"||!["resolved","not_required"].includes(snapshot.attention_resolution_state))return;
     const task=this.dispatcher.tasks.forAttempt(job.job_id);
-    if(!task||task.current_attempt_id!==job.job_id||task.state!=="completed"||job.status!=="completed"||!job.result_json)return;
+    if(!task||task.current_attempt_id!==job.job_id||task.state!==job.status)return;
     return task;
   }
   private notificationScopes(eventId:string):string[] {
     const notification=this.notificationTask(eventId);if(!notification)return [];
-    return (this.sql.prepare(`SELECT DISTINCT m.root_task_id FROM task_continuation_members m JOIN tasks t USING(task_id)
-      WHERE t.source_event_id=? AND t.state='completed'`).all(notification.source_event_id) as Array<{root_task_id:string}>).map(row=>row.root_task_id);
+    return (this.sql.prepare(`SELECT DISTINCT m.root_task_id FROM task_continuation_members m JOIN tasks t USING(task_id) JOIN jobs j ON j.job_id=t.current_attempt_id
+      WHERE t.source_event_id=? AND t.state='completed' AND j.status='completed' AND j.result_json IS NOT NULL`).all(notification.source_event_id) as Array<{root_task_id:string}>).map(row=>row.root_task_id);
   }
   canRead(id:string,eventId:string):boolean {
     const scope=this.scope(id);
@@ -97,6 +101,14 @@ export class TaskContinuations {
     const {source_event_id,continuation,...request}=input;
     return digest({...request,continuation:continuation?{parent_task_id:continuation.parent_task_id,operation:continuation.operation}:undefined});
   }
+  storageKey(input:TaskRequest):string {
+    return input.continuation ? `c.${digest({root_task_id:this.scope(input.continuation.parent_task_id)!.root_task_id,task_key:input.task_key}).slice(0,62)}` : input.task_key;
+  }
+  logicalKey(task:TaskRow):string {return this.member(task.task_id)?.task_key??task.task_key;}
+  admission(id:string):Record<string,unknown>|null {
+    const row=this.sql.prepare("SELECT request_json FROM task_continuation_requests WHERE task_id=?").get(id) as {request_json:string}|undefined;
+    return row?JSON.parse(row.request_json):null;
+  }
   lookup(input:TaskRequest):TaskRow|undefined {
     const scope=this.assertSource(input);
     const prior=this.sql.prepare("SELECT * FROM task_continuation_members WHERE root_task_id=? AND task_key=?").get(scope.root_task_id,input.task_key) as Member|undefined;
@@ -115,13 +127,14 @@ export class TaskContinuations {
       if(input.continuation||this.dispatcher.get(input.source_event_id)?.source!=="slack")throw Error("task_continuation_scope_invalid");
       if(input.policy.max_attempts>input.continuation_scope.max_attempts_per_task)throw Error("task_continuation_budget_exceeded");
     }
+    if((input.continuation?.operation??input.initial_operation)==="read_only"&&input.project?.completion_status==="Merge Ready")throw Error("task_continuation_scope_mismatch");
     if(!input.continuation)return;
     const row=this.assertSource(input),scope=continuationScopeSchema.parse(JSON.parse(row.scope_json));
     if(row.state!=="active")throw Error("task_continuation_stopped");
     if(row.revision!==input.continuation.scope_revision)throw Error("task_continuation_revision_conflict");
     const parent=this.dispatcher.tasks.get(input.continuation.parent_task_id)!;
     if(parent.revision!==input.continuation.parent_revision)throw Error("task_revision_conflict");
-    if(parent.state!=="completed"||parent.desired_state!=="running"||parent.steer_pending_event_id)throw Error("task_continuation_parent_not_completed");
+    if(parent.state!=="completed"||parent.desired_state!=="running"||parent.steer_pending_event_id||!this.dispatcher.getJob(parent.current_attempt_id)?.result_json)throw Error("task_continuation_parent_not_completed");
     const count=this.sql.prepare("SELECT COUNT(*) AS n FROM task_continuation_members WHERE root_task_id=?").get(row.root_task_id) as {n:number};
     if(count.n>=scope.max_tasks||input.policy.max_attempts>scope.max_attempts_per_task)throw Error("task_continuation_budget_exceeded");
     if(!scope.operations.includes(input.continuation.operation))throw Error("task_continuation_scope_mismatch");
@@ -131,8 +144,7 @@ export class TaskContinuations {
       const repository=input.workspace.repository;
       const allowed=scope.targets.some(target=>target.repository.toLowerCase()===repository.toLowerCase()&&target.issue_numbers.includes(input.issue_number??0)&&
         (!input.project||!!target.project&&input.project.owner.toLowerCase()===target.project.owner.toLowerCase()&&input.project.number===target.project.number));
-      if(!allowed||
-        input.continuation.operation==="read_only"&&input.project?.completion_status==="Merge Ready")throw Error("task_continuation_scope_mismatch");
+      if(!allowed)throw Error("task_continuation_scope_mismatch");
     }
   }
   attach(input:TaskRequest,task:TaskRow):void {
@@ -140,15 +152,21 @@ export class TaskContinuations {
     const root=input.continuation_scope?task.task_id:input.continuation?this.scope(input.continuation.parent_task_id)!.root_task_id:undefined;
     if(root) {
       this.sql.prepare("INSERT INTO task_continuation_members VALUES(?,?,?,?,?)").run(task.task_id,root,input.task_key,this.requestHash(input),input.continuation?.parent_task_id??null);
+      const operation=input.continuation?.operation??input.initial_operation!;
+      const project=input.project?{...input.project,project_id:task.project_json?JSON.parse(task.project_json).project_id??null:null}:null;
+      const admission={workspace:input.workspace,issue_number:input.issue_number??null,issue_node_id:task.resource_id?.startsWith("github:")?task.resource_id.slice(7):null,project,operation};
+      this.sql.prepare("INSERT INTO task_continuation_requests VALUES(?,?)").run(task.task_id,stableStringify(admission));
       const scope=this.scope(task.task_id)!,job=this.dispatcher.getJob(task.current_attempt_id)!;
       const workspace={...JSON.parse(job.workspace_json),_dona_continuation:{root_task_id:root,root_event_id:scope.root_event_id,
-        scope:JSON.parse(scope.scope_json),operation:input.continuation?.operation??input.initial_operation!}};
+        scope:JSON.parse(scope.scope_json),operation,task_key:input.task_key}};
       this.sql.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(stableStringify(workspace),job.job_id);
     }
   }
   projection(id:string):Record<string,unknown>|undefined {
     const row=this.scope(id);if(!row)return;
-    const members=this.sql.prepare(`SELECT m.task_id,m.task_key,m.parent_task_id,t.state,t.revision,t.max_attempts FROM task_continuation_members m JOIN tasks t USING(task_id) WHERE m.root_task_id=? ORDER BY t.created_at,m.task_id`).all(row.root_task_id);
+    const members=(this.sql.prepare(`SELECT m.task_id,m.task_key,m.parent_task_id,t.state,t.revision,t.max_attempts,r.request_json FROM task_continuation_members m JOIN tasks t USING(task_id)
+      LEFT JOIN task_continuation_requests r USING(task_id) WHERE m.root_task_id=? ORDER BY t.created_at,m.task_id`).all(row.root_task_id) as Array<Record<string,unknown>&{request_json:string|null}>)
+      .map(({request_json,...member})=>({...member,admission:request_json?JSON.parse(request_json):null}));
     return {root_task_id:row.root_task_id,root_event_id:row.root_event_id,state:row.state,revision:row.revision,scope:JSON.parse(row.scope_json),members};
   }
   control(id:string,input:z.infer<typeof continuationControlSchema>):Record<string,unknown> {
