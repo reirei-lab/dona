@@ -76,6 +76,26 @@ class RetentionTests(unittest.TestCase):
         parent = self.results if kind == "result" else self.workspace / "scratch"
         return parent / (".retention-" + hashlib.sha256((job + ":" + kind).encode()).hexdigest())
 
+    def test_continuation_scope_keeps_terminal_evidence(self):
+        self.db.executescript("""CREATE TABLE task_continuation_members(task_id TEXT,root_task_id TEXT);
+            CREATE TABLE task_continuation_scopes(root_task_id TEXT,state TEXT);
+            INSERT INTO task_continuation_scopes VALUES('root','active');""")
+        self.db.execute("INSERT INTO task_continuation_members VALUES(?,'root')", ("task-" + JOB,))
+        self.db.commit()
+        for state in ("active", "paused", "unknown"):
+            self.db.execute("UPDATE task_continuation_scopes SET state=?", (state,))
+            self.db.commit()
+            self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["continuation_unsettled"])
+            with self.assertRaisesRegex(Protected, "continuation_unsettled"):
+                self.engine.cleanup(JOB, "result", NOW)
+            self.assertEqual(self.db.execute("SELECT COUNT(*) FROM task_artifact_retention").fetchone()[0], 0)
+        self.db.execute("DELETE FROM task_continuation_scopes")
+        self.db.commit()
+        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["continuation_unsettled"])
+        self.db.execute("INSERT INTO task_continuation_scopes VALUES('root','cancelled')")
+        self.db.commit()
+        self.assertTrue(self.engine.inventory(JOB, NOW)["size_is_complete"])
+
     def test_dry_run_measures_without_purge(self):
         inventory = self.engine.batch(NOW)
         self.assertTrue(inventory["size_is_complete"])

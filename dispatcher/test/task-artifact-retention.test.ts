@@ -20,6 +20,10 @@ test("retention ledger works with current Dispatcher migrations and Task trigger
     const task = database.tasks.create(taskRequestSchema.parse({
       source_event_id: event.event_id, task_key: "retention", objective: "isolated fixture",
       workspace: { kind: "scratch" }, policy: { max_attempts: 1, retry_delay_ms: 1000 },
+      initial_operation: "read_only", continuation_scope: {
+        objective: "isolated retention continuation", targets: [], allow_scratch: true,
+        operations: ["read_only"], max_tasks: 2, max_attempts_per_task: 1,
+      },
     }), config.jobsWorkspaceRoot, config.jobResultsDir).task;
     const job = database.getJob(task.current_attempt_id)!;
     for (const directory of [job.workspace_path, path.dirname(job.result_path),
@@ -79,6 +83,13 @@ db=sqlite3.connect(sys.argv[1])
 db.execute('PRAGMA foreign_keys=ON')
 engine=Retention(db,sys.argv[2],sys.argv[3],Policy(7,0))
 engine.install()
+assert engine.inventory(sys.argv[4],1791244800)['protection_reasons']==['continuation_unsettled']
+db.execute("UPDATE task_continuation_scopes SET state='paused'")
+db.commit()
+assert engine.inventory(sys.argv[4],1791244800)['protection_reasons']==['continuation_unsettled']
+# Only this private fixture's irreversible cancellation releases the scope.
+db.execute("UPDATE task_continuation_scopes SET state='cancelled'")
+db.commit()
 item=engine.inventory(sys.argv[4],1791244800)
 assert item.get('size_is_complete'),item
 event=db.execute('SELECT all_terminal_event_id FROM job_groups WHERE source_event_id=(SELECT source_event_id FROM jobs WHERE job_id=?)',(sys.argv[4],)).fetchone()[0]

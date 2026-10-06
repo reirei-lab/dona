@@ -24,6 +24,8 @@ matching completion行がある場合も、各通知eventとgroup最終eventの�
 
 Git worktreeは登録解除契約が未確定なので、関連progress/Resultも含め候補全体を保護する。handoff markerだけでなく同じworkspace pathへの全Job参照も照合し、markerのないpredecessorからも共有workspaceを削除しない。この版の削除対象は独立scratch workspace、そのprogress directory、Attempt専用Result directoryだけ。
 
+mainで追加されたTask continuationはterminal memberのDB Resultを次段階の認可・成果projectionに使うため、memberが属するscopeが`cancelled`以外ならartifact全体を保護する。`active`、`paused`、未知state、scope欠落は削除しない。Task自身のterminalだけでは継続workflowの終了とは扱わず、不可逆なscope cancellation後だけ他の保持条件を評価する。
+
 ## purge、隔離、再開
 
 `install()`は呼出元が明示的に行う専用ledger/guardの追加で、Dispatcher起動には接続していない。artifact本体・root・全祖先の実体identity、割当容量、保持状態を`task_artifact_retention`へ保存する。新規削除は`purged`をcommitしてから行い、Resultでは通常Slack Taskの`jobs.result_json`とAttempt checkpointを先に解放する。local dashboardのDB Resultは上記閲覧契約のため保持する。jobsのpath文字列は変更不可の監査資料として残し、artifact参照の状態はledgerで判定する。purged後のstatus変更、Result/checkpoint再受理、path変更はDB triggerで拒否する。

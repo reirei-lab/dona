@@ -257,6 +257,19 @@ class Retention:
             JOIN tasks t ON t.task_id=a.task_id WHERE j.job_id=?""", (job_id,)).fetchone()
         if not row:
             raise Protected("task_binding_missing")
+        # Continuation admission and projection still consume terminal Results.
+        # A terminal member is not an expired workflow while its scope can run.
+        tables = {item[0] for item in self.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('task_continuation_members','task_continuation_scopes')")}
+        if tables:
+            if len(tables) != 2:
+                raise Protected("continuation_contract_unverified")
+            if self.db.execute("""SELECT 1 FROM task_continuation_members m
+                LEFT JOIN task_continuation_scopes s USING(root_task_id)
+                WHERE m.task_id=? AND (s.state IS NULL OR s.state<>'cancelled') LIMIT 1""",
+                               (row["task_id"],)).fetchone():
+                raise Protected("continuation_unsettled")
         terminal = ("completed", "failed", "cancelled")
         if row["status"] not in terminal or row["task_state"] not in terminal:
             raise Protected("active_or_needs_review")
