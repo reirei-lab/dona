@@ -326,7 +326,7 @@ describe("SlackUpdateNotificationReporter", () => {
     assert.equal(client.statusCount, 0);
   });
 
-  test("returns a permanent partial receipt when Slack does not persist the identity block", async () => {
+  test("identity未保存の投稿はsessionを更新せず成功receiptも返さない", async () => {
     const { client, reporter } = await reporterFixture();
     const original = client.postMessage.bind(client);
     client.postMessage = async (input) => {
@@ -343,9 +343,69 @@ describe("SlackUpdateNotificationReporter", () => {
       (error: unknown) => error instanceof Error &&
         error.name === "UpdateNotificationPermanentError" &&
         (error as { code?: unknown }).code === "identity_block_not_persisted" &&
-        (error as { receipt?: { message_ts?: unknown } }).receipt?.message_ts === "1788390700.1",
+        (error as { receipt?: unknown }).receipt === undefined,
     );
     assert.equal(client.postCount, 1);
-    assert.equal(client.statusCount, 1);
+    assert.equal(client.statusCount, 0);
   });
+  test("201件のthreadで投稿応答喪失後に全pageを照合してからsessionを更新する", async () => {
+    const { client, reporter } = await reporterFixture();
+    const order: string[] = [];
+    const originalPost = client.postMessage.bind(client);
+    client.postMessage = async (input) => {
+      order.push("post");
+      await originalPost(input);
+      throw new Error("post response lost");
+    };
+    client.threadPageReader = (cursor) => {
+      order.push(cursor ? "page2" : "page1");
+      if (!cursor) return { messages: Array.from({ length: 200 }, (_, index) => ({
+        ts: `1788390600.${index}`, text: "other", fileIds: [], blockIds: [], reactions: [],
+      })), hasMore: true, nextCursor: "next" };
+      return { messages: [...client.messages], hasMore: false };
+    };
+    const originalStatus = client.setAgentSessionStatus.bind(client);
+    client.setAgentSessionStatus = async () => {
+      assert.equal(order.at(-1), "page2");
+      order.push("session");
+      return originalStatus();
+    };
+    const receipt = await reporter.deliver(request);
+    assert.equal(receipt.message_ts, "1788390700.1");
+    assert.equal(client.postCount, 1);
+    assert.deepEqual(order, ["page1", "page2", "post", "page1", "page2", "page1", "page2", "session"]);
+  });
+
+  test("投稿成功応答後のread-back不能は永久保留としsessionを更新しない", async () => {
+    const { client, reporter } = await reporterFixture();
+    client.threadPageReader = () => {
+      if (client.postCount) throw new Error("thread inaccessible");
+      return { messages: [], hasMore: false };
+    };
+    await assert.rejects(reporter.deliver(request), (error: unknown) =>
+      error instanceof Error && error.name === "UpdateNotificationPermanentError" &&
+      (error as { code?: string }).code === "ambiguous_update_notification");
+    assert.equal(client.postCount, 1);
+    assert.equal(client.statusCount, 0);
+  });
+
+  test("投稿応答とread-backのtimestamp・本文・宛先不一致はsession更新前に止める", async () => {
+    for (const change of [
+      { text: "別の報告" }, { threadTs: "1756722031.123456" },
+      { subtype: "thread_broadcast" }, { ts: "1788390701.1" },
+    ]) {
+      const { client, reporter } = await reporterFixture();
+      const original = client.postMessage.bind(client);
+      client.postMessage = async (input) => {
+        const posted = await original(input);
+        Object.assign(client.messages[0]!, change);
+        return posted;
+      };
+      await assert.rejects(reporter.deliver(request), (error: unknown) =>
+        error instanceof Error && error.name === "UpdateNotificationPermanentError");
+      assert.equal(client.postCount, 1);
+      assert.equal(client.statusCount, 0);
+    }
+  });
+
 });

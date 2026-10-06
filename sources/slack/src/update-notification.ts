@@ -215,6 +215,25 @@ export class SlackUpdateNotificationReporter implements UpdateNotificationPort {
         }
       }
     }
+    // 投稿応答だけでは配送receiptを確定しない。session更新より先に全pageを照合する。
+    if (postStatus === "created") {
+      let observedMessageTs: string | undefined;
+      try {
+        observedMessageTs = await existingMessage(connection.client, input, connection.botId, connection.botUserId);
+      } catch (error) {
+        if (error instanceof UpdateNotificationPermanentError) throw error;
+        throw new UpdateNotificationPermanentError(
+          "ambiguous_update_notification",
+          "Slack accepted a post response but its exact identity could not be reconciled",
+        );
+      }
+      if (observedMessageTs !== messageTs) {
+        throw new UpdateNotificationPermanentError(
+          "identity_block_not_persisted",
+          "Slack post response did not match the exact persisted notification",
+        );
+      }
+    }
     const session = await connection.client.setAgentSessionStatus({
       channelId: input.channel_id,
       threadTs: input.thread_ts,
@@ -232,21 +251,6 @@ export class SlackUpdateNotificationReporter implements UpdateNotificationPort {
       post_status: postStatus,
       session_status: session.status,
     };
-    if (postStatus === "created") {
-      const observedMessageTs = await existingMessage(
-        connection.client,
-        input,
-        connection.botId,
-        connection.botUserId,
-      );
-      if (observedMessageTs !== messageTs) {
-        throw new UpdateNotificationPermanentError(
-          "identity_block_not_persisted",
-          "Slack posted the notification without the exact identity block",
-          result,
-        );
-      }
-    }
     return result;
   }
 
