@@ -12,7 +12,7 @@
 
 既存のowner-only DB、監査schema、approval schema、rollback-resistant外部anchor/clock providerが必要。明示的な`installTaskGrantSchema`はversion 1のschemaだけを追加し、既存rowを推測backfillしない。部分schema、未知version、偽table/trigger/temp shadowは拒否する。既存Task世代DBへの追加とfresh DBの両方を同じ経路で扱う。
 
-新しいscopeのempty rootは信頼済みissuerが`initialize`を認可した場合だけ監査commitする。既存row/rootの片方欠落・改変から自動再初期化しない。`put`/`revoke`はexpected revisionを要求し、revoked IDを再利用しない。snapshotには最大1024 grants、各grantの明示resource/destination集合は最大128件の上限があり、上限到達は拒否する。revokeやaudit履歴を削除するretentionは提供しない。
+新しいscopeのempty rootは信頼済みissuerが`initialize`を認可した場合だけ監査commitする。既存row/rootの片方欠落・改変から自動再初期化しない。`put`/`revoke`はexpected revisionを要求し、revoked IDを再利用しない。revokeは時間上のactiveを要求せず、開始前・expiry後にもissuer認可とCASを確認して失効を記録する。snapshotには最大1024 grants、各grantの明示resource/destination集合は最大128件の上限があり、上限到達は拒否する。revokeやaudit履歴を削除するretentionは提供しない。
 
 ## 発行と評価
 
@@ -20,7 +20,7 @@ issuer capabilityは信頼済みprocessのcomposition rootが注入する同期c
 
 Epic membershipは発行時のrevisionと明示child node集合を保存する。未来child、cancel/merge/production、公開先を推測追加しない。委譲はresource/operation/destination/期間を親の部分集合に限定し、親のexact revisionを保存する。別bot/service principalへのact-asは別grant発行とissuer認可を必要とする。祖先のcurrentBindingも毎回再評価する。親revoke・expiry・revision変更は既存子と今後の委譲の両方を拒否する。cycleを作る親変更も拒否する。
 
-`evaluate`はcurrent principal/revision、exact Task binding、操作、公開先、Epic membership revisionを受け、保護時計と現在bindingを再評価してbooleanだけを返す。grant全文をmodelへ開示しない。authority/disclosure両方の許可を確認後も外部操作を行う責務は別componentにある。異常時計、監査不一致、非同期callback、commit/receipt不明はredacted errorで停止し、同一transaction IDを自動再送しない。read-only照合・operatorによる既存共有primitiveの回復手順を使う。
+`evaluate`はcurrent principal/revision、exact Task binding、操作、公開先、Epic membership revisionを受け、保護時計と現在bindingを再評価してbooleanだけを返す。currentBinding providerはserver注入のverified current contextから照会者の本人性も照合する。queryのprincipal文字列や既存bindingの存在だけを本人性の証明にしない。grant全文をmodelへ開示しない。authority/disclosure両方の許可を確認後も外部操作を行う責務は別componentにある。異常時計、監査不一致、非同期callback、commit/receipt不明はredacted errorで停止し、同一transaction IDを自動再送しない。read-only照合・operatorによる既存共有primitiveの回復手順を使う。
 
 ## 検証境界
 

@@ -173,7 +173,7 @@ export class TaskGrantRepository {
           const key = command.kind === "put" ? command.grant.grant_id : command.grant_id;
           const previous = next.grants.find(g => g.grant_id === key);
           if ((previous?.revision ?? 0) !== command.expected_revision || previous?.revoked_at !== null && previous !== undefined) return denied();
-          if (previous && !active(previous,next.grants,mark.effective_utc)) return denied();
+          if (command.kind === "put" && previous && !active(previous,next.grants,mark.effective_utc)) return denied();
           if (command.expected_revision === Number.MAX_SAFE_INTEGER) return denied();
           if (command.kind === "revoke") {
             if (!previous) return denied();
