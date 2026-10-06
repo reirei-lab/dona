@@ -132,9 +132,9 @@ test("拒否照会の自己申告principalを監査actor/revisionとして保存
 test("混在IDの永続canonical orderはICU/localeCompareに依存しない",t=>{
  const f=fixture(t),original=String.prototype.localeCompare;
  const grantIds=new Set(["z","a","Z","A","a_","a-"]);
- String.prototype.localeCompare=function(other,...args){
+ String.prototype.localeCompare=function(other){
   if(grantIds.has(this.toString()) && grantIds.has(other)) throw Error("grant locale comparator must not run");
-  return original.call(this,other,...args);
+  return original.call(this,other);
  };
  try {
   for(const [i,key] of ["z","a","Z","A","a_","a-"].entries()) f.repo.write("put"+i,{kind:"put",expected_revision:0,grant:grant(key)});
