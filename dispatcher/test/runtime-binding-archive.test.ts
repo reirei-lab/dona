@@ -32,7 +32,7 @@ test("過去generationは再起動後も登録済みキャッシュだけを返�
  }finally{store.close();fs.rmSync(root,{recursive:true,force:true});}
 });
 
-test("過去generationの履歴と通知は件数・bytesを超えず欠落を明示する",async()=>{
+test("過去generationは本文を保持し履歴件数と通知bytesの欠落を明示する",async()=>{
  const root=fs.mkdtempSync(path.join(os.tmpdir(),"dona-history-bound-")),store=new RuntimeStore(path.join(root,"runtime.db"));
  try{
   store.put(agent("old"));
@@ -42,7 +42,9 @@ test("過去generationの履歴と通知は件数・bytesを超えず欠落を�
   }
   store.put(agent("new"));const manager=new AppServerManager(store,()=>{throw Error("must_not_connect");});
   const result=await manager.conversation("worker","old",0);
-  assert.ok(result.items.length<=200);assert.ok(result.events.length<=1000);assert.ok(Buffer.byteLength(JSON.stringify(result))<800_000);assert.equal(result.gap,true);assert.equal(result.truncated,true);
+  assert.equal(result.items.length,200);assert.equal(result.items[0]?.id,"802");assert.equal(result.items.at(-1)?.id,"1001");
+  assert.ok(result.items.every(item=>item.text==="あ".repeat(8192)));
+  assert.ok(result.events.length<=1000);assert.ok(Buffer.byteLength(JSON.stringify(result.events))<265_000);assert.equal(result.gap,true);assert.equal(result.truncated,true);
  }finally{store.close();fs.rmSync(root,{recursive:true,force:true});}
 });
 
