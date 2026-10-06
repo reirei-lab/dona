@@ -20,6 +20,8 @@ local dashboardの固定`destination: none`にはSlack通知を要求しない�
 
 owner bindingを常に要求し、local dashboardのreceipt照合はcompletion行があっても省略しない。completionの宛先も固定bindingと比較する。
 
+通常通知actionは`success: true`または`ok: true`が明示され、相反するfalseやerrorがない場合だけ成功とする。local dashboardのcancelled TaskがResultを持たない場合は、同じowner/Task/current Attempt/source eventのcancel receipt、取消desired state、停止完了stateと強い停止receiptを確認する。cancel receiptの発行後にも保持期限を要求し、cancel受理だけで停止完了とは扱わない。
+
 matching completion行がある場合も、各通知eventとgroup最終eventの完了後にpolicyの保持期間を要求する。通知が遅れて届いても、jobの古いterminal時刻だけで直後に削除しない。
 
 Git worktreeは登録解除契約が未確定なので、関連progress/Resultも含め候補全体を保護する。handoff markerだけでなく同じworkspace pathへの全Job参照も照合し、markerのないpredecessorからも共有workspaceを削除しない。この版の削除対象は独立scratch workspace、そのprogress directory、Attempt専用Result directoryだけ。

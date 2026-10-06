@@ -60,11 +60,40 @@ test("retention ledger works with current Dispatcher migrations and Task trigger
       schema_version: 1, job_id: localJob.job_id, status: "completed", summary: "local fixture", completed_at: old,
     }, localJob.result_path);
     database.enqueueJobNotification(localJob.job_id);
+    const authority = { instance_id: "fixture", owner_id: "operator", device_id: "device", grant_revision: 1 };
+    const cancelled = database.localDashboard.create(authority, {
+      request_id: "cancel-retention", objective: "isolated local cancellation", workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir);
+    const cancelJob = cancelled.row;
+    for (const directory of [cancelJob.workspace_path, path.dirname(cancelJob.result_path),
+      path.join(path.dirname(cancelJob.workspace_path), ".dona-progress", cancelJob.job_id)]) {
+      await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+      await fs.writeFile(path.join(directory, "evidence"), "cancel isolated");
+    }
+    database.beginJobPreparation(cancelJob.job_id);
+    database.setJobRuntime(cancelJob.job_id, "cancel-fixture", "cancel-pane");
+    database.beginJobDispatch(cancelJob.job_id);
+    database.markJobRunning(cancelJob.job_id);
+    const request = database.localDashboard.cancel(authority, {
+      request_id: "cancel-command", task_id: cancelled.task.task_id, attempt_id: cancelJob.job_id,
+      revision: database.tasks.get(cancelled.task.task_id)!.revision,
+    });
+    assert.equal(request.task.state, "waiting");
+    const simulatedStop = { state: "stopped" as const, reason: "app_server_verified_empty_scope" as const,
+      observed_at: old, process_ids: [], process_groups: [] };
+    database.tasks.claimStop(request.task, simulatedStop);
+    database.tasks.stopped(request.task, simulatedStop);
+    database.tasks.replaceStopped(cancelled.task.task_id, config.jobResultsDir);
+    assert.equal(database.tasks.get(cancelled.task.task_id)!.state, "cancelled");
+    assert.equal(database.getJob(cancelJob.job_id)!.result_json, null);
     // Model already-verified stop and delivered notification in this private DB.
     // No runtime/Slack calls are made, and this is not live stop evidence.
     const sql = new Database(config.databasePath);
     try {
       sql.prepare("UPDATE jobs SET created_at=? WHERE job_id IN (?,?)").run(old, job.job_id, localJob.job_id);
+      sql.prepare("UPDATE jobs SET created_at=?,completed_at=? WHERE job_id=?").run(old, old, cancelJob.job_id);
+      sql.prepare("UPDATE task_attempts SET stop_receipt_json=? WHERE attempt_id=?").run(JSON.stringify(simulatedStop), cancelJob.job_id);
+      sql.prepare("UPDATE local_dashboard_command_receipts SET created_at=? WHERE attempt_id=?").run(old, cancelJob.job_id);
       sql.prepare("UPDATE task_attempts SET stop_receipt_json=? WHERE attempt_id=?").run(
         JSON.stringify({ state: "stopped", reason: "app_server_verified_empty_scope", observed_at: old }), job.job_id);
       sql.prepare("UPDATE task_attempts SET stop_receipt_json=? WHERE attempt_id=?").run(
@@ -94,6 +123,17 @@ item=engine.inventory(sys.argv[4],1791244800)
 assert item.get('size_is_complete'),item
 event=db.execute('SELECT all_terminal_event_id FROM job_groups WHERE source_event_id=(SELECT source_event_id FROM jobs WHERE job_id=?)',(sys.argv[4],)).fetchone()[0]
 saved=db.execute('SELECT result_json FROM events WHERE event_id=?',(event,)).fetchone()[0]
+# Incomplete historical action records cannot establish delivery or session success.
+for index in (0,1):
+    broken=json.loads(saved)
+    del broken['actions'][index]['success']
+    db.execute('UPDATE events SET result_json=? WHERE event_id=?',(json.dumps(broken),event))
+    db.commit()
+    assert engine.inventory(sys.argv[4],1791244800)['protection_reasons']==['notification_unsettled']
+    broken['actions'][index]['ok']=True
+    db.execute('UPDATE events SET result_json=? WHERE event_id=?',(json.dumps(broken),event))
+    db.commit()
+    assert engine.inventory(sys.argv[4],1791244800).get('size_is_complete')
 broken=json.loads(saved)
 broken['actions'][0]['ambiguous']=True
 db.execute('UPDATE events SET result_json=? WHERE event_id=?',(json.dumps(broken),event))
@@ -129,9 +169,27 @@ if sys.platform=='darwin':
     assert engine.cleanup(sys.argv[5],'result',1791244800)=='deleted'
     retained=json.loads(db.execute('SELECT result_json FROM jobs WHERE job_id=?',(sys.argv[5],)).fetchone()[0])
     assert retained['summary']=='local fixture'
+cancel=sys.argv[6]
+assert engine.inventory(cancel,1791244800).get('size_is_complete')
+db.execute("UPDATE local_dashboard_command_receipts SET owner_id='other' WHERE attempt_id=? AND operation='cancel'",(cancel,))
+db.commit()
+assert engine.inventory(cancel,1791244800)['protection_reasons']==['local_cancel_unverified']
+db.execute("UPDATE local_dashboard_command_receipts SET owner_id='operator' WHERE attempt_id=? AND operation='cancel'",(cancel,))
+db.execute("UPDATE tasks SET stop_state='attempting' WHERE current_attempt_id=?",(cancel,))
+db.commit()
+assert engine.inventory(cancel,1791244800)['protection_reasons']==['local_cancel_unverified']
+db.execute("UPDATE tasks SET stop_state='stopped' WHERE current_attempt_id=?",(cancel,))
+db.execute("UPDATE local_dashboard_command_receipts SET created_at='2026-10-05T00:00:00Z' WHERE attempt_id=? AND operation='cancel'",(cancel,))
+db.commit()
+assert engine.inventory(cancel,1791244800)['protection_reasons']==['retention_not_expired']
+db.execute("UPDATE local_dashboard_command_receipts SET created_at='2026-09-01T00:00:00Z' WHERE attempt_id=? AND operation='cancel'",(cancel,))
+db.commit()
+if sys.platform=='darwin':
+    assert engine.cleanup(cancel,'result',1791244800)=='deleted'
+    assert db.execute('SELECT result_json FROM jobs WHERE job_id=?',(cancel,)).fetchone()[0] is None
 print(json.dumps(item))
 db.close()
-`, config.databasePath, config.jobsWorkspaceRoot, config.jobResultsDir, job.job_id, localJob.job_id], {
+`, config.databasePath, config.jobsWorkspaceRoot, config.jobResultsDir, job.job_id, localJob.job_id, cancelJob.job_id], {
       cwd: fileURLToPath(new URL("../../scripts/maintenance", import.meta.url)), encoding: "utf8", timeout: 30_000,
     });
     assert.equal(result.status, 0, result.error?.message ?? result.stderr);

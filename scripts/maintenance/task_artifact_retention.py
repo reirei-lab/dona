@@ -304,7 +304,7 @@ class Retention:
         if local:
             if object_json(binding["destination_json"]) != {"kind": "none"}:
                 raise Protected("notification_binding_mismatch")
-            self.local_completion(row, binding)
+            self.local_completion(row, binding, now)
         matching = False
         for completion in completions:
             destination = object_json(completion["destination_json"])
@@ -358,7 +358,7 @@ class Retention:
             raise Protected("notification_unverified")
         destination = object_json(binding["destination_json"])
         if destination == {"kind": "none"}:
-            self.local_completion(row, binding)
+            self.local_completion(row, binding, now)
             return
         if not isinstance(destination, dict) or destination.get("kind") != "slack_thread":
             raise Protected("notification_route_unsupported")
@@ -377,7 +377,7 @@ class Retention:
         if not isinstance(actions, list) or any(not isinstance(action, dict) or action.get("ambiguous") is True for action in actions):
             raise Protected("notification_unsettled")
         def succeeded(action):
-            return action.get("success") is not False and action.get("ok") is not False and "error" not in action
+            return (action.get("success") is True or action.get("ok") is True) and action.get("success") is not False and action.get("ok") is not False and "error" not in action
         def same_target(action):
             return all(action.get(key) == destination.get(key) for key in ("workspace_id", "channel_id", "thread_ts"))
         posted = any(action.get("tool") in ("dona_slack.post_message", "mcp__dona_slack__post_message") and
@@ -390,7 +390,7 @@ class Retention:
         if timestamp(event["completed_at"]) + self.policy.retention_days * 86400 > now:
             raise Protected("retention_not_expired")
 
-    def local_completion(self, row, binding):
+    def local_completion(self, row, binding, now):
         owner = object_json(binding["owner_json"])
         event = self.db.execute("SELECT * FROM events WHERE event_id=?", (row["source_event_id"],)).fetchone()
         if owner.get("kind") != "local_dashboard" or row["source"] != "web" or not event or event["source"] != "web" or event["reply_target_json"] is not None or event["status"] != "completed":
@@ -404,6 +404,20 @@ class Retention:
                                   (row["task_id"], owner["instance_id"], owner["owner_id"], row["source_event_id"])).fetchone()
         if not recorded or recorded["owner_json"] != binding["owner_json"] or object_json(recorded["destination_json"]) != {"kind": "none"} or not receipt:
             raise Protected("notification_binding_mismatch")
+        if row["status"] == "cancelled" and row["result_json"] is None:
+            # Cancellation settles without a worker Result. The authenticated
+            # command receipt alone is not proof that retirement completed.
+            cancelled = self.db.execute("""SELECT c.* FROM local_dashboard_command_receipts c
+                JOIN tasks t USING(task_id) WHERE c.task_id=? AND c.attempt_id=?
+                AND c.operation='cancel' AND c.instance_id=? AND c.owner_id=? AND c.event_id=?
+                AND t.current_attempt_id=c.attempt_id AND t.state='cancelled'
+                AND t.desired_state='cancelled' AND t.stop_state='stopped' LIMIT 2""",
+                (row["task_id"], row["job_id"], owner["instance_id"], owner["owner_id"], row["source_event_id"])).fetchall()
+            if len(cancelled) != 1 or not cancelled[0]["device_id"] or cancelled[0]["grant_revision"] < 1 or not re.fullmatch(r"[0-9a-f]{64}", cancelled[0]["canonical_sha256"]):
+                raise Protected("local_cancel_unverified")
+            if timestamp(cancelled[0]["created_at"]) + self.policy.retention_days * 86400 > now:
+                raise Protected("retention_not_expired")
+            return
         result = object_json(row["result_json"])
         if result.get("job_id") != row["job_id"] or result.get("status") != row["status"]:
             raise Protected("local_completion_unverified")
