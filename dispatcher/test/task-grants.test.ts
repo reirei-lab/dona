@@ -177,3 +177,29 @@ test("開始前とexpiry後にもissuer認可とCASでrevokeし将来の有効�
  const unauthorized=fixture(t);unauthorized.repo.write("future",{kind:"put",expected_revision:0,grant:future});unauthorized.deny();
  assert.equal(unauthorized.repo.write("denied_revoke",{kind:"revoke",grant_id:"root",expected_revision:1}).status,"denied");
 });
+test("byte容量境界でrevoke用余白を予約し緊急失効を拒否しない",t=>{
+ const f=fixture(t),g=grant(),limit=4194304;
+ const initial=Buffer.byteLength(stableStringify({version:1,scope,grants:[g]}));
+ // 可変長の合法なdecimal thread IDで、snapshotを上限の1 byte手前へ埋める。
+ g.destinations[0]!.thread_ts += "0".repeat(limit-initial-1);
+ assert.equal(f.repo.write("unreserved",{kind:"put",expected_revision:0,grant:g}).status,"denied");
+ g.destinations[0]!.thread_ts=g.destinations[0]!.thread_ts.slice(0,-39);
+ assert.equal(Buffer.byteLength(stableStringify({version:1,scope,grants:[g]})),limit-40);
+ assert.equal(f.repo.write("reserved",{kind:"put",expected_revision:0,grant:g}).status,"succeeded");
+ assert.equal(f.repo.write("emergency_revoke",{kind:"revoke",grant_id:"root",expected_revision:1}).status,"succeeded");
+ const state=f.db.prepare("SELECT state_json FROM task_grant_state").pluck().get() as string;
+ assert.ok(Buffer.byteLength(state)<=limit);assert.equal(JSON.parse(state).grants[0].revoked_at,start);
+ assert.equal(f.repo.evaluate("revoked",{...query(),revision:2,destination:g.destinations[0]!}),false);
+});
+test("revision上限の最後の値をrevokeへ予約する",t=>{
+ const f=fixture(t),g={...grant(),revision:Number.MAX_SAFE_INTEGER-2};
+ const canonical=stableStringify({version:1,scope,grants:[g]});
+ const digest=createHash("sha256").update("dona.task-grants.v1\0").update(canonical).digest("hex");
+ f.transaction.runPrepared("fixture_revision",()=>({event:{scope,actor:{kind:"system",id:"fixture_issuer"},action:"binding_change",operation:"binding.change.v1",resource_id:"task_grants_v1",
+  outcome:"succeeded",reason:"none",session_ref:null,receipt_id:null,attempt_id:null,policy_revision:1,binding_revision:1,authz_revision:1},resource_digest:digest,
+  mutation:()=>{f.db.prepare("UPDATE task_grant_state SET state_json=?").run(canonical);return null;}}));
+ assert.equal(f.repo.write("last_active",{kind:"put",expected_revision:g.revision,grant:{...g,revision:g.revision+1}}).status,"succeeded");
+ assert.equal(f.repo.write("cannot_exhaust",{kind:"put",expected_revision:g.revision+1,grant:{...g,revision:Number.MAX_SAFE_INTEGER}}).status,"denied");
+ assert.deepEqual(f.repo.write("last_revoke",{kind:"revoke",grant_id:"root",expected_revision:g.revision+1}),{status:"succeeded",revision:Number.MAX_SAFE_INTEGER});
+ assert.equal(f.repo.evaluate("never_reactivate",{...query(),revision:Number.MAX_SAFE_INTEGER}),false);
+});
