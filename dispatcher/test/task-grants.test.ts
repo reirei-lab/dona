@@ -163,3 +163,17 @@ test("1023件の監査済みsnapshotから1024件目を保存し上限でもread
  assert.equal(f.repo.evaluate("existing",query("grant_1023")),true);
  assert.equal(JSON.parse(f.db.prepare("SELECT state_json FROM task_grant_state").pluck().get() as string).grants.length,1024);
 });
+test("開始前とexpiry後にもissuer認可とCASでrevokeし将来の有効化を防ぐ",t=>{
+ const f=fixture(t),future={...grant(),starts_at:"2026-09-19T00:10:00.000Z"};
+ f.repo.write("future",{kind:"put",expected_revision:0,grant:future});
+ assert.equal(f.repo.evaluate("before_start",query()),false);
+ assert.equal(f.repo.write("stale",{kind:"revoke",grant_id:"root",expected_revision:2}).status,"denied");
+ assert.equal(f.repo.write("revoke_before_start",{kind:"revoke",grant_id:"root",expected_revision:1}).status,"succeeded");
+ f.setNow(future.starts_at);assert.equal(f.repo.evaluate("never_activated",{...query(),revision:2}),false);
+ assert.equal(f.repo.write("no_reactivation",{kind:"put",expected_revision:2,grant:{...future,revision:3}}).status,"denied");
+ const expired=fixture(t);expired.repo.write("put",{kind:"put",expected_revision:0,grant:grant()});expired.setNow(end);
+ assert.equal(expired.repo.write("expired_revoke",{kind:"revoke",grant_id:"root",expected_revision:1}).status,"succeeded");
+ assert.equal(expired.repo.evaluate("expired_revoked",{...query(),revision:2}),false);
+ const unauthorized=fixture(t);unauthorized.repo.write("future",{kind:"put",expected_revision:0,grant:future});unauthorized.deny();
+ assert.equal(unauthorized.repo.write("denied_revoke",{kind:"revoke",grant_id:"root",expected_revision:1}).status,"denied");
+});
