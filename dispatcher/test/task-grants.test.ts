@@ -117,3 +117,25 @@ test("親principal/binding失効とcurrent Epic membership driftを子へ伝播"
  assert.equal(f.repo.write("future_delegation",{kind:"put",expected_revision:0,grant:{...child,grant_id:"future"}}).status,"denied");
  f.issuer.currentBinding=(_r,_p,_s,e)=>e?.membership_revision===2;assert.equal(f.repo.evaluate("epic_drift",q),false);
 });
+test("拒否照会の自己申告principalを監査actor/revisionとして保存しない",t=>{
+ const f=fixture(t);f.repo.write("put",{kind:"put",expected_revision:0,grant:grant()});
+ for(const [name,q] of [["missing",query("missing")],["principal",{...query(),principal:{...principal,id:"impersonated",authz_revision:99}}],
+  ["revision",{...query(),revision:99}],["resource",{...query(),resource:{...resource,issue_node_id:"other"}}]] as const){
+  assert.equal(f.repo.evaluate(name,q),false);
+  const record=JSON.parse(f.db.prepare("SELECT record_json FROM security_audit_records WHERE transaction_id=?").pluck().get(name) as string);
+  assert.deepEqual(record.event.actor,{kind:"unauthenticated",id:null});assert.equal(record.event.authz_revision,0);assert.equal(record.event.binding_revision,0);
+ }
+ assert.equal(f.repo.evaluate("verified",query()),true);
+ const record=JSON.parse(f.db.prepare("SELECT record_json FROM security_audit_records WHERE transaction_id='verified'").pluck().get() as string);
+ assert.deepEqual(record.event.actor,{kind:"principal",id:"owner"});assert.equal(record.event.authz_revision,1);
+});
+test("混在IDの永続canonical orderはICU/localeCompareに依存しない",t=>{
+ const f=fixture(t),original=String.prototype.localeCompare;
+ String.prototype.localeCompare=function(){throw Error("locale comparator must not run");};
+ try {
+  for(const [i,key] of ["z","a","Z","A","a_","a-"].entries()) f.repo.write("put"+i,{kind:"put",expected_revision:0,grant:grant(key)});
+  const stored=JSON.parse(f.db.prepare("SELECT state_json FROM task_grant_state").pluck().get() as string);
+  assert.deepEqual(stored.grants.map((g:TaskGrant)=>g.grant_id),["A","Z","a","a-","a_","z"]);
+  assert.equal(f.repo.evaluate("read",query("A")),true);
+ } finally {String.prototype.localeCompare=original;}
+});
