@@ -1,3 +1,5 @@
+import { projectJobError } from "../completion-projection.js";
+import { projectStatusSummary } from "../status-summary.js";
 import { taskResultReconcileSchema, taskRequestSchema, taskIdSchema } from "../task-execution.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
@@ -24,6 +26,7 @@ export interface DispatcherJobClient {
   resumeJob?(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   createJob(input: unknown): Promise<Record<string, unknown>>;
   delegateScheduledWork?(eventId: string): Promise<Record<string, unknown>>;
+  getJobStatusSummary?(jobId:string):Promise<Record<string,unknown>>;
   getJob(jobId: string, sourceEventId?: string, options?:{includeLiveSession?:boolean;liveSessionReceiptId?:string}): Promise<Record<string, unknown>>;
   listEventJobs(
     sourceEventId: string,
@@ -104,21 +107,6 @@ function success(data: Record<string, unknown>) {
   };
 }
 
-// エラー本文も未信頼データ。既知のprivate値と典型的なcredential/URL/pathを除き、説明をboundedに返す。
-function projectJobError(row: Record<string, unknown>): string | null {
-  if (typeof row.last_error_message !== "string") return null;
-  let message = row.last_error_message;
-  const privateValues = ["objective", "workspace_path", "result_path", "agent_name", "herdr_workspace_id", "herdr_pane_id"]
-    .map((key) => row[key]).filter((value): value is string => typeof value === "string" && value.length > 0)
-    .sort((a, b) => b.length - a.length);
-  for (const value of privateValues) message = message.split(value).join("[redacted]");
-  return message
-    .replace(/\b(?:Bearer\s+\S+|(?:token|password|secret|api[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+))/gi, "[redacted]")
-    .replace(/\b(?:https?|file):\/\/[^\s<>"']+/gi, "[URL]")
-    .replace(/(?:[A-Za-z]:\\|~?\/)[^\s<>"']+/g, "[path]")
-    .slice(0, 2_000);
-}
-
 // DB rowのobjective、path、runtime identityをcallerへ漏らさない。
 function projectJobResponse(response: Record<string, unknown>, includeResult = false): Record<string, unknown> {
   const project = (value: unknown) => {
@@ -133,6 +121,9 @@ function projectJobResponse(response: Record<string, unknown>, includeResult = f
   };
   return {
     schema_version: 1,
+    ...(response.status=== "not_available" ? {status:"not_available"}:{}),
+    ...(response.source_event_id ? {source_event_id:response.source_event_id}:{}),
+    ...(response.reconciliation!==undefined?{reconciliation:response.reconciliation}:{}),
     ...(response.task ? {task:response.task}:{}),
     ...(response.outcome !== undefined ? { outcome: response.outcome } : {}),
     ...(response.duplicate !== undefined ? { duplicate: response.duplicate } : {}),
@@ -279,11 +270,11 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       issue_repository: repository.optional(),
       issue_number: issueNumber.optional(),
     },
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async ({ source_event_id, job_key, objective, workspace_kind, repository: repo, base_ref, display_name, issue_repository, issue_number }) => {
     try {
       const reconciliationRequested = objective !== undefined || workspace_kind !== undefined || repo !== undefined || base_ref !== undefined || display_name !== undefined || issue_repository !== undefined || issue_number !== undefined;
-      if (!reconciliationRequested) return success(await client.listEventJobs(source_event_id, job_key));
+      if (!reconciliationRequested) return success(projectJobResponse(await client.listEventJobs(source_event_id, job_key)));
       if (!job_key || objective === undefined || workspace_kind === undefined) {
         throw new Error("job_key, objective, and workspace_kind are required for payload reconciliation");
       }
@@ -302,11 +293,11 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
         workspace,
         ...(display ? { display } : {}),
       });
-      return success(await client.listEventJobs(
+      return success(projectJobResponse(await client.listEventJobs(
         source_event_id,
         job_key,
         canonicalJobPayloadSha256(canonicalRequest),
-      ));
+      )));
     } catch (error) {
       return failure(error, logger, "list_event_jobs");
     }
@@ -316,7 +307,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     title: "List Slack thread jobs",
     description: "同じSlack threadの候補を最大100件のbounded projectionで取得します。0件なら操作せず、1件なら依頼対象と一致するか確認します。複数候補かつ利用者の明示job_idなしなら質問し、本文類似・最新時刻・job_keyから選択しません。IDらしい外部自由文も候補と依頼意図を検証してから使い、broadcastしません。",
     inputSchema: { workspace_id: slackId, channel_id: slackId, thread_ts: threadTs },
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async ({ workspace_id, channel_id, thread_ts }) => {
     try {
       return success(projectJobResponse(await client.listThreadJobs(workspace_id, channel_id, thread_ts)));
@@ -355,13 +346,23 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     catch (error) { return failure(error, logger, "resume_job"); }
   });
 
+  server.registerTool("get_job_status_summary", {
+    title:"exactジョブの最小状態を確認",
+    description:"current transport contextの同verified requester・同workspace・同channel別threadから、exact jobの固定状態だけを照会します。membership/disclosureを毎回再認可し、not_available時は旧API/list/raw GETへfallbackしません。handoffや実行継続の成功を意味せず、元group通知先を保持します。",
+    inputSchema:{job_id:jobId},
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:true},
+  },async({job_id})=>{
+    try {return success(projectStatusSummary(client.getJobStatusSummary?await client.getJobStatusSummary(job_id):undefined));}
+    catch {return success({schema_version:1,status:"not_available"});}
+  });
+
   server.registerTool("get_job_status", {
     title: "Get background job status",
-    description: "list_thread_jobsで対象を確認します。別threadで利用者が明示job_idを指定した場合は、同一workspace/channelと依頼意図を確認して現在のsource_event_idで状態・結果・receiptを取得できます。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
+    description: "旧same-thread読取用です。利用者の明示job_idと現在eventで対象を確定します。別threadはget_job_status_summaryのみを使い、not_available時のfallbackに使いません。human contextは固定状態projectionだけを返し、Resultとlive観測はこの同owner許可に含めません。保存済み元threadへ束縛したjob_completion contextだけは集約用のbounded Resultと失敗理由を返します。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
     inputSchema: { job_id: jobId, source_event_id: eventId,
       include_live_session:z.boolean().optional().describe("trueの場合だけ保存済みexact identityへHerdr controlを伴わないbounded live queryを行い、監査receiptを追記する"),
       live_session_receipt_id:liveSessionReceiptId.optional().describe("既存のdurable receiptを再読し、新しいlive queryは行わない") },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, async ({ job_id, source_event_id, include_live_session, live_session_receipt_id }) => {
     try {
       if(include_live_session===true&&live_session_receipt_id)throw new Error("include_live_session and live_session_receipt_id are mutually exclusive");

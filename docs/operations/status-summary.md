@@ -1,0 +1,29 @@
+# 別threadの最小状態確認
+
+`get_job_status_summary(job_id)`は、同verified requester・同workspace・同channelのexact jobだけを対象にする。短命なcurrent contextはDispatcherがcurrent event/attemptへ束縛して発行し、MCP clientがtransport headerへ載せる。利用者の自由記述からactorやeventを注入しない。
+
+許可時のJSONは`schema_version`、`job_id`、`status`、`observed_at`、`revision`、`message`だけを持つ。`message`はstatusごとの固定文、`revision`はexact job状態・Task revision・principal binding・開示先・policy revisionを結び付けたSHA-256である。時計は観測時点のUTCを示す。revisionは数値のカウンタではなく、同じ認可snapshotの変更検知用である。
+
+不存在、別actor/workspace/channel、未署名owner、unknown/schedule owner、bot、provider停止、期限切れ/旧contextは同じ`{schema_version:1,status:"not_available"}`へ収束する。旧API、list、raw GET、Task操作へfallbackしない。成功はhandoff、停止確認、Task継続の証明ではなく、通知先も変更しない。
+
+## 採用した基盤とTask適合
+
+PR #267の`a8d7abc751bdbea3068921c91abb402208096d92`からauthority/disclosureを分ける共通policyとdefault-denyのtyped portを採用し、Task正本から最小owner/resource bindingを組み立てるadapterを加えた。status用portはexact status操作だけを許可する。
+
+#166が提出された`feature/cross-thread-authorization`の`63c8a0e1cf61d5b95216256aca174ea2c16fe11b`からprincipal proof/bindingとcontext managerを採用した。feature全体、human wait、永続grantは採用していない。署名はSlack Socket Modeのauthenticated workspaceを使い、version 2でchannel・開示先を含むEnvelope全体のhashへ束縛する。Ingress時は最大200msでlive channel visibilityを取得して署名対象に含め、照会時のkindと異なる場合（privateからpublicへの変化を含む）も拒否する。eventの永続化とprincipal bindingの保存は同一transactionにする。既存の未署名eventをactor文字列からbackfillしない。bindingにはproof versionとEnvelope hashも保存し、v1からのupgradeでは新columnを未確認のまま残す。古いprincipal-only証拠や保存Envelopeの改竄をstatus認可へ流用しない。
+
+mainのTaskは仕事identity、jobはAttempt identityなので、exact jobのsource eventとTaskのsource eventが一致することを照合する。旧Attemptを最新Attemptに置換して返さない。statusの同owner許可はgrant永続化やdiscovery/writeへ流用せず、#168の責務を残す。
+
+現在membershipと開示policyは照会ごとにSlack adapterへ内部認証付きで確認する。human state/visibilityが不明、shared channel、退会・削除、bot/app、DMの相手不一致は拒否する。provider await後にもcontext、owner binding、状態revisionを再照合する。再起動時はcredentialを無効化し、保存済みbindingからcontextを再発行してもmembershipを再取得する。
+
+通知起点のjobは、immutable owner/destinationと永続通知receiptを最大16段だけ辿って元のverified Slack ownerを解決する。自由記述のsource ID、不一致、循環、上限超過は許可しない。
+
+status用membership readは5秒の期限またはHTTP切断で実Web API readとpaginationを中断する。visibility readも200ms期限で中断する。
+
+visibilityの遅延・失敗時は未署名のままdurable ingressとACKを継続し、後着の照会結果からbindingを追加しない。追加readでSlackの受付を滞留させない。
+
+旧job読取経路もproduction serviceのcontext managerで保護する。humanの旧読取は元eventの同threadの固定状態だけに限定し、Resultやlive観測を返さない。`list_thread_jobs`はcurrent eventの同workspace/channel/threadに限り、毎回再認可して同verified ownerの固定状態候補だけを返す。owner-wideと別threadのdiscoveryは拒否する。`list_event_jobs`はcurrent human eventの照合か、保存されたsource eventへ束縛したjob completion purposeだけを許可し、固定のjob状態projectionへ揃える。`get_job_status`の内部completionだけは、同じ再認可後に先行siblingを含む集約用Result（summary/output/artifacts、受理上限1MiB）と既存のredacted errorを返す。Resultの自由field/actionやruntime identityを投影しない。内部completionもmembershipとorigin visibilityを現在値で確認する。内部completionの既存集約を、別threadの自由なsource event指定へ開放しない。
+
+本番切替・Slackへの実投稿は本Issueの検証に含まない。
+
+Slackのstate/visibilityは[User object](https://docs.slack.dev/reference/objects/user-object/)と[Conversation object](https://docs.slack.dev/reference/objects/conversation-object/)の公開contractに照合した。`is_bot`がfalseになるSlackbotもservice扱いで拒否し、共有予定のchannelもshared扱いにする。

@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import http from "node:http";
 
 export class DispatcherClientError extends Error {
@@ -9,6 +11,14 @@ export class DispatcherClientError extends Error {
 
 export class DispatcherApiClient {
   constructor(private readonly socketPath: string, private readonly timeoutMs = 10_000) {}
+
+  async getJobStatusSummary(jobId:string):Promise<Record<string,unknown>> {
+    try {
+      const context=JSON.parse(await fs.readFile(path.join(path.dirname(this.socketPath),"status-context.json"),"utf8")) as {token:string;event_id:string};
+      return await this.request("GET",`/v1/jobs/${encodeURIComponent(jobId)}/status-summary`,undefined,
+        {"x-dona-agent-token":context.token,"x-dona-agent-event-id":context.event_id});
+    } catch { return {schema_version:1,status:"not_available"}; }
+  }
 
   createTask(input:unknown):Promise<Record<string,unknown>> {return this.request("POST","/v1/tasks",input);}
   inspectTaskRecovery(id:string,eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/${encodeURIComponent(id)}/recovery?${new URLSearchParams({source_event_id:eventId})}`);}
@@ -105,17 +115,22 @@ export class DispatcherApiClient {
     return this.request("POST", "/v1/self-update/cancel", input);
   }
 
-  private request(method: string, route: string, body?: unknown): Promise<Record<string, unknown>> {
+  private async request(method: string, route: string, body?: unknown, extraHeaders:Record<string,string>={}): Promise<Record<string, unknown>> {
+    if(Object.keys(extraHeaders).length===0) {
+      try { const context=JSON.parse(await fs.readFile(path.join(path.dirname(this.socketPath),"status-context.json"),"utf8"));
+        extraHeaders={"x-dona-agent-token":context.token,"x-dona-agent-event-id":context.event_id};
+      } catch { /* 認可の判断はserverで行う。 */ }
+    }
     const encoded = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
     return new Promise((resolve, reject) => {
       const request = http.request({
         socketPath: this.socketPath,
         method,
         path: route,
-        headers: encoded ? {
+        headers: { ...extraHeaders,...(encoded ? {
           "content-type": "application/json",
           "content-length": encoded.length,
-        } : undefined,
+        } : {})},
       }, (response) => {
         const chunks: Buffer[] = [];
         let size = 0;

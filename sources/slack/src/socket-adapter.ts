@@ -30,6 +30,8 @@ export interface SocketClientLike {
 
 export interface WorkspaceSocket {
   workspace: string;
+  authenticatedTeamId?:string;
+  statusOriginVisibility?:(channelId:string,signal?:AbortSignal)=>Promise<string|undefined>;
   client: SocketClientLike;
 }
 
@@ -331,7 +333,10 @@ export class SlackSocketAdapter {
     let response: DispatcherResponse;
     const dispatchStarted = Date.now();
     try {
-      response = await this.dispatcher.postEvent(normalized.envelope);
+      const socket=this.sockets.find(socket=>socket.workspace===workspace);
+      const visibility=await this.originVisibility(socket,String(normalized.envelope.subject.channel_id));
+      const value=visibility?{...normalized.envelope,trace:{...normalized.envelope.trace,status_origin_visibility:visibility}}:normalized.envelope;
+      response = await this.dispatcher.postEvent(value,visibility?socket?.authenticatedTeamId:undefined);
     } catch (error) {
       this.logger.error("Dispatcher connection failed; Socket Mode envelope was not acknowledged", {
         workspace,
@@ -385,6 +390,17 @@ export class SlackSocketAdapter {
         duration_to_ack_ms: Date.now() - started,
       });
     }
+  }
+
+  private async originVisibility(socket:WorkspaceSocket|undefined,channelId:string):Promise<string|undefined> {
+    if(!socket?.statusOriginVisibility)return undefined;
+    // 追加のreadでdurable ingress/ACKを滞留させない。期限外は未署名で保存しstatusだけdenyする。
+    const controller=new AbortController();
+    const lookup=this.trackExternal(Promise.resolve().then(()=>socket.statusOriginVisibility!(channelId,controller.signal)));
+    let timer:NodeJS.Timeout|undefined;
+    try {
+      return await Promise.race([lookup.catch(()=>undefined),new Promise<undefined>(resolve=>{timer=setTimeout(()=>{controller.abort();resolve(undefined);},200);})]);
+    } finally {if(timer)clearTimeout(timer);}
   }
 
   private async ackIgnored(
