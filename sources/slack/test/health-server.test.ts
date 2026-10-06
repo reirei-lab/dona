@@ -421,3 +421,23 @@ for(const operation of ["job-delivery-confirmations","job-session-settlements","
     }finally{release();finishBody?.();await server.stop();}
   });
 }
+
+for(const mode of ["disconnect","deadline"] as const)test(`status membership ${mode} cancels provider and drains operation`,async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-status-cancel-"));roots.push(root);
+ const socketPath=path.join(root,"slack.sock"),tokenPath=path.join(root,"token"),token="t".repeat(64);await fs.writeFile(tokenPath,token,{mode:0o600});
+ let active=0,aborted=false,start:()=>void=()=>{};const started=new Promise<void>(r=>{start=r;});
+ const reporter:UpdateNotificationPort={async deliver(){throw Error("not used");},async confirmScheduleAccess(_input,signal){
+  assert.ok(signal);active++;start();return new Promise((_resolve,reject)=>{signal.addEventListener("abort",()=>{active--;aborted=true;reject(signal.reason);},{once:true});});
+ }};
+ const server=new SlackHealthServer(socketPath,{isSocketReady:()=>true,isStopping:()=>false,connectionStates:()=>({}),async quiesce(){},drainStatus:()=>({quiescing:false,drained:active===0,in_flight:active,unsafe_states:[]})},{healthReady:async()=>true},logger,"2".repeat(40),reporter,tokenPath);
+ await server.start();try {
+  const input={schema_version:1,event_id:"evt_test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",status_summary:true};
+  if(mode==="disconnect") {
+   const encoded=Buffer.from(JSON.stringify(input)),req=http.request({socketPath,path:"/v1/internal/schedule-access-confirmations",method:"POST",headers:{"x-dona-update-token":token,"content-type":"application/json","content-length":encoded.length}});req.on("error",()=>{});req.end(encoded);
+   await started;req.destroy();for(let i=0;i<100&&!aborted;i++)await new Promise(r=>setTimeout(r,10));
+  } else {
+   const began=Date.now();assert.equal((await request(socketPath,"/v1/internal/schedule-access-confirmations","POST",input,{"x-dona-update-token":token})).status,409);assert.ok(Date.now()-began<6500);
+  }
+  assert.equal(aborted,true);assert.equal(active,0);
+ }finally{await server.stop();}
+});

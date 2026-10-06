@@ -202,7 +202,7 @@ test("Taskの後継Attemptを作ってもexact旧jobと現在jobの状態を混�
 });
 
 test("MCPはlive membership providerへの外部依存を宣言する",async()=>{
- const f=await fixture();try {const tools=(await f.mcp.listTools()).tools;for(const name of ["get_job_status_summary","list_event_jobs","get_job_status"])assert.equal(tools.find(t=>t.name===name)!.annotations?.openWorldHint,true,name);assert.equal(tools.find(t=>t.name==="get_job_status_summary")!.annotations?.readOnlyHint,true);}finally{await f.close();}
+ const f=await fixture();try {const tools=(await f.mcp.listTools()).tools;for(const name of ["get_job_status_summary","list_event_jobs","get_job_status","list_thread_jobs"])assert.equal(tools.find(t=>t.name===name)!.annotations?.openWorldHint,true,name);assert.equal(tools.find(t=>t.name==="get_job_status_summary")!.annotations?.readOnlyHint,true);}finally{await f.close();}
 });
 
 for(const mode of ["api","mcp"] as const)test(`${mode}: all_terminal通知から先行完了siblingを含むResultを集約できる`,async()=>{
@@ -223,4 +223,30 @@ for(const mode of ["api","mcp"] as const)test(`${mode}: all_terminal通知から
 });
 test("完了projectionは不正・過大Resultと自由fieldを返さない",()=>{
  for(const value of ["invalid","x".repeat(1024*1024+1)])assert.equal(projectCompletionJob({job_id:"job_test",result_json:value}).result_json,null);
+});
+
+for(const mode of ["api","mcp"] as const)test(`${mode}: same-thread候補はcurrent ownerへ限定し再認可する`,async()=>{
+ const f=await fixture();try {
+  const other=await f.event(`foreign-thread-${mode}`,"U_OTHER","C_TEST","T_TEST","1756722030.123456");
+  f.db.tasks.create(taskRequestSchema.parse({source_event_id:other.event_id,task_key:"other",objective:"foreign",workspace:{kind:"scratch"},policy:{max_attempts:3,retry_delay_ms:1000}}),f.config.jobsWorkspaceRoot,f.config.jobResultsDir);
+  const row=await f.event(`same-thread-${mode}`,"U_TEST","C_TEST","T_TEST","1756722030.123456");await f.current(row);
+  const list=async()=>mode==="api"?f.client.listThreadJobs("T_TEST","C_TEST","1756722030.123456"):(await f.mcp.callTool({name:"list_thread_jobs",arguments:{workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456"}})).structuredContent as Record<string,unknown>;
+  const result=await list();assert.deepEqual((result.jobs as Array<{job_id:string}>).map(j=>j.job_id),[f.jobId]);assert.ok(!JSON.stringify(result).includes(canary));
+  assert.equal((await f.client.getJob(f.jobId,row.event_id)).job!==undefined,true);assert.ok(!JSON.stringify(await f.client.getJob(f.jobId,row.event_id)).includes(canary));
+  f.setAccess(false);assert.deepEqual(await list(),statusNotAvailable);f.setAccess(true);
+  await f.current(await f.event(`different-thread-${mode}`));assert.deepEqual(await list(),statusNotAvailable);
+ }finally{await f.close();}
+});
+for(const mode of ["api","mcp"] as const)test(`${mode}: durable通知receiptから元のverified ownerへboundedに解決する`,async()=>{
+ const f=await fixture();try {
+  await f.current(f.origin);f.db.markWaiting(f.origin.event_id);f.db.saveCompleted(f.origin.event_id,{schema_version:1,event_id:f.origin.event_id,status:"completed",summary:"delegated",completed_at:new Date().toISOString()},path.join(f.root,"origin.json"));
+  f.db.markJobNeedsReview(f.jobId,"test","test");const notice=f.db.enqueueJobNotification(f.jobId).row;await f.current(notice);
+  const child=f.db.createJob({source_event_id:notice.event_id,job_key:"from-notice",objective:"follow-up",workspace:{kind:"scratch"}},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).row;
+  await f.current(await f.event(`notice-owner-${mode}`));assert.equal((await f.query(mode,child.job_id)).job_id,child.job_id);
+  await f.current(await f.event(`notice-other-${mode}`,"U_OTHER"));assert.deepEqual(await f.query(mode,child.job_id),statusNotAvailable);
+  await f.current(await f.event(`notice-return-${mode}`));
+  const sql=new Database(f.config.databasePath);const subject=JSON.parse(notice.subject_json);subject.source_event_id=notice.event_id;
+  sql.prepare("UPDATE events SET subject_json=? WHERE event_id=?").run(JSON.stringify(subject),notice.event_id);sql.close();
+  assert.deepEqual(await f.query(mode,child.job_id),statusNotAvailable);
+ }finally{await f.close();}
 });

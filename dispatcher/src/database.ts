@@ -1272,6 +1272,8 @@ export class DispatcherDatabase {
     })();
   }
 
+  getEventJobBinding(eventId:string) {return readEventJobBinding(this.db,eventId);}
+
   getVerifiedPrincipalProofConsumption(hash:string) {return readVerifiedPrincipalProofConsumption(this.db,hash);}
 
   getVerifiedPrincipalBinding(eventId:string) {
@@ -2019,12 +2021,12 @@ export class DispatcherDatabase {
     return this.db.prepare("SELECT 1 FROM legacy_job_agents_to_stop WHERE job_id=? AND stopped_at IS NOT NULL").get(jobId)!==undefined;
   }
 
-  listThreadJobs(workspaceId: string, channelId: string, threadTs: string, limit = 100): JobRow[] {
+  listThreadJobs(workspaceId: string, channelId: string, threadTs: string, limit = 100,actorId?:string): JobRow[] {
     return this.db.prepare(`
       SELECT * FROM jobs
-      WHERE workspace_id = ? AND channel_id = ? AND thread_ts = ?
+      WHERE workspace_id = ? AND channel_id = ? AND thread_ts = ? AND (? IS NULL OR actor_id = ?)
       ORDER BY created_at DESC LIMIT ?
-    `).all(workspaceId, channelId, threadTs, limit) as JobRow[];
+    `).all(workspaceId, channelId, threadTs, actorId??null,actorId??null,limit) as JobRow[];
   }
 
   listOwnerJobs(sourceEventId: string, limit = 100): JobRow[] {

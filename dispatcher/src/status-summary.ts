@@ -1,3 +1,4 @@
+import { resolveVerifiedSlackOwner } from "./verified-owner-origin.js";
 import { AgentReadAuthorization, type AgentReadOwnerBinding } from "./agent-read-authorization.js";
 import { createHash } from "node:crypto";
 import type { AgentExecutionContext } from "./agent-context.js";
@@ -27,10 +28,10 @@ export class StatusSummaryService {
   if(context.purpose!=="human_command"||context.policy_revision!==1||context.principal_kind!=="human")return;
   const event=this.database.get(context.event_id),job=this.database.getJob(jobId);
   if(!event||event.source!=="slack"||!job)return;
-  const owner=this.database.getVerifiedPrincipalBinding(job.source_event_id),requester=this.database.getVerifiedPrincipalBinding(context.event_id);
+  const resolved=resolveVerifiedSlackOwner(this.database,job.source_event_id),owner=resolved?.principal,requester=this.database.getVerifiedPrincipalBinding(context.event_id);
   if(!owner||!requester||owner.revoked_at!==null||requester.revoked_at!==null)return;
   if([owner,requester].some(p=>p.principal_id!==context.principal_id||p.tenant_id!==context.tenant_id||p.workspace_id!==context.workspace_id))return;
-  const origin=this.database.get(job.source_event_id);
+  const origin=resolved?.origin;
   if(!origin||origin.source!=="slack")return;
   const destination=event.reply_target_json?JSON.parse(event.reply_target_json) as Record<string,unknown>:undefined;
   const source=origin.reply_target_json?JSON.parse(origin.reply_target_json) as Record<string,unknown>:undefined;
@@ -42,7 +43,7 @@ export class StatusSummaryService {
   if(task&&task.source_event_id!==job.source_event_id)return;
   const revision=createHash("sha256").update(stableStringify({job_id:job.job_id,status:job.status,updated_at:job.updated_at,
     task_id:task?.task_id??null,task_revision:task?.revision??null,owner_proof:owner.proof_sha256,
-    requester_proof:requester.proof_sha256,destination,origin_trace:origin.trace_json,origin_destination:source,policy_revision:1})).digest("hex");
+    requester_proof:requester.proof_sha256,ownership_path:resolved?.path,destination,origin_trace:origin.trace_json,origin_destination:source,policy_revision:1})).digest("hex");
   const originVisibility=origin.trace_json?JSON.parse(origin.trace_json).status_origin_visibility:undefined;
   if(!["public_channel","private_channel","im","mpim"].includes(originVisibility))return;
   const binding:AgentReadOwnerBinding={job_id:job.job_id,source_event_id:job.source_event_id,owner_kind:"human_verified",

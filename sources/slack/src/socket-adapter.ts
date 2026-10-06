@@ -31,7 +31,7 @@ export interface SocketClientLike {
 export interface WorkspaceSocket {
   workspace: string;
   authenticatedTeamId?:string;
-  statusOriginVisibility?:(channelId:string)=>Promise<string|undefined>;
+  statusOriginVisibility?:(channelId:string,signal?:AbortSignal)=>Promise<string|undefined>;
   client: SocketClientLike;
 }
 
@@ -395,10 +395,11 @@ export class SlackSocketAdapter {
   private async originVisibility(socket:WorkspaceSocket|undefined,channelId:string):Promise<string|undefined> {
     if(!socket?.statusOriginVisibility)return undefined;
     // 追加のreadでdurable ingress/ACKを滞留させない。期限外は未署名で保存しstatusだけdenyする。
-    const lookup=this.trackExternal(Promise.resolve().then(()=>socket.statusOriginVisibility!(channelId)));
+    const controller=new AbortController();
+    const lookup=this.trackExternal(Promise.resolve().then(()=>socket.statusOriginVisibility!(channelId,controller.signal)));
     let timer:NodeJS.Timeout|undefined;
     try {
-      return await Promise.race([lookup.catch(()=>undefined),new Promise<undefined>(resolve=>{timer=setTimeout(()=>resolve(undefined),200);})]);
+      return await Promise.race([lookup.catch(()=>undefined),new Promise<undefined>(resolve=>{timer=setTimeout(()=>{controller.abort();resolve(undefined);},200);})]);
     } finally {if(timer)clearTimeout(timer);}
   }
 

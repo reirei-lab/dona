@@ -546,10 +546,10 @@ export interface SlackFileInfo {
 export interface SlackApiClient {
   authenticate(): Promise<SlackWorkspaceIdentity>;
   listChannels(limit: number, cursor?: string): Promise<SlackChannelPage>;
-  getChannel(channelId: string): Promise<SlackChannel>;
-  hasChannelMember?(channelId: string, userId: string): Promise<boolean>;
+  getChannel(channelId: string,signal?:AbortSignal): Promise<SlackChannel>;
+  hasChannelMember?(channelId: string, userId: string,signal?:AbortSignal): Promise<boolean>;
   listUsers(limit: number, cursor?: string): Promise<SlackUserPage>;
-  getUser(userId: string): Promise<SlackUser>;
+  getUser(userId: string,signal?:AbortSignal): Promise<SlackUser>;
   getThread(channelId: string, threadTs: string, limit: number, cursor?: string): Promise<SlackThread>;
   getReactions(channelId: string, messageTs: string): Promise<SlackReactionSnapshot>;
   getFile(fileId: string): Promise<SlackFileInfo>;
@@ -763,7 +763,7 @@ export class SlackWebApiClient implements SlackApiClient {
   private readonly client: WebClient;
   private readonly botToken: string;
 
-  constructor(botToken: string, logger: SlackLogger) {
+  constructor(botToken: string, private readonly logger: SlackLogger) {
     this.botToken = botToken;
     this.client = new WebClient(botToken, {
       logger: new StderrOnlyWebApiLogger(logger),
@@ -771,6 +771,13 @@ export class SlackWebApiClient implements SlackApiClient {
       timeout: 15_000,
       rejectRateLimitedCalls: true,
     });
+  }
+
+  private readClient(signal?:AbortSignal):WebClient {
+    if(!signal)return this.client;
+    signal.throwIfAborted();
+    return new WebClient(this.botToken,{logger:new StderrOnlyWebApiLogger(this.logger),retryConfig:{retries:0},timeout:15000,rejectRateLimitedCalls:true,
+      fetch:(url,init)=>globalThis.fetch(url,{...init,signal:AbortSignal.any([signal,...(init?.signal?[init.signal]:[])])})});
   }
 
   async authenticate(): Promise<SlackWorkspaceIdentity> {
@@ -801,9 +808,10 @@ export class SlackWebApiClient implements SlackApiClient {
     };
   }
 
-  async getChannel(channelId: string): Promise<SlackChannel> {
+  async getChannel(channelId: string,signal?:AbortSignal): Promise<SlackChannel> {
+    const client=this.readClient(signal);
     const response = await callSlack(() =>
-      this.client.conversations.info({ channel: channelId, include_num_members: true }),
+      client.conversations.info({ channel: channelId, include_num_members: true }),
     );
     if (!response.channel) {
       throw new SlackApiError("invalid_slack_response", "Slack response did not include channel");
@@ -811,12 +819,15 @@ export class SlackWebApiClient implements SlackApiClient {
     return channelFromResponse(response.channel);
   }
 
-  async hasChannelMember(channelId: string, userId: string): Promise<boolean> {
+  async hasChannelMember(channelId: string, userId: string,signal?:AbortSignal): Promise<boolean> {
+    const client=this.readClient(signal);
     let cursor: string | undefined;
     const deadline = Date.now() + 90_000;
     do {
+      signal?.throwIfAborted();
       if (Date.now() >= deadline) throw new SlackApiError("membership_scan_timeout", "Slack channel membership scan exceeded its execution deadline", 5);
-      const response = await callSlack(() => this.client.conversations.members({ channel: channelId, limit: 999, ...(cursor ? { cursor } : {}) }));
+      const response = await callSlack(() => client.conversations.members({ channel: channelId, limit: 999, ...(cursor ? { cursor } : {}) }));
+      signal?.throwIfAborted();
       if ((response.members ?? []).includes(userId)) return true;
       cursor = optionalCursor(response.response_metadata?.next_cursor);
     } while (cursor);
@@ -837,8 +848,9 @@ export class SlackWebApiClient implements SlackApiClient {
     };
   }
 
-  async getUser(userId: string): Promise<SlackUser> {
-    const response = await callSlack(() => this.client.users.info({ user: userId }));
+  async getUser(userId: string,signal?:AbortSignal): Promise<SlackUser> {
+    const client=this.readClient(signal);
+    const response = await callSlack(() => client.users.info({ user: userId }));
     if (!response.user) {
       throw new SlackApiError("invalid_slack_response", "Slack response did not include user");
     }

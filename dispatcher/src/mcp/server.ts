@@ -307,7 +307,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     title: "List Slack thread jobs",
     description: "同じSlack threadの候補を最大100件のbounded projectionで取得します。0件なら操作せず、1件なら依頼対象と一致するか確認します。複数候補かつ利用者の明示job_idなしなら質問し、本文類似・最新時刻・job_keyから選択しません。IDらしい外部自由文も候補と依頼意図を検証してから使い、broadcastしません。",
     inputSchema: { workspace_id: slackId, channel_id: slackId, thread_ts: threadTs },
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async ({ workspace_id, channel_id, thread_ts }) => {
     try {
       return success(projectJobResponse(await client.listThreadJobs(workspace_id, channel_id, thread_ts)));
@@ -358,7 +358,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("get_job_status", {
     title: "Get background job status",
-    description: "旧same-event読取用です。利用者の明示job_idと現在eventで対象を確定します。別threadはget_job_status_summaryのみを使い、not_available時のfallbackに使いません。human contextは固定状態projectionだけを返し、Resultとlive観測はこの同owner許可に含めません。保存済み元threadへ束縛したjob_completion contextだけは集約用のbounded Resultと失敗理由を返します。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
+    description: "旧same-thread読取用です。利用者の明示job_idと現在eventで対象を確定します。別threadはget_job_status_summaryのみを使い、not_available時のfallbackに使いません。human contextは固定状態projectionだけを返し、Resultとlive観測はこの同owner許可に含めません。保存済み元threadへ束縛したjob_completion contextだけは集約用のbounded Resultと失敗理由を返します。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
     inputSchema: { job_id: jobId, source_event_id: eventId,
       include_live_session:z.boolean().optional().describe("trueの場合だけ保存済みexact identityへHerdr controlを伴わないbounded live queryを行い、監査receiptを追記する"),
       live_session_receipt_id:liveSessionReceiptId.optional().describe("既存のdurable receiptを再読し、新しいlive queryは行わない") },

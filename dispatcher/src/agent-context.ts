@@ -1,3 +1,4 @@
+import { resolveVerifiedSlackOwner } from "./verified-owner-origin.js";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -30,7 +31,7 @@ export class AgentPrincipalUnavailableError extends Error {
 interface ActiveContext extends AgentExecutionContext { token_sha256: string; }
 
 export const agentPurposeOperations: Record<AgentPurpose, readonly string[]> = {
-  human_command: ["get_job_status_summary", "list_event_jobs", "get_job_status"],
+  human_command: ["get_job_status_summary", "list_event_jobs", "get_job_status", "list_thread_jobs"],
   job_completion: ["list_event_jobs", "get_job_status"],
   schedule_work: [],
   update_completion: [],
@@ -45,13 +46,7 @@ function purpose(row: EventRow): AgentPurpose {
 }
 
 function verifiedPrincipal(database: DispatcherDatabase, row: EventRow) {
-  let binding = database.getVerifiedPrincipalBinding(row.event_id);
-  if(!binding && row.source==="dona_job") {
-    try { const source=JSON.parse(row.subject_json).source_event_id??(row.trace_json?JSON.parse(row.trace_json).source_event_id:undefined);
-      if(typeof source==="string")binding=database.getVerifiedPrincipalBinding(source);
-    } catch {return undefined;}
-  }
-  return binding?.revoked_at === null ? binding : undefined;
+  return resolveVerifiedSlackOwner(database,row.event_id)?.principal;
 }
 
 export class AgentContextManager {
@@ -120,7 +115,7 @@ export class AgentContextManager {
     const expected = Buffer.from(active.token_sha256, "hex");
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return undefined;
     const current = this.database.get(active.event_id);
-    if (!current || current.attempt_count !== active.attempt || !["dispatching", "waiting_agent", "blocked"].includes(current.status)) return undefined;
+    if (!current || purpose(current)!==active.purpose || current.attempt_count !== active.attempt || !["dispatching", "waiting_agent", "blocked"].includes(current.status)) return undefined;
     const principal = verifiedPrincipal(this.database, current);
     if (!principal || principal.revoked_at !== null ||
       principal.tenant_id !== active.tenant_id || principal.workspace_id !== active.workspace_id ||

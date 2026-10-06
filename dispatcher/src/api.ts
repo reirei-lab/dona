@@ -1,3 +1,4 @@
+import { resolveVerifiedSlackOwner } from "./verified-owner-origin.js";
 import { projectCompletionJob } from "./completion-projection.js";
 import { verifySlackPrincipalProof } from "./principal-proof.js";
 import type { AgentContextManager } from "./agent-context.js";
@@ -804,22 +805,30 @@ export class DispatcherApi {
       if(context.purpose==="job_completion") {
         const event=this.database.get(context.event_id);if(!event||event.source!=="dona_job")return false;
         const source=JSON.parse(event.subject_json).source_event_id??(event.trace_json?JSON.parse(event.trace_json).source_event_id:undefined);
-        const original=typeof source==="string"?this.database.get(source):undefined;
+        const resolved=typeof source==="string"?resolveVerifiedSlackOwner(this.database,source):undefined,original=resolved?.origin;
         const destination=event.reply_target_json?JSON.parse(event.reply_target_json):undefined;
         const origin=original?.reply_target_json?JSON.parse(original.reply_target_json):undefined;
         const originKind=original?.trace_json?JSON.parse(original.trace_json).status_origin_visibility:undefined;
         if(!destination||!origin||destination.workspace_id!==context.workspace_id||destination.channel_id!==origin.channel_id||destination.thread_ts!==origin.thread_ts)return false;
         const key=await readPrivateToken(this.config.updateInternalTokenPath);if(!key)return false;
         const access=await confirmScheduleAccess(this.config.slackAdapterSocketPath,key,{event_id:context.event_id,workspace_id:context.workspace_id,channel_id:destination.channel_id,user_id:context.principal_id,status_summary:true},5000);
-        if(this.database.get(context.event_id)?.reply_target_json!==event.reply_target_json||this.database.get(context.event_id)?.subject_json!==event.subject_json||this.database.get(source)?.trace_json!==original?.trace_json)return false;
+        if(this.database.get(context.event_id)?.reply_target_json!==event.reply_target_json||this.database.get(context.event_id)?.subject_json!==event.subject_json||(resolved&&stableStringify(resolveVerifiedSlackOwner(this.database,source))!==stableStringify(resolved)))return false;
         if(access.authorized!==true||access.event_id!==context.event_id||access.workspace_id!==context.workspace_id||access.channel_id!==destination.channel_id||access.user_id!==context.principal_id||access.destination_kind!==originKind||!this.agentContexts?.authorize(token,eventId,operation))return false;
         if(isEvents)return sourceEventId===source;
         const job=this.database.getJob(decodeURIComponent(url.pathname.split("/")[3]!));
         return !!job && job.source_event_id===source && sourceEventId===context.event_id;
       }
-      if(context.purpose!=="human_command"||sourceEventId!==context.event_id)return false;
+      if(context.purpose!=="human_command")return false;
+      if(operation!=="list_thread_jobs"&&sourceEventId!==context.event_id)return false;
+      if(operation==="list_thread_jobs") {
+        const row=this.database.get(context.event_id),destination=row?.reply_target_json?JSON.parse(row.reply_target_json):undefined;
+        if(!destination||url.searchParams.get("workspace_id")!==context.workspace_id||url.searchParams.get("channel_id")!==destination.channel_id||url.searchParams.get("thread_ts")!==destination.thread_ts)return false;
+        const key=await readPrivateToken(this.config.updateInternalTokenPath);if(!key)return false;
+        const access=await confirmScheduleAccess(this.config.slackAdapterSocketPath,key,{event_id:context.event_id,workspace_id:context.workspace_id,channel_id:destination.channel_id,user_id:context.principal_id,status_summary:true},5000);
+        return access.authorized===true&&access.event_id===context.event_id&&access.workspace_id===context.workspace_id&&access.channel_id===destination.channel_id&&access.user_id===context.principal_id&&access.destination_kind===(row?.trace_json?JSON.parse(row.trace_json).status_origin_visibility:undefined)&&this.database.get(context.event_id)?.reply_target_json===row?.reply_target_json&&!!this.agentContexts?.authorize(token,eventId,operation);
+      }
       // owner-wide discoveryは別Issue。同threadの旧readだけを維持する。
-      if(operation==="list_owner_jobs"||operation==="list_thread_jobs")return false;
+      if(operation==="list_owner_jobs")return false;
       if(isEvents) {
         const event=this.database.get(context.event_id),destination=event?.reply_target_json?JSON.parse(event.reply_target_json):undefined;
         if(!destination||destination.workspace_id!==context.workspace_id||typeof destination.channel_id!=="string")return false;
@@ -829,7 +838,8 @@ export class DispatcherApi {
       }
       const jobId=decodeURIComponent(url.pathname.split("/")[3]!),job=this.database.getJob(jobId);
       // 別threadのfull ResultやTask Attemptはsummary認可を迂回できない。
-      if(!job||job.source_event_id!==context.event_id)return false;
+      const resolved=job?resolveVerifiedSlackOwner(this.database,job.source_event_id):undefined,event=this.database.get(context.event_id);
+      if(!job||!resolved||!event?.reply_target_json||!resolved.origin.reply_target_json||JSON.parse(event.reply_target_json).thread_ts!==JSON.parse(resolved.origin.reply_target_json).thread_ts)return false;
       const key=await readPrivateToken(this.config.updateInternalTokenPath);if(!key)return false;
       const result=await new StatusSummaryService(this.database,input=>confirmScheduleAccess(this.config.slackAdapterSocketPath,key,{...input,status_summary:true},5000))
         .read(jobId,context,()=>this.agentContexts?.authorize(token,eventId,operation));
@@ -901,10 +911,15 @@ export class DispatcherApi {
       if (!workspaceId || !channelId || !threadTs) {
         throw new ApiRequestError(400, "invalid_request", "workspace_id, channel_id, and thread_ts are required");
       }
-      const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs, 101);
+      const token=request.headers["x-dona-agent-token"],eventId=request.headers["x-dona-agent-event-id"],context=typeof token==="string"&&typeof eventId==="string"?this.agentContexts?.authorize(token,eventId,"list_thread_jobs"):undefined;
+      if(this.agentContexts&&!context){sendJson(response,200,{schema_version:1,status:"not_available"});return;}
+      const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs, 101,context?.principal_id);
+      const current=this.database.get(context?.event_id??""),kind=current?.trace_json?JSON.parse(current.trace_json).status_origin_visibility:undefined;
+      const visible=this.agentContexts?candidates.filter(job=>{const resolved=resolveVerifiedSlackOwner(this.database,job.source_event_id);return !!resolved&&resolved.principal.principal_id===context?.principal_id&&resolved.principal.workspace_id===context?.workspace_id&&!!resolved.origin.trace_json&&JSON.parse(resolved.origin.trace_json).status_origin_visibility===kind;}).map(job=>({job_id:job.job_id,status:job.status,created_at:job.created_at,updated_at:job.updated_at,completed_at:job.completed_at})):candidates;
+      if(this.agentContexts&&!(typeof token==="string"&&typeof eventId==="string"&&this.agentContexts.authorize(token,eventId,"list_thread_jobs"))){sendJson(response,200,{schema_version:1,status:"not_available"});return;}
       sendJson(response, 200, {
         schema_version: 1,
-        jobs: candidates.slice(0,100),
+        jobs: visible.slice(0,100),
         truncated: candidates.length > 100,
       });
       return;

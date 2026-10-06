@@ -336,3 +336,11 @@ test("status membershipはbot・不明state・shared・private/public開示を�
  channel={...channel,id:"D123",isIm:true,userId:"U_OTHER"};await assert.rejects(reporter.confirmScheduleAccess({...input,channel_id:"D123"}));
  client.getUser=async()=>{throw Error("provider stopped");};await assert.rejects(reporter.confirmScheduleAccess(input));
 });
+
+test("status cancellation reaches user/channel/member reads and refuses a late answer",async()=>{
+ const {client,reporter}=await reporterFixture(),controller=new AbortController();let active=0;const reads:SlackApiClient=client;
+ reads.getUser=async(_id,signal)=>{assert.ok(signal);return {id:"U_TEST",teamId:"T123",stateKnown:true,isBot:false,isAppUser:false,isDeleted:false};};
+ reads.getChannel=async(_id,signal)=>{assert.ok(signal);return {id:"C123",visibilityKnown:true,isPrivate:false,isArchived:false,isMember:true,isShared:false};};
+ reads.hasChannelMember=async(_channel,_user,signal)=>{assert.ok(signal);active++;return new Promise<boolean>((_resolve,reject)=>{signal.addEventListener("abort",()=>{active--;reject(signal.reason);},{once:true});setTimeout(()=>controller.abort(),25);});};
+ await assert.rejects(reporter.confirmScheduleAccess({schema_version:1,event_id:"evt_01m1zfewbjx8v0844yrrkqwzc7",workspace_id:"T123",channel_id:"C123",user_id:"U_TEST",status_summary:true},controller.signal));assert.equal(active,0);
+});
