@@ -215,7 +215,8 @@ export async function waitForUpdaterIdentity(socketPath, expectedSha, domain, ti
     let health;
     try { health = await healthRead(); }
     catch { await new Promise(resolve => setTimeout(resolve, 100)); continue; }
-    if (health?.status !== "ready" || health.service !== "updater" || health.build_sha !== expectedSha) {
+    if (health?.status !== "ready" || health.service !== "updater" || health.build_sha !== expectedSha ||
+        (options.expectedUpdateSchema !== undefined && health.update_schema !== options.expectedUpdateSchema)) {
       await new Promise(resolve => setTimeout(resolve, 100));
       continue;
     }
@@ -242,7 +243,8 @@ export async function waitForUpdaterIdentity(socketPath, expectedSha, domain, ti
         registrationPid !== lock.pid) {
       throw new Error("updater socket, PID, start identity, and launchd registration disagree");
     }
-    return;
+    return { build_sha: expectedSha, pid: lock.pid, process_start: lock.process_start,
+      update_schema: health.update_schema };
   } while (Date.now() < deadline);
   throw new Error("updater process identity was not observed before timeout");
 }

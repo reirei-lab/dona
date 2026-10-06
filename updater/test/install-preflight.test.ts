@@ -909,20 +909,32 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
     await fs.writeFile(newDispatcherPlist, "new dispatcher");
     await advance("verified");
     const receiptPath = path.join(root, "control-receipt.tmp");
+    const { writeControlReceipt } = await import(pathToFileURL(controlReceipt).href);
+    const receiptOptions = {
+      healthRead: async () => ({ status: "ready", service: "updater", build_sha: "2".repeat(40),
+        pid: 123, process_start: "fixture start", update_schema: 3 }),
+      lockRead: async () => ({ pid: 123, process_start: "fixture start" }),
+      registrationRead: async () => `pid = 123\nDONA_UPDATER_BUILD_SHA => ${"2".repeat(40)}`,
+      processStartRead: async () => "fixture start",
+    };
+    const writeReceipt = () => writeControlReceipt(attempt, receiptPath, "2".repeat(40), controlUpdater,
+      path.join(root, "updater.sock"), "gui/501", receiptOptions);
     const currentModule = path.join(controlUpdater, "dist", "database.js");
     await fs.chmod(path.join(controlUpdater, "dist"), 0o700);
     await fs.chmod(currentModule, 0o600);
     await fs.writeFile(currentModule, "tampered");
     await fs.chmod(currentModule, 0o400);
     await fs.chmod(path.join(controlUpdater, "dist"), 0o500);
-    await assert.rejects(execute(process.execPath, [controlReceipt, attempt, receiptPath, "2".repeat(40), controlUpdater]), /verified release/);
+    await assert.rejects(writeReceipt(), /verified release/);
     await fs.chmod(path.join(controlUpdater, "dist"), 0o700);
     await fs.chmod(currentModule, 0o600);
     await fs.writeFile(currentModule, "verified");
     await fs.chmod(currentModule, 0o400);
     await fs.chmod(path.join(controlUpdater, "dist"), 0o500);
-    await execute(process.execPath, [controlReceipt, attempt, receiptPath, "2".repeat(40), controlUpdater]);
+    await writeReceipt();
     const receipt = JSON.parse(await fs.readFile(receiptPath, "utf8"));
+    assert.deepEqual(receipt.process_identity, { build_sha: "2".repeat(40), pid: 123,
+      process_start: "fixture start", update_schema: 3 });
     assert.equal(receipt.attempt_id, path.basename(attempt));
     assert.match(receipt.attempt_sha256, /^[0-9a-f]{64}$/);
     assert.match(receipt.restore_rehearsal_sha256, /^[0-9a-f]{64}$/);
@@ -930,7 +942,7 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
     assert.equal(receipt.control_updater_tree_sha256, snapshot.new_updater_tree_sha256);
     assert.match(receipt.old_updater_tree_sha256, /^[0-9a-f]{64}$/);
     assert.match(receipt.dispatcher_plist_sha256, /^[0-9a-f]{64}$/);
-    await assert.rejects(execute(process.execPath, [controlReceipt, attempt, receiptPath, "2".repeat(40), controlUpdater]));
+    await assert.rejects(writeReceipt());
     await advance("restore_required");
     const restoredDb = path.join(root, "restored.sqlite3");
     await fs.copyFile(backup, restoredDb);
