@@ -56,16 +56,14 @@ import readline from 'node:readline';import fs from 'node:fs';const send=v=>proc
  }finally{if(manager)for(const agent of f.runtime.agents())if(agent.state!=='stopped')await manager.stop(agent.name,agent.generation);await f.close();}
 });
 
-for(const kind of ['approval','result','paused','budget','identity','checkpoint'] as const)test(`停止更新は${kind}を自動再実行へ変換しない`,async()=>{
+for(const kind of ['result','paused','budget','identity','checkpoint'] as const)test(`停止更新は${kind}を自動再実行へ変換しない`,async()=>{
  const f=await fixture();try{
   if(kind==='checkpoint'){await fs.mkdir(path.dirname(f.job.result_path),{recursive:true});await fs.writeFile(path.join(path.dirname(f.job.result_path),'checkpoint.json'),JSON.stringify({schema_version:1,task_id:f.task.task_id,attempt_id:f.job.job_id,sequence:1,summary:'結果確認待ち',remaining:[],artifacts:[],unresolved_operations:['pushの受理不明'],waiting:'external_effect_unknown'}));}
-  if(kind==='approval')f.runtime.addQuestion({question_id:'approval',agent:f.job.agent_name,generation:'original-generation',thread_id:'saved-thread',turn_id:'old-turn',rpc_id_json:'1',kind:'approval',payload_json:'{}',state:'pending',answer_hash:null,created_at:new Date().toISOString()});
   if(kind==='result'){await fs.mkdir(path.dirname(f.job.result_path),{recursive:true});await fs.writeFile(f.job.result_path,'{"summary":"停止直前の成果"}');}
   if(kind==='paused')f.db.tasks.control(f.task.task_id,f.event.event_id,f.db.tasks.get(f.task.task_id)!.revision,'pause');
   if(kind==='budget')f.db.tasks.offlineResumes['sql'].prepare('UPDATE tasks SET max_attempts=1 WHERE task_id=?').run(f.task.task_id);
   if(kind==='identity')f.runtime.put({...f.runtime.agent(f.job.agent_name)!,cwd:f.root});
   f.migrate();assert.equal(f.db.tasks.get(f.task.task_id)!.current_attempt_id,f.job.job_id);
-  if(kind==='approval'){assert.equal(f.runtime.question('approval')!.state,'expired');assert.equal(f.db.tasks.get(f.task.task_id)!.wait_reason,'human_input');}
   if(kind==='result')assert.equal(await fs.readFile(f.job.result_path,'utf8'),'{"summary":"停止直前の成果"}');
   f.migrate();assert.equal(f.db.tasks.attempts(f.task.task_id).length,1);
  }finally{await f.close();}
@@ -157,7 +155,72 @@ test('activation後の再停止は現在Attemptのスレッドを次Attemptへ�
   f.migrate();const current=f.db.tasks.get(f.task.task_id)!,job=f.db.getJob(current.current_attempt_id)!;
   f.db.beginJobPreparation(job.job_id,new Date(job.available_at));f.db.setJobRuntime(job.job_id,job.agent_name,job.agent_name,JSON.stringify(['second-generation','saved-thread']));f.db.beginJobDispatch(job.job_id);f.db.markJobRunning(job.job_id);
   f.runtime.put({...f.runtime.agent(f.job.agent_name)!,name:job.agent_name,generation:'second-generation',state:'working',config_json:JSON.stringify({attemptId:job.job_id})});
+  const history=new Database(f.config.databasePath);history.prepare('UPDATE task_attempts SET checkpoint_json=? WHERE attempt_id=?').run(JSON.stringify({schema_version:1,task_id:f.task.task_id,attempt_id:f.job.job_id,sequence:1,summary:'過去の解決済み質問',remaining:[],artifacts:[],unresolved_operations:[],waiting:'human_input'}),f.job.job_id);history.close();
   f.migrate();const latest=f.db.tasks.get(f.task.task_id)!,next=f.db.getJob(latest.current_attempt_id)!;
   assert.equal(latest.attempt_number,3);assert.equal(JSON.parse(next.workspace_json)._dona_resume.source.attempt_id,job.job_id);assert.equal(JSON.parse(next.workspace_json)._dona_resume.source.generation,'second-generation');assert.equal(JSON.parse(next.workspace_json)._dona_resume.source.thread_id,'saved-thread');
  }finally{await f.close();}
+});
+
+for(const kind of ['question','approval'] as const)test(`停止更新後の${kind}は旧回答を移植せず新しい要求へ回答する`,async()=>{
+ const f=await fixture();let manager:AppServerManager|undefined;try{
+  f.runtime.addQuestion({question_id:'old-question',agent:f.job.agent_name,generation:'original-generation',thread_id:'saved-thread',turn_id:'old-turn',rpc_id_json:'1',kind,payload_json:JSON.stringify({questions:[{id:'choice',question:'続行条件'}]}),state:'pending',answer_hash:null,created_at:new Date().toISOString()});
+  f.runtime.put({...f.runtime.agent(f.job.agent_name)!,state:'waiting'});f.db.tasks.wait(f.db.tasks.get(f.task.task_id)!,'human_input');
+  f.migrate();const task=f.db.tasks.get(f.task.task_id)!,job=f.db.getJob(task.current_attempt_id)!;assert.notEqual(job.job_id,f.job.job_id);assert.equal(f.runtime.question('old-question')!.state,'expired');assert.match(buildJobPrompt(job),/native_requests/);
+  const script=path.join(f.root,'question.mjs');await fs.writeFile(script,`import readline from 'node:readline';const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);if(r.method==='initialize')send({id:r.id,result:{}});if(r.method==='thread/resume')send({id:r.id,result:{thread:{id:r.params.threadId}}});if(r.method==='turn/start'){send({method:'turn/started',params:{threadId:'saved-thread',turn:{id:'new-turn'}}});send({id:r.id,result:{turn:{id:'new-turn'}}});send({id:'new-request',method:${JSON.stringify(kind==='question'?'item/tool/requestUserInput':'item/permissions/requestApproval')},params:{threadId:'saved-thread',turnId:'new-turn',itemId:'item',questions:[{id:'choice',question:'続行条件',isSecret:false,options:null}],permissions:{network:{enabled:true}}}});}if(r.id==='new-request'&&r.result)send({method:'serverRequest/resolved',params:{threadId:'saved-thread',requestId:'new-request'}});});`);
+  manager=new AppServerManager(f.runtime,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));const agent=await manager.start({name:job.agent_name,attemptId:job.job_id,role:'worker',cwd:job.workspace_path,release:f.root,args:[],threadConfig:{},resumeFrom:JSON.parse(job.workspace_json)._dona_resume.source});
+  f.db.beginJobPreparation(job.job_id,new Date(job.available_at));f.db.setJobRuntime(job.job_id,agent.name,agent.name,JSON.stringify([agent.generation,agent.thread_id]));f.db.beginJobDispatch(job.job_id);f.db.markJobRunning(job.job_id);
+  await manager.prompt(agent.name,'new-turn',buildJobPrompt(job));for(let i=0;i<100&&!f.runtime.questions(agent.name).length;i++)await new Promise(r=>setTimeout(r,10));
+  const q=f.runtime.questions(agent.name)[0]!;assert.equal(q.kind,kind);assert.equal(q.state,'pending');
+  if(kind==='question'){
+   const s=supervisor(f);s['runtime'].questions=async(name)=>f.runtime.questions(name);s['runtime'].answerQuestion=async(name,id,answers)=>manager!.answer(name,id,answers);
+   await s.answerTaskQuestion(task.task_id,f.event.event_id,f.db.tasks.get(task.task_id)!.revision,q.question_id,{choice:{answers:['続行']}});
+  }else await manager.approve(agent.name,q.question_id,true);
+  assert.equal(f.runtime.question(q.question_id)!.answer_hash!==null,true);assert.equal(f.runtime.question('old-question')!.answer_hash,null);
+ }finally{if(manager)for(const agent of f.runtime.agents())if(agent.state!=='stopped')await manager.stop(agent.name,agent.generation);await f.close();}
+});
+
+test('未解決checkpointはnative質問とcapacity hintより優先する',async()=>{
+ const f=await fixture();try{
+  await fs.mkdir(path.dirname(f.job.result_path),{recursive:true});await fs.writeFile(path.join(path.dirname(f.job.result_path),'checkpoint.json'),JSON.stringify({schema_version:1,task_id:f.task.task_id,attempt_id:f.job.job_id,sequence:1,summary:'操作照合待ち',remaining:[],artifacts:[],unresolved_operations:['push'],waiting:'human_input'}));
+  f.runtime.put({...f.runtime.agent(f.job.agent_name)!,state:'waiting'});f.runtime.addQuestion({question_id:'q',agent:f.job.agent_name,generation:'original-generation',thread_id:'saved-thread',turn_id:'old-turn',rpc_id_json:'1',kind:'question',payload_json:'{}',state:'pending',answer_hash:null,created_at:new Date().toISOString()});f.runtime.db.prepare('INSERT INTO recovery_hints VALUES(?,?,?,NULL)').run(f.job.agent_name,'original-generation','capacity_wait');
+  f.migrate();const task=f.db.tasks.get(f.task.task_id)!;assert.equal(task.current_attempt_id,f.job.job_id);assert.equal(task.wait_reason,'external_effect_unknown');assert.throws(()=>f.db.tasks.prepareSteer(task.task_id,f.event.event_id,task.revision,'回答'),/conflict/);
+ }finally{await f.close();}
+});
+
+test('期限なしcapacity待機は保存時からretry_delay_msだけ待つ',async()=>{
+ const f=await fixture();try{
+  const before=Date.now();f.runtime.db.prepare('INSERT INTO recovery_hints VALUES(?,?,?,NULL)').run(f.job.agent_name,'original-generation','capacity_wait');f.migrate();
+  const saved=f.db.tasks.offlineResumes.saved(f.job.job_id)!;assert.ok(Date.parse(saved.retry_after!)>=before+f.task.retry_delay_ms);
+  due(f);await supervisor(f).reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)!.current_attempt_id,f.job.job_id);
+  const sql=new Database(f.config.databasePath);sql.prepare('UPDATE offline_task_resumes SET retry_after=?').run(new Date(Date.now()-1).toISOString());sql.close();due(f);await supervisor(f).reconcileTasks();assert.notEqual(f.db.tasks.get(f.task.task_id)!.current_attempt_id,f.job.job_id);
+ }finally{await f.close();}
+});
+
+for(const state of ['working','idle'] as const)test(`過去turnのexpired要求は現在${state}のworkerを保留しない`,async()=>{
+ const f=await fixture();try{
+  f.runtime.addQuestion({question_id:'past',agent:f.job.agent_name,generation:'original-generation',thread_id:'saved-thread',turn_id:'past-turn',rpc_id_json:'1',kind:'question',payload_json:'{}',state:'expired',answer_hash:null,created_at:new Date().toISOString()});
+  f.runtime.db.prepare("INSERT INTO external_tool_requests(request_id,agent,generation,thread_id,turn_id,call_id,rpc_id_json,role,operation_slot,text,state,created_at) VALUES(?,?,?,?,?,?,?,'worker','slot','hash','expired',?)").run('past-tool',f.job.agent_name,'original-generation','saved-thread','past-turn','call','2',new Date().toISOString());
+  f.runtime.put({...f.runtime.agent(f.job.agent_name)!,state});f.migrate();assert.notEqual(f.db.tasks.get(f.task.task_id)!.current_attempt_id,f.job.job_id);
+ }finally{await f.close();}
+});
+
+test('更新開始前に停止証明済みのworkerも同じthreadから再開する',async()=>{
+ const f=await fixture();try{
+  const evidence={state:'stopped' as const,reason:'prior-stop',observed_at:new Date().toISOString(),process_ids:[],process_groups:[]};const claimed=f.db.tasks.claimStop(f.db.tasks.get(f.task.task_id)!,evidence);f.db.tasks.stopped(claimed,evidence);
+  f.runtime.put({...f.runtime.agent(f.job.agent_name)!,state:'stopped'});f.runtime.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopped')").run(f.job.agent_name,'original-generation','[]');
+  f.migrate();const job=f.db.getJob(f.db.tasks.get(f.task.task_id)!.current_attempt_id)!;assert.notEqual(job.job_id,f.job.job_id);assert.equal(JSON.parse(job.workspace_json)._dona_resume.source.thread_id,'saved-thread');
+ }finally{await f.close();}
+});
+
+for(const phase of ['not_sent','sending'] as const)test(`crash後のresume claimは永続phase ${phase} と停止証拠で処理する`,async()=>{
+ const f=await fixture();let manager:AppServerManager|undefined;try{
+  f.migrate();const job=f.db.getJob(f.db.tasks.get(f.task.task_id)!.current_attempt_id)!,source=JSON.parse(job.workspace_json)._dona_resume.source;
+  const input:StartAgent={name:job.agent_name,attemptId:job.job_id,role:'worker',cwd:job.workspace_path,release:f.root,args:[],threadConfig:{},resumeFrom:source};
+  f.runtime.put({...f.runtime.agent(f.job.agent_name)!,name:job.agent_name,generation:'crashed',state:'starting',config_json:JSON.stringify(input)});
+  f.runtime.db.prepare('INSERT INTO thread_resume_claims VALUES(?,?,?)').run(source.name,source.generation,job.agent_name);f.runtime.db.prepare('INSERT INTO startup_phases VALUES(?,?,?)').run(job.agent_name,'crashed',phase);
+  const script=path.join(f.root,'recover.mjs');await fs.writeFile(script,`import readline from 'node:readline';readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);if(r.id!==undefined)process.stdout.write(JSON.stringify({id:r.id,result:r.method==='thread/resume'?{thread:{id:r.params.threadId}}:{}})+'\\n');});`);
+  manager=new AppServerManager(f.runtime,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));await manager.recover();
+  if(phase==='not_sent')assert.equal((await manager.start({...input,name:'after-crash',attemptId:'after-crash'})).thread_id,'saved-thread');
+  else await assert.rejects(manager.start({...input,name:'after-crash',attemptId:'after-crash'}),/already_claimed/);
+ }finally{if(manager)for(const agent of f.runtime.agents())if(agent.state!=='stopped')await manager.stop(agent.name,agent.generation);await f.close();}
 });

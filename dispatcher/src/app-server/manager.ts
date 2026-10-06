@@ -379,8 +379,12 @@ export class AppServerManager {
       if((this.recoveryAfter.get(candidate.name)??0)>Date.now())continue;
       const phase=this.store.db.prepare("SELECT phase FROM startup_phases WHERE agent=? AND generation=?").get(candidate.name,candidate.generation) as {phase:string}|undefined;
       if(candidate.state!=="stopped"&&phase?.phase==="not_sent"){
-        await this.serialized(candidate.name,()=>this.stopAgent(candidate.name,candidate.generation)).catch(()=>{});continue;
+        await this.serialized(candidate.name,async()=>{
+          const stopped=await this.stopAgent(candidate.name,candidate.generation);
+          if(this.store.db.prepare("SELECT 1 FROM stops WHERE agent=? AND generation=? AND state='stopped'").get(stopped.name,stopped.generation))this.releaseUnsentResume(stopped);
+        }).catch(()=>{});continue;
       }
+      if(candidate.state==="stopped"&&phase?.phase==="not_sent"&&this.store.db.prepare("SELECT 1 FROM stops WHERE agent=? AND generation=? AND state='stopped'").get(candidate.name,candidate.generation))this.releaseUnsentResume(candidate);
       if(this.reconnect&&candidate.state!=="stopped"&&candidate.pid&&identity(candidate.pid)?.start===candidate.process_start&&!this.store.db.prepare("SELECT 1 FROM stops WHERE agent=? AND generation=?").get(candidate.name,candidate.generation)){
         this.recoveryAfter.set(candidate.name,Date.now()+30_000);
         await this.serialized(candidate.name,async()=>{
