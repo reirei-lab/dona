@@ -1,0 +1,86 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+import Database from "better-sqlite3";
+import { DispatcherDatabase } from "../src/database.js";
+import { taskRequestSchema } from "../src/task-execution.js";
+import { eventEnvelope, tempConfig } from "./helpers.js";
+
+test("retention ledger works with current Dispatcher migrations and Task triggers in a private database", async () => {
+  const { root, config } = await tempConfig();
+  const canonical = await fs.realpath(root);
+  config.jobsWorkspaceRoot = path.join(canonical, "workspaces");
+  config.jobResultsDir = path.join(canonical, "job-results");
+  const database = new DispatcherDatabase(config.databasePath);
+  try {
+    const event = database.enqueue(eventEnvelope("retention-fixture")).row;
+    const task = database.tasks.create(taskRequestSchema.parse({
+      source_event_id: event.event_id, task_key: "retention", objective: "isolated fixture",
+      workspace: { kind: "scratch" }, policy: { max_attempts: 1, retry_delay_ms: 1000 },
+    }), config.jobsWorkspaceRoot, config.jobResultsDir).task;
+    const job = database.getJob(task.current_attempt_id)!;
+    for (const directory of [job.workspace_path, path.dirname(job.result_path),
+      path.join(path.dirname(job.workspace_path), ".dona-progress", job.job_id)]) {
+      await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+      await fs.writeFile(path.join(directory, "evidence"), "isolated");
+    }
+    await fs.chmod(config.jobsWorkspaceRoot, 0o700);
+    await fs.chmod(config.jobResultsDir, 0o700);
+    const old = "2026-09-01T00:00:00Z";
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id, "fixture-workspace", "fixture-pane");
+    database.beginJobDispatch(job.job_id);
+    database.markJobRunning(job.job_id);
+    database.saveJobResult(job.job_id, {
+      schema_version: 1, job_id: job.job_id, status: "completed", summary: "fixture", completed_at: old,
+    }, job.result_path);
+    database.sealJobGroup(event.event_id);
+    const notification = database.enqueueJobNotification(job.job_id).row;
+    // Model already-verified stop and delivered notification in this private DB.
+    // No runtime/Slack calls are made, and this is not live stop evidence.
+    const sql = new Database(config.databasePath);
+    try {
+      sql.prepare("UPDATE task_attempts SET stop_receipt_json=? WHERE attempt_id=?").run(
+        JSON.stringify({ state: "stopped", reason: "app_server_verified_empty_scope", observed_at: old }), job.job_id);
+      const target = JSON.parse(notification.reply_target_json!);
+      sql.prepare("UPDATE events SET status='completed',completed_at=?,result_json=? WHERE event_id=?").run(old,
+        JSON.stringify({ schema_version: 1, event_id: notification.event_id, status: "completed", actions: [
+          { tool: "dona_slack.post_message", ...target, message_ts: "1756684800.000001", reply_broadcast: false, success: true },
+          { tool: "dona_slack.set_agent_session_status", ...target, status: "active", success: true },
+        ] }), notification.event_id);
+    } finally { sql.close(); }
+    const result = spawnSync("python3", ["-B", "-c", `
+import json,sqlite3,sys
+from task_artifact_retention import Retention,Policy
+db=sqlite3.connect(sys.argv[1])
+db.execute('PRAGMA foreign_keys=ON')
+engine=Retention(db,sys.argv[2],sys.argv[3],Policy(7,0))
+engine.install()
+item=engine.inventory(sys.argv[4],1791244800)
+assert item.get('size_is_complete'),item
+event=db.execute('SELECT all_terminal_event_id FROM job_groups').fetchone()[0]
+saved=db.execute('SELECT result_json FROM events WHERE event_id=?',(event,)).fetchone()[0]
+broken=json.loads(saved)
+broken['actions'][0]['ambiguous']=True
+db.execute('UPDATE events SET result_json=? WHERE event_id=?',(json.dumps(broken),event))
+db.commit()
+assert engine.inventory(sys.argv[4],1791244800)['protection_reasons']==['notification_unsettled']
+db.execute('UPDATE events SET result_json=? WHERE event_id=?',(saved,event))
+db.commit()
+if sys.platform=='darwin':
+    assert engine.cleanup(sys.argv[4],'result',1791244800)=='deleted'
+print(json.dumps(item))
+db.close()
+`, config.databasePath, config.jobsWorkspaceRoot, config.jobResultsDir, job.job_id], {
+      cwd: fileURLToPath(new URL("../../scripts/maintenance", import.meta.url)), encoding: "utf8", timeout: 30_000,
+    });
+    assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+    assert.equal(JSON.parse(result.stdout).artifacts.length, 3);
+  } finally {
+    database.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
