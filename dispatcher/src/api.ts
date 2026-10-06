@@ -1,3 +1,4 @@
+import { projectCompletionJob } from "./completion-projection.js";
 import { verifySlackPrincipalProof } from "./principal-proof.js";
 import type { AgentContextManager } from "./agent-context.js";
 import { StatusSummaryService } from "./status-summary.js";
@@ -786,6 +787,11 @@ export class DispatcherApi {
     }
   }
 
+  private currentReadPurpose(request:IncomingMessage) {
+    const token=request.headers["x-dona-agent-token"],eventId=request.headers["x-dona-agent-event-id"];
+    return typeof token==="string"&&typeof eventId==="string"?this.agentContexts?.authorize(token,eventId,"get_job_status")?.purpose:undefined;
+  }
+
   private async authorizeLegacyRead(request:IncomingMessage,url:URL):Promise<boolean> {
     try {
       const token=request.headers["x-dona-agent-token"],eventId=request.headers["x-dona-agent-event-id"];
@@ -805,6 +811,7 @@ export class DispatcherApi {
         if(!destination||!origin||destination.workspace_id!==context.workspace_id||destination.channel_id!==origin.channel_id||destination.thread_ts!==origin.thread_ts)return false;
         const key=await readPrivateToken(this.config.updateInternalTokenPath);if(!key)return false;
         const access=await confirmScheduleAccess(this.config.slackAdapterSocketPath,key,{event_id:context.event_id,workspace_id:context.workspace_id,channel_id:destination.channel_id,user_id:context.principal_id,status_summary:true},5000);
+        if(this.database.get(context.event_id)?.reply_target_json!==event.reply_target_json||this.database.get(context.event_id)?.subject_json!==event.subject_json||this.database.get(source)?.trace_json!==original?.trace_json)return false;
         if(access.authorized!==true||access.event_id!==context.event_id||access.workspace_id!==context.workspace_id||access.channel_id!==destination.channel_id||access.user_id!==context.principal_id||access.destination_kind!==originKind||!this.agentContexts?.authorize(token,eventId,operation))return false;
         if(isEvents)return sourceEventId===source;
         const job=this.database.getJob(decodeURIComponent(url.pathname.split("/")[3]!));
@@ -964,7 +971,7 @@ export class DispatcherApi {
         }
         catch{throw new ApiRequestError(503,"live_session_audit_unavailable","Live session observation could not be durably audited");}
       }else sendJson(response, 200, { schema_version: 1, job: this.agentContexts
-        ?{job_id:job.job_id,status:job.status,created_at:job.created_at,updated_at:job.updated_at,completed_at:job.completed_at}
+        ?(this.currentReadPurpose(request)==="job_completion"?projectCompletionJob(job as unknown as Record<string,unknown>):{job_id:job.job_id,status:job.status,created_at:job.created_at,updated_at:job.updated_at,completed_at:job.completed_at})
         :{...job,...this.database.jobNotificationState(jobId)} });
       return;
     }

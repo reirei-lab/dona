@@ -1,3 +1,4 @@
+import { projectJobError } from "../completion-projection.js";
 import { projectStatusSummary } from "../status-summary.js";
 import { taskResultReconcileSchema, taskRequestSchema, taskIdSchema } from "../task-execution.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -104,21 +105,6 @@ function success(data: Record<string, unknown>) {
     content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
     structuredContent: data,
   };
-}
-
-// エラー本文も未信頼データ。既知のprivate値と典型的なcredential/URL/pathを除き、説明をboundedに返す。
-function projectJobError(row: Record<string, unknown>): string | null {
-  if (typeof row.last_error_message !== "string") return null;
-  let message = row.last_error_message;
-  const privateValues = ["objective", "workspace_path", "result_path", "agent_name", "herdr_workspace_id", "herdr_pane_id"]
-    .map((key) => row[key]).filter((value): value is string => typeof value === "string" && value.length > 0)
-    .sort((a, b) => b.length - a.length);
-  for (const value of privateValues) message = message.split(value).join("[redacted]");
-  return message
-    .replace(/\b(?:Bearer\s+\S+|(?:token|password|secret|api[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+))/gi, "[redacted]")
-    .replace(/\b(?:https?|file):\/\/[^\s<>"']+/gi, "[URL]")
-    .replace(/(?:[A-Za-z]:\\|~?\/)[^\s<>"']+/g, "[path]")
-    .slice(0, 2_000);
 }
 
 // DB rowのobjective、path、runtime identityをcallerへ漏らさない。
@@ -364,7 +350,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     title:"exactジョブの最小状態を確認",
     description:"current transport contextの同verified requester・同workspace・同channel別threadから、exact jobの固定状態だけを照会します。membership/disclosureを毎回再認可し、not_available時は旧API/list/raw GETへfallbackしません。handoffや実行継続の成功を意味せず、元group通知先を保持します。",
     inputSchema:{job_id:jobId},
-    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:true},
   },async({job_id})=>{
     try {return success(projectStatusSummary(client.getJobStatusSummary?await client.getJobStatusSummary(job_id):undefined));}
     catch {return success({schema_version:1,status:"not_available"});}
@@ -372,7 +358,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("get_job_status", {
     title: "Get background job status",
-    description: "旧same-event読取用です。利用者の明示job_idと現在eventで対象を確定します。別threadはget_job_status_summaryのみを使い、not_available時のfallbackに使いません。productionのcurrent contextでは固定状態projectionだけを返し、Resultとlive観測はこの同owner許可に含めません。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
+    description: "旧same-event読取用です。利用者の明示job_idと現在eventで対象を確定します。別threadはget_job_status_summaryのみを使い、not_available時のfallbackに使いません。human contextは固定状態projectionだけを返し、Resultとlive観測はこの同owner許可に含めません。保存済み元threadへ束縛したjob_completion contextだけは集約用のbounded Resultと失敗理由を返します。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
     inputSchema: { job_id: jobId, source_event_id: eventId,
       include_live_session:z.boolean().optional().describe("trueの場合だけ保存済みexact identityへHerdr controlを伴わないbounded live queryを行い、監査receiptを追記する"),
       live_session_receipt_id:liveSessionReceiptId.optional().describe("既存のdurable receiptを再読し、新しいlive queryは行わない") },

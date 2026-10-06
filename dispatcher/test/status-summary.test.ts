@@ -1,3 +1,4 @@
+import { projectCompletionJob } from "../src/completion-projection.js";
 import { AgentReadAuthorization, type AgentReadOwnerBinding } from "../src/agent-read-authorization.js";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -41,14 +42,14 @@ async function fixture(ownerActor="U_TEST") {
  }
  const origin=await event("origin",ownerActor,"C_TEST","T_TEST","1756722030.123456"),request=taskRequestSchema.parse({source_event_id:origin.event_id,task_key:"status",objective:canary,workspace:{kind:"scratch"},policy:{max_attempts:3,retry_delay_ms:1000}});
  const task=db.tasks.create(request,config.jobsWorkspaceRoot,config.jobResultsDir).task,jobId=task.current_attempt_id;
- const sql=new Database(config.databasePath);sql.prepare("UPDATE jobs SET last_error_code=?,last_error_message=?,result_json=?,job_key=? WHERE job_id=?").run(canary,canary,JSON.stringify({summary:canary,artifacts:[{reference:canary}],title:canary}),canary,jobId);sql.close();
+ const sql=new Database(config.databasePath);sql.prepare("UPDATE jobs SET last_error_code=?,last_error_message=?,result_json=?,job_key=? WHERE job_id=?").run(canary,canary,JSON.stringify({schema_version:1,job_id:jobId,status:"completed",summary:canary,output:{format:"markdown",text:"先行完了の成果"},artifacts:[{kind:"report",reference:"成果参照"}],actions:[{secret:canary}],completed_at:new Date().toISOString(),title:canary}),canary,jobId);sql.close();
  const client=new DispatcherApiClient(config.socketPath),server=createDispatcherMcpServer(client,logger),mcp=new Client({name:"status-test",version:"1"});
  const [a,b]=InMemoryTransport.createLinkedPair();await server.connect(a);await mcp.connect(b);
  async function current(row:Awaited<ReturnType<typeof event>>) {const existing=db.get(row.event_id)!;const active=existing.status==="queued"?db.beginDispatch(row.event_id,path.join(root,`${row.event_id}.json`)):existing;return contexts.issue(active);}
  async function query(mode:"api"|"mcp",id=jobId) {const result=mode==="api"?await client.getJobStatusSummary(id):await mcp.callTool({name:"get_job_status_summary",arguments:{job_id:id}});
   const value=mode==="api"?result:JSON.parse(((result as {content:{text:string}[]}).content[0]!).text);
   assert.ok(!JSON.stringify(result).includes(canary));assert.ok(!JSON.stringify(logs).includes(canary));return value;}
- return {root,config,db,contexts,event,current,query,client,jobId,origin,task,setAccess(v:boolean){authorized=v;},calls:()=>calls,setKind(kind:string){destinationKind=kind;},async stopProvider(){await new Promise<void>(r=>membership.close(()=>r()));},setAfter(v:()=>void){afterMembership=v;},async close(){await mcp.close();await server.close();await api.stop();await new Promise<void>(r=>membership.close(()=>r()));db.close();await fs.rm(root,{recursive:true,force:true});}};
+ return {root,config,db,contexts,event,current,query,client,mcp,jobId,origin,task,setAccess(v:boolean){authorized=v;},calls:()=>calls,setKind(kind:string){destinationKind=kind;},async stopProvider(){await new Promise<void>(r=>membership.close(()=>r()));},setAfter(v:()=>void){afterMembership=v;},async close(){await mcp.close();await server.close();await api.stop();await new Promise<void>(r=>membership.close(()=>r()));db.close();await fs.rm(root,{recursive:true,force:true});}};
 }
 for(const mode of ["api","mcp"] as const)test(`${mode}: same requesterの別thread、全拒否matrix、秘密canary、再認可`,async()=>{
  const f=await fixture();try {
@@ -132,7 +133,14 @@ test("list_event_jobsはcurrent human/保存されたcompletion purposeだけに
   f.db.markJobNeedsReview(f.jobId,"test",canary);
   const notice=f.db.enqueueJobNotification(f.jobId).row;await f.current(notice);
   const completion=await f.client.listEventJobs(f.origin.event_id);assert.equal((completion.jobs as unknown[]).length,1);assert.ok(!JSON.stringify(completion).includes(canary));
-  const projected=await f.client.getJob(f.jobId,notice.event_id);assert.ok(!JSON.stringify(projected).includes(canary));assert.deepEqual(Object.keys(projected.job as object).sort(),["job_id","status","created_at","updated_at","completed_at"].sort());
+  const projected=await f.client.getJob(f.jobId,notice.event_id),result=JSON.parse((projected.job as {result_json:string}).result_json);
+  assert.equal(result.summary,canary);assert.equal(result.output.text,"先行完了の成果");assert.deepEqual(result.artifacts,[{kind:"report",reference:"成果参照"}]);assert.deepEqual(result.actions,[]);assert.equal(result.title,undefined);
+  const mcp=await f.mcp.callTool({name:"get_job_status",arguments:{job_id:f.jobId,source_event_id:notice.event_id}});
+  assert.deepEqual(JSON.parse((mcp.structuredContent as {job:{result_json:string}}).job.result_json),result);
+  assert.equal((projected.job as {last_error_message:string}).last_error_message,"[redacted]");
+  f.setAccess(false);assert.deepEqual(await f.client.getJob(f.jobId,notice.event_id),statusNotAvailable);f.setAccess(true);
+  f.setAfter(()=>{const sql=new Database(f.config.databasePath);sql.prepare("UPDATE events SET reply_target_json=? WHERE event_id=?").run(JSON.stringify({kind:"slack_thread",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"foreign"}),notice.event_id);sql.close();});
+  assert.deepEqual(await f.client.getJob(f.jobId,notice.event_id),statusNotAvailable);f.setAfter(()=>{});
   assert.deepEqual(await f.query("api"),statusNotAvailable);
   const unrelated=await f.event("unrelated");assert.deepEqual(await f.client.listEventJobs(unrelated.event_id),statusNotAvailable);
  }finally{await f.close();}
@@ -191,4 +199,28 @@ test("Taskの後継Attemptを作ってもexact旧jobと現在jobの状態を混�
   }
   assert.equal(f.db.getJob(f.jobId)!.thread_ts,successor.thread_ts);
  }finally{await f.close();}
+});
+
+test("MCPはlive membership providerへの外部依存を宣言する",async()=>{
+ const f=await fixture();try {const tool=(await f.mcp.listTools()).tools.find(t=>t.name==="get_job_status_summary")!;assert.equal(tool.annotations?.openWorldHint,true);assert.equal(tool.annotations?.readOnlyHint,true);}finally{await f.close();}
+});
+
+for(const mode of ["api","mcp"] as const)test(`${mode}: all_terminal通知から先行完了siblingを含むResultを集約できる`,async()=>{
+ const f=await fixture();try {
+  const sibling=f.db.tasks.create(taskRequestSchema.parse({source_event_id:f.origin.event_id,task_key:"sibling",objective:"先行成果",workspace:{kind:"scratch"},policy:{max_attempts:3,retry_delay_ms:1000}}),f.config.jobsWorkspaceRoot,f.config.jobResultsDir).task;
+  const ids=[f.jobId,sibling.current_attempt_id];const sql=new Database(f.config.databasePath);
+  for(const [n,id] of ids.entries())sql.prepare("UPDATE jobs SET status='completed',completed_at=?,result_json=? WHERE job_id=?").run(new Date().toISOString(),JSON.stringify({schema_version:1,job_id:id,status:"completed",summary:`成果${n}`,output:{format:"markdown",text:`詳細${n}`},artifacts:[{kind:"report",reference:`参照${n}`}],actions:[],completed_at:new Date().toISOString()}),id);
+  sql.close();await f.current(f.origin);f.db.markWaiting(f.origin.event_id);
+  f.db.saveCompleted(f.origin.event_id,{schema_version:1,event_id:f.origin.event_id,status:"completed",summary:"delegated",completed_at:new Date().toISOString()},path.join(f.root,"origin.json"));
+  const notice=f.db.enqueueJobNotification(sibling.current_attempt_id).row;assert.equal(JSON.parse(notice.payload_json).group.transition,"all_terminal");await f.current(notice);
+  for(const [n,id] of ids.entries()) {
+   const response=mode==="api"?await f.client.getJob(id,notice.event_id):(await f.mcp.callTool({name:"get_job_status",arguments:{job_id:id,source_event_id:notice.event_id}})).structuredContent;
+   const result=JSON.parse((response as {job:{result_json:string}}).job.result_json);assert.equal(result.summary,`成果${n}`);assert.equal(result.output.text,`詳細${n}`);assert.deepEqual(result.artifacts,[{kind:"report",reference:`参照${n}`}]);
+  }
+  f.setAccess(false);assert.deepEqual(await f.client.getJob(f.jobId,notice.event_id),statusNotAvailable);
+  const other=await f.event(`human-completion-${mode}`);await f.current(other);assert.deepEqual(await f.client.getJob(f.jobId,other.event_id),statusNotAvailable);assert.ok(!JSON.stringify(await f.query(mode)).includes("成果0"));
+ }finally{await f.close();}
+});
+test("完了projectionは不正・過大Resultと自由fieldを返さない",()=>{
+ for(const value of ["invalid","x".repeat(1024*1024+1)])assert.equal(projectCompletionJob({job_id:"job_test",result_json:value}).result_json,null);
 });
