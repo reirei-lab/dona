@@ -281,3 +281,56 @@ test("Issue Task照会をmainの許可設定からMCP・UDSへ通す",async()=>{
   assert.equal(found.error,undefined);assert.equal(found.data.task.task_id,task.task_id);assert.equal(f.database.listEventJobs(follow.event_id).length,0);
  }finally{await f.close();}
 });
+
+test("元依頼の継続をmain設定・MCP・UDS・完了通知・worker promptまで通す",async()=>{
+ const f=await fixture();try {
+  const config=await fs.readFile(new URL("../../.codex/config.toml",import.meta.url),"utf8");
+  assert.match(config.split("[mcp_servers.dona_dispatcher]")[1]!,/"control_task_continuation"/);
+  const first=await f.call("delegate_task",{source_event_id:f.source,task_key:"audit",objective:"監査後に実装へ進む",workspace:{kind:"scratch"},
+    continuation_scope:{objective:"監査と実装・PR提出",targets:[{repository:"org/repo",issue_numbers:[167]}],allow_scratch:true,operations:["read_only","submit_pr"],max_tasks:3,max_attempts_per_task:3}});
+  assert.equal(first.error,undefined);
+  const root=first.data.task,job=f.database.getJob(root.current_attempt_id)!;
+  f.database.beginJobPreparation(job.job_id,new Date(job.available_at));f.database.setJobRuntime(job.job_id,"w","p");f.database.beginJobDispatch(job.job_id);f.database.markJobRunning(job.job_id);
+  f.database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"監査完了",completed_at:new Date().toISOString()},job.result_path);
+  f.database.sealJobGroup(f.source);const notice=f.database.enqueueJobNotification(job.job_id).row;
+  const gh=f.config.databasePath+".fake-gh";
+  await fs.writeFile(gh,`#!/bin/sh\nprintf '%s' '{"data":{"repository":{"nameWithOwner":"org/repo","issue":{"id":"I_continuation","number":167}}}}'\n`,{mode:0o700});f.config.ghPath=gh;
+  const parent=(await f.call("get_task",{source_event_id:notice.event_id,task_id:root.task_id})).data.task;
+  const input={source_event_id:notice.event_id,task_key:"implement-167",objective:"実装・検証済みPRを提出",workspace:{kind:"github",repository:"org/repo"},issue_number:167,
+    continuation:{parent_task_id:root.task_id,parent_revision:parent.revision,scope_revision:parent.continuation.revision,operation:"submit_pr"}};
+  const create=f.uds.createTask.bind(f.uds);
+  f.uds.createTask=async(args)=>{await create(args);throw new DispatcherClientError(undefined,"response lost");};
+  const lost=await f.call("delegate_task",input);assert.equal(lost.error,true);assert.equal(lost.data?.action,undefined);
+  const listed=await f.call("list_tasks",{source_event_id:notice.event_id});assert.equal(listed.error,undefined);
+  const successor=listed.data.tasks.find((t:any)=>t.task_key==="implement-167");assert.ok(successor);
+  const got=await f.call("get_task",{source_event_id:notice.event_id,task_id:successor.task_id});assert.equal(got.error,undefined);
+  assert.match(buildJobPrompt(f.database.getJob(successor.current_attempt_id)!),/submit_pr/);
+  f.uds.createTask=create;const reused=await f.call("delegate_task",input);
+  assert.equal(reused.data.action.outcome,"reused");assert.equal(reused.data.action.source_event_id,notice.event_id);
+  const pause=f.database.enqueue(eventEnvelope("pause-chain")).row;
+  const paused=await f.call("control_task_continuation",{source_event_id:pause.event_id,task_id:root.task_id,revision:1,state:"paused"});
+  assert.equal(paused.error,undefined);assert.equal(paused.data.continuation.state,"paused");
+  const next=await f.call("delegate_task",{...input,task_key:"next",workspace:{kind:"scratch"},issue_number:undefined,continuation:{...input.continuation,operation:"read_only"}});
+  assert.equal(next.error,true);assert.equal(f.database.tasks.list(notice.event_id).length,2);
+ }finally{await f.close();}
+});
+
+test("GitHub照会中に取消された継続scopeからTaskを作成しない",async()=>{
+ const f=await fixture();try {
+  const first=await f.call("delegate_task",{source_event_id:f.source,task_key:"audit",objective:"調査して実装",workspace:{kind:"scratch"},continuation_scope:{objective:"Issue実装",targets:[{repository:"org/repo",issue_numbers:[167]}],allow_scratch:true,operations:["submit_pr"],max_tasks:2,max_attempts_per_task:3}});
+  const parent=first.data.task,job=f.database.getJob(parent.current_attempt_id)!;
+  f.database.beginJobPreparation(job.job_id,new Date(job.available_at));f.database.setJobRuntime(job.job_id,"w","p");f.database.beginJobDispatch(job.job_id);f.database.markJobRunning(job.job_id);
+  f.database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},job.result_path);
+  f.database.sealJobGroup(f.source);const notice=f.database.enqueueJobNotification(job.job_id).row;
+  const gh=f.config.databasePath+".slow-gh",entered=gh+".entered",release=gh+".release";
+  await fs.writeFile(gh,`#!${process.execPath}\nconst fs=require('node:fs');fs.writeFileSync(${JSON.stringify(entered)},'1');const deadline=Date.now()+5000;const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clearInterval(timer);process.stdout.write(JSON.stringify({data:{repository:{nameWithOwner:'org/repo',issue:{id:'I_race',number:167}}}}));}else if(Date.now()>deadline){process.exit(1);}},10);\n`,{mode:0o700});f.config.ghPath=gh;
+  const pending=f.call("delegate_task",{source_event_id:notice.event_id,task_key:"implementation",objective:"実装",workspace:{kind:"github",repository:"org/repo"},issue_number:167,
+   continuation:{parent_task_id:parent.task_id,parent_revision:f.database.tasks.get(parent.task_id)!.revision,scope_revision:1,operation:"submit_pr"}});
+  const deadline=Date.now()+5000;
+  while(!(await fs.access(entered).then(()=>true,()=>false))){assert.ok(Date.now()<deadline,"GitHub照会を開始する");await new Promise(r=>setTimeout(r,10));}
+  const stop=f.database.enqueue(eventEnvelope("cancel-during-query")).row;
+  assert.equal((await f.call("control_task_continuation",{source_event_id:stop.event_id,task_id:parent.task_id,revision:1,state:"cancelled"})).error,undefined);
+  await fs.writeFile(release,"1");assert.equal((await pending).error,true);
+  assert.equal(f.database.listEventJobs(notice.event_id).length,0);
+ }finally{await f.close();}
+});
