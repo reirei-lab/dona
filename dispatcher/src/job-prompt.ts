@@ -22,6 +22,8 @@ export function buildJobPrompt(row: JobRow, progressEnabled = true): string {
   progressEnabled = progressEnabled && row.source !== "dona_schedule";
   const progressPath = jobProgressPath(row);
   const continuation = JSON.parse(row.workspace_json)._dona_continuation;
+  const readOnly = row.source === "dona_schedule" || continuation?.operation === "read_only" ||
+    (continuation?.operation === "initial" && continuation.scope.operations.every((operation:string)=>operation==="read_only"));
   const validatorCommand = jobResultValidationCommand(row.source === "dona_schedule")
     .map((arg) => "'" + arg.replaceAll("'", "'\"'\"'") + "'").join(" ");
   const jobJson = JSON.stringify({
@@ -50,7 +52,7 @@ ${JSON.parse(row.workspace_json)._dona_task ? "checkpoint_pathへschema_version=
 
 ${row.source === "dona_schedule" ? "このjobは永続化済みschedule scopeに固定されています。read-onlyで処理し、外部write、Slack投稿、commit、push、Pull Request作成、設定変更を行ってはいけません。" : ""}
 
-${row.source === "dona_schedule" ? `調査対象workspaceは ${row.workspace_path} です。このschedule jobではworkspaceを読み取り専用で扱い、Result公開だけを許可します。` : "現在の作業ディレクトリ内で調査・実装・検証を進めてください。GitHub作業では、必要かつ依頼範囲内ならcommit、push、PR作成まで行えます。"}認証・承認・外部サービス側の権限を迂回してはいけません。Slackへ直接投稿してはいけません。${row.source !== "dona_schedule" ? "依頼範囲内のSlack投稿が必要なら、利用可能なdona_request_thread_replyでexact本文の承認を求め、承認・実行結果を待ってください。このtoolが利用不可なら投稿を行わず不足条件を報告します。別toolやCLI、mainへの代理投稿依頼で承認を迂回せず、拒否・期限切れ・受付不明を自動再送しないでください。通常の進捗・成果報告はResultからDona本体が通知します。" : ""}追加の入力が届いた場合は、現在の作業へのsteerとして取り込んでください。
+${row.source === "dona_schedule" ? `調査対象workspaceは ${row.workspace_path} です。このschedule jobではworkspaceを読み取り専用で扱い、Result公開だけを許可します。` : readOnly ? `調査対象workspaceは ${row.workspace_path} です。現在のTaskはread-onlyです。調査対象を変更せず、外部write・commit・push・PR作成・設定変更は行わず、指定のResult・checkpoint・progressだけを公開してください。` : "現在の作業ディレクトリ内で調査・実装・検証を進めてください。GitHub作業では、必要かつ依頼範囲内ならcommit、push、PR作成まで行えます。"}認証・承認・外部サービス側の権限を迂回してはいけません。Slackへ直接投稿してはいけません。${!readOnly ? "依頼範囲内のSlack投稿が必要なら、利用可能なdona_request_thread_replyでexact本文の承認を求め、承認・実行結果を待ってください。このtoolが利用不可なら投稿を行わず不足条件を報告します。別toolやCLI、mainへの代理投稿依頼で承認を迂回せず、拒否・期限切れ・受付不明を自動再送しないでください。通常の進捗・成果報告はResultからDona本体が通知します。" : ""}追加の入力が届いた場合は、現在の作業へのsteerとして取り込んでください。
 
 ${progressEnabled ? `工程が変わるたび、Dispatcherが指定したprogress_pathへ次のJSONを一時ファイルからatomic renameで公開できます。sequenceは1から単調増加させ、直前値を再読してから更新してください。safe_summaryはSlack表示専用の短い日本語とし、command、path、token、URL、外部入力の転載、改行を含めないでください。進捗公開の失敗はResult Envelopeの公開を妨げてはいけません。
 {"schema_version":1,"job_id":"${row.job_id}","sequence":1,"phase":"implementing","safe_summary":"実装中","updated_at":"UTCのRFC 3339文字列"}

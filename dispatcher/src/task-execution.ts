@@ -40,7 +40,10 @@ export const taskRequestSchema = z.object({
   continuation: continuationSchema.optional(),
   policy: z.object({max_attempts:z.number().int().min(1).max(10).default(3),retry_delay_ms:z.number().int().min(1000).max(86_400_000).default(60_000)}).strict().default({max_attempts:3,retry_delay_ms:60_000}),
 }).strict().refine(v=>v.issue_number===undefined||v.workspace.kind==="github", "Issue requires a GitHub workspace")
-  .refine(v=>v.project===undefined||v.issue_number!==undefined,"Project requires an Issue");
+  .refine(v=>v.project===undefined||v.issue_number!==undefined,"Project requires an Issue")
+  .refine(v=>!(v.continuation_scope||v.continuation)||v.task_key!=="legacy-default","task_continuation_reserved_key")
+  .refine(v=>!v.continuation_scope||v.workspace.kind!=="github"||v.issue_number===undefined||
+    !v.continuation_scope.targets.some(t=>v.workspace.kind==="github"&&t.repository.toLowerCase()===v.workspace.repository.toLowerCase()&&t.issue_numbers.includes(v.issue_number!)),"task_continuation_initial_issue_conflict");
 export type TaskRequest = z.infer<typeof taskRequestSchema>;
 export const taskResultReconcileSchema=z.object({
   source_event_id:z.string().regex(/^evt_[0-9a-hjkmnp-tv-z]{26}$/i),revision:z.number().int().positive(),

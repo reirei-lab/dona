@@ -153,3 +153,52 @@ test("自動回復の次Attemptにも独立した継続契約を保持する",as
   assert.match(buildJobPrompt(next),/merge・本番反映/);
  }finally{await f.dispose();}
 });
+
+for(const scopedLast of [true,false])test(`all_terminalの最後のTaskが${scopedLast?"別scope":"scopeなし"}でも各scopeを継続する`,async()=>{
+ const f=await fixture();try {
+  const event=f.db.enqueue(eventEnvelope("multi-scope")).row;
+  const one=f.db.tasks.create({...f.request,source_event_id:event.event_id,task_key:"first-scope"},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).task;
+  const secondRequest={...f.request,source_event_id:event.event_id,task_key:"second-scope",...(scopedLast?{}:{continuation_scope:undefined})};
+  const two=f.db.tasks.create(secondRequest,f.config.jobsWorkspaceRoot,f.config.jobResultsDir).task;
+  assert.equal(JSON.parse(f.finish(one).payload_json).group.transition,"progress");
+  const notice=f.finish(two);assert.equal(JSON.parse(notice.payload_json).group.transition,"all_terminal");
+  const a=f.create(f.child("first-implementation",167,one,notice.event_id));
+  assert.equal(f.db.tasks.assertOwner(a.task_id,notice.event_id).task_id,a.task_id);
+  if(scopedLast){const b=f.create(f.child("second-implementation",168,two,notice.event_id));assert.equal(f.db.tasks.assertOwner(b.task_id,notice.event_id).task_id,b.task_id);}
+  assert.equal(f.db.tasks.list(notice.event_id).length,scopedLast?4:2);
+  // 他eventのscopeへは拡張しない。
+  assert.throws(()=>f.create(f.child("unrelated",229,f.task,notice.event_id)),/owner_mismatch/);
+ }finally{await f.dispose();}
+});
+
+test("初回が後続対象Issueを先取りする設定はclaim前に拒否し、同じeventで訂正できる",async()=>{
+ const f=await fixture();try {
+  const event=f.db.enqueue(eventEnvelope("initial-issue")).row;
+  const input={...f.request,source_event_id:event.event_id,workspace:{kind:"github" as const,repository:"ORG/REPO"},issue_number:167};
+  assert.equal(taskRequestSchema.safeParse(input).success,false);
+  assert.throws(()=>f.db.tasks.create(input,f.config.jobsWorkspaceRoot,f.config.jobResultsDir,{node_id:"I_167",repository:"org/repo",number:167}),/task_continuation_initial_issue_conflict/);
+  assert.equal(f.db.listEventJobs(event.event_id).length,0);
+  assert.equal(f.db.tasks.create({...f.request,source_event_id:event.event_id},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).task.state,"active");
+ }finally{await f.dispose();}
+});
+
+test("scope付き初回・後続ではlegacy-defaultを作成前に拒否する",async()=>{
+ const f=await fixture();try {
+  for(const input of [f.request,f.child()]) {
+   assert.equal(taskRequestSchema.safeParse({...input,task_key:"legacy-default"}).success,false);
+   assert.throws(()=>f.create({...input,task_key:"legacy-default"}),/task_continuation_reserved_key/);
+  }
+  assert.equal(f.db.tasks.list(f.notice.event_id).length,1);
+ }finally{await f.dispose();}
+});
+
+test("将来のsubmit_prを含むscopeでも現在のread_onlyにwrite許可を渡さない",async()=>{
+ const f=await fixture();try {
+  const input=f.child();input.continuation!.operation="read_only";
+  const task=f.create(input),prompt=buildJobPrompt(f.db.getJob(task.current_attempt_id)!);
+  assert.match(prompt,/現在のTaskはread-only/);assert.match(prompt,/外部write・commit・push・PR作成・設定変更は行わず/);
+  assert.doesNotMatch(prompt,/commit、push、PR作成まで行えます|dona_request_thread_reply/);
+  const write=f.create(f.child("submit-168",168)),writePrompt=buildJobPrompt(f.db.getJob(write.current_attempt_id)!);
+  assert.match(writePrompt,/commit、push、PR作成まで行えます/);
+ }finally{await f.dispose();}
+});

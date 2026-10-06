@@ -61,15 +61,21 @@ export class TaskContinuations {
     if(!task||task.current_attempt_id!==job.job_id||task.state!=="completed"||job.status!=="completed"||!job.result_json)return;
     return task;
   }
+  private notificationScopes(eventId:string):string[] {
+    const notification=this.notificationTask(eventId);if(!notification)return [];
+    return (this.sql.prepare(`SELECT DISTINCT m.root_task_id FROM task_continuation_members m JOIN tasks t USING(task_id)
+      WHERE t.source_event_id=? AND t.state='completed'`).all(notification.source_event_id) as Array<{root_task_id:string}>).map(row=>row.root_task_id);
+  }
   canRead(id:string,eventId:string):boolean {
-    const notification=this.notificationTask(eventId),scope=this.scope(id);
-    return !!notification&&!!scope&&this.scope(notification.task_id)?.root_task_id===scope.root_task_id;
+    const scope=this.scope(id);
+    return !!scope&&this.notificationScopes(eventId).includes(scope.root_task_id);
   }
   list(eventId:string):TaskRow[] {
-    const notification=this.notificationTask(eventId),scope=notification&&this.scope(notification.task_id);
-    if(!scope)throw Error("task_owner_mismatch");
-    this.dispatcher.tasks.assertOwner(notification!.task_id,eventId,true);
-    return this.sql.prepare("SELECT t.* FROM tasks t JOIN task_continuation_members m USING(task_id) WHERE m.root_task_id=? ORDER BY t.created_at DESC,t.task_id").all(scope.root_task_id) as TaskRow[];
+    const notification=this.notificationTask(eventId),scopes=this.notificationScopes(eventId);
+    if(!notification||!scopes.length)throw Error("task_owner_mismatch");
+    this.dispatcher.tasks.assertOwner(notification.task_id,eventId,true);
+    return this.sql.prepare(`SELECT t.* FROM tasks t JOIN task_continuation_members m USING(task_id)
+      WHERE m.root_task_id IN (SELECT value FROM json_each(?)) ORDER BY t.created_at DESC,t.task_id LIMIT 100`).all(JSON.stringify(scopes)) as TaskRow[];
   }
   private assertSource(input:TaskRequest):ScopeRow {
     const continuation=input.continuation;
@@ -82,7 +88,7 @@ export class TaskContinuations {
       event.reply_target_json!==root.reply_target_json||JSON.parse(event.subject_json).actor_id!==JSON.parse(root.subject_json).actor_id)throw Error("task_owner_mismatch");
     if(event.source==="dona_job") {
       const notified=this.notificationTask(event.event_id);
-      if(!notified||this.scope(notified.task_id)?.root_task_id!==scope.root_task_id||parent.source_event_id!==notified.source_event_id)throw Error("task_owner_mismatch");
+      if(!notified||parent.source_event_id!==notified.source_event_id)throw Error("task_owner_mismatch");
     } else if(event.source!=="slack")throw Error("task_owner_mismatch");
     return scope;
   }
@@ -99,6 +105,11 @@ export class TaskContinuations {
     return this.dispatcher.tasks.get(prior.task_id)!;
   }
   validate(input:TaskRequest):void {
+    if((input.continuation_scope||input.continuation)&&input.task_key==="legacy-default")throw Error("task_continuation_reserved_key");
+    if(input.continuation_scope&&input.workspace.kind==="github"&&input.issue_number!==undefined) {
+      const repository=input.workspace.repository;
+      if(input.continuation_scope.targets.some(t=>t.repository.toLowerCase()===repository.toLowerCase()&&t.issue_numbers.includes(input.issue_number!)))throw Error("task_continuation_initial_issue_conflict");
+    }
     if(input.continuation_scope) {
       if(input.continuation||this.dispatcher.get(input.source_event_id)?.source!=="slack")throw Error("task_continuation_scope_invalid");
       if(input.policy.max_attempts>input.continuation_scope.max_attempts_per_task)throw Error("task_continuation_budget_exceeded");
