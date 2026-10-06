@@ -42,6 +42,7 @@ test('実CLIはpairing・観測・SIGKILL回復・preserve更新・rollbackでwo
   await run(globalThis.process.execPath,[path.join(repo,'dispatcher/node_modules/typescript/bin/tsc'),'-p',path.join(repo,'dispatcher/tsconfig.build.json'),'--outDir',path.join(releaseA,'dispatcher/dist')],{timeout:30000,maxBuffer:1024*1024});
   await run(globalThis.process.execPath,[path.join(repo,'sources/web/node_modules/typescript/bin/tsc'),'-p',path.join(repo,'sources/web/tsconfig.build.json'),'--outDir',path.join(releaseA,'sources/web/dist')],{timeout:30000,maxBuffer:1024*1024});
   await fs.writeFile(path.join(releaseA,'package.json'),'{"type":"module"}');await fs.symlink(path.join(repo,'dispatcher/node_modules'),path.join(releaseA,'dispatcher/node_modules'));
+  await fs.symlink(path.join(repo,'sources/web/node_modules'),path.join(releaseA,'sources/web/node_modules'));
   const manifest=(sha:string)=>JSON.stringify({sha,lock_hashes:{'sources/web':'c'.repeat(64)}});
   await fs.writeFile(path.join(releaseA,'release-manifest.json'),manifest(a));await fs.cp(releaseA,releaseB,{recursive:true});await fs.writeFile(path.join(releaseB,'release-manifest.json'),manifest(b));await fs.symlink(releaseA,pointer);
   const authSocket=path.join(root,'a.sock'),fixture=new OperatorFixture();

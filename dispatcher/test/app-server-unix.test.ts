@@ -132,7 +132,7 @@ test("未送信startupは停止確認後に再試行でき、曖昧なthread作�
  }finally{const row=store.agent("worker");if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);manager.closeConnections();store.close();fs.rmSync(root,{recursive:true,force:true});}
 });
 
-test("全世代retention・cache受信順・長文と通知byte上限を保持する",async()=>{
+test("全世代retention・cache受信順・長文の保持と通知byte上限を確認する",async()=>{
  const root=fs.mkdtempSync(path.join(os.tmpdir(),"dr-expiry-")),file=path.join(root,"runtime.db");let store=new RuntimeStore(file);
  try{
   store.observe("old","old-generation",{kind:"item/agentMessage/delta",text:"secret"});
@@ -145,7 +145,8 @@ test("全世代retention・cache受信順・長文と通知byte上限を保持�
   assert.deepEqual(store.cachedItems("current","g").map(x=>x.id),['z','a']);
   assert.equal(store.cachedItems("current","g")[0]!.status,'completed');
 
-  assert.equal(projectHistory({thread:{id:"t",turns:[{id:"turn",items:[{id:"long",type:"agentMessage",text:"x".repeat(9000)}]}]}}).truncated,true);
+  const history=projectHistory({thread:{id:"t",turns:[{id:"turn",items:[{id:"long",type:"agentMessage",text:"x".repeat(9000)}]}]}});
+  assert.equal(history.truncated,false);assert.equal(history.items[0]?.text,"x".repeat(9000));
   for(let i=0;i<1000;i++)store.observe("current","g",{kind:"item/agentMessage/delta",text:"x".repeat(512)});
   const bounded=store.observations("current","g",0);assert.ok(Buffer.byteLength(JSON.stringify(bounded.events))<265000);assert.equal(bounded.gap,true);assert.ok(bounded.cursor<1001);assert.ok(store.observations("current","g",bounded.cursor).events.length>0);
   store.db.prepare("UPDATE observation_events SET observed_at='2000-01-01T00:00:00Z'").run();const manager=new AppServerManager(store,()=>{throw Error('no spawn');});await manager.recover();assert.equal((store.db.prepare("SELECT COUNT(*) AS n FROM observation_events").get() as {n:number}).n,0);

@@ -1,8 +1,14 @@
+import { diffRenderer } from "./observer-diff.js";
+import { mermaidLibrary, mermaidRenderer } from "./observer-mermaid.js";
 import { createHash } from "node:crypto";
+import { shikiScript, shikiStyles } from "./generated/shiki-bundle.js";
+import { observerStyles } from "./observer-styles.js";
+import { markdownLibrary, markdownRenderer } from "./observer-markdown.js";
 
 /** Paired operator dashboard.
  * The service authenticates every API read; this module grants no authority. */
-const script = String.raw`(() => {
+const style = observerStyles + '\n' + shikiStyles;
+const script = mermaidLibrary + '\n' + markdownLibrary + '\n' + shikiScript + '\n' + String.raw`(() => {
 'use strict';
 const byId = id => document.getElementById(id);
 const list = byId('tasks'), detail = byId('detail'), connection = byId('connection');
@@ -15,8 +21,18 @@ let selected = null, selectedAttempt = null, selectedMain = null, capabilities =
 const labels = {interrupted:'中断',idle:'待機中',working:'実行中',starting:'起動中',stopped:'停止済み',error:'エラー',preparing:'実行準備中',dispatching:'起動処理中',blocked:'入力・承認待ち',needs_review:'確認が必要',cancelling:'取消処理中',inProgress:'進行中',declined:'拒否済み',active:'実行中',capacity_wait:'実行枠の空き待ち',rate_limit_wait:'利用上限の回復待ち',retry_exhausted:'再試行上限',running:'実行中',waiting:'待機中',queued:'実行待ち',paused:'一時停止',completed:'完了',failed:'失敗',cancelled:'取消済み',human_input:'質問への回答待ち',external_approval:'外部操作の承認・照合待ち',external_effect_unknown:'外部操作の実行結果を要確認（再実行保留）',rate_limit:'利用上限の回復待ち',retry_limit:'再試行上限',retry_wait:'再試行待ち',unknown:'状態未確認'};
 const label = value => labels[value] || String(value || '未確認');
 const node = (tag, text, className) => { const n = document.createElement(tag); if(text !== undefined) n.textContent = String(text); if(className) n.className = className; return n; };
+function statusIndicator(value,description=label(value),reason=null,interactive=true) {
+  const marker=node('span',undefined,'state status-indicator');
+  marker.dataset.tone=['failed','error'].includes(value)?'error':reason||['blocked','needs_review','capacity_wait','rate_limit_wait','retry_exhausted','declined'].includes(value)?'attention':['completed'].includes(value)?'success':['working','running','active','inProgress','preparing','dispatching','starting','cancelling'].includes(value)?'working':'neutral';
+  marker.setAttribute('role','img');marker.setAttribute('aria-label',description);if(interactive)marker.tabIndex=0;
+  const dot=node('span',undefined,'status-dot'),tooltip=node('span',description,'status-tooltip');dot.setAttribute('aria-hidden','true');tooltip.setAttribute('aria-hidden','true');marker.append(dot,tooltip);return marker;
+}
+${mermaidRenderer}
+${markdownRenderer}
+${diffRenderer}
 const validId = id => typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id);
 function clearPrivate(message, auth) {
+  mermaidCache.clear();conversationFingerprint=null;followConversationResize=false;
   generation++; authEpoch++; externalEpoch++; externalTracked=null;externalView=null; byId('external-panel').hidden=true;byId('external-items').replaceChildren();byId('external-detail').replaceChildren();byId('external-status').textContent='';byId('external-reconcile').hidden=true;credentialReady=false; if(auth){byId("objective").value="";byId("repository").value="";byId("base-ref").value="";} csrf=null; capabilities=[];stream=null;deferredDetail=null; byId("credential-panel").hidden=true; byId("submit-panel").hidden=true; byId("task-panel").hidden=true; byId("command-status").textContent=""; byId('main-conversations').replaceChildren(); byId('main-panel').hidden=true; list.replaceChildren(); detail.replaceChildren(node('p',message)); next = null; byId('next').disabled = true;
   connection.textContent = message; connection.dataset.state = 'disconnected';
   if(auth) { stopped = true; byId('pairing').hidden = false;byId('logout').hidden=true; }
@@ -29,41 +45,90 @@ async function read(url) {
     return await response.json();
   } finally { clearTimeout(timer); }
 }
+// 初回と新しい会話内容だけを追従し、開閉や同じ内容の再取得では閲覧位置を保つ。
+let latestFrame=0,followConversationResize=false,conversationFingerprint=null;
+function replaceConversation(content,runtime) {
+  const conversation=runtime?.conversation;
+  const fingerprint=JSON.stringify([selected,selectedAttempt,selectedMain,conversation?.name,conversation?.generation,conversation?.items]);
+  const changed=!detail.querySelector('.messages')||fingerprint!==conversationFingerprint;
+  const previousTop=detail.scrollTop;
+  followConversationResize=changed;conversationFingerprint=fingerprint;
+  detail.replaceChildren(content);
+  detail.scrollTop=changed?detail.scrollHeight:previousTop;
+}
+function followLatestConversation() {
+  if(!followConversationResize||latestFrame)return;
+  latestFrame=requestAnimationFrame(()=>{latestFrame=0;if(followConversationResize&&detail.querySelector('.messages'))detail.scrollTop=detail.scrollHeight;});
+}
+// summaryのclickはマウス・キーボードの両方を含む。開閉に伴う遅延描画も追従しない。
+detail.addEventListener('click',event=>{if(event.target.closest('summary'))followConversationResize=false;},true);
+const conversationResize=new ResizeObserver(followLatestConversation);
+new MutationObserver(()=>{
+  conversationResize.disconnect();
+  for(const child of detail.children)conversationResize.observe(child);
+  followLatestConversation();
+}).observe(detail,{childList:true});
+function metadataDisclosure(title,key) {
+  const box=node('details',undefined,'metadata-disclosure');box.dataset.metadata=key;
+  box.open=Array.from(detail.querySelectorAll('details[open][data-metadata]')).some(n=>n.dataset.metadata===key);
+  box.append(node('summary',title));return box;
+}
 function renderDetail(value) {
   const task = value?.snapshot?.task;
   if(!task || task.task_id!==selected || (selectedAttempt && value.snapshot.selected_attempt_id!==selectedAttempt) || !Array.isArray(value.snapshot.attempts)) throw Error();
   if(document.activeElement?.closest('[data-question-form]')){deferredDetail=value;return;}
   deferredDetail=null;
-  const content = document.createDocumentFragment();
-  content.append(node('h2',task.task_key || task.task_id),node('p',task.task_id,'muted'),node('p','Task: '+label(task.state)+(task.wait_reason?' · '+label(task.wait_reason):''),'state'));
-  if(typeof value.snapshot.request==='string'&&value.snapshot.request)content.append(node('h3','依頼内容'),node('pre',value.snapshot.request));
-  content.append(node('p','ワーカー: '+label(task.worker_status)+' · 更新 '+displayTime(task.updated_at),'muted'));
+  const content = document.createDocumentFragment(),metadata=node('section',undefined,'conversation-metadata');metadata.setAttribute('aria-label','会話の情報');content.append(metadata);
+  const heading=node('div',undefined,'metadata-heading'),identity=node('div');identity.append(node('h2',task.task_key || task.task_id),node('p',task.task_id,'muted'));heading.append(identity,statusIndicator(task.state,'Task: '+label(task.state)+(task.wait_reason?' · '+label(task.wait_reason):''),task.wait_reason));metadata.append(heading);
+  if(typeof value.snapshot.request==='string'&&value.snapshot.request){const request=metadataDisclosure('依頼内容',task.task_id+':request');request.append(markdown(value.snapshot.request));metadata.append(request);}
+  const worker=node('p',undefined,'muted metadata-status');worker.append(node('span','ワーカー'),statusIndicator(task.worker_status,'ワーカー: '+label(task.worker_status)),node('span','更新 '+displayTime(task.updated_at)));metadata.append(worker);
   if(task.local_operator_owned===true && capabilities.includes('tasks:cancel') && task.desired_state==='running' && !['completed','failed','cancelled'].includes(task.state)) {
     const button=node('button','このTaskを取り消す');button.type='button';button.disabled=!!pending;
-    button.addEventListener('click',()=>{if(!confirm('このTaskの実行を取り消しますか？ 停止確認が完了するまで取消処理中になります。'))return;void command('/api/tasks/'+encodeURIComponent(task.task_id)+'/cancel','cancel',{attempt_id:task.current_attempt_id,revision:task.revision},button);});content.append(button);
+    button.addEventListener('click',()=>{if(!confirm('このTaskの実行を取り消しますか？ 停止確認が完了するまで取消処理中になります。'))return;void command('/api/tasks/'+encodeURIComponent(task.task_id)+'/cancel','cancel',{attempt_id:task.current_attempt_id,revision:task.revision},button);});metadata.append(button);
   }
-  const questions=node('section');questions.dataset.questions=task.task_id;content.append(questions);
+  const questions=node('section');questions.dataset.questions=task.task_id;metadata.append(questions);
   if(task.local_operator_owned===true && capabilities.includes('tasks:submit') && task.desired_state==='running')void loadQuestions(task.task_id,questions);
-  if(capabilities.includes('approvals:native') && task.desired_state==='running') {const approvals=node('section');content.append(approvals);void loadNativeApprovals(task.task_id,approvals);}
-  content.append(node('h3','実行履歴'));
-  const attempts = node('ol');
+  if(capabilities.includes('approvals:native') && task.desired_state==='running') {const approvals=node('section');metadata.append(approvals);void loadNativeApprovals(task.task_id,approvals);}
+
+  const attempts = node('ol',undefined,'attempt-list');attempts.setAttribute('aria-label','実行履歴');
   for(const attempt of value.snapshot.attempts) {
-    const item=node('li'),button=node('button','Attempt '+attempt.number+' · '+label(attempt.status)+(attempt.outcome?' · '+label(attempt.outcome):''));button.type='button';button.dataset.attempt=attempt.attempt_id;
+    const item=node('li'),button=node('button');button.setAttribute('aria-label','Attempt '+attempt.number+' · '+label(attempt.status)+(attempt.outcome?' · '+label(attempt.outcome):''));button.append(statusIndicator(attempt.status,label(attempt.status)+(attempt.outcome?' · '+label(attempt.outcome):''),null,false),node('span','Attempt '+attempt.number));button.type='button';button.dataset.attempt=attempt.attempt_id;
     button.setAttribute('aria-pressed',String(attempt.attempt_id===(selectedAttempt || value.snapshot.selected_attempt_id || task.current_attempt_id)));
     button.disabled=!validId(attempt.attempt_id);
     button.addEventListener('click',()=>{selectedAttempt=attempt.attempt_id;rememberSelection();generation++;detail.replaceChildren(node('p','実行履歴を取得しています…'));void detailRead();});item.append(button);attempts.append(item);
   }
-  content.append(attempts,node('h3','ワーカーの会話'));
-  if(task.next_check_at)content.append(node('p','次の確認予定: '+displayTime(task.next_check_at),'muted'));
+  if(value.snapshot.attempts.length)metadata.append(attempts);
+  if(task.next_check_at)metadata.append(node('p','次の確認予定: '+displayTime(task.next_check_at),'muted'));
   if(value.snapshot.result) {
-    const result=value.snapshot.result;content.append(node('h3','実行結果'),node('p',displayTime(result.completed_at),'muted'),node('pre',result.summary));
-    if(result.output)content.append(node('pre',result.output));
-    for(const artifact of result.artifacts || [])content.append(node('p',artifact.display_name+' · '+artifact.kind));
+    const result=value.snapshot.result,resultBox=metadataDisclosure('実行結果',task.task_id+':'+(value.snapshot.selected_attempt_id||task.current_attempt_id)+':result');metadata.append(resultBox);resultBox.append(node('p',displayTime(result.completed_at),'muted'),markdown(result.summary));
+    if(result.output)resultBox.append(markdown(result.output));
+    for(const artifact of result.artifacts || [])resultBox.append(node('p',artifact.display_name+' · '+artifact.kind));
   }
-  appendConversation(content,value.runtime);
-  const focus=document.activeElement?.dataset?.attempt;detail.replaceChildren(content);if(focus)Array.from(detail.querySelectorAll('button')).find(b=>b.dataset.attempt===focus)?.focus({preventScroll:true});
+  appendConversation(content,value.runtime,metadata);
+  const focus=document.activeElement?.dataset?.attempt;replaceConversation(content,value.runtime);if(focus)Array.from(detail.querySelectorAll('button')).find(b=>b.dataset.attempt===focus)?.focus({preventScroll:true});
 }
 const displayTime = value => {const time=new Date(value);return Number.isFinite(time.getTime())?new Intl.DateTimeFormat('ja-JP',{dateStyle:'medium',timeStyle:'medium'}).format(time):String(value||'時刻未確認');};
+const messageTimeFormat=new Intl.DateTimeFormat('ja-JP',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});
+function appendMessageTimes(head,item,times) {
+  const timestamps=node('span',undefined,'message-times');
+  const add=(value,prefix,meaning)=>{
+    const time=node('time',prefix+messageTimeFormat.format(new Date(value)));time.dateTime=new Date(value).toISOString();
+    time.title=meaning+'（'+messageTimeFormat.resolvedOptions().timeZone+'）';
+    time.setAttribute('aria-label',time.textContent+'。'+time.title);timestamps.append(time);
+  };
+  const eventTime=(field,prefix)=>{const t=times?.[field];if(t)add(t.value,prefix+(t.actual?'':'を観測')+': ',t.actual?'App Serverが返した'+prefix+'日時':'Donaが'+prefix+'通知を受信した観測日時。実際の発生日時とは異なる場合があります。');};
+  if(item.kind==='tool_progress'){eventTime('started','開始');eventTime('completed','完了');}
+  else {
+    const actual=times?.completed?.actual?times.completed:times?.started?.actual?times.started:null;
+    const t=actual||times?.completed||times?.started;
+    if(t)add(t.value,t.actual?'':'観測: ',t.actual?'App Serverが返したメッセージの'+(t===times.completed?'完了':'開始')+'日時':'Donaがメッセージ通知を受信した観測日時。実際の発生日時とは異なる場合があります。');
+  }
+  if(!timestamps.childNodes.length){
+    if(typeof item.turn_started_at==='string'&&Number.isFinite(Date.parse(item.turn_started_at)))add(item.turn_started_at,'ターン開始: ','App Serverが返した、この項目を含むターンの開始日時。個別の発言・ツールの発生日時ではありません。');
+    else {timestamps.textContent='日時未記録';timestamps.title='この項目の日時を取得できません。';}
+  }
+  head.append(timestamps);
+}
 function selectionState() {
   for(const button of list.querySelectorAll('[data-task]'))button.setAttribute('aria-pressed',String(!selectedMain&&button.dataset.task===selected));
   for(const button of byId('main-conversations').querySelectorAll('[data-main]'))button.setAttribute('aria-pressed',String(!!selectedMain&&button.dataset.main===selectedMain.name+':'+selectedMain.generation));
@@ -72,11 +137,11 @@ function emptyDetail() {
   if(selected||selectedMain)return;
   detail.replaceChildren(node('h2','会話を選んでください'),node('p',capabilities.includes('conversations:main:read')&&capabilities.includes('tasks:read')?'左のDona本体またはTaskを選ぶと、状態・実行履歴・会話を確認できます。':capabilities.includes('conversations:main:read')?'Dona本体を選ぶと、現在の状態と会話を確認できます。':capabilities.includes('tasks:read')?'Taskを選ぶと、状態・実行履歴・ワーカーの会話を確認できます。':'この端末に許可された操作を利用できます。'));
 }
-function appendConversation(content,runtime) {
+function appendConversation(content,runtime,metadata) {
   if(runtime?.status==='observed') {
     const c = runtime.conversation;
     if(!Array.isArray(c.items)) throw Error();
-    content.append(node('p','状態: '+label(c.state)+' · '+(c.connected?'Runtime接続中':'Runtime接続なし')+' · 観測 '+displayTime(c.observed_at),'muted'));
+    const runtimeState=node('p',undefined,'muted metadata-status');runtimeState.append(node('span','Runtime'),statusIndicator(c.state,'状態: '+label(c.state)),node('span',(c.connected?'Runtime接続中':'Runtime接続なし')+' · 観測 '+displayTime(c.observed_at)));metadata.append(runtimeState);
     if(c.gap || c.truncated) content.append(node('p','履歴の一部は保持期間または表示上限のため省略されています。','notice'));
     const visible=c.items.filter(item=>['user_message','assistant_message','tool_progress'].includes(item.kind));
     if(visible.length===0) content.append(node('p',c.connected?'この会話には表示できる発言やツール実行がまだありません。更新を待つか、別の会話を選んでください。':'この世代には表示できる保存済みの発言やツール実行がありません。','muted'));
@@ -85,45 +150,52 @@ function appendConversation(content,runtime) {
       if(!['item/started','item/completed'].includes(event.kind)||typeof event.item_id!=='string'||typeof event.turn_id!=='string'||typeof event.observed_at!=='string'||!Number.isFinite(Date.parse(event.observed_at)))continue;
       const key=JSON.stringify([event.turn_id,event.item_id]),times=observedTimes.get(key)||{};
       const field=event.kind==='item/started'?'started':'completed';
-      if(!times[field]||(field==='started'?Date.parse(event.observed_at)<Date.parse(times[field]):Date.parse(event.observed_at)>Date.parse(times[field])))times[field]=event.observed_at;
+      const actual=typeof event.occurred_at==='string'&&Number.isFinite(Date.parse(event.occurred_at)),value=actual?event.occurred_at:event.observed_at,previous=times[field];
+      if(!previous||(actual&&!previous.actual)||(actual===previous.actual&&(field==='started'?Date.parse(value)<Date.parse(previous.value):Date.parse(value)>Date.parse(previous.value))))times[field]={value,actual};
       observedTimes.set(key,times);
     }
-    const messages = node('div',undefined,'messages');
+    const messages = node('div',undefined,'messages');messages.setAttribute('aria-label','会話');
+    let turn=null,turnId=null;
     const open=new Set(Array.from(detail.querySelectorAll('details[open][data-item-detail]')).map(n=>n.dataset.itemDetail));
     const toolLabels={sleep:'待機',contextCompaction:'会話の要約',enteredReviewMode:'レビュー開始',exitedReviewMode:'レビュー終了',subAgentActivity:'サブエージェントの活動',functionCallOutput:'ツールの応答',imageGeneration:'画像生成',collabAgentToolCall:'サブエージェント操作',commandExecution:'コマンド実行',fileChange:'ファイル変更',mcpToolCall:'MCPツール',dynamicToolCall:'ツール実行',webSearch:'Web検索',imageView:'画像の確認'};
     for(const item of visible) {
-      const entry = node('article');entry.dataset.item=item.id;
+      const itemTurn=typeof item.turn_id==='string'&&item.turn_id?item.turn_id:null;
+      if(!turn||(itemTurn&&turnId&&itemTurn!==turnId)||(item.kind==='user_message'&&(!itemTurn||itemTurn!==turnId))) {
+        turn=node('section',undefined,'conversation-turn');
+        messages.append(turn);turnId=itemTurn;
+      } else if(itemTurn&&!turnId)turnId=itemTurn;
+      const entry = node('article');entry.dataset.item=item.id;entry.dataset.kind=item.kind;
       const imageGeneration=item.kind==='tool_progress'&&item.tool_type==='imageGeneration';
       const functionOutput=item.kind==='tool_progress'&&item.tool_type==='functionCallOutput';
       const metadataOnly=item.kind==='tool_progress'&&['sleep','contextCompaction','enteredReviewMode','exitedReviewMode','subAgentActivity'].includes(item.tool_type);
-      entry.append(node('h4',item.kind==='assistant_message'?'Codex':item.kind==='user_message'?'ユーザー・依頼入力':imageGeneration?'画像生成':metadataOnly||functionOutput?toolLabels[item.tool_type]:item.tool_name||toolLabels[item.tool_type]||'ツールの進捗'));
+      const messageHead=node('div',undefined,'message-head');entry.append(messageHead);
+      messageHead.append(node('h4',item.kind==='assistant_message'?'Codex':item.kind==='user_message'?'ユーザー・依頼入力':imageGeneration?'画像生成':metadataOnly||functionOutput?toolLabels[item.tool_type]:item.tool_name||toolLabels[item.tool_type]||'ツールの進捗'));
       const fold=(title,text,field)=>{if(typeof text!=='string'||!text)return;const key=[c.name,c.generation,item.id,field].join(':');const box=node('details');box.dataset.itemDetail=key;box.open=open.has(key);box.append(node('summary',title),node('pre',text));entry.append(box);};
-      if(item.status) entry.append(node('p',label(item.status),'state'));
+      if(item.status) messageHead.append(statusIndicator(item.status));
       const times=observedTimes.get(JSON.stringify([item.turn_id,item.id]));
-      if(times?.started)entry.append(node('p','開始を観測: '+displayTime(times.started),'muted'));
-      if(times?.completed)entry.append(node('p','完了を観測: '+displayTime(times.completed),'muted'));
-      if(imageGeneration){messages.append(entry);continue;}
+      appendMessageTimes(messageHead,item,times);
+      if(imageGeneration){turn.append(entry);continue;}
       if(functionOutput){
         if(typeof item.tool_name==='string')entry.append(node('p',item.tool_name));
         fold('実行結果を表示',item.output,'output');
         if(item.truncated)entry.append(node('p','この項目の内容は表示上限のため一部省略されています。','notice'));
-        messages.append(entry);continue;
+        turn.append(entry);continue;
       }
       if(metadataOnly){
         if(item.tool_type==='sleep'&&Number.isFinite(item.duration_ms))entry.append(node('p','所要時間 '+(item.duration_ms/1000).toLocaleString('ja-JP',{maximumFractionDigits:2})+' 秒','muted'));
-        messages.append(entry);continue;
+        turn.append(entry);continue;
       }
-      if(item.text) entry.append(node('pre',item.text));
+      if(item.text) entry.append(item.kind==='tool_progress'?node('pre',item.text):markdown(item.text));
       if(item.command) entry.append(node('h5','コマンド'),node('pre',item.command,'command'));
       const facts=[];if(Number.isFinite(item.exit_code))facts.push('終了コード '+item.exit_code);if(Number.isFinite(item.duration_ms))facts.push('所要時間 '+(item.duration_ms/1000).toLocaleString('ja-JP',{maximumFractionDigits:2})+' 秒');
       if(facts.length)entry.append(node('p',facts.join(' · '),'muted'));
       if(item.error)entry.append(node('h5','エラー'),node('pre',item.error,'notice'));
-      if(Array.isArray(item.files)&&item.files.length){const files=node('ul');for(const file of item.files){const counts=[];if(Number.isFinite(file.additions))counts.push('+'+file.additions);if(Number.isFinite(file.deletions))counts.push('−'+file.deletions);const moved=file.change==='update'&&typeof file.move_path==='string'&&file.move_path.length>0;files.append(node('li',(moved?'移動':({add:'追加',delete:'削除',update:'更新'})[file.change])+' · '+file.path+(moved?' → '+file.move_path:'')+(counts.length?' ('+counts.join(' / ')+')':'')));}entry.append(node('h5','変更ファイル'),files);}
+      if(Array.isArray(item.files)&&item.files.length){const files=node('div',undefined,'file-diffs');item.files.forEach((file,index)=>files.append(fileDiff(file,[c.name,c.generation,item.id,'diff',index,file.path].join(':'),open)));entry.append(files);}
       fold('入力を表示',item.input,'input');
       fold('実行結果を表示',item.output,'output');
       if(item.truncated)entry.append(node('p','この項目の内容は表示上限のため一部省略されています。','notice'));
       if(item.kind==='tool_progress'&&!item.text&&!item.command&&!item.input&&!item.output&&!item.error&&!item.files?.length)entry.append(node('p','この履歴には実行内容・結果の詳細が記録されていません。','muted'));
-      messages.append(entry);
+      turn.append(entry);
     }
     content.append(messages);
   } else content.append(node('p',({unavailable:'会話を現在取得できません。Taskの状態とは別の接続状態です。',not_started:'会話はまだ開始されていません。',forbidden:'この接続では会話の閲覧が許可されていません。'})[runtime?.status] || '会話の状態を確認できません。','notice'));
@@ -134,13 +206,24 @@ async function detailRead() {
   try { const value=await read('/api/tasks/'+encodeURIComponent(id)+(selectedAttempt?'?attempt='+encodeURIComponent(selectedAttempt):'')); if(token!==generation || id!==selected || stopped)return; renderDetail(value);rememberStream(value,taskPath()); }
   catch(error) { if(token!==generation || id!==selected || stopped)return; clearPrivate(error.auth?'接続の認証が必要です。':'接続が切れています。表示を消去しました。',error.auth); }
 }
+const relativeTimeFormat=new Intl.RelativeTimeFormat('ja-JP',{numeric:'always'});
+function relativeListTime(value) {
+  const date=new Date(value),seconds=(date.getTime()-Date.now())/1000;
+  if(!Number.isFinite(seconds))return node('span','日時不明','list-time');
+  let text='たった今';
+  if(Math.abs(seconds)>=60){
+    const [unit,size]=Math.abs(seconds)>=31536000?['year',31536000]:Math.abs(seconds)>=2592000?['month',2592000]:Math.abs(seconds)>=86400?['day',86400]:Math.abs(seconds)>=3600?['hour',3600]:['minute',60];
+    text=relativeTimeFormat.format(Math.trunc(seconds/size),unit);
+  }
+  const time=node('time',text,'list-time');time.dateTime=date.toISOString();time.title=displayTime(value);time.setAttribute('aria-label',text+'（'+displayTime(value)+'）');return time;
+}
 function renderList(value) {
   if(!Array.isArray(value?.items) || (value.next!==null && !validId(value.next))) throw Error();
   const focused=document.activeElement?.dataset?.task;
   const content=document.createDocumentFragment();
   for(const task of value.items) {
     if(!validId(task.task_id)) throw Error();
-    const button=node('button',(task.task_key || task.task_id)+' · '+label(task.state)); button.type='button'; button.dataset.task=task.task_id;button.setAttribute('aria-label',(task.task_key || task.task_id)+' · '+label(task.state));if(task.updated_at)button.append(node('span','更新 '+displayTime(task.updated_at),'list-time'));
+    const button=node('button');const title=node('span',undefined,'conversation-name');title.append(statusIndicator(task.state,label(task.state)+(task.wait_reason?' · '+label(task.wait_reason):''),task.wait_reason,false),node('span',task.task_key || task.task_id));button.append(title); button.type='button'; button.dataset.task=task.task_id;button.setAttribute('aria-label',(task.task_key || task.task_id)+' · '+label(task.state));if(task.updated_at)button.append(relativeListTime(task.updated_at));
     button.setAttribute('aria-pressed',String(task.task_id===selected));
     button.addEventListener('click',()=> {selected=task.task_id; selectedAttempt=null;selectedMain=null;rememberSelection(); generation++; detail.replaceChildren(node('p','会話を取得しています…'));
       selectionState(); void detailRead(); });
@@ -156,7 +239,7 @@ async function refresh() {
     if(selected&&!capabilities.includes('tasks:read')){selected=null;selectedAttempt=null;rememberSelection();}
     if(selectedMain&&!capabilities.includes('conversations:main:read')){selectedMain=null;rememberSelection();}
     byId('submit-panel').hidden=!capabilities.includes('tasks:submit');byId('task-panel').hidden=!capabilities.includes('tasks:read');byId('control-hint').hidden=capabilities.includes('tasks:read')||!capabilities.includes('tasks:cancel');
-    byId('task-layout').hidden=!capabilities.includes('tasks:read')&&!capabilities.includes('conversations:main:read');byId('submit-task').disabled=!!pending;showPending();await credentialStatus();
+    byId('detail').hidden=!capabilities.includes('tasks:read')&&!capabilities.includes('conversations:main:read');byId('submit-task').disabled=!!pending;showPending();await credentialStatus();
     let mainAvailable=true;
     try {await mainList();}catch(error){
       if(token!==generation||stopped)return;
@@ -178,7 +261,7 @@ async function mainList() {
   const box=document.createDocumentFragment();
   for(const entry of value.items || []) {
     if(typeof entry.name!=='string'||typeof entry.generation!=='string'||!/^[A-Za-z0-9_-]{1,160}$/.test(entry.name)||!/^[A-Za-z0-9_-]{1,160}$/.test(entry.generation))throw Error();
-    const button=node('button',entry.name+' · '+label(entry.state)+(entry.connected?' · 接続中':' · 保存された履歴'));if(entry.observed_at)button.append(node('span','観測 '+displayTime(entry.observed_at),'list-time'));button.append(node('span',entry.generation,'list-time'));button.type='button';button.dataset.main=entry.name+':'+entry.generation;
+    const button=node('button'),title=node('span',undefined,'conversation-name');const description=label(entry.state)+(entry.connected?' · 接続中':' · 保存された履歴');title.append(statusIndicator(entry.state,description,null,false),node('span',entry.name));button.append(title);button.setAttribute('aria-label',entry.name+' · '+description);if(entry.observed_at)button.append(relativeListTime(entry.observed_at));button.append(node('span',entry.generation,'list-time'));button.type='button';button.dataset.main=entry.name+':'+entry.generation;
     button.addEventListener('click',()=>{selectedMain={name:entry.name,generation:entry.generation};selected=null;selectedAttempt=null;rememberSelection();generation++;detail.replaceChildren(node('p','Dona本体の会話を取得しています…'));selectionState();void mainRead();});box.append(button);
   }
   const focused=document.activeElement?.dataset?.main;if(!box.childNodes.length)box.append(node('p','表示できるDona本体の会話はありません。','muted'));byId('main-conversations').replaceChildren(box);selectionState();
@@ -187,7 +270,7 @@ async function mainList() {
 async function mainRead() {
   if(!selectedMain||stopped)return;const target=selectedMain,token=++generation;
   try {const value=await read('/api/conversations/main/'+encodeURIComponent(target.name)+'/'+encodeURIComponent(target.generation));if(token!==generation||selectedMain!==target||stopped)return;
-    const content=document.createDocumentFragment();content.append(node('h2','Dona本体の会話'),node('p','このDona全体にまたがる発言です。特定のTaskの会話ではありません。','notice'));appendConversation(content,value);detail.replaceChildren(content);rememberStream(value,mainPath());
+    const content=document.createDocumentFragment(),metadata=node('section',undefined,'conversation-metadata');metadata.setAttribute('aria-label','会話の情報');metadata.append(node('h2','Dona本体の会話'),node('p','このDona全体にまたがる発言です。特定のTaskの会話ではありません。','muted'));content.append(metadata);appendConversation(content,value,metadata);replaceConversation(content,value);rememberStream(value,mainPath());
   }catch(error){if(token===generation&&!stopped){if(error.auth)clearPrivate('接続の認証が必要です。',true);else {stream=null;deferredDetail=null;detail.replaceChildren(node('p','Dona本体の会話を現在取得できません。','notice'));}}}
 }
 function taskPath() {return '/api/tasks/'+encodeURIComponent(selected)+(selectedAttempt?'?attempt='+encodeURIComponent(selectedAttempt):'');}
@@ -449,11 +532,11 @@ window.addEventListener('pagehide',()=>{stopped=true;clearPrivate('接続を終�
 window.addEventListener('pageshow',event=>{if(event.persisted){stopped=false;clearPrivate('接続を再確認しています…',false);void refresh();}});
 void refresh();setInterval(()=>{if(!document.hidden)void refresh();},5000);
 })();`;
-const style = `[hidden]{display:none!important}p{overflow-wrap:anywhere}body>section.panel{max-width:1152px;margin:16px auto}#external-items{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}#external-detail>button{margin-right:8px;margin-bottom:8px}@media(max-width:720px){body>section.panel{margin:16px}}:root{color-scheme:light dark;font-family:system-ui,sans-serif;background:#101923;color:#eaf0f4}*{box-sizing:border-box}body{margin:0}header,main{max-width:1200px;margin:auto;padding:24px}header{border-bottom:1px solid #405060}h1{font-size:26px;margin:0 0 8px}h2{overflow-wrap:anywhere}h3{margin-top:28px}h4{margin:0 0 12px}.muted{color:#adbfce;font-size:14px}.layout{display:grid;grid-template-columns:minmax(220px,1fr) minmax(0,2fr);gap:24px}nav,.panel{background:#182531;border:1px solid #405060;border-radius:12px;padding:20px}button,a{font:inherit}button{cursor:pointer;background:#253747;color:#eaf0f4;border:1px solid #6d8699;border-radius:6px;padding:10px 12px}button:disabled{opacity:.45;cursor:default}button:focus-visible,a:focus-visible{outline:3px solid #8fd8eb;outline-offset:3px}#tasks{display:grid;gap:10px;margin-bottom:20px}#tasks button{text-align:left;overflow-wrap:anywhere}.list-time{display:block;font-size:12px;color:#adbfce;margin-top:6px}#main-conversations{display:grid;gap:10px}#main-conversations button{text-align:left;overflow-wrap:anywhere}summary{cursor:pointer;color:#8fd8eb}h5{margin:14px 0 4px}#main-conversations button[aria-pressed=true],#tasks button[aria-pressed=true]{border-color:#8fd8eb;background:#304c5c}label{display:block;margin:12px 0 6px}input,textarea,select{font:inherit;width:100%;padding:10px;background:#101923;color:#eaf0f4;border:1px solid #6d8699;border-radius:6px}textarea{min-height:100px}fieldset{margin:16px 0;border:1px solid #405060}#submit-panel{margin-top:20px}.controls{display:flex;gap:8px;flex-wrap:wrap}.notice{border-left:3px solid #e2b66f;padding:12px}.messages article{padding:16px;background:#101923;border-radius:8px;margin:12px 0}pre{font:inherit;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}a{color:#8fd8eb}.skip{position:absolute;top:-100px}.skip:focus{top:10px}#connection[data-state=disconnected]{color:#edbd87}@media(max-width:720px){header,main{padding:16px}.layout{grid-template-columns:1fr}.panel,nav{padding:16px}}`;
+
 const digest = (value: string) => createHash("sha256").update(value).digest("base64");
 export function observerDashboardPage(): {status: 200; headers: Record<string,string>; body: string} {
   return {status:200,headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store","referrer-policy":"no-referrer",
     "x-content-type-options":"nosniff","x-frame-options":"DENY",
-    "content-security-policy":`default-src 'none'; script-src 'sha256-${digest(script)}'; style-src 'sha256-${digest(style)}'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`},
-    body:`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dona dashboard</title><style>${style}</style></head><body><a class="skip" href="#detail">詳細へ移動</a><header><h1>Dona dashboard</h1><p class="muted">会話と作業状況を確認し、依頼・取消・承認を行えます。Macで付与された権限の範囲で利用できます。</p><p id="connection" role="status" aria-live="polite">接続を確認しています…</p><section id="pairing" hidden><h2>この端末を接続する</h2><p>Macで発行した接続コードを入力すると、Macで付与された範囲の機能を利用できます。Dona本体の会話や操作の権限は、Macで明示的に付与された場合だけ利用できます。</p><form id="pair-form"><label for="code">接続コード</label><input id="code" autocomplete="off" type="password" required maxlength="256"><button id="pair-submit" type="submit">この端末を接続する</button></form><p id="pair-status" role="status"></p></section><button id="logout" type="button">この端末を解除</button><button id="refresh" type="button">更新</button></header><section id="submit-panel" class="panel" hidden><h2>新しい依頼</h2><form id="submit-form"><label for="objective">Donaへの依頼</label><textarea id="objective" required maxlength="100000"></textarea><label for="repository">GitHubリポジトリ（任意）</label><input id="repository" placeholder="owner/repository" pattern="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"><label for="base-ref">開始ブランチ（任意）</label><input id="base-ref" maxlength="255"><p class="muted">リポジトリを指定しない場合は一時作業として実行します。</p><button id="submit-task" type="submit">依頼する</button></form></section><section id="credential-panel" class="panel" hidden><h2>この端末での承認</h2><p id="credential-status" role="status"></p><button id="credential-register" type="button" hidden>承認用パスキーを登録</button></section><section id="external-panel" class="panel" hidden><h2>Donaの外部操作承認</h2><div id="external-items"></div><button id="external-first" type="button">承認一覧の先頭へ</button><button id="external-next" type="button" disabled>承認一覧の次へ</button><div id="external-detail"></div><p id="external-status" role="status"></p><button id="external-reconcile" type="button" hidden>外部操作の状態を確認</button></section><p id="control-hint" hidden>取消するTaskを選ぶには、MacでTask閲覧権限も付与してください。</p><p id="command-status" role="status" aria-live="polite"></p><button id="reconcile" type="button" hidden>受付状況を確認</button><main id="task-layout" class="layout"><nav aria-label="Task一覧"><section id="main-panel" hidden><h2>Dona本体</h2><div id="main-conversations"></div></section><section id="task-panel"><h2>Task一覧</h2><div id="tasks"></div><div class="controls"><button id="first" type="button">先頭へ</button><button id="next" type="button" disabled>次のページ</button></div></section></nav><section id="detail" class="panel" tabindex="-1" aria-label="Taskの詳細"><p>Taskを選ぶと実行履歴と会話を表示します。</p></section></main><script>${script}</script></body></html>`};
+    "content-security-policy":`default-src 'none'; script-src 'sha256-${digest(script)}'; style-src 'unsafe-inline'; img-src blob:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`},
+    body:`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dona dashboard</title><style>${style}</style></head><body><a class="skip" href="#detail">詳細へ移動</a><header class="topbar"><h1>Dona</h1><p id="connection" role="status" aria-live="polite">接続を確認しています…</p><div class="controls"><button id="refresh" type="button">更新</button><button id="logout" type="button">この端末を解除</button></div></header><main id="task-layout" class="layout"><nav aria-label="会話と操作" tabindex="0"><section id="pairing" hidden><h2>この端末を接続する</h2><p>Macで発行した接続コードを入力すると、Macで付与された範囲の機能を利用できます。Dona本体の会話や操作の権限は、Macで明示的に付与された場合だけ利用できます。</p><form id="pair-form"><label for="code">接続コード</label><input id="code" autocomplete="off" type="password" required maxlength="256"><button id="pair-submit" type="submit">この端末を接続する</button></form><p id="pair-status" role="status"></p></section><section id="main-panel" hidden><h2>Dona本体</h2><div id="main-conversations"></div></section><section id="task-panel"><h2>Task一覧</h2><div id="tasks"></div><div class="controls"><button id="first" type="button">先頭へ</button><button id="next" type="button" disabled>次のページ</button></div></section><section id="submit-panel" class="panel" hidden><h2>新しい依頼</h2><form id="submit-form"><label for="objective">Donaへの依頼</label><textarea id="objective" required maxlength="100000"></textarea><label for="repository">GitHubリポジトリ（任意）</label><input id="repository" placeholder="owner/repository" pattern="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"><label for="base-ref">開始ブランチ（任意）</label><input id="base-ref" maxlength="255"><p class="muted">リポジトリを指定しない場合は一時作業として実行します。</p><button id="submit-task" type="submit">依頼する</button></form></section><section id="credential-panel" class="panel" hidden><h2>この端末での承認</h2><p id="credential-status" role="status"></p><button id="credential-register" type="button" hidden>承認用パスキーを登録</button></section><section id="external-panel" class="panel" hidden><h2>Donaの外部操作承認</h2><div id="external-items"></div><button id="external-first" type="button">承認一覧の先頭へ</button><button id="external-next" type="button" disabled>承認一覧の次へ</button><div id="external-detail"></div><p id="external-status" role="status"></p><button id="external-reconcile" type="button" hidden>外部操作の状態を確認</button></section><p id="control-hint" hidden>取消するTaskを選ぶには、MacでTask閲覧権限も付与してください。</p><p id="command-status" role="status" aria-live="polite"></p><button id="reconcile" type="button" hidden>受付状況を確認</button></nav><section id="detail" class="panel" tabindex="-1" aria-label="Taskの詳細"><p>Taskを選ぶと実行履歴と会話を表示します。</p></section></main><script>${script}</script></body></html>`};
 }

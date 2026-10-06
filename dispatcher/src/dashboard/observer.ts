@@ -1,4 +1,4 @@
-import { sanitizeConversationItem, type ConversationItem } from "../app-server/observation.js";
+import { validObservationTimestamp, sanitizeConversationItem, type ConversationItem } from "../app-server/observation.js";
 import { DashboardTaskReader, type DashboardTaskSnapshot } from "./task-reader.js";
 
 export interface ObservedConversation {
@@ -8,7 +8,7 @@ export interface ObservedConversation {
 }
 export interface ConversationContent extends ObservedConversation {
   items: readonly ConversationItem[];
-  events: readonly {sequence: number; kind: string; turn_id?: string; item_id?: string; text?: string; observed_at: string}[]; cursor: number; oldest_sequence: number; gap: boolean; truncated: boolean;
+  events: readonly {occurred_at?: string; sequence: number; kind: string; turn_id?: string; item_id?: string; text?: string; observed_at: string}[]; cursor: number; oldest_sequence: number; gap: boolean; truncated: boolean;
 }
 export interface ObservationRuntime {
   conversations(after?: string): Promise<{items: ObservedConversation[]; next: string | null}>;
@@ -137,12 +137,12 @@ function publicConversation(value: ConversationContent): ConversationContent {
   const events=value.events.filter(event=>kinds.has(event.kind)).map(event=>{
     if(!Number.isSafeInteger(event.sequence)||event.sequence<0||!Number.isFinite(Date.parse(event.observed_at)))throw Error("observation_projection_invalid");
     return {sequence:event.sequence,kind:event.kind,observed_at:event.observed_at,
+      ...(validObservationTimestamp(event.occurred_at)?{occurred_at:event.occurred_at}:{}),
       ...(event.turn_id===undefined?{}:{turn_id:id(event.turn_id)}),...(event.item_id===undefined?{}:{item_id:id(event.item_id)})};
   });
   const result={name:id(value.name),generation:id(value.generation),role:value.role,thread_id:value.thread_id===null?null:id(value.thread_id),
     attempt_id:value.attempt_id===null?null:id(value.attempt_id),connected:value.connected,observed_at:value.observed_at,state:id(value.state),
     items,events,cursor:value.cursor,oldest_sequence:value.oldest_sequence,gap:value.gap,truncated:value.truncated};
-  if(Buffer.byteLength(JSON.stringify(result))>1_048_576)throw Error("observation_projection_limit");
   return result;
 }
 

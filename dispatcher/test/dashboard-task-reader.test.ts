@@ -199,8 +199,8 @@ test('Dona本体の履歴は別grantを要求しrole/threadの一致とI/O中失
     assert.equal(details.conversation.items[0]!.duration_ms,123);
     assert.match(details.conversation.items[0]!.output!,/3 tests passed/);
     assert.equal(details.conversation.items[1]!.text,'テストを実行して');
-    assert.equal(details.conversation.items[2]!.output,'[機密情報を含む内容を省略]');
-    assert.equal(JSON.stringify(details).includes('hidden_token'),false);
+    assert.equal(details.conversation.items[2]!.output,'3 tests passed\nAuthorization: Bearer hidden_token');
+    assert.equal(JSON.stringify(details).includes('hidden_token'),true);
   }
 
   assert.equal((await observer.mainDetail('other','old',auth))!.status,'unavailable');
