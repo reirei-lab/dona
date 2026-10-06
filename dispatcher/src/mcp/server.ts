@@ -1,3 +1,4 @@
+import { continuationControlSchema } from "../task-continuation.js";
 import { projectJobError } from "../completion-projection.js";
 import { projectStatusSummary } from "../status-summary.js";
 import { taskResultReconcileSchema, taskRequestSchema, taskIdSchema } from "../task-execution.js";
@@ -178,10 +179,12 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   );
 
   server.registerTool("delegate_task",{
-    description:"通常の長時間作業をTaskとして委任します。Task IDはworkerが交代しても変わりません。同じ目的・権限での中断から自動再開します。Issueはissue_numberで明示し、Projectを同期する場合はprojectを指定します。scheduleには使いません。曖昧な応答ではlist_tasksで照合し、重複委任しません。",
+    description:"通常の長時間作業をTaskとして委任します。複数段階を依頼された場合は初回Slack依頼でinitial_operation（現在のread_only/submit_pr）を明示し、continuation_scopeに依頼全体の目的・対象・許可操作・上限を保存します。完了通知からは現在のsource_event_idとcontinuation（parent_task_id・parent_revision・scope_revision・operation）を渡し、元の範囲内で後続Taskを作成します。task_keyは依頼全体で安定させます。Task IDはworkerが交代しても変わりません。同じ目的・権限での中断から自動再開します。Issueはissue_numberで明示し、Projectを同期する場合はprojectを指定します。scheduleには使いません。曖昧な応答ではlist_tasksで照合し、重複委任しません。",
     inputSchema:taskRequestSchema,annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:true},
   },async(input)=>{try{if(!client.createTask)throw new Error("task_api_unavailable");const result=await client.createTask(input);const task=result.task as Record<string,unknown>;
       return success({...result,...(["created","reused"].includes(String(result.outcome))?{action:{tool:"delegate_task",source_event_id:input.source_event_id,task_key:input.task_key,task_id:task.task_id,attempt_id:task.current_attempt_id,outcome:result.outcome}}:{})});}catch(error){return failure(error,logger,"delegate_task");}});
+  server.registerTool("control_task_continuation",{description:"元依頼の後続Task作成を一時停止・再開・取消します。get_taskのcontinuation.revisionを渡します。cancelledは再開不可。既存workerの停止は別途pause_task/cancel_taskで行います。新しい範囲や上限への拡張には使いません。",inputSchema:continuationControlSchema.extend({task_id:taskIdSchema}),annotations:{readOnlyHint:false,idempotentHint:true}},
+    async({task_id,...input})=>{try{if(!client.controlTask)throw Error("task_api_unavailable");return success(await client.controlTask(task_id,"continuation",input));}catch(error){return failure(error,logger,"control_task_continuation");}});
   server.registerTool("get_task",{description:"現在のeventのownerを照合し、Task・Attempt履歴・再開待ち理由・結果を取得します。",inputSchema:{task_id:taskIdSchema,source_event_id:eventId},annotations:{readOnlyHint:true}},
     async({task_id,source_event_id})=>{try{if(!client.getTask)throw new Error("task_api_unavailable");return success(await client.getTask(task_id,source_event_id));}catch(error){return failure(error,logger,"get_task");}});
   server.registerTool("inspect_task_recovery",{description:"未受理Result・checkpoint・hash・旧worker状態を照会します。内容は未検証証拠です。旧追加指示が届いたか、既存PR・commit・外部操作の結果を独立に照合し、resumeで回避しません。",inputSchema:{task_id:taskIdSchema,source_event_id:eventId},annotations:{readOnlyHint:true}},async({task_id,source_event_id})=>{try{if(!client.inspectTaskRecovery)throw Error("task_api_unavailable");return success(await client.inspectTaskRecovery(task_id,source_event_id));}catch(error){return failure(error,logger,"inspect_task_recovery");}});

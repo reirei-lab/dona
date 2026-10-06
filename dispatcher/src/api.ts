@@ -1,3 +1,4 @@
+import { continuationControlSchema } from "./task-continuation.js";
 import { resolveVerifiedSlackOwner } from "./verified-owner-origin.js";
 import { projectCompletionJob } from "./completion-projection.js";
 import { verifySlackPrincipalProof } from "./principal-proof.js";
@@ -730,6 +731,7 @@ export class DispatcherApi {
       if(request.method==="POST"&&url.pathname==="/v1/tasks") {
         const input=taskRequestSchema.parse(await this.readJson(request));
         const existing=this.database.tasks.lookupRequest(input);
+        if(!existing)this.database.tasks.continuations.validate(input);
         const issue=existing?undefined:await verifyTaskIssue(input,githubQuery(this.config.ghPath));
         const result=existing?{outcome:"reused" as const,task:existing}:this.database.tasks.create(input,this.config.jobsWorkspaceRoot,this.config.jobResultsDir,issue);
         this.jobs.wake();sendJson(response,result.outcome==="created"?202:200,{schema_version:1,outcome:result.outcome,task:this.database.tasks.projection(result.task)});return;
@@ -745,12 +747,16 @@ export class DispatcherApi {
         if(!issue)throw new Error("task_issue_identity_unverified");
         sendJson(response,200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.findIssue(source,issue),true)});return;
       }
-      const match=/^\/v1\/tasks\/([^/]+)(?:\/(pause|resume|cancel|steer|retry|questions|answer|approve|recovery|reconcile))?$/.exec(url.pathname);
+      const match=/^\/v1\/tasks\/([^/]+)(?:\/(pause|resume|cancel|steer|retry|questions|answer|approve|recovery|reconcile|continuation))?$/.exec(url.pathname);
       if(!match)throw new Error("task_route_not_found");
       const id=taskIdSchema.parse(match[1]),action=match[2];
       if(request.method==="GET"&&action==="recovery"){if(!this.jobs.inspectTaskRecovery)throw Error("task_recovery_unavailable");sendJson(response,200,await this.jobs.inspectTaskRecovery(id,source));return;}
       if(request.method==="GET"&&action==="questions"){if(!this.jobs.taskQuestions)throw Error("task_questions_unavailable");sendJson(response,200,await this.jobs.taskQuestions(id,source));return;}
       if(request.method==="GET"&&!action){sendJson(response,200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.assertOwner(id,source),true)});return;}
+      if(request.method==="POST"&&action==="continuation") {
+        const input=continuationControlSchema.parse(await this.readJson(request));
+        sendJson(response,200,{schema_version:1,continuation:this.database.tasks.continuations.control(id,input)});return;
+      }
       if(request.method==="POST"&&action&&action!=="questions") {
         const input=await this.readJson(request) as Record<string,unknown>;
         if(typeof input.source_event_id!=="string"||!Number.isSafeInteger(input.revision))throw new Error("task_control_invalid");
