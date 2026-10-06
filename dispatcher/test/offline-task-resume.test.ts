@@ -283,3 +283,33 @@ for(const newer of [false,true])test(`human_inputへの回答送信中停止は�
   assert.notEqual(task.current_attempt_id,f.job.job_id);assert.match(f.db.getJob(task.current_attempt_id)!.objective,/保存済み回答/);
  }finally{await f.close();}
 });
+
+for(const state of ['working','idle'] as const)test(`native回答resolved後のTask待機遅延を保留しない state=${state}`,async()=>{
+ const f=await fixture();try{
+  f.runtime.addQuestion({question_id:'resolved',agent:f.job.agent_name,generation:'original-generation',thread_id:'saved-thread',turn_id:'old-turn',rpc_id_json:'1',kind:'question',payload_json:'{}',state:'resolved',answer_hash:'accepted',created_at:new Date().toISOString()});
+  f.runtime.put({...f.runtime.agent(f.job.agent_name)!,state});f.db.tasks.wait(f.db.tasks.get(f.task.task_id)!,'human_input');f.migrate();assert.notEqual(f.db.tasks.get(f.task.task_id)!.current_attempt_id,f.job.job_id);
+ }finally{await f.close();}
+});
+
+test('turn完了後も未回答のnative質問はthreadとgenerationで引き継ぐ',async()=>{
+ const f=await fixture();try{
+  f.runtime.addQuestion({question_id:'unanswered',agent:f.job.agent_name,generation:'original-generation',thread_id:'saved-thread',turn_id:'old-turn',rpc_id_json:'1',kind:'question',payload_json:'{"questions":[{"id":"answer","question":"選択してください"}]}',state:'pending',answer_hash:null,created_at:new Date().toISOString()});f.runtime.put({...f.runtime.agent(f.job.agent_name)!,turn_id:null,state:'waiting'});f.db.tasks.wait(f.db.tasks.get(f.task.task_id)!,'human_input');
+  f.migrate();const task=f.db.tasks.get(f.task.task_id)!;assert.notEqual(task.current_attempt_id,f.job.job_id);assert.equal(JSON.parse(f.db.getJob(task.current_attempt_id)!.workspace_json)._dona_resume.native_requests[0].question_id,'unanswered');
+ }finally{await f.close();}
+});
+
+for(const modern of [false,true])test(`Runtime DBにagentがない旧Taskは既存復旧を維持しmodern欠落は保留する modern=${modern}`,async()=>{
+ const f=await fixture();try{
+  f.runtime.db.prepare('DELETE FROM agents WHERE name=?').run(f.job.agent_name);
+  if(!modern){const sql=new Database(f.config.databasePath);sql.prepare('UPDATE job_live_session_identities SET herdr_agent_session_id=? WHERE job_id=?').run('legacy-session',f.job.job_id);sql.close();}
+  if(!modern)migrateStoppedRuntime(f.config.databasePath,path.join(f.root,'runtime.db'),{processes:[],launch_agents:['dev.dona.dispatcher','dev.dona.updater','dev.dona.slack-adapter'],herdr_session:'dona',verified_at:new Date().toISOString()},f.root);
+  f.migrate();
+  if(modern){assert.equal(f.db.tasks.get(f.task.task_id)!.wait_reason,'worker_unknown');assert.equal(f.db.tasks.get(f.task.task_id)!.current_attempt_id,f.job.job_id);}
+  else {
+   assert.equal(f.db.tasks.offlineResumes.saved(f.job.job_id),undefined);assert.equal(f.runtime.agent(f.job.agent_name)!.request_hash,'legacy-stopped');
+   const adapter=new AppServerJobRuntime(f.config,false,()=> 'legacy-session',()=>true);adapter.client.status=async name=>f.runtime.agent(name)??null;
+   f.db.markJobNeedsReview(f.job.job_id,'agent_not_running','legacy stopped');due(f);const s=new JobSupervisor(f.db,adapter,f.config,{debug(){},info(){},warn(){},error(){}},()=>{});await s.reconcileTasks();
+   const task=f.db.tasks.get(f.task.task_id)!;assert.notEqual(task.current_attempt_id,f.job.job_id);assert.equal(JSON.parse(f.db.getJob(task.current_attempt_id)!.workspace_json)._dona_resume,undefined);
+  }
+ }finally{await f.close();}
+});

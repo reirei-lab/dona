@@ -698,7 +698,7 @@ class FreshGenerationTests(unittest.TestCase):
             runner.run=root/'prepared';runner.node='/node'
             runner.policy={'main_agent':{'runtime':'app_server'}}
             runner.inv={'databases':[str(root/str(i)) for i in range(4)],
-                        'policy':{'control_root':str(root/'old-control')},'old_results':[str(root/'events'),str(root/'jobs')]}
+                        'policy':{'control_root':str(root/'old-control'),'main_agent':{'runtime':'app_server'}},'old_results':[str(root/'events'),str(root/'jobs')]}
             runner.journal={'source_stop_receipt':{'verified_at':'now','processes':[]}}
             with patch.object(m,'command') as call:
                 runner.migrate()
@@ -706,6 +706,9 @@ class FreshGenerationTests(unittest.TestCase):
                 self.assertEqual(request['task_resume'],{'result_dir':str(root/'jobs')})
                 self.assertEqual(request['runtime_migration']['stop_receipt'],runner.journal['source_stop_receipt'])
                 call.reset_mock();runner.migrate(retire_only=True)
+                self.assertNotIn('task_resume',m.json.loads(call.call_args.kwargs['input']))
+                runner.inv['policy']['main_agent']['runtime']='herdr'
+                call.reset_mock();runner.migrate()
                 self.assertNotIn('task_resume',m.json.loads(call.call_args.kwargs['input']))
 
     def test_runtime_restart_snapshots_current_tasks_except_rollback_and_fresh(self):

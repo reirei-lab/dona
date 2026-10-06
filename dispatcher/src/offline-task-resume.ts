@@ -21,6 +21,9 @@ export class OfflineTaskResumes {
     if(!job.dispatch_started_at||job.result_json||['completed','failed','cancelled'].includes(job.status))continue;
     if(this.saved(job.job_id))continue;
     const agent=runtime.agent(job.agent_name),identity=this.dispatcher.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id;
+    // Herdrの旧sessionはApp Serverのgeneration/thread bindingではない。
+    // 旧Taskはmigrationが作るlegacy stop receiptと既存Supervisor経路へ残す。
+    if(agent?.state==='stopped'&&agent.request_hash==='legacy-stopped'&&!identity?.trimStart().startsWith('[')&&(identity??null)===agent.thread_id)continue;
     let source:ResumeFrom|null=null,reason:string|null=null,blocker:string|null=null,retryAfter:string|null=null;
     let nativeRequests:Array<{question_id:string;kind:string;payload_json:string}>=[];
     if(agent?.role==='worker'&&agent.thread_id&&agent.cwd===job.workspace_path&&JSON.parse(agent.config_json).attemptId===job.job_id&&identity===JSON.stringify([agent.generation,agent.thread_id]))
@@ -35,8 +38,8 @@ export class OfflineTaskResumes {
      }
     }catch{blocker='result_conflict';}
     if(source&&agent){
-     const where="agent=? AND generation=? AND turn_id IS ? AND (state IN ('pending','answering') OR (state='expired' AND ?='waiting'))";
-     const args=[agent.name,agent.generation,agent.turn_id,agent.state];
+     const where="agent=? AND generation=? AND thread_id=? AND (state IN ('pending','answering') OR (state='expired' AND ?='waiting' AND turn_id IS ?))";
+     const args=[agent.name,agent.generation,agent.thread_id,agent.state,agent.turn_id];
      const size=runtime.db.prepare(`SELECT count(*) AS count,COALESCE(sum(length(CAST(payload_json AS BLOB))),0) AS bytes FROM questions WHERE ${where}`).get(...args) as {count:number;bytes:number};
      if(size.count>8||size.bytes>65_536)blocker??='native_requests_overflow';
      else nativeRequests=runtime.db.prepare(`SELECT question_id,kind,payload_json FROM questions WHERE ${where} ORDER BY question_id LIMIT 8`).all(...args) as typeof nativeRequests;
@@ -60,7 +63,8 @@ export class OfflineTaskResumes {
     const steer=task.steer_pending_event_id||job.steer_state==='dispatching'?JSON.stringify({pending_event_id:task.steer_pending_event_id,event_id:job.steer_event_id,state:job.steer_state,acceptance:'unknown'}):null;
     if(steer&&!reason)reason='steer_acceptance_unknown';
     if(task.wait_reason&&['external_effect_unknown','result_reconciliation_required','result_conflict','worker_unknown'].includes(task.wait_reason))blocker??=task.wait_reason;
-    if(!reason&&task.wait_reason&&['human_input','external_approval','retry_exhausted','steer_acceptance_unknown'].includes(task.wait_reason))reason=task.wait_reason;
+    const staleHumanWait=task.wait_reason==='human_input'&&!!source&&['working','idle'].includes(agent?.state??'');
+    if(!reason&&!staleHumanWait&&task.wait_reason&&['human_input','external_approval','retry_exhausted','steer_acceptance_unknown'].includes(task.wait_reason))reason=task.wait_reason;
     if(reason==='capacity_wait'&&!Number.isFinite(Date.parse(retryAfter??'')))retryAfter=new Date(Date.now()+task.retry_delay_ms).toISOString();
     if(blocker)reason=blocker;
     if(task.desired_state!=='running')reason=task.desired_state==='paused'?'paused':'cancel_requested';
