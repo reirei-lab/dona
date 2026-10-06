@@ -6,12 +6,12 @@ import type {TaskRow} from "./task-execution.js";
 import fs from "node:fs";
 
 export interface ResumeFrom {name:string;generation:string;thread_id:string;attempt_id:string;}
-interface Saved {attempt_id:string;task_id:string;run_id:string;source_json:string|null;state:string;reason:string|null;successor_id:string|null;retry_after:string|null;}
+interface Saved {attempt_id:string;task_id:string;run_id:string;source_json:string|null;state:string;reason:string|null;successor_id:string|null;retry_after:string|null;steer_json:string|null;}
 /** 全writer停止後の保守runner専用。API/MCPから発行しない。 */
 export class OfflineTaskResumes {
  constructor(private sql:Database.Database,private dispatcher:DispatcherDatabase){
   sql.exec(`CREATE TABLE IF NOT EXISTS offline_task_resumes(attempt_id TEXT PRIMARY KEY REFERENCES jobs(job_id),task_id TEXT NOT NULL REFERENCES tasks(task_id),
-   run_id TEXT NOT NULL,source_json TEXT,state TEXT NOT NULL,reason TEXT,successor_id TEXT REFERENCES jobs(job_id),retry_after TEXT);`);
+   run_id TEXT NOT NULL,source_json TEXT,state TEXT NOT NULL,reason TEXT,successor_id TEXT REFERENCES jobs(job_id),retry_after TEXT,steer_json TEXT);`);
  }
  capture(runtime:RuntimeStore,runId:string):void {
   this.sql.transaction(()=>{
@@ -40,17 +40,19 @@ export class OfflineTaskResumes {
      const hint=runtime.db.prepare("SELECT reason,retry_after FROM recovery_hints WHERE agent=? AND generation=?").get(agent.name,agent.generation) as {reason:string;retry_after:string|null}|undefined;
      if(hint){reason=hint.reason==='capacity_wait'?'capacity_wait':'human_input';if(hint.retry_after&&(!retryAfter||hint.retry_after>retryAfter))retryAfter=hint.retry_after;}
     }
-    if(task.steer_pending_event_id||job.steer_state==='dispatching')reason='steer_acceptance_unknown';
+    if(task.wait_reason==='external_approval'&&reason==='human_input')reason='external_approval';
+    const steer=task.steer_pending_event_id||job.steer_state==='dispatching'?JSON.stringify({pending_event_id:task.steer_pending_event_id,event_id:job.steer_event_id,state:job.steer_state,acceptance:'unknown'}):null;
+    if(steer&&!reason)reason='steer_acceptance_unknown';
     if(task.desired_state!=='running')reason=task.desired_state==='paused'?'paused':'cancel_requested';
-    if(task.wait_reason&&['human_input','external_effect_unknown','external_approval','result_reconciliation_required','retry_exhausted','steer_acceptance_unknown'].includes(task.wait_reason))reason=task.wait_reason;
-    this.sql.prepare("INSERT INTO offline_task_resumes VALUES(?,?,?,?,?,?,NULL,?)").run(job.job_id,task.task_id,runId,source?JSON.stringify(source):null,reason?'held':'pending',reason,retryAfter);
+    if(!['worker_unknown','result_conflict','external_effect_unknown','human_input'].includes(reason??'')&&task.wait_reason&&['human_input','external_effect_unknown','external_approval','result_reconciliation_required','retry_exhausted','steer_acceptance_unknown'].includes(task.wait_reason))reason=task.wait_reason;
+    this.sql.prepare("INSERT INTO offline_task_resumes VALUES(?,?,?,?,?,?,NULL,?,?)").run(job.job_id,task.task_id,runId,source?JSON.stringify(source):null,reason&&!['external_approval','capacity_wait'].includes(reason)?'held':'pending',reason,retryAfter,steer);
    }
   }).immediate();
  }
  saved(attemptId:string):Saved|undefined{return this.sql.prepare("SELECT * FROM offline_task_resumes WHERE attempt_id=?").get(attemptId) as Saved|undefined;}
  hold(task:TaskRow):string|undefined {
   const row=this.saved(task.current_attempt_id);
-  return row?.state==='held'&&row.reason!=='capacity_wait'&&!task.steer_pending_event_id&&task.desired_state==='running'&&task.wait_reason!=='resume_requested'?row.reason??'human_input':undefined;
+  return row?.state==='held'&&!['capacity_wait','external_approval'].includes(row.reason??'')&&!task.steer_pending_event_id&&task.desired_state==='running'&&task.wait_reason!=='resume_requested'?row.reason??'human_input':undefined;
  }
  capacityDelay(task:TaskRow):number {
   const row=this.saved(task.current_attempt_id);
@@ -78,8 +80,22 @@ export class OfflineTaskResumes {
    const job=this.dispatcher.getJob(row.attempt_id)!;
    // 停止直前に公開されたResultは通常collectorへ渡す。上書きも再実行もしない。
    if(job.result_json||fs.existsSync(job.result_path))return;
+   // 旧workerの追加指示受付は今後確定しない。元receiptはsnapshotへ保存し、
+   // 既知の未解決操作がなければ保存済みobjectiveを新turnへ渡す（旧steerは再送しない）。
+   if(row.reason==='steer_acceptance_unknown'&&row.source_json){
+    const checkpoint=checkpointSnapshot(job,task.task_id).checkpoint??this.dispatcher.tasks.latestCheckpoint(task.task_id);
+    if(checkpoint&&(checkpoint.unresolved_operations.length||['external_effect_unknown','human_input'].includes(checkpoint.waiting))){
+     this.sql.prepare("UPDATE offline_task_resumes SET state='held',reason=? WHERE attempt_id=?").run(checkpoint.waiting==='human_input'?'human_input':'external_effect_unknown',job.job_id);
+     this.sql.prepare("UPDATE jobs SET status='needs_review',last_error_code='offline_update_held' WHERE job_id=?").run(job.job_id);
+     this.dispatcher.tasks.wait(task,checkpoint.waiting==='human_input'?'human_input':'external_effect_unknown');return;
+    }
+    this.sql.prepare("UPDATE jobs SET steer_state=NULL WHERE job_id=?").run(job.job_id);
+    this.sql.prepare("UPDATE tasks SET steer_pending_event_id=NULL WHERE task_id=?").run(task.task_id);
+    this.sql.prepare("UPDATE offline_task_resumes SET state='pending' WHERE attempt_id=?").run(job.job_id);
+    row.state='pending';
+   }
    const evidence={state:'stopped' as const,reason:'offline_update',observed_at:new Date().toISOString(),process_ids:[],process_groups:[]};
-   if(row.state==='held'&&row.reason!=='capacity_wait'){
+   if(row.state==='held'&&!['capacity_wait','external_approval'].includes(row.reason??'')){
     this.sql.prepare("UPDATE jobs SET status='needs_review',last_error_code='offline_update_held' WHERE job_id=?").run(job.job_id);
     this.dispatcher.tasks.wait(task,row.reason??'human_input');return;
    }

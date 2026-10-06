@@ -56,11 +56,10 @@ import readline from 'node:readline';import fs from 'node:fs';const send=v=>proc
  }finally{if(manager)for(const agent of f.runtime.agents())if(agent.state!=='stopped')await manager.stop(agent.name,agent.generation);await f.close();}
 });
 
-for(const kind of ['approval','steer','result','paused','budget','identity','checkpoint'] as const)test(`停止更新は${kind}を自動再実行へ変換しない`,async()=>{
+for(const kind of ['approval','result','paused','budget','identity','checkpoint'] as const)test(`停止更新は${kind}を自動再実行へ変換しない`,async()=>{
  const f=await fixture();try{
   if(kind==='checkpoint'){await fs.mkdir(path.dirname(f.job.result_path),{recursive:true});await fs.writeFile(path.join(path.dirname(f.job.result_path),'checkpoint.json'),JSON.stringify({schema_version:1,task_id:f.task.task_id,attempt_id:f.job.job_id,sequence:1,summary:'結果確認待ち',remaining:[],artifacts:[],unresolved_operations:['pushの受理不明'],waiting:'external_effect_unknown'}));}
   if(kind==='approval')f.runtime.addQuestion({question_id:'approval',agent:f.job.agent_name,generation:'original-generation',thread_id:'saved-thread',turn_id:'old-turn',rpc_id_json:'1',kind:'approval',payload_json:'{}',state:'pending',answer_hash:null,created_at:new Date().toISOString()});
-  if(kind==='steer')f.db.tasks.prepareSteer(f.task.task_id,f.event.event_id,f.db.tasks.get(f.task.task_id)!.revision,'追加条件');
   if(kind==='result'){await fs.mkdir(path.dirname(f.job.result_path),{recursive:true});await fs.writeFile(f.job.result_path,'{"summary":"停止直前の成果"}');}
   if(kind==='paused')f.db.tasks.control(f.task.task_id,f.event.event_id,f.db.tasks.get(f.task.task_id)!.revision,'pause');
   if(kind==='budget')f.db.tasks.offlineResumes['sql'].prepare('UPDATE tasks SET max_attempts=1 WHERE task_id=?').run(f.task.task_id);
@@ -126,4 +125,39 @@ for(const failure of ['spawn','initialize','rejected','unknown'] as const)test(`
   if(failure==='unknown')await assert.rejects(manager.start({...input,name:'retry',attemptId:'retry'}),/already_claimed/);
   else assert.equal((await manager.start({...input,name:'retry',attemptId:'retry'})).thread_id,'saved-thread');
  }finally{if(manager)for(const agent of f.runtime.agents())if(agent.state!=='stopped')await manager.stop(agent.name,agent.generation);await f.close();}
+});
+
+for(const unresolved of [false,true])test(`停止前の未確定steerはreceiptを残し既知の未解決操作を照合する unresolved=${unresolved}`,async()=>{
+ const f=await fixture();try{
+  f.db.tasks.prepareSteer(f.task.task_id,f.event.event_id,f.db.tasks.get(f.task.task_id)!.revision,'追加条件を引き継ぐ');f.db.beginJobSteer(f.job.job_id,f.event.event_id);
+  if(unresolved){await fs.mkdir(path.dirname(f.job.result_path),{recursive:true});await fs.writeFile(path.join(path.dirname(f.job.result_path),'checkpoint.json'),JSON.stringify({schema_version:1,task_id:f.task.task_id,attempt_id:f.job.job_id,sequence:1,summary:'push結果未確認',remaining:[],artifacts:[],unresolved_operations:['push'],waiting:'external_effect_unknown'}));}
+  f.migrate();const task=f.db.tasks.get(f.task.task_id)!;
+  assert.equal(JSON.parse(f.db.tasks.offlineResumes.saved(f.job.job_id)!.steer_json!).state,'dispatching');
+  if(unresolved){assert.equal(task.current_attempt_id,f.job.job_id);assert.equal(task.wait_reason,'external_effect_unknown');}
+  else {assert.notEqual(task.current_attempt_id,f.job.job_id);assert.equal(task.steer_pending_event_id,null);const next=f.db.getJob(task.current_attempt_id)!;assert.match(next.objective,/追加条件を引き継ぐ/);assert.match(buildJobPrompt(next),/"prior_steer_acceptance":\s*"unknown"/);}
+ }finally{await f.close();}
+});
+
+test('実際のexternal_approval待機もterminal receipt照合後に再開する',async()=>{
+ const f=await fixture();try{
+  const sql=new Database(f.config.databasePath);sql.exec('CREATE TABLE task_external_approval_checkpoints(attempt_id TEXT,runtime_request_id TEXT,request_id TEXT,state TEXT)');sql.prepare('INSERT INTO task_external_approval_checkpoints VALUES(?,?,?,?)').run(f.job.job_id,'runtime-request','request','pending');
+  sql.prepare("UPDATE jobs SET status='blocked',last_error_code='runtime_external_approval_pending' WHERE job_id=?").run(f.job.job_id);sql.close();
+  f.db.tasks.wait(f.db.tasks.get(f.task.task_id)!,'external_approval',0);
+  f.runtime.put({...f.runtime.agent(f.job.agent_name)!,state:'waiting'});
+  f.migrate();assert.equal(f.db.tasks.get(f.task.task_id)!.current_attempt_id,f.job.job_id);assert.equal(f.db.tasks.offlineResumes.saved(f.job.job_id)!.state,'pending');
+  due(f);await supervisor(f).reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)!.wait_reason,'external_approval');
+  const terminal=new Database(f.config.databasePath);terminal.prepare("UPDATE task_external_approval_checkpoints SET state='succeeded'").run();terminal.close();
+  f.db.tasks.registerExternalApprovalRecoveryVerifier(input=>({effect:'accepted',request_id:input.request_id,attempt_id:input.attempt_id,receipt_ref:'receipt'}));
+  due(f);await supervisor(f).reconcileTasks();assert.notEqual(f.db.tasks.get(f.task.task_id)!.current_attempt_id,f.job.job_id);
+ }finally{await f.close();}
+});
+
+test('activation後の再停止は現在Attemptのスレッドを次Attemptへ保存する',async()=>{
+ const f=await fixture();try{
+  f.migrate();const current=f.db.tasks.get(f.task.task_id)!,job=f.db.getJob(current.current_attempt_id)!;
+  f.db.beginJobPreparation(job.job_id,new Date(job.available_at));f.db.setJobRuntime(job.job_id,job.agent_name,job.agent_name,JSON.stringify(['second-generation','saved-thread']));f.db.beginJobDispatch(job.job_id);f.db.markJobRunning(job.job_id);
+  f.runtime.put({...f.runtime.agent(f.job.agent_name)!,name:job.agent_name,generation:'second-generation',state:'working',config_json:JSON.stringify({attemptId:job.job_id})});
+  f.migrate();const latest=f.db.tasks.get(f.task.task_id)!,next=f.db.getJob(latest.current_attempt_id)!;
+  assert.equal(latest.attempt_number,3);assert.equal(JSON.parse(next.workspace_json)._dona_resume.source.attempt_id,job.job_id);assert.equal(JSON.parse(next.workspace_json)._dona_resume.source.generation,'second-generation');assert.equal(JSON.parse(next.workspace_json)._dona_resume.source.thread_id,'saved-thread');
+ }finally{await f.close();}
 });

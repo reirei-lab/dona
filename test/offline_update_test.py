@@ -708,6 +708,27 @@ class FreshGenerationTests(unittest.TestCase):
                 call.reset_mock();runner.migrate(retire_only=True)
                 self.assertNotIn('task_resume',m.json.loads(call.call_args.kwargs['input']))
 
+    def test_runtime_restart_snapshots_current_tasks_except_rollback_and_fresh(self):
+        for old, mode in [(False,'preserve'),(True,'preserve'),(False,'fresh_generation')]:
+            with self.subTest(old=old, mode=mode), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);runner=object.__new__(m.Runner)
+                runner.plan={'mode':mode,'release':str(root/'release')}
+                runner.g=root/'target';runner.run=root/'prepared-run';runner.node='/node'
+                control=root/'control';control.mkdir();(control/'runtime.sqlite3').touch()
+                runner.policy={'control_root':str(control)}
+                runner.inv={'policy':runner.policy,'databases':[str(root/'dispatcher')],
+                            'old_results':[str(root/'events'),str(root/'jobs')]}
+                runner.journal={'last_stop_receipt':{'processes':[],'verified_at':'now'}}
+                runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+                with patch.object(m,'command',side_effect=RuntimeError('migration captured')) as call:
+                    with self.assertRaisesRegex(RuntimeError,'migration captured'):runner.start_app_server_main(old)
+                    request=m.json.loads(call.call_args.kwargs['input'])
+                    self.assertTrue(request['runtime_only'])
+                    if not old and mode=='preserve':
+                        self.assertEqual(request['run_id'],'prepared-run')
+                        self.assertEqual(request['task_resume'],{'result_dir':str(root/'jobs')})
+                    else:self.assertNotIn('task_resume',request)
+
     def test_fresh_migration_requires_stop_receipt_and_only_targets_new_paths(self):
         runner=object.__new__(m.Runner)
         runner.plan={'mode':'fresh_generation','release':'/target/release','target_sha':'a'*40}

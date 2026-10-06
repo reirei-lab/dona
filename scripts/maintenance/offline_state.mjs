@@ -45,7 +45,8 @@ export function assertFreshDatabase(db) {
 export async function migrate(request) {
   if(request.runtime_only) {
     const {migrateStoppedRuntime}=await import(pathToFileURL(path.join(request.release,'dispatcher/dist/app-server/migration.js')));
-    migrateStoppedRuntime(request.databases[0],request.runtime_migration.database,request.runtime_migration.stop_receipt,request.release);
+    migrateStoppedRuntime(request.databases[0],request.runtime_migration.database,request.runtime_migration.stop_receipt,request.release,
+      request.task_resume ? {runId:request.run_id,resultDir:request.task_resume.result_dir} : undefined);
     return;
   }
   if (request.fresh_generation) {

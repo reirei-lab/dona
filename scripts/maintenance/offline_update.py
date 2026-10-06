@@ -823,6 +823,9 @@ class Runner:
             dispatcher_database = fresh_databases(self.g)[0] if fresh(self.plan) and not old else self.inv['databases'][0]
             request = {'runtime_only':True,'release':self.plan['release'],'databases':[dispatcher_database],
                        'runtime_migration':{'database':str(runtime_database),'stop_receipt':self.journal['last_stop_receipt']}}
+            if not old and not fresh(self.plan):
+                request['run_id'] = self.run.name
+                request['task_resume'] = {'result_dir':self.inv['old_results'][1]}
             command([self.node,str(self.run/'offline_state.mjs')],input=encode(request),timeout=120)
         self.start_service(RUNTIME_LABEL)
         socket_path = str(Path(policy['control_root'])/'runtime.sock')
