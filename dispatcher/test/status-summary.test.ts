@@ -202,7 +202,7 @@ test("Taskの後継Attemptを作ってもexact旧jobと現在jobの状態を混�
 });
 
 test("MCPはlive membership providerへの外部依存を宣言する",async()=>{
- const f=await fixture();try {const tool=(await f.mcp.listTools()).tools.find(t=>t.name==="get_job_status_summary")!;assert.equal(tool.annotations?.openWorldHint,true);assert.equal(tool.annotations?.readOnlyHint,true);}finally{await f.close();}
+ const f=await fixture();try {const tools=(await f.mcp.listTools()).tools;for(const name of ["get_job_status_summary","list_event_jobs","get_job_status"])assert.equal(tools.find(t=>t.name===name)!.annotations?.openWorldHint,true,name);assert.equal(tools.find(t=>t.name==="get_job_status_summary")!.annotations?.readOnlyHint,true);}finally{await f.close();}
 });
 
 for(const mode of ["api","mcp"] as const)test(`${mode}: all_terminal通知から先行完了siblingを含むResultを集約できる`,async()=>{
