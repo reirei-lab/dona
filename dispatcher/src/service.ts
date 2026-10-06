@@ -1,3 +1,5 @@
+import path from "node:path";
+import { AgentContextManager } from "./agent-context.js";
 import {RuntimeClient} from "./app-server/client.js";
 import {openLocalApprovalService} from "./approval/local-service.js";
 import { assertTaskGenerationFile } from "./task-execution.js";
@@ -46,7 +48,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
   let jobProgress = jobProgressStore
     ? new JobProgressCoordinator(database, jobProgressStore, config, createLogger("dispatcher_job_progress"))
     : undefined;
-  const worker = new DispatcherWorker(database, herdr, config, workerLogger,new SlackAdapterJobNotificationVerifier(config), () => jobSupervisor.wake());
+  const agentContexts = new AgentContextManager(database,path.join(path.dirname(config.socketPath),"status-context.json"));
+  const worker = new DispatcherWorker(database, herdr, config, workerLogger,new SlackAdapterJobNotificationVerifier(config), () => jobSupervisor.wake(),agentContexts);
   const scheduler = new SchedulerService(
     database.scheduler,
     new SystemClock(),
@@ -94,6 +97,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     undefined,
     () => scheduler.wake(),
     scheduler,
+    agentContexts,
   );
   let external:Awaited<ReturnType<typeof openLocalApprovalService>>;
   let stopWebJobProjectionMaintenance:(()=>void)|undefined;

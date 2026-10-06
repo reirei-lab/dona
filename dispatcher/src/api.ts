@@ -1,4 +1,9 @@
 import { continuationControlSchema } from "./task-continuation.js";
+import { resolveVerifiedSlackOwner } from "./verified-owner-origin.js";
+import { projectCompletionJob } from "./completion-projection.js";
+import { verifySlackPrincipalProof } from "./principal-proof.js";
+import type { AgentContextManager } from "./agent-context.js";
+import { StatusSummaryService } from "./status-summary.js";
 import { taskRequestSchema, taskIdSchema } from "./task-execution.js";
 import { operatorRequest } from "./dashboard/operator-api.js";
 import { OperatorAuthError } from "./dashboard/operator-auth.js";
@@ -154,6 +159,7 @@ export class DispatcherApi {
   setExternalHealth(check:()=>{configured:boolean;ready:boolean;reason?:string}):void {this.externalHealth=check;}
   setExternalApproval(service:LocalExternalApprovalService|undefined):void {this.externalApproval=service;}
   private server: http.Server | undefined;
+  private ownsStatusContext=false;
   private shuttingDown = false;
   private quiesceOperationId: string | undefined;
   private quiescePromise: Promise<void> | undefined;
@@ -174,6 +180,7 @@ export class DispatcherApi {
     scheduleNow: () => Date = () => new Date(),
     wakeScheduler: () => void = () => {},
     private readonly schedulerState?: ApiSchedulerState,
+    private readonly agentContexts?:AgentContextManager,
   ) { this.schedules = new ScheduleApiService(database, scheduleNow, () => { wakeScheduler(); jobs.wake(); }); }
 
   disableJobProgress(): void { this.jobProgress = undefined; }
@@ -204,6 +211,7 @@ export class DispatcherApi {
       });
     });
     await fs.chmod(this.config.socketPath, 0o600);
+    if(this.agentContexts) {await this.agentContexts.initialize();this.ownsStatusContext=true;}
     this.logger.info("Dispatcher API started", { socket_path: this.config.socketPath });
   }
 
@@ -228,6 +236,7 @@ export class DispatcherApi {
   async stop(): Promise<void> {
     this.beginShutdown();
     const ownsSocket = this.server?.listening === true;
+    if(this.ownsStatusContext) {await this.agentContexts?.revoke();this.ownsStatusContext=false;}
     if (this.server?.listening) {
       await new Promise<void>((resolve, reject) => {
         this.server!.close((error) => (error ? reject(error) : resolve()));
@@ -314,6 +323,9 @@ export class DispatcherApi {
         sendJson(response, 200, { schema_version: 1, event_id: eventId, terminal: this.database.isEventCompleted(eventId) });
         return;
       }
+      if(this.agentContexts && request.method==="GET" && (/^\/v1\/events\/[^/]+\/jobs$/.test(url.pathname)||url.pathname==="/v1/jobs"||(/^\/v1\/jobs\/[^/]+(?:\/live-session-receipts\/[^/]+|\/worker)?$/.test(url.pathname)))) {
+        if(!await this.authorizeLegacyRead(request,url)) {sendJson(response,200,{schema_version:1,status:"not_available"});return;}
+      }
       if (request.method === "GET" && /^\/v1\/events\/[^/]+\/jobs$/.test(url.pathname)) {
         const sourceEventId = decodeURIComponent(url.pathname.split("/")[3]!);
         if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId)) {
@@ -334,7 +346,7 @@ export class DispatcherApi {
         sendJson(response, 200, {
           schema_version: 1,
           source_event_id: sourceEventId,
-          jobs: this.database.listEventJobs(sourceEventId, jobKey),
+          jobs: this.database.listEventJobs(sourceEventId, jobKey).map(row=>this.agentContexts?{job_id:row.job_id,status:row.status,created_at:row.created_at,updated_at:row.updated_at,completed_at:row.completed_at}:row),
           ...(canonicalPayloadSha256 !== undefined && jobKey !== undefined
             ? { reconciliation: this.database.reconcileEventJob(sourceEventId, jobKey, canonicalPayloadSha256) }
             : {}),
@@ -482,6 +494,20 @@ export class DispatcherApi {
       if (url.pathname === "/v1/tasks" || url.pathname.startsWith("/v1/tasks/")) {
         await this.handleTasks(request,response,url);return;
       }
+      const summaryMatch=/^\/v1\/jobs\/([^/]+)\/status-summary$/.exec(url.pathname);
+      if(summaryMatch) {
+        const eventId=request.headers["x-dona-agent-event-id"],token=request.headers["x-dona-agent-token"];
+        const context=typeof eventId==="string"&&typeof token==="string"?this.agentContexts?.authorize(token,eventId,"get_job_status_summary"):undefined;
+        const service=new StatusSummaryService(this.database,async input=>{
+          const key=await readPrivateToken(this.config.updateInternalTokenPath);
+          if(!key)throw new Error("status_provider_unavailable");
+          return confirmScheduleAccess(this.config.slackAdapterSocketPath,key,{...input,status_summary:true},5000);
+        });
+        const result=request.method==="GET" && [...url.searchParams.keys()].length===0
+          ?await service.read((()=>{try{return decodeURIComponent(summaryMatch[1]!);}catch{return "";}})(),context,()=>typeof token==="string"&&typeof eventId==="string"?this.agentContexts?.authorize(token,eventId,"get_job_status_summary"):undefined)
+          :{schema_version:1,status:"not_available"};
+        sendJson(response,200,result);return;
+      }
       if (url.pathname === "/v1/jobs" || url.pathname.startsWith("/v1/jobs/")) {
         await this.handleJobs(request, response, url);
         return;
@@ -513,7 +539,13 @@ export class DispatcherApi {
       const envelope = parseEventEnvelope(input);
       let result;
       try {
-        result = this.database.enqueue(envelope);
+        let principal;
+        if(envelope.source==="slack" && request.headers["x-dona-slack-principal-proof"]) {
+          const key=await readPrivateToken(this.config.updateInternalTokenPath);
+          if(!key)throw new Error("status_provider_unavailable");
+          principal=verifySlackPrincipalProof(envelope,request.headers["x-dona-slack-principal-proof"],request.headers["x-dona-slack-principal-signature"],key);
+        }
+        result = this.database.enqueue(envelope,new Date(),principal);
       } catch (error) {
         throw new PersistenceUnavailableError(
           error instanceof Error ? error.message : "Event could not be persisted",
@@ -762,6 +794,65 @@ export class DispatcherApi {
     }
   }
 
+  private currentReadPurpose(request:IncomingMessage) {
+    const token=request.headers["x-dona-agent-token"],eventId=request.headers["x-dona-agent-event-id"];
+    return typeof token==="string"&&typeof eventId==="string"?this.agentContexts?.authorize(token,eventId,"get_job_status")?.purpose:undefined;
+  }
+
+  private async authorizeLegacyRead(request:IncomingMessage,url:URL):Promise<boolean> {
+    try {
+      const token=request.headers["x-dona-agent-token"],eventId=request.headers["x-dona-agent-event-id"];
+      if(typeof token!=="string"||typeof eventId!=="string")return false;
+      const isEvents=/^\/v1\/events\/[^/]+\/jobs$/.test(url.pathname);
+      const operation=isEvents?"list_event_jobs":url.pathname==="/v1/jobs"?(url.searchParams.has("source_event_id")?"list_owner_jobs":"list_thread_jobs"):"get_job_status";
+      const context=this.agentContexts?.authorize(token,eventId,operation);if(!context)return false;
+      const sourceEventId=isEvents?decodeURIComponent(url.pathname.split("/")[3]!):url.searchParams.get("source_event_id");
+      if(url.pathname.endsWith("/worker")||url.searchParams.get("include_live_session")==="true"||url.pathname.includes("/live-session-receipts/"))return false;
+      if(context.purpose==="job_completion") {
+        const event=this.database.get(context.event_id);if(!event||event.source!=="dona_job")return false;
+        const source=JSON.parse(event.subject_json).source_event_id??(event.trace_json?JSON.parse(event.trace_json).source_event_id:undefined);
+        const resolved=typeof source==="string"?resolveVerifiedSlackOwner(this.database,source):undefined,original=resolved?.origin;
+        const destination=event.reply_target_json?JSON.parse(event.reply_target_json):undefined;
+        const origin=original?.reply_target_json?JSON.parse(original.reply_target_json):undefined;
+        const originKind=original?.trace_json?JSON.parse(original.trace_json).status_origin_visibility:undefined;
+        if(!destination||!origin||destination.workspace_id!==context.workspace_id||destination.channel_id!==origin.channel_id||destination.thread_ts!==origin.thread_ts)return false;
+        const key=await readPrivateToken(this.config.updateInternalTokenPath);if(!key)return false;
+        const access=await confirmScheduleAccess(this.config.slackAdapterSocketPath,key,{event_id:context.event_id,workspace_id:context.workspace_id,channel_id:destination.channel_id,user_id:context.principal_id,status_summary:true},5000);
+        if(this.database.get(context.event_id)?.reply_target_json!==event.reply_target_json||this.database.get(context.event_id)?.subject_json!==event.subject_json||(resolved&&stableStringify(resolveVerifiedSlackOwner(this.database,source))!==stableStringify(resolved)))return false;
+        if(access.authorized!==true||access.event_id!==context.event_id||access.workspace_id!==context.workspace_id||access.channel_id!==destination.channel_id||access.user_id!==context.principal_id||access.destination_kind!==originKind||!this.agentContexts?.authorize(token,eventId,operation))return false;
+        if(isEvents)return sourceEventId===source;
+        const job=this.database.getJob(decodeURIComponent(url.pathname.split("/")[3]!));
+        return !!job && job.source_event_id===source && sourceEventId===context.event_id;
+      }
+      if(context.purpose!=="human_command")return false;
+      if(operation!=="list_thread_jobs"&&sourceEventId!==context.event_id)return false;
+      if(operation==="list_thread_jobs") {
+        const row=this.database.get(context.event_id),destination=row?.reply_target_json?JSON.parse(row.reply_target_json):undefined;
+        if(!destination||url.searchParams.get("workspace_id")!==context.workspace_id||url.searchParams.get("channel_id")!==destination.channel_id||url.searchParams.get("thread_ts")!==destination.thread_ts)return false;
+        const key=await readPrivateToken(this.config.updateInternalTokenPath);if(!key)return false;
+        const access=await confirmScheduleAccess(this.config.slackAdapterSocketPath,key,{event_id:context.event_id,workspace_id:context.workspace_id,channel_id:destination.channel_id,user_id:context.principal_id,status_summary:true},5000);
+        return access.authorized===true&&access.event_id===context.event_id&&access.workspace_id===context.workspace_id&&access.channel_id===destination.channel_id&&access.user_id===context.principal_id&&access.destination_kind===(row?.trace_json?JSON.parse(row.trace_json).status_origin_visibility:undefined)&&this.database.get(context.event_id)?.reply_target_json===row?.reply_target_json&&!!this.agentContexts?.authorize(token,eventId,operation);
+      }
+      // owner-wide discoveryは別Issue。同threadの旧readだけを維持する。
+      if(operation==="list_owner_jobs")return false;
+      if(isEvents) {
+        const event=this.database.get(context.event_id),destination=event?.reply_target_json?JSON.parse(event.reply_target_json):undefined;
+        if(!destination||destination.workspace_id!==context.workspace_id||typeof destination.channel_id!=="string")return false;
+        const key=await readPrivateToken(this.config.updateInternalTokenPath);if(!key)return false;
+        const access=await confirmScheduleAccess(this.config.slackAdapterSocketPath,key,{event_id:context.event_id,workspace_id:context.workspace_id,channel_id:destination.channel_id,user_id:context.principal_id,status_summary:true},5000);
+        return access.authorized===true&&access.workspace_id===context.workspace_id&&access.channel_id===destination.channel_id&&access.user_id===context.principal_id&&access.event_id===context.event_id&&access.destination_kind===(event?.trace_json?JSON.parse(event.trace_json).status_origin_visibility:undefined)&&!!this.agentContexts?.authorize(token,eventId,operation);
+      }
+      const jobId=decodeURIComponent(url.pathname.split("/")[3]!),job=this.database.getJob(jobId);
+      // 別threadのfull ResultやTask Attemptはsummary認可を迂回できない。
+      const resolved=job?resolveVerifiedSlackOwner(this.database,job.source_event_id):undefined,event=this.database.get(context.event_id);
+      if(!job||!resolved||!event?.reply_target_json||!resolved.origin.reply_target_json||JSON.parse(event.reply_target_json).thread_ts!==JSON.parse(resolved.origin.reply_target_json).thread_ts)return false;
+      const key=await readPrivateToken(this.config.updateInternalTokenPath);if(!key)return false;
+      const result=await new StatusSummaryService(this.database,input=>confirmScheduleAccess(this.config.slackAdapterSocketPath,key,{...input,status_summary:true},5000))
+        .read(jobId,context,()=>this.agentContexts?.authorize(token,eventId,operation));
+      return result.status!=="not_available";
+    } catch {return false;}
+  }
+
   private async handleJobs(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
     if (this.shuttingDown && request.method !== "GET") {
       throw new ApiRequestError(503, "shutting_down", "Dispatcher is shutting down");
@@ -826,10 +917,15 @@ export class DispatcherApi {
       if (!workspaceId || !channelId || !threadTs) {
         throw new ApiRequestError(400, "invalid_request", "workspace_id, channel_id, and thread_ts are required");
       }
-      const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs, 101);
+      const token=request.headers["x-dona-agent-token"],eventId=request.headers["x-dona-agent-event-id"],context=typeof token==="string"&&typeof eventId==="string"?this.agentContexts?.authorize(token,eventId,"list_thread_jobs"):undefined;
+      if(this.agentContexts&&!context){sendJson(response,200,{schema_version:1,status:"not_available"});return;}
+      const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs, 101,context?.principal_id);
+      const current=this.database.get(context?.event_id??""),kind=current?.trace_json?JSON.parse(current.trace_json).status_origin_visibility:undefined;
+      const visible=this.agentContexts?candidates.filter(job=>{const resolved=resolveVerifiedSlackOwner(this.database,job.source_event_id);return !!resolved&&resolved.principal.principal_id===context?.principal_id&&resolved.principal.workspace_id===context?.workspace_id&&!!resolved.origin.trace_json&&JSON.parse(resolved.origin.trace_json).status_origin_visibility===kind;}).map(job=>({job_id:job.job_id,status:job.status,created_at:job.created_at,updated_at:job.updated_at,completed_at:job.completed_at})):candidates;
+      if(this.agentContexts&&!(typeof token==="string"&&typeof eventId==="string"&&this.agentContexts.authorize(token,eventId,"list_thread_jobs"))){sendJson(response,200,{schema_version:1,status:"not_available"});return;}
       sendJson(response, 200, {
         schema_version: 1,
-        jobs: candidates.slice(0,100),
+        jobs: visible.slice(0,100),
         truncated: candidates.length > 100,
       });
       return;
@@ -895,7 +991,9 @@ export class DispatcherApi {
           sendJson(response,200,projectLiveJobResponse({...refreshed,...this.database.jobNotificationState(jobId)},receipt));
         }
         catch{throw new ApiRequestError(503,"live_session_audit_unavailable","Live session observation could not be durably audited");}
-      }else sendJson(response, 200, { schema_version: 1, job: {...job,...this.database.jobNotificationState(jobId)} });
+      }else sendJson(response, 200, { schema_version: 1, job: this.agentContexts
+        ?(this.currentReadPurpose(request)==="job_completion"?projectCompletionJob(job as unknown as Record<string,unknown>):{job_id:job.job_id,status:job.status,created_at:job.created_at,updated_at:job.updated_at,completed_at:job.completed_at})
+        :{...job,...this.database.jobNotificationState(jobId)} });
       return;
     }
     if (request.method === "POST" && action === "steer") {
