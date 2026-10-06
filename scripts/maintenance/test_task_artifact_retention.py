@@ -7,6 +7,7 @@ import pathlib
 import sqlite3
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from task_artifact_retention import Retention, Protected, Policy
@@ -30,7 +31,7 @@ class RetentionTests(unittest.TestCase):
         self.db.executescript("""
           CREATE TABLE jobs(job_id TEXT PRIMARY KEY,source_event_id TEXT,status TEXT,
             completed_at TEXT,created_at TEXT,workspace_json TEXT,workspace_path TEXT,
-            result_path TEXT,agent_name TEXT,steer_state TEXT,result_json TEXT,completion_event_id TEXT);
+            result_path TEXT,agent_name TEXT,steer_state TEXT,result_json TEXT,completion_event_id TEXT,source TEXT DEFAULT 'slack');
           CREATE TABLE tasks(task_id TEXT PRIMARY KEY,state TEXT,current_attempt_id TEXT,
             wait_reason TEXT,steer_pending_event_id TEXT);
           CREATE TABLE task_attempts(attempt_id TEXT PRIMARY KEY,task_id TEXT,stop_receipt_json TEXT,checkpoint_json TEXT);
@@ -55,7 +56,7 @@ class RetentionTests(unittest.TestCase):
         for item in (work, progress, result):
             item.mkdir(parents=True, mode=0o700)
             (item / "data.json").write_text("kept evidence")
-        self.db.execute("INSERT INTO jobs VALUES(?,?,'completed',?,?,?, ?,?,?,NULL,?,NULL)",
+        self.db.execute("INSERT INTO jobs(job_id,source_event_id,status,completed_at,created_at,workspace_json,workspace_path,result_path,agent_name,steer_state,result_json,completion_event_id) VALUES(?,?,'completed',?,?,?, ?,?,?,NULL,?,NULL)",
                         (job, "event-" + job, OLD, OLD, json.dumps({"kind": "scratch"}), str(work),
                          str(result / "result.json"), job, '{"summary":"saved"}'))
         self.db.execute("INSERT INTO tasks VALUES(?,'completed',?,NULL,NULL)", (task, job))
@@ -84,6 +85,7 @@ class RetentionTests(unittest.TestCase):
                  ("UPDATE task_attempts SET stop_receipt_json=NULL", "worker_stop_unverified"),
                  ("UPDATE job_completion_results SET notification_state='pending'", "notification_unsettled"),
                  ("UPDATE job_completion_results SET content_delete_at='2027-01-01T00:00:00Z'", "retention_not_expired"),
+                 ("UPDATE jobs SET created_at='2026-10-05T00:00:00Z'", "retention_not_expired"),
                  ("UPDATE tasks SET wait_reason='human_input'", "task_attention_unsettled")]
         for sql, expected in cases:
             with self.subTest(sql=sql):
@@ -175,6 +177,54 @@ class RetentionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 Policy(days, floor)
 
+    def test_overlapping_roots_are_rejected(self):
+        for result in (self.workspace, self.workspace / "scratch", self.root):
+            with self.assertRaisesRegex(Protected, "artifact_roots_overlap"):
+                Retention(self.db, str(self.workspace), str(result), Policy(7, 0))
+
+    def test_both_root_capacities_and_unavailable_observation(self):
+        self.engine.policy = Policy(7, 200)
+        workspace_inode = self.workspace.stat().st_ino
+        def capacity(fd):
+            return SimpleNamespace(f_bavail=100 if os.fstat(fd).st_ino == workspace_inode else 1000, f_frsize=1)
+        with patch("task_artifact_retention.os.fstatvfs", side_effect=capacity):
+            item = self.engine.batch(NOW)
+        self.assertEqual(item["available_bytes"], 100)
+        self.assertFalse(item["disk_floor_met"])
+        self.assertTrue(item["root_capacities"]["result"]["disk_floor_met"])
+        with patch("task_artifact_retention.os.fstatvfs", side_effect=OSError("unavailable")):
+            item = self.engine.batch(NOW)
+        self.assertIsNone(item["available_bytes"])
+        self.assertFalse(item["disk_floor_met"])
+
+    def test_mount_device_mismatch_is_protected_before_descent(self):
+        work = self.workspace / "scratch" / JOB
+        mount = work / "mounted"
+        mount.mkdir(mode=0o700)
+        (mount / "keep").write_text("other volume fixture")
+        original = os.stat
+        def sample(name, *args, **kwargs):
+            info = original(name, *args, **kwargs)
+            if name == "mounted":
+                values = {key: getattr(info, key) for key in ("st_dev", "st_ino", "st_uid", "st_mode", "st_nlink", "st_blocks")}
+                values["st_dev"] += 1
+                return SimpleNamespace(**values)
+            return info
+        with patch("task_artifact_retention.os.stat", side_effect=sample):
+            item = self.engine.inventory(JOB, NOW)["artifacts"][0]
+        self.assertEqual(item["cleanup_error"], "mount_boundary")
+        self.assertEqual((mount / "keep").read_text(), "other volume fixture")
+        def ancestor(name, *args, **kwargs):
+            info = sample(name, *args, **kwargs)
+            if name == "scratch":
+                values = {key: getattr(info, key) for key in ("st_dev", "st_ino", "st_uid", "st_mode", "st_nlink", "st_blocks")}
+                values["st_dev"] += 1
+                return SimpleNamespace(**values)
+            return info
+        with patch("task_artifact_retention.os.stat", side_effect=ancestor):
+            item = self.engine.inventory(JOB, NOW)["artifacts"][0]
+        self.assertEqual(item["cleanup_error"], "mount_boundary")
+
     @unittest.skipUnless(HAS_BIRTH, "macOS birthtime必須")
     def test_disk_observation_failure_cannot_purge(self):
         with patch("task_artifact_retention.os.fstatvfs", side_effect=OSError("disk observation unavailable")):
@@ -264,6 +314,38 @@ class RetentionTests(unittest.TestCase):
             self.engine.cleanup(JOB, "worktree", NOW, hook=replace)
         old = self.workspace.with_name("original-root") / "scratch" / self.tomb().name
         self.assertEqual((old / "data.json").read_text(), "kept evidence")
+
+    @unittest.skipUnless(HAS_BIRTH, "macOS birthtime必須")
+    def test_restart_root_and_ancestor_generation_are_bound(self):
+        def crash(phase):
+            if phase == "renamed":
+                raise RuntimeError("crash")
+        with self.assertRaises(RuntimeError):
+            self.engine.cleanup(JOB, "worktree", NOW, hook=crash)
+        original_root = self.workspace.with_name("saved-root")
+        self.workspace.rename(original_root)
+        self.workspace.mkdir(mode=0o700)
+        (self.workspace / "scratch").mkdir(mode=0o700)
+        (original_root / "scratch" / self.tomb().name).rename(self.tomb())
+        with self.assertRaisesRegex(Protected, "root_replaced"):
+            self.engine.cleanup(JOB, "worktree", NOW)
+        self.assertEqual((self.tomb() / "data.json").read_text(), "kept evidence")
+
+    @unittest.skipUnless(HAS_BIRTH, "macOS birthtime必須")
+    def test_restart_replaced_ancestor_cannot_rebind_same_artifact(self):
+        def crash(phase):
+            if phase == "renamed":
+                raise RuntimeError("crash")
+        with self.assertRaises(RuntimeError):
+            self.engine.cleanup(JOB, "worktree", NOW, hook=crash)
+        parent = self.workspace / "scratch"
+        old = self.workspace / "old-scratch"
+        parent.rename(old)
+        parent.mkdir(mode=0o700)
+        (old / self.tomb().name).rename(self.tomb())
+        with self.assertRaisesRegex(Protected, "ancestor_replaced"):
+            self.engine.cleanup(JOB, "worktree", NOW)
+        self.assertEqual((self.tomb() / "data.json").read_text(), "kept evidence")
 
     @unittest.skipUnless(HAS_BIRTH, "macOS birthtime必須")
     def test_disk_floor_and_bounded_restart(self):

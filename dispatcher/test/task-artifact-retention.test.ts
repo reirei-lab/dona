@@ -39,12 +39,32 @@ test("retention ledger works with current Dispatcher migrations and Task trigger
     }, job.result_path);
     database.sealJobGroup(event.event_id);
     const notification = database.enqueueJobNotification(job.job_id).row;
+    const local = database.localDashboard.create({ instance_id: "fixture", owner_id: "operator", device_id: "device", grant_revision: 1 }, {
+      request_id: "local-retention", objective: "isolated local completion", workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir);
+    const localJob = database.getJob(local.task.current_attempt_id)!;
+    for (const directory of [localJob.workspace_path, path.dirname(localJob.result_path),
+      path.join(path.dirname(localJob.workspace_path), ".dona-progress", localJob.job_id)]) {
+      await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+      await fs.writeFile(path.join(directory, "evidence"), "local isolated");
+    }
+    database.beginJobPreparation(localJob.job_id);
+    database.setJobRuntime(localJob.job_id, "local-fixture", "local-pane");
+    database.beginJobDispatch(localJob.job_id);
+    database.markJobRunning(localJob.job_id);
+    database.saveJobResult(localJob.job_id, {
+      schema_version: 1, job_id: localJob.job_id, status: "completed", summary: "local fixture", completed_at: old,
+    }, localJob.result_path);
+    database.enqueueJobNotification(localJob.job_id);
     // Model already-verified stop and delivered notification in this private DB.
     // No runtime/Slack calls are made, and this is not live stop evidence.
     const sql = new Database(config.databasePath);
     try {
+      sql.prepare("UPDATE jobs SET created_at=? WHERE job_id IN (?,?)").run(old, job.job_id, localJob.job_id);
       sql.prepare("UPDATE task_attempts SET stop_receipt_json=? WHERE attempt_id=?").run(
         JSON.stringify({ state: "stopped", reason: "app_server_verified_empty_scope", observed_at: old }), job.job_id);
+      sql.prepare("UPDATE task_attempts SET stop_receipt_json=? WHERE attempt_id=?").run(
+        JSON.stringify({ state: "stopped", reason: "app_server_verified_empty_scope", observed_at: old }), localJob.job_id);
       const target = JSON.parse(notification.reply_target_json!);
       sql.prepare("UPDATE events SET status='completed',completed_at=?,result_json=? WHERE event_id=?").run(old,
         JSON.stringify({ schema_version: 1, event_id: notification.event_id, status: "completed", actions: [
@@ -61,7 +81,7 @@ engine=Retention(db,sys.argv[2],sys.argv[3],Policy(7,0))
 engine.install()
 item=engine.inventory(sys.argv[4],1791244800)
 assert item.get('size_is_complete'),item
-event=db.execute('SELECT all_terminal_event_id FROM job_groups').fetchone()[0]
+event=db.execute('SELECT all_terminal_event_id FROM job_groups WHERE source_event_id=(SELECT source_event_id FROM jobs WHERE job_id=?)',(sys.argv[4],)).fetchone()[0]
 saved=db.execute('SELECT result_json FROM events WHERE event_id=?',(event,)).fetchone()[0]
 broken=json.loads(saved)
 broken['actions'][0]['ambiguous']=True
@@ -72,9 +92,15 @@ db.execute('UPDATE events SET result_json=? WHERE event_id=?',(saved,event))
 db.commit()
 if sys.platform=='darwin':
     assert engine.cleanup(sys.argv[4],'result',1791244800)=='deleted'
+local=engine.inventory(sys.argv[5],1791244800)
+assert local.get('size_is_complete'),local
+if sys.platform=='darwin':
+    assert engine.cleanup(sys.argv[5],'result',1791244800)=='deleted'
+    retained=json.loads(db.execute('SELECT result_json FROM jobs WHERE job_id=?',(sys.argv[5],)).fetchone()[0])
+    assert retained['summary']=='local fixture'
 print(json.dumps(item))
 db.close()
-`, config.databasePath, config.jobsWorkspaceRoot, config.jobResultsDir, job.job_id], {
+`, config.databasePath, config.jobsWorkspaceRoot, config.jobResultsDir, job.job_id, localJob.job_id], {
       cwd: fileURLToPath(new URL("../../scripts/maintenance", import.meta.url)), encoding: "utf8", timeout: 30_000,
     });
     assert.equal(result.status, 0, result.error?.message ?? result.stderr);

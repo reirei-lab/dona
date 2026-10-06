@@ -131,6 +131,8 @@ def parent_handle(root_fd, relative):
         for segment in parts[:-1]:
             info = os.stat(segment, dir_fd=descriptor, follow_symlinks=False)
             checked(info, True)
+            if info.st_dev != os.fstat(descriptor).st_dev:
+                raise Protected("mount_boundary")
             child = os.open(segment, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
             if identity(os.fstat(child)) != identity(info):
                 os.close(child)
@@ -143,6 +145,7 @@ def parent_handle(root_fd, relative):
                 checked(info, True)
                 if identity(info) != expected:
                     raise Protected("ancestor_replaced")
+        recheck.snapshot = [[segment, expected] for _, segment, expected in chain]
         yield descriptor, parts[-1], recheck
     finally:
         os.close(descriptor)
@@ -157,6 +160,8 @@ def walk(parent, name, budget, delete=False, expected=None, depth=0):
         raise Protected("depth_budget_exceeded")
     info = os.stat(name, dir_fd=parent, follow_symlinks=False)
     checked(info)
+    if info.st_dev != os.fstat(parent).st_dev:
+        raise Protected("mount_boundary")
     if expected is not None and identity(info) != expected:
         raise Protected("artifact_replaced")
     allocated = info.st_blocks * 512
@@ -196,6 +201,13 @@ class Retention:
         self.db = database
         self.db.row_factory = sqlite3.Row
         self.roots = {"workspace": workspace_root, "result": result_root}
+        canonical = [os.path.realpath(root) for root in self.roots.values()]
+        if os.path.commonpath(canonical) in canonical:
+            raise Protected("artifact_roots_overlap")
+        # Also reject same-inode aliases that lexical canonicalization misses.
+        with private_root(workspace_root) as workspace, private_root(result_root) as result:
+            if identity(os.fstat(workspace)) == identity(os.fstat(result)):
+                raise Protected("artifact_roots_overlap")
         self.policy = policy
 
     def install(self):
@@ -264,7 +276,8 @@ class Retention:
             raise Protected("worker_stop_unverified")
         stopped = timestamp(receipt.get("verified_at", receipt.get("observed_at")))
         completed = timestamp(row["completed_at"])
-        if max(stopped, completed) + self.policy.retention_days * 86400 > now:
+        created = timestamp(row["created_at"])
+        if max(created, stopped, completed) + self.policy.retention_days * 86400 > now:
             raise Protected("retention_not_expired")
         completions = self.db.execute("SELECT * FROM job_completion_results WHERE job_id=?", (job_id,)).fetchall()
         matching = False
@@ -282,6 +295,12 @@ class Retention:
                 raise Protected("retention_not_expired")
             if completion["job_status"] == row["status"]:
                 matching = True
+        if not matching:
+            binding = self.db.execute("SELECT * FROM job_owner_bindings WHERE job_id=? AND source_event_id=?",
+                                      (row["job_id"], row["source_event_id"])).fetchone()
+            if binding and object_json(binding["destination_json"]) == {"kind": "none"}:
+                self.local_completion(row, binding)
+                return row
         # Grouped delivery is not settled by a sibling's completion receipt.
         group = self.db.execute("SELECT * FROM job_groups WHERE source_event_id=?", (row["source_event_id"],)).fetchone()
         event_id = row["completion_event_id"]
@@ -299,6 +318,8 @@ class Retention:
         elif any(object_json(item["destination_json"]) != {"kind": "none"} for item in completions):
             raise Protected("notification_unverified")
         if not matching:
+            # A fixed local destination:none intentionally has no all-terminal
+            # notification. Validate its command receipt and retained DB Result.
             self.regular_notification(row, event_id, now)
         return row
 
@@ -310,6 +331,9 @@ class Retention:
         if not binding:
             raise Protected("notification_unverified")
         destination = object_json(binding["destination_json"])
+        if destination == {"kind": "none"}:
+            self.local_completion(row, binding)
+            return
         if not isinstance(destination, dict) or destination.get("kind") != "slack_thread":
             raise Protected("notification_route_unsupported")
         event = self.db.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
@@ -339,6 +363,25 @@ class Retention:
             raise Protected("notification_unsettled")
         if timestamp(event["completed_at"]) + self.policy.retention_days * 86400 > now:
             raise Protected("retention_not_expired")
+
+    def local_completion(self, row, binding):
+        owner = object_json(binding["owner_json"])
+        event = self.db.execute("SELECT * FROM events WHERE event_id=?", (row["source_event_id"],)).fetchone()
+        if owner.get("kind") != "local_dashboard" or row["source"] != "web" or not event or event["source"] != "web" or event["reply_target_json"] is not None or event["status"] != "completed":
+            raise Protected("notification_binding_mismatch")
+        subject = object_json(event["subject_json"])
+        if any(subject.get(key) != owner.get(key) for key in ("instance_id", "owner_id")):
+            raise Protected("notification_binding_mismatch")
+        recorded = self.db.execute("SELECT * FROM event_job_bindings WHERE event_id=?", (row["source_event_id"],)).fetchone()
+        receipt = self.db.execute("""SELECT 1 FROM local_dashboard_command_receipts
+            WHERE task_id=? AND operation='create' AND instance_id=? AND owner_id=? AND event_id=? LIMIT 1""",
+                                  (row["task_id"], owner["instance_id"], owner["owner_id"], row["source_event_id"])).fetchone()
+        if not recorded or recorded["owner_json"] != binding["owner_json"] or object_json(recorded["destination_json"]) != {"kind": "none"} or not receipt:
+            raise Protected("notification_binding_mismatch")
+        result = object_json(row["result_json"])
+        if result.get("job_id") != row["job_id"] or result.get("status") != row["status"]:
+            raise Protected("local_completion_unverified")
+        timestamp(result.get("completed_at"))
 
     def candidates(self, row):
         workspace = object_json(row["workspace_json"])
@@ -430,13 +473,21 @@ class Retention:
                 cursor = job_id
             finally:
                 del self._batch_budget
-        with private_root(self.roots["result"]) as root:
-            capacity = os.fstatvfs(root)
-            available = capacity.f_bavail * capacity.f_frsize
+        capacities = {}
+        for root_kind, root_path in self.roots.items():
+            try:
+                with private_root(root_path) as root:
+                    capacity = os.fstatvfs(root)
+                    available = capacity.f_bavail * capacity.f_frsize
+                capacities[root_kind] = {"available_bytes": available, "disk_floor_met": self.policy is not None and available >= self.policy.disk_floor_bytes}
+            except (Protected, OSError):
+                capacities[root_kind] = {"available_bytes": None, "disk_floor_met": False, "cleanup_error": "disk_observation_unverified"}
+        available = min(item["available_bytes"] for item in capacities.values()) if all(
+            item["available_bytes"] is not None for item in capacities.values()) else None
         artifacts = [artifact for item in results for artifact in item["artifacts"]]
         return {"dry_run": dry_run, "jobs": results, "next_cursor": cursor,
                 "has_more": len(rows) > len(results), "available_bytes": available,
-                "disk_floor_met": self.policy is not None and available >= self.policy.disk_floor_bytes, "artifact_count": len(artifacts),
+                "root_capacities": capacities, "disk_floor_met": all(item["disk_floor_met"] for item in capacities.values()), "artifact_count": len(artifacts),
                 "measured_bytes": sum(item["allocated_bytes"] or 0 for item in artifacts),
                 "unmeasured_count": sum(item["allocated_bytes"] is None for item in artifacts),
                 "size_is_complete": not any(item["protection_reasons"] for item in results) and
@@ -476,11 +527,13 @@ class Retention:
                         current = os.stat(name, dir_fd=parent, follow_symlinks=False)
                         if identity(current) != identity(info) or current.st_ctime_ns != info.st_ctime_ns:
                             raise Protected("artifact_replaced")
+                        scope = {"artifact": identity(info), "root": identity(os.fstat(root)), "ancestors": recheck.snapshot}
                         self.db.execute("INSERT INTO task_artifact_retention VALUES(?,?,?,?,?,?,'purged',?,?,NULL)",
-                                        (job_id, kind, root_kind, relative, json.dumps(identity(info)), str(info.st_ctime_ns),
+                                        (job_id, kind, root_kind, relative, json.dumps(scope), str(info.st_ctime_ns),
                                          allocated, dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat().replace("+00:00", "Z")))
                         if kind == "result":
-                            self.db.execute("UPDATE jobs SET result_json=NULL WHERE job_id=?", (job_id,))
+                            if row["source"] != "web":
+                                self.db.execute("UPDATE jobs SET result_json=NULL WHERE job_id=?", (job_id,))
                             self.db.execute("UPDATE task_attempts SET checkpoint_json=NULL WHERE attempt_id=?", (job_id,))
                     self.db.commit()
                     hook("purged")
@@ -493,9 +546,16 @@ class Retention:
             self.eligible(job_id, now)
             saved = self.db.execute("SELECT * FROM task_artifact_retention WHERE job_id=? AND kind=?", (job_id, kind)).fetchone()
             with private_root(self.roots[root_kind]) as root:
-                expected = json.loads(saved["identity_json"])
+                scope = object_json(saved["identity_json"])
+                expected = scope.get("artifact")
+                if not isinstance(expected, list) or len(expected) != 5 or not isinstance(scope.get("ancestors"), list):
+                    raise Protected("artifact_identity_unverified")
+                if identity(os.fstat(root)) != scope.get("root"):
+                    raise Protected("root_replaced")
                 tomb = ".retention-" + hashlib.sha256((job_id + ":" + kind).encode()).hexdigest()
                 with parent_handle(root, relative) as (parent, name, recheck):
+                    if recheck.snapshot != scope["ancestors"]:
+                        raise Protected("ancestor_replaced")
                     try:
                         tomb_info = os.stat(tomb, dir_fd=parent, follow_symlinks=False)
                     except FileNotFoundError:
