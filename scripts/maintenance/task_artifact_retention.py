@@ -310,15 +310,17 @@ class Retention:
             destination = object_json(completion["destination_json"])
             if destination != object_json(binding["destination_json"]):
                 raise Protected("notification_binding_mismatch")
+            superseded = False
             if completion["notification_state"] == "none" and destination != {"kind": "none"}:
-                raise Protected("notification_unsettled")
+                self.superseded_completion(row, completion, binding, now)
+                superseded = True
             if completion["notification_state"] not in ("none", "accepted"):
                 raise Protected("notification_unsettled")
             if completion["notification_state"] == "accepted" and completion["notification_event_id"]:
                 self.settled_event(completion["notification_event_id"], now)
             if timestamp(completion["content_delete_at"]) > now:
                 raise Protected("retention_not_expired")
-            if completion["job_status"] == row["status"]:
+            if completion["job_status"] == row["status"] and not superseded:
                 matching = True
         if local:
             return row
@@ -341,6 +343,24 @@ class Retention:
             # notification. Validate its command receipt and retained DB Result.
             self.regular_notification(row, event_id, now)
         return row
+
+    def superseded_completion(self, row, completion, binding, now):
+        # Only Dispatcher-settled historical schedule notifications qualify.
+        # They cannot stand in for the final accepted notification.
+        if object_json(binding["owner_json"]).get("kind") != "schedule":
+            raise Protected("notification_unsettled")
+        destination = object_json(binding["destination_json"])
+        target = destination.get("target") if destination.get("kind") == "slack" else None
+        if not isinstance(target, dict):
+            raise Protected("notification_binding_mismatch")
+        event = self.db.execute("SELECT * FROM events WHERE event_id=?",
+                                (completion["notification_event_id"],)).fetchone()
+        if not event or event["source"] != "dona_job" or event["status"] != "completed" or event["last_error_code"] != "job_result_superseded":
+            raise Protected("notification_unsettled")
+        subject = object_json(event["subject_json"])
+        if subject.get("job_id") != row["job_id"] or subject.get("source_event_id") != row["source_event_id"] or object_json(event["reply_target_json"]) != target:
+            raise Protected("notification_binding_mismatch")
+        self.settled_event(event["event_id"], now)
 
     def settled_event(self, event_id, now):
         event = self.db.execute("SELECT status,completed_at FROM events WHERE event_id=?", (event_id,)).fetchone()

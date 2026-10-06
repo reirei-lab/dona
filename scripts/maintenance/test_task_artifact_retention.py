@@ -96,6 +96,42 @@ class RetentionTests(unittest.TestCase):
         self.db.commit()
         self.assertTrue(self.engine.inventory(JOB, NOW)["size_is_complete"])
 
+    def test_superseded_schedule_completion_requires_bound_settled_event_and_final_delivery(self):
+        for column in ("source", "subject_json", "reply_target_json", "last_error_code"):
+            self.db.execute("ALTER TABLE events ADD COLUMN " + column + " TEXT")
+        owner = json.dumps({"kind": "schedule", "run_id": "private-run"})
+        target = json.dumps({"kind": "thread", "workspace_id": "fixture", "channel_id": "fixture", "thread_ts": "1.000001"})
+        destination = json.dumps({"kind": "slack", "target": json.loads(target)})
+        subject = json.dumps({"job_id": JOB, "source_event_id": "event-" + JOB})
+        old_event, final_event = "report-" + JOB, "final-" + JOB
+        self.db.execute("UPDATE job_owner_bindings SET owner_json=?,destination_json=? WHERE job_id=?", (owner, destination, JOB))
+        self.db.execute("UPDATE job_completion_results SET notification_state='none',job_status='needs_review',destination_json=? WHERE job_id=?", (destination, JOB))
+        self.db.execute("UPDATE events SET source='dona_job',last_error_code='job_result_superseded',subject_json=?,reply_target_json=? WHERE event_id=?",
+                        (subject, target, old_event))
+        self.db.execute("INSERT INTO events(event_id,status) VALUES(?,'completed')", (final_event,))
+        self.db.execute("INSERT INTO job_completion_results VALUES(?,'completed',?,'accepted',?,?)", (JOB, destination, OLD, final_event))
+        self.db.execute("UPDATE jobs SET completion_event_id=? WHERE job_id=?", (final_event, JOB))
+        self.db.commit()
+        self.assertTrue(self.engine.inventory(JOB, NOW)["size_is_complete"])
+        self.db.execute("UPDATE events SET last_error_code=NULL WHERE event_id=?", (old_event,))
+        self.db.commit()
+        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
+        self.db.execute("UPDATE events SET last_error_code='job_result_superseded',subject_json='{}' WHERE event_id=?", (old_event,))
+        self.db.commit()
+        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_binding_mismatch"])
+        self.db.execute("UPDATE events SET subject_json=?,completed_at='2026-10-05T00:00:00Z' WHERE event_id=?", (subject, old_event))
+        self.db.commit()
+        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["retention_not_expired"])
+        self.db.execute("UPDATE events SET completed_at=? WHERE event_id=?", (OLD, old_event))
+        self.db.execute("UPDATE job_completion_results SET notification_state='pending' WHERE notification_event_id=?", (final_event,))
+        self.db.commit()
+        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
+        self.db.execute("UPDATE job_completion_results SET notification_state='accepted' WHERE notification_event_id=?", (final_event,))
+        self.db.commit()
+        self.assertTrue(self.engine.inventory(JOB, NOW)["size_is_complete"])
+        if HAS_BIRTH:
+            self.assertEqual(self.engine.cleanup(JOB, "result", NOW), "deleted")
+
     def test_dry_run_measures_without_purge(self):
         inventory = self.engine.batch(NOW)
         self.assertTrue(inventory["size_is_complete"])

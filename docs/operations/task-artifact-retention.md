@@ -24,6 +24,8 @@ owner bindingを常に要求し、local dashboardのreceipt照合はcompletion�
 
 matching completion行がある場合も、各通知eventとgroup最終eventの完了後にpolicyの保持期間を要求する。通知が遅れて届いても、jobの古いterminal時刻だけで直後に削除しない。
 
+scheduleの旧completionが`none`でも、同じJob/source event/固定宛先の通知eventが`completed`かつ`job_result_superseded`と確定した場合だけ旧通知の決着として扱う。その完了後にも保持期間を要求し、後続の最終通知が未決着なら保護する。superseded行を最終通知成功の代用にしない。
+
 Git worktreeは登録解除契約が未確定なので、関連progress/Resultも含め候補全体を保護する。handoff markerだけでなく同じworkspace pathへの全Job参照も照合し、markerのないpredecessorからも共有workspaceを削除しない。この版の削除対象は独立scratch workspace、そのprogress directory、Attempt専用Result directoryだけ。
 
 mainで追加されたTask continuationはterminal memberのDB Resultを次段階の認可・成果projectionに使うため、memberが属するscopeが`cancelled`以外ならartifact全体を保護する。`active`、`paused`、未知state、scope欠落は削除しない。Task自身のterminalだけでは継続workflowの終了とは扱わず、不可逆なscope cancellation後だけ他の保持条件を評価する。
