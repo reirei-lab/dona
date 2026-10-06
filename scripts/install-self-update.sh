@@ -678,7 +678,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
     assert_control_targets
     record_control_phase verified
     CONTROL_RECEIPT_TMP="$CONTROL_ROOT/.control-plane-receipt.json.$$.$RANDOM.tmp"
-    $NODE_PATH "$SCRIPT_DIR/write-control-receipt.mjs" "$BACKUP_ROOT" "$CONTROL_RECEIPT_TMP" "$INSTALL_SHA" "$CONTROL_ROOT/updater"
+    $NODE_PATH "$SCRIPT_DIR/write-control-receipt.mjs" "$BACKUP_ROOT" "$CONTROL_RECEIPT_TMP" "$INSTALL_SHA" "$CONTROL_ROOT/updater" "$UPDATER_SOCKET" "$DOMAIN"
     /bin/mv "$CONTROL_RECEIPT_TMP" "$CONTROL_ROOT/control-plane-receipt.json"
     $NODE_PATH -e 'const fs=require("node:fs");const fd=fs.openSync(process.argv[1],"r");try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}' "$CONTROL_ROOT"
     CONTROL_UPGRADE_ACTIVE=0
