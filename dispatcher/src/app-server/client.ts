@@ -3,6 +3,7 @@ import type {ConversationIdentity,ConversationSnapshot} from "./observation.js";
 import http from "node:http";
 import type {AgentRecord,QuestionRecord,ArchivedConversation} from "./store.js";
 import type {StartAgent} from "./manager.js";
+import {workerHandoffProtocol,type WorkerHandoffInventory} from "./worker-handoff.js";
 
 export class RuntimeResponseError extends Error {
   constructor(readonly code:string,readonly status:number){super(code);}
@@ -25,6 +26,7 @@ export class RuntimeClient {
   externalRequests():Promise<ExternalToolRequest[]>{return this.call("externalRequests");}
   resolveExternal(name:string,id:string,result:{request_id:string|null;state:string}):Promise<unknown>{return this.call("resolveExternal",{name,id,result});}
   conversations(after?:string):Promise<{items:ConversationIdentity[];next:string|null}>{return this.call("conversations",{after});}
+  workerHandoffInventory(after?:string):Promise<WorkerHandoffInventory>{return this.call("workerHandoffInventory",{protocol:workerHandoffProtocol,after});}
   conversationHistory(name:string,afterGeneration?:string):Promise<{items:ArchivedConversation[];next:string|null}>{return this.call("conversationHistory",{name,afterGeneration});}
   conversation(name:string,generation:string,afterSequence?:number):Promise<ConversationSnapshot>{return this.call("conversation",{name,generation,afterSequence});}
   status(name:string):Promise<AgentRecord|null>{return this.call("status",{name});}
