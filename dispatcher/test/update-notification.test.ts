@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import http from "node:http";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
@@ -10,6 +11,7 @@ import type { Logger } from "../src/logger.js";
 import type { EventEnvelope } from "../src/types.js";
 import {
   renderUpdateNotification,
+  SlackAdapterNotificationClient,
   type SlackNotificationPort,
   UpdateNotificationDatabase,
   UpdateNotificationWorker,
@@ -288,7 +290,7 @@ describe("UpdateNotificationWorker", () => {
     notifications.close();
   });
 
-  test("keeps a confirmed partial Slack receipt when identity-block persistence fails", async () => {
+  test("identity未保存receiptを成功actionへ変換しない", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const events = new DispatcherDatabase(config.databasePath);
@@ -316,13 +318,90 @@ describe("UpdateNotificationWorker", () => {
     await waitFor(() => events.get(event.event_id)?.status === "needs_review");
     await worker.stop();
     const row = notifications.get(event.event_id)!;
-    assert.equal(row.message_ts, "1788390700.384279");
-    assert.equal(row.post_status, "created");
+    assert.equal(row.message_ts, null);
+    assert.equal(row.post_status, null);
     const result = JSON.parse(await fs.readFile(path.join(config.resultsDir, `${event.event_id}.json`), "utf8")) as Record<string, unknown>;
     assert.equal(result.status, "failed");
-    assert.equal((result.actions as unknown[]).length, 2);
+    assert.equal((result.actions as unknown[]).length, 0);
     events.close();
     notifications.close();
+  });
+
+  test("private UDSの不正成功receiptと旧identity未保存receiptは永久保留となる", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    await fs.mkdir(path.dirname(config.updateInternalTokenPath), { recursive: true, mode: 0o700 });
+    await fs.writeFile(config.updateInternalTokenPath, "test-internal-token".repeat(3), { mode: 0o600 });
+    await fs.mkdir(path.dirname(config.slackAdapterSocketPath), { recursive: true, mode: 0o700 });
+    const input = { notification_id: updateEnvelope().external_event_id,
+      workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456",
+      desired_session_status: "active" };
+    const receipt = { ...input, message_ts: "1788390700.384279", post_status: "created", session_status: "active" };
+    let status = 200, body: Record<string, unknown> = receipt, calls = 0;
+    const server = http.createServer((request, response) => {
+      calls += 1;
+      request.resume();
+      response.writeHead(status, { "content-type": "application/json" });
+      response.end(JSON.stringify(body));
+    });
+    await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(config.slackAdapterSocketPath, resolve); });
+    try {
+      const client = new SlackAdapterNotificationClient(config);
+      assert.equal((await client.deliver(input)).outcome, "reported");
+      body = { ...receipt, session_status: "suspended" };
+      assert.deepEqual(await client.deliver(input), { outcome: "permanent", code: "invalid_slack_adapter_response",
+        message: "Slack Adapter receipt could not be bound to the delivery" });
+      status = 409;
+      body = { receipt, error: { code: "identity_block_not_persisted", message: "unverified" } };
+      assert.deepEqual(await client.deliver(input), { outcome: "permanent", code: "identity_block_not_persisted", message: "unverified" });
+      assert.equal(calls, 3);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  test("不一致receiptは再送せずneeds_reviewをrestart後も保持する", async () => {
+    for (const change of [
+      { notification_id: "other" }, { workspace_id: "T_OTHER" },
+      { channel_id: "C_OTHER" }, { thread_ts: "1756722031.123456" },
+      { message_ts: "invalid" }, { session_status: "suspended" },
+    ]) {
+      const { root, config } = await tempConfig();
+      roots.push(root);
+      const events = new DispatcherDatabase(config.databasePath);
+      let notifications = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
+      const event = events.enqueue(updateEnvelope()).row;
+      let calls = 0;
+      const slack: SlackNotificationPort = {
+        async deliver(input) {
+          calls += 1;
+          return { outcome: "reported", receipt: {
+            notification_id: input.notification_id as string,
+            workspace_id: input.workspace_id as string,
+            channel_id: input.channel_id as string,
+            thread_ts: input.thread_ts as string,
+            message_ts: "1788390700.384279", post_status: "created", session_status: "active",
+            ...change,
+          } as import("../src/update-notification.js").SlackNotificationReceipt };
+        },
+      };
+      const worker = new UpdateNotificationWorker(events, notifications, slack, config, logger);
+      worker.start();
+      await waitFor(() => events.get(event.event_id)?.status === "needs_review");
+      await worker.stop();
+      notifications.close();
+      notifications = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
+      const restarted = new UpdateNotificationWorker(events, notifications, slack, config, logger);
+      restarted.start();
+      await new Promise((resolve) => setTimeout(resolve, config.queuePollMs * 2));
+      await restarted.stop();
+      assert.equal(calls, 1);
+      assert.equal(notifications.get(event.event_id)?.status, "needs_review");
+      const result = JSON.parse(await fs.readFile(path.join(config.resultsDir, `${event.event_id}.json`), "utf8"));
+      assert.deepEqual(result.actions, []);
+      events.close();
+      notifications.close();
+    }
   });
 
   test("recovers an unexpected ambiguous delivery and reconciles it before retrying", async () => {

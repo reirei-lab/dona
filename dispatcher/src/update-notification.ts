@@ -75,6 +75,16 @@ function slackReceipt(value: unknown): SlackNotificationReceipt | undefined {
   return receipt as unknown as SlackNotificationReceipt;
 }
 
+function boundSlackReceipt(value: unknown, input: Record<string, unknown>): SlackNotificationReceipt | undefined {
+  const receipt = slackReceipt(value);
+  if (!receipt || receipt.notification_id !== input.notification_id ||
+    receipt.workspace_id !== input.workspace_id || receipt.channel_id !== input.channel_id ||
+    receipt.thread_ts !== input.thread_ts || receipt.session_status !== input.desired_session_status ||
+    !/^\d{10,}\.\d+$/.test(receipt.message_ts) ||
+    !Number.isFinite(Number(receipt.message_ts))) return undefined;
+  return receipt;
+}
+
 function terminalFence(externalEventId: string): number {
   const value = Number(/:terminal:(\d+)$/.exec(externalEventId)?.[1]);
   if (!Number.isSafeInteger(value) || value < 0) throw new Error("terminal fence is invalid");
@@ -370,21 +380,17 @@ export class SlackAdapterNotificationClient implements SlackNotificationPort {
     try {
       const response = await udsRequest(this.config.slackAdapterSocketPath, token, input, this.config.jobCommandTimeoutMs);
       if (response.statusCode === 200) {
-        const receipt = slackReceipt(response.body);
-        if (!receipt || receipt.notification_id !== input.notification_id ||
-          receipt.workspace_id !== input.workspace_id || receipt.channel_id !== input.channel_id ||
-          receipt.thread_ts !== input.thread_ts) {
-          return { outcome: "retryable", code: "invalid_slack_adapter_response", message: "Slack Adapter response was invalid" };
+        const receipt = boundSlackReceipt(response.body, input);
+        if (!receipt) {
+          return { outcome: "permanent", code: "invalid_slack_adapter_response", message: "Slack Adapter receipt could not be bound to the delivery" };
         }
         return { outcome: "reported", receipt };
       }
       const error = response.body.error as Record<string, unknown> | undefined;
       const code = typeof error?.code === "string" ? error.code : `slack_adapter_http_${response.statusCode}`;
       const message = typeof error?.message === "string" ? error.message : "Slack Adapter rejected the notification";
-      const receipt = response.statusCode === 409 ? slackReceipt(response.body.receipt) : undefined;
-      const boundReceipt = receipt && receipt.notification_id === input.notification_id &&
-        receipt.workspace_id === input.workspace_id && receipt.channel_id === input.channel_id &&
-        receipt.thread_ts === input.thread_ts ? receipt : undefined;
+      const boundReceipt = response.statusCode === 409 && code !== "identity_block_not_persisted"
+        ? boundSlackReceipt(response.body.receipt, input) : undefined;
       return [400, 401, 403, 409].includes(response.statusCode)
         ? { outcome: "permanent", code, message, ...(boundReceipt ? { receipt: boundReceipt } : {}) }
         : { outcome: "retryable", code, message };
@@ -566,7 +572,7 @@ export class UpdateNotificationWorker {
     const row = this.notifications.beginDelivery(candidate.event_id);
     const replyTarget = JSON.parse(row.reply_target_json) as Record<string, unknown>;
     const payload = JSON.parse(row.payload_json) as { update_status: string };
-    const outcome = await this.slack.deliver({
+    const deliveryInput = {
       schema_version: 1,
       notification_id: row.notification_id,
       request_id: row.request_id,
@@ -577,7 +583,8 @@ export class UpdateNotificationWorker {
       thread_ts: replyTarget.thread_ts,
       text: row.rendered_text,
       desired_session_status: row.desired_session_status,
-    });
+    };
+    const outcome = await this.slack.deliver(deliveryInput);
     if (outcome.outcome === "retryable") {
       this.notifications.markPending(row.event_id, outcome.code, outcome.message);
       return;
@@ -587,13 +594,21 @@ export class UpdateNotificationWorker {
         row.event_id,
         outcome.code,
         outcome.message,
-        outcome.receipt,
+        outcome.code === "identity_block_not_persisted" ? undefined : boundSlackReceipt(outcome.receipt, deliveryInput),
       );
       await this.finalizePermanent(event, permanent);
       return;
     }
-    const posted = this.notifications.markPosted(row.event_id, outcome.receipt);
-    await this.finalizeReported(event, posted, outcome.receipt);
+    const receipt = boundSlackReceipt(outcome.receipt, deliveryInput);
+    if (!receipt) {
+      const rejected = this.notifications.markPermanentPosted(
+        row.event_id, "invalid_slack_adapter_response", "Slack Adapter receipt could not be bound to the delivery",
+      );
+      await this.finalizePermanent(event, rejected);
+      return;
+    }
+    const posted = this.notifications.markPosted(row.event_id, receipt);
+    await this.finalizeReported(event, posted, receipt);
   }
 
   private async finalizeReported(

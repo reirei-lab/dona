@@ -19,3 +19,30 @@ schema v2 から v3 への移行では、terminal な旧 Slack job の元 event 
 確認には `job_legacy_notification_migration` の `state`、固定 `workspace_id`、`channel_id`、`thread_ts`、`message_ts`、`jobs.completion_event_id`、対応する `events.external_event_id` を同一 DB snapshot で読む。Result 本文、objective、認証情報を診断ログへ転記しない。
 
 受理不明を運用者が「未送信」と確認した場合は、`job legacy-notification <job_id>` で現在の job 更新時刻と marker 分類時刻を読む。投稿履歴・元 Result・固定宛先の照合証拠の SHA-256 を用意し、`job reconcile-legacy-notification <job_id> <expected_job_updated_at> <expected_classified_at> <evidence_sha256> --notification-reviewed --no-post-confirmed` を一度だけ実行する。現在の status、error code、両時刻、`completion_event_id`、既存 `dona_job` event を transaction 内で再検査し、合致したときだけ marker を `not_sent` に変えて証拠 digest と判断時刻を別 table へ記録する。この command は監査記録だけを確定し、旧 thread への通知を生成しない。次に `job notification-preview` で保留候補を確認し、承認・access 再検証・配送 receipt の仕組みが実装されるまで投稿せず隔離する。応答が曖昧なら同じ command を再実行せず、`job legacy-notification` と event を再読する。既送信と判断した場合は、この未送信確定 command を使わず個別に調査する。
+
+
+## update通知のread-backとreceiptの境界
+
+update reporterは投稿前の全page照合に加えて、投稿成功応答後も本文、bot author、identity block、固定thread、非broadcast、message timestampを全pageで照合してからAgent Sessionを更新する。identity未保存・異内容・照合不能ではsessionを終端化せず、成功actionを含むreceiptを返さない。照合不能は永久保留として`needs_review`へ進める。投稿応答喪失後は同じidentityをread-onlyで照合し、確認不能なら自動再投稿しない。
+
+Dispatcherはreceiptのnotification ID、workspace、channel、thread、message timestamp形式、要求したsession statusを照合する。不一致の成功応答をretryableへ戻さず、成功actionなしのfailed Resultと`needs_review`を保存する。`identity_block_not_persisted`の旧形式partial receiptも成功actionへ変換しない。session更新のみ失敗した場合は次の処理で先に全pageを照合し、既送信が一意に確認できるときだけsessionを再調整する。
+
+これは配送照合の部分実装であり、現在のowner/access認可を証明しない。以下のowner bindingが未確定の通知は未送信または`needs_review`のまま隔離し、この部分PRのみを根拠にactivation・旧thread投稿・operator batch再送を行わない。
+
+## update owner復元の未確定契約
+
+現在のUpdater `update_requests`は`request_id`、`source_event_id`、`approval_event_id`、`reply_target_json`を保存する。`update_outbox`のterminal envelopeにはrequest IDと固定宛先があるが、ownerやsource/approval eventへの参照は渡されない。Dispatcherからの`get_self_update_status`は安全なstatus projectionであり、現在のowner認可receiptを発行するAPIではない。Slack内部tokenはサービス間の呼出し元認証であり、保存宛先へowner情報を開示する権限の代用ではない。
+
+必要な照合経路は次のとおり。未確認のownerをpayload、古いreply target、job ID、承認actorから推測しない。
+
+1. terminal request IDから保存済みupdate requestと最新outboxを読む。request ID、external ID、terminal fence、payload digest、固定reply targetを照合し、superseded outboxを配送対象から除外する。
+2. 保存済みsource eventとapproval eventの参照をDispatcherの永続eventに照合する。workspace/channel/threadが固定reply targetと一致するか、actorが取得可能か、承認receiptがexact plan/fenceへ束縛されるか確認する。event欠損・別tenant・宛先drift・receipt unknownは配送を許可しない。
+3. 既存のupdate owner認可契約を確認する。request actorとapproval actorは別identityとして保持する。承認されたことだけでapproval actorをrequest ownerへ昇格させない。Task grantのresource/operationをupdateへ自動拡張しない。
+4. 確定したownerについて現在のworkspace/channel accessを照会する。request/fence、notification ID、payload digest、destination、owner、authorization revision、発行時刻・有効期限へ束縛した一回限りのaccess receiptを、write直前に同じ永続世代と照合する。revoke・supersede・group transitionの競合時は配送を保留する。
+5. read-back済み配送receiptとaccess receiptを同一通知identityへ保存する。外部write後の応答喪失・receipt保存前の再起動では新規writeをせず、保存receiptと全pageのexact identityからread-only reconcileする。保存済みreceiptの存在だけでは現在の開示権限を保証しない。
+
+追加APIの候補は、Updaterのrequest/outboxを照合する内部read-only projection、Dispatcherの保存source/approval eventを照合する内部projection、確定済みowner契約に基づく通知専用authorize/receipt-consumeである。現行status APIの情報開示scopeを無条件に広げない。承認actorからownerを自動決定するAPIや任意user IDを受け付けるAPIにはしない。
+
+仕様決定が必要なのは、request ownerの正本と委任の可否、承認者が別actorの場合の受領者と認可権限、元event消失時の保留/回復policy、grantのresource/operationとexpiry/revoke、access receiptの発行主体・署名・再検証・消費境界である。承認者をownerとする案は委任契約が未定、Task grantを使用する案はupdate resource契約が未定なので、いずれも採用済み仕様とはしない。
+
+本資料のfixture証拠はfake Slackとprivate一時DBでの検証である。current owner/access接続、job/update統合receipt、operator-approved historical batch、activation整合、2026-09-20の7 event shapeと全restart/group raceの受入は残る。mainにはTask/App Serverの後続変更があり、このfeature向け部分PRはmain統合完了を意味しない。
