@@ -224,3 +224,26 @@ for(const phase of ['not_sent','sending'] as const)test(`crash後のresume claim
   else await assert.rejects(manager.start({...input,name:'after-crash',attemptId:'after-crash'}),/already_claimed/);
  }finally{if(manager)for(const agent of f.runtime.agents())if(agent.state!=='stopped')await manager.stop(agent.name,agent.generation);await f.close();}
 });
+
+for(const remaining of [false,true])test(`PID保存直後のidentity欠落は不在証拠だけでclaimを解放する remaining=${remaining}`,async()=>{
+ const f=await fixture();let manager:AppServerManager|undefined;try{
+  f.migrate();const job=f.db.getJob(f.db.tasks.get(f.task.task_id)!.current_attempt_id)!,source=JSON.parse(job.workspace_json)._dona_resume.source;
+  const input:StartAgent={name:job.agent_name,attemptId:job.job_id,role:'worker',cwd:job.workspace_path,release:f.root,args:[],threadConfig:{},resumeFrom:source};
+  const pid=2147483645;manager=new AppServerManager(f.runtime,()=>({child:{pid}} as unknown as AppServerRpc));
+  await assert.rejects(manager.start(input),/runtime_process_identity_missing/);assert.equal(f.runtime.agent(job.agent_name)!.pid,pid);assert.equal(f.runtime.agent(job.agent_name)!.process_start,null);
+  const script=path.join(f.root,'identity-recovery.mjs');await fs.writeFile(script,`import readline from 'node:readline';readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);if(r.id!==undefined)process.stdout.write(JSON.stringify({id:r.id,result:r.method==='thread/resume'?{thread:{id:r.params.threadId}}:{}})+'\\n');});`);
+  manager=new AppServerManager(f.runtime,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd),false,()=>remaining?[{pid:pid-1,parent:1,group:pid,uid:process.getuid!(),start:'child',state:'S'}]:[]);
+  await manager.recover();
+  if(remaining){assert.notEqual(f.runtime.agent(job.agent_name)!.state,'stopped');await assert.rejects(manager.start({...input,name:'next',attemptId:'next'}),/already_claimed/);}
+  else assert.equal((await manager.start({...input,name:'next',attemptId:'next'})).thread_id,'saved-thread');
+ }finally{if(manager)for(const agent of f.runtime.agents())if(agent.state!=='stopped'&&agent.process_start)await manager.stop(agent.name,agent.generation);await f.close();}
+});
+
+test('回答済みのhuman_input checkpointを更新時に保留へ戻さない',async()=>{
+ const f=await fixture();try{
+  const checkpoint={schema_version:1 as const,task_id:f.task.task_id,attempt_id:f.job.job_id,sequence:1,summary:'回答済み',remaining:[],artifacts:[],unresolved_operations:[],waiting:'human_input' as const};
+  await fs.mkdir(path.dirname(f.job.result_path),{recursive:true});await fs.writeFile(path.join(path.dirname(f.job.result_path),'checkpoint.json'),JSON.stringify(checkpoint));f.db.tasks.checkpoint(f.job,checkpoint);f.db.tasks.wait(f.db.tasks.get(f.task.task_id)!,'human_input');
+  f.db.tasks.prepareSteer(f.task.task_id,f.event.event_id,f.db.tasks.get(f.task.task_id)!.revision,'回答');f.db.beginJobSteer(f.job.job_id,f.event.event_id);f.db.markJobSteerAccepted(f.job.job_id,f.event.event_id);f.db.tasks.finishSteer(f.task.task_id,f.event.event_id);
+  assert.equal(f.db.tasks.checkpointAnswered(f.job,checkpoint),true);f.migrate();assert.notEqual(f.db.tasks.get(f.task.task_id)!.current_attempt_id,f.job.job_id);
+ }finally{await f.close();}
+});

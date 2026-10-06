@@ -30,8 +30,8 @@ export class OfflineTaskResumes {
      const checkpoint=checkpointSnapshot(job,task.task_id).checkpoint??this.dispatcher.tasks.attemptCheckpoint(job.job_id);
      if(checkpoint){this.dispatcher.tasks.checkpoint(job,checkpoint);
       if(checkpoint.unresolved_operations.length||checkpoint.waiting==='external_effect_unknown')blocker='external_effect_unknown';
-      else if(checkpoint.waiting==='human_input')reason='human_input';
-      else if(checkpoint.waiting==='usage_limit'){reason='capacity_wait';retryAfter=checkpoint.retry_after??null;}
+      else if(!this.dispatcher.tasks.checkpointAnswered(job,checkpoint)&&checkpoint.waiting==='human_input')reason='human_input';
+      else if(!this.dispatcher.tasks.checkpointAnswered(job,checkpoint)&&checkpoint.waiting==='usage_limit'){reason='capacity_wait';retryAfter=checkpoint.retry_after??null;}
      }
     }catch{blocker='result_conflict';}
     if(source&&agent){

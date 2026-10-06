@@ -115,8 +115,9 @@ export class AppServerManager {
       }
       // spawn直後のPIDを他のawaitより前に保存する。開始identityが取得できなければ準備は未確定。
       const pid=rpc.child.pid;if(!pid)throw Error("runtime_spawn_identity_missing");
+      row.pid=pid;this.store.put(row);
       const processIdentity=identity(pid);if(!processIdentity)throw Error("runtime_process_identity_missing");
-      row.pid=pid;row.process_start=processIdentity.start;this.store.put(row);
+      row.process_start=processIdentity.start;this.store.put(row);
       this.bind(row,rpc);
       try {
         await rpc.initialize();
@@ -351,7 +352,7 @@ export class AppServerManager {
     if(!row||row.generation!==generation)throw Error("runtime_stop_identity_changed");
     this.store.db.prepare("DELETE FROM main_recoveries WHERE agent=? AND generation=?").run(name,generation);
     if(row.state!=="stopped") {
-      if(!row.pid||!row.process_start)throw Error("runtime_process_stop_evidence_missing");
+      if(!row.pid||!row.process_start)return this.serialized(name,()=>this.stopAgent(name,generation));
       const root:ProcessIdentity={pid:row.pid,parent:0,group:row.pid,uid:process.getuid!(),start:row.process_start,state:"unknown"};
       this.store.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopping') ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,processes_json=excluded.processes_json,state='stopping' WHERE stops.generation<>excluded.generation").run(name,generation,JSON.stringify([root]));
     }
@@ -360,7 +361,17 @@ export class AppServerManager {
   private async stopAgent(name:string,generation:string):Promise<AgentRecord> {
     const row=this.store.agent(name);if(!row||row.generation!==generation)throw Error("runtime_stop_identity_changed");
     if(row.state==="stopped")return row;
-    if(!row.pid||!row.process_start)throw Error("runtime_process_stop_evidence_missing");
+    if(!row.pid)throw Error("runtime_process_stop_evidence_missing");
+    if(!row.process_start){
+      const phase=this.store.db.prepare("SELECT phase FROM startup_phases WHERE agent=? AND generation=?").get(name,generation) as {phase:string}|undefined;
+      if(phase?.phase!=="not_sent"||this.processSample().some(p=>!p.state.includes("Z")&&(p.pid===row.pid||p.group===row.pid)))throw Error("runtime_process_stop_evidence_missing");
+      this.store.db.transaction(()=>{
+        this.store.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopped') ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,processes_json=excluded.processes_json,state='stopped'").run(name,generation,"[]");
+        this.store.change(name,generation,{state:"stopped",turn_id:null});
+      }).immediate();
+      this.connections.delete(name);return this.store.agent(name)!;
+    }
+
     const saved=this.store.db.prepare("SELECT processes_json FROM stops WHERE agent=? AND generation=?").get(name,generation) as {processes_json:string}|undefined;
     const root:ProcessIdentity={pid:row.pid,parent:0,group:row.pid,uid:process.getuid!(),start:row.process_start,state:"unknown"};
     await stopScope(root,saved?JSON.parse(saved.processes_json):[],rows=>this.store.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopping') ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,processes_json=excluded.processes_json,state='stopping'").run(name,generation,JSON.stringify(rows)));
