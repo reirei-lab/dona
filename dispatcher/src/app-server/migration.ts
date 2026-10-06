@@ -1,3 +1,4 @@
+import {DispatcherDatabase} from "../database.js";
 import fs from "node:fs";
 import Database from "better-sqlite3";
 import {randomUUID} from "node:crypto";
@@ -6,11 +7,12 @@ import {processes,same,type ProcessIdentity} from "./process.js";
 
 interface StopReceipt {processes:ProcessIdentity[];launch_agents:string[];herdr_session:string;verified_at:string;}
 /** 外部保守runnerだけが全writer停止後に呼ぶ。既存Task/Result/権限は変更しない。 */
-export function migrateStoppedRuntime(dispatcherFile:string,runtimeFile:string,receipt:StopReceipt,release:string):void {
+export function migrateStoppedRuntime(dispatcherFile:string,runtimeFile:string,receipt:StopReceipt,release:string,resume?:{runId:string;resultDir:string}):void {
  if(receipt.herdr_session!=="dona"||!["dev.dona.dispatcher","dev.dona.updater","dev.dona.slack-adapter"].every(label=>receipt.launch_agents.includes(label))||!Array.isArray(receipt.processes))throw Error("runtime_migration_stop_receipt_invalid");
  const sample=processes();
  if(receipt.processes.some(p=>{const live=sample.find(x=>x.pid===p.pid);return p.uid!==process.getuid?.()||(same(p,live)&&!live!.state.includes("Z"));}))throw Error("runtime_migration_process_still_alive");
  const source=new Database(dispatcherFile,{readonly:true,fileMustExist:true}),store=new RuntimeStore(runtimeFile);
+ const dispatcher=resume?new DispatcherDatabase(dispatcherFile):undefined;
  try {
   store.db.exec("CREATE TABLE IF NOT EXISTS stops(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,processes_json TEXT NOT NULL,state TEXT NOT NULL)");
   store.db.transaction(()=>{
@@ -20,6 +22,9 @@ export function migrateStoppedRuntime(dispatcherFile:string,runtimeFile:string,r
     store.db.prepare("DELETE FROM host_owner").run();
    }
    if(store.db.prepare("SELECT 1 FROM sqlite_master WHERE name='main_recoveries'").get())store.db.prepare("DELETE FROM main_recoveries").run();
+   // capture前にも全workerの停止を照合する。未確認の状態を再開権限にしない。
+   for(const agent of store.agents())if(agent.state!=="stopped"&&(!agent.pid||!agent.process_start||sample.some(p=>!p.state.includes("Z")&&((p.pid===agent.pid&&p.start===agent.process_start)||p.group===agent.pid))))throw Error("runtime_migration_agent_stop_missing");
+   if(resume)dispatcher!.tasks.offlineResumes.capture(store,resume.runId);
    // 古いApp Server要求は旧stdio接続に束縛されている。新接続へ回答を移植しない。
    store.db.prepare("UPDATE questions SET state='expired' WHERE state IN ('pending','answering')").run();
    for(const agent of store.agents()) {
@@ -40,6 +45,7 @@ export function migrateStoppedRuntime(dispatcherFile:string,runtimeFile:string,r
     store.put(row);store.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopped')").run(row.name,row.generation,JSON.stringify(receipt.processes));
    }
   }).immediate();
- }finally{source.close();store.close();}
+  if(resume)dispatcher!.tasks.offlineResumes.activate(resume.runId,resume.resultDir);
+ }finally{source.close();store.close();dispatcher?.close();}
  fs.chmodSync(runtimeFile,0o600);
 }

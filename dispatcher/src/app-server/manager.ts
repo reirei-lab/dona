@@ -1,3 +1,4 @@
+import type {ResumeFrom} from "../offline-task-resume.js";
 import {ExternalToolQueue,externalReplyTool} from "./external-tools.js";
 import { createHash,randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -10,7 +11,7 @@ import { identity,processes,same,stopScope,type ProcessIdentity } from "./proces
 import {workerHandoffProtocol,workerHandoffContractBlockers,workerHandoffBlockers,type WorkerHandoffInventory,type WorkerHandoffObservation} from "./worker-handoff.js";
 
 export const hash=(value:unknown)=>createHash("sha256").update(stableStringify(value)).digest("hex");
-export interface StartAgent {attemptId?:string;name:string;role:"main"|"worker";cwd:string;release:string;args:string[];threadConfig:Record<string,unknown>}
+export interface StartAgent {resumeFrom?:ResumeFrom;attemptId?:string;name:string;role:"main"|"worker";cwd:string;release:string;args:string[];threadConfig:Record<string,unknown>}
 export type RpcFactory=(args:string[],cwd:string,agent?:AgentRecord,attach?:boolean)=>AppServerRpc;
 const object=(x:unknown):Record<string,unknown>=>x!==null&&typeof x==="object"&&!Array.isArray(x)?x as Record<string,unknown>:{};
 
@@ -22,6 +23,7 @@ export class AppServerManager {
   private recoveryAfter=new Map<string,number>();
   constructor(readonly store:RuntimeStore,private readonly factory:RpcFactory,private readonly reconnect=false,private readonly processSample=processes) {
     this.external=new ExternalToolQueue(store);this.external.expireRestart();
+    store.db.exec("CREATE TABLE IF NOT EXISTS thread_resume_claims(source_name TEXT NOT NULL,source_generation TEXT NOT NULL,target_name TEXT NOT NULL UNIQUE,PRIMARY KEY(source_name,source_generation))");
     store.db.exec("CREATE TABLE IF NOT EXISTS startup_phases(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,phase TEXT NOT NULL)");
     store.db.exec("CREATE TABLE IF NOT EXISTS main_readiness(agent TEXT PRIMARY KEY,generation TEXT NOT NULL)");
     store.db.exec("CREATE TABLE IF NOT EXISTS turn_outcomes(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,state TEXT NOT NULL)");
@@ -78,9 +80,22 @@ export class AppServerManager {
         if(!this.connections.get(input.name)?.connected||!prior.thread_id||!["idle","working","waiting","interrupted"].includes(prior.state))throw Error("runtime_agent_recovery_required");
         return prior;
       }
+      if(prior&&this.store.db.prepare("SELECT 1 FROM thread_resume_claims WHERE source_name=? AND source_generation=?").get(prior.name,prior.generation))throw Error("runtime_resume_already_claimed");
+      const resumed=input.resumeFrom;
+      if(resumed){
+        const source=this.store.agent(resumed.name),sample=this.processSample();
+        if(input.role!=="worker"||!input.attemptId||input.name===resumed.name||!source||source.role!=="worker"||source.state!=="stopped"||source.generation!==resumed.generation||source.thread_id!==resumed.thread_id||source.cwd!==input.cwd||JSON.parse(source.config_json).attemptId!==resumed.attempt_id||
+          !this.store.db.prepare("SELECT 1 FROM stops WHERE agent=? AND generation=? AND state='stopped'").get(source.name,source.generation)||
+          sample.some(p=>!p.state.includes("Z")&&((p.pid===source.pid&&p.start===source.process_start)||p.group===source.pid)))throw Error("runtime_resume_source_unverified");
+      }
       const row:AgentRecord={name:input.name,generation:randomUUID(),role:input.role,cwd:input.cwd,release:input.release,
-        thread_id:input.role==="worker"?(prior?.thread_id??null):null,turn_id:null,pid:null,process_start:null,state:"starting",request_hash:requestHash,config_json:JSON.stringify(input),sequence:0};
+        thread_id:input.role==="worker"?(resumed?.thread_id??prior?.thread_id??null):null,turn_id:null,pid:null,process_start:null,state:"starting",request_hash:requestHash,config_json:JSON.stringify(input),sequence:0};
       this.store.db.transaction(()=>{
+        if(resumed){
+          const claim=this.store.db.prepare("SELECT target_name FROM thread_resume_claims WHERE source_name=? AND source_generation=?").get(resumed.name,resumed.generation) as {target_name:string}|undefined;
+          if(claim&&claim.target_name!==input.name)throw Error("runtime_resume_already_claimed");
+          this.store.db.prepare("INSERT OR IGNORE INTO thread_resume_claims VALUES(?,?,?)").run(resumed.name,resumed.generation,input.name);
+        }
         this.store.put(row);
         this.store.db.prepare("INSERT INTO startup_phases VALUES(?,?,'not_sent') ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,phase=excluded.phase").run(row.name,row.generation);
         if(recoveryGeneration)this.store.db.prepare("UPDATE main_recoveries SET generation=? WHERE agent=? AND generation=?").run(row.generation,row.name,recoveryGeneration);
@@ -94,20 +109,22 @@ export class AppServerManager {
         if(error instanceof RpcSpawnFailure)this.store.db.transaction(()=>{
           this.store.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopped') ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,processes_json=excluded.processes_json,state='stopped'").run(row.name,row.generation,"[]");
           this.store.change(row.name,row.generation,{state:"stopped",turn_id:null});this.connections.delete(row.name);
+          this.releaseUnsentResume(row);
         }).immediate();
         throw error;
       }
       // spawn直後のPIDを他のawaitより前に保存する。開始identityが取得できなければ準備は未確定。
       const pid=rpc.child.pid;if(!pid)throw Error("runtime_spawn_identity_missing");
+      row.pid=pid;this.store.put(row);
       const processIdentity=identity(pid);if(!processIdentity)throw Error("runtime_process_identity_missing");
-      row.pid=pid;row.process_start=processIdentity.start;this.store.put(row);
+      row.process_start=processIdentity.start;this.store.put(row);
       this.bind(row,rpc);
       try {
         await rpc.initialize();
         const params={...input.threadConfig,...(object(input.threadConfig.config)["features.default_mode_request_user_input"]!==false?{dynamicTools:[externalReplyTool]}:{}),cwd:input.cwd,...(row.thread_id?{threadId:row.thread_id,excludeTurns:true}:{})};
         this.store.db.prepare("UPDATE startup_phases SET phase='sending' WHERE agent=? AND generation=?").run(row.name,row.generation);
         const result=object(await rpc.request(row.thread_id?"thread/resume":"thread/start",params,90_000));
-        const thread=object(result.thread);if(typeof thread.id!=="string")throw Error("runtime_thread_identity_missing");
+        const thread=object(result.thread);if(typeof thread.id!=="string"||(row.thread_id&&thread.id!==row.thread_id))throw Error("runtime_thread_identity_missing");
         this.store.change(row.name,row.generation,{thread_id:thread.id,state:"idle"});
         this.store.db.prepare("UPDATE startup_phases SET phase='ready' WHERE agent=? AND generation=?").run(row.name,row.generation);
         return this.store.agent(row.name)!;
@@ -116,10 +133,14 @@ export class AppServerManager {
         const phase=this.store.db.prepare("SELECT phase FROM startup_phases WHERE agent=? AND generation=?").get(row.name,row.generation) as {phase:string};
         if(phase.phase==="not_sent"||(error instanceof RpcFailure&&["not_sent","rejected"].includes(error.acceptance))){
           this.store.db.prepare("UPDATE startup_phases SET phase='not_sent' WHERE agent=? AND generation=?").run(row.name,row.generation);
-          await this.stopAgent(row.name,row.generation);throw Error("runtime_start_not_sent");
+          await this.stopAgent(row.name,row.generation);this.releaseUnsentResume(row);throw Error("runtime_start_not_sent");
         }
         throw error;
       }
+  }
+  private releaseUnsentResume(row:AgentRecord):void {
+    const source=(JSON.parse(row.config_json) as StartAgent).resumeFrom;
+    if(source)this.store.db.prepare("DELETE FROM thread_resume_claims WHERE source_name=? AND source_generation=? AND target_name=?").run(source.name,source.generation,row.name);
   }
   private bind(row:AgentRecord,rpc:AppServerRpc):void {
       rpc.on("request",(message:RpcMessage)=>this.onRequest(row,message));
@@ -331,7 +352,7 @@ export class AppServerManager {
     if(!row||row.generation!==generation)throw Error("runtime_stop_identity_changed");
     this.store.db.prepare("DELETE FROM main_recoveries WHERE agent=? AND generation=?").run(name,generation);
     if(row.state!=="stopped") {
-      if(!row.pid||!row.process_start)throw Error("runtime_process_stop_evidence_missing");
+      if(!row.pid||!row.process_start)return this.serialized(name,()=>this.stopAgent(name,generation));
       const root:ProcessIdentity={pid:row.pid,parent:0,group:row.pid,uid:process.getuid!(),start:row.process_start,state:"unknown"};
       this.store.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopping') ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,processes_json=excluded.processes_json,state='stopping' WHERE stops.generation<>excluded.generation").run(name,generation,JSON.stringify([root]));
     }
@@ -340,7 +361,17 @@ export class AppServerManager {
   private async stopAgent(name:string,generation:string):Promise<AgentRecord> {
     const row=this.store.agent(name);if(!row||row.generation!==generation)throw Error("runtime_stop_identity_changed");
     if(row.state==="stopped")return row;
-    if(!row.pid||!row.process_start)throw Error("runtime_process_stop_evidence_missing");
+    if(!row.pid)throw Error("runtime_process_stop_evidence_missing");
+    if(!row.process_start){
+      const phase=this.store.db.prepare("SELECT phase FROM startup_phases WHERE agent=? AND generation=?").get(name,generation) as {phase:string}|undefined;
+      if(phase?.phase!=="not_sent"||this.processSample().some(p=>!p.state.includes("Z")&&(p.pid===row.pid||p.group===row.pid)))throw Error("runtime_process_stop_evidence_missing");
+      this.store.db.transaction(()=>{
+        this.store.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopped') ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,processes_json=excluded.processes_json,state='stopped'").run(name,generation,"[]");
+        this.store.change(name,generation,{state:"stopped",turn_id:null});
+      }).immediate();
+      this.connections.delete(name);return this.store.agent(name)!;
+    }
+
     const saved=this.store.db.prepare("SELECT processes_json FROM stops WHERE agent=? AND generation=?").get(name,generation) as {processes_json:string}|undefined;
     const root:ProcessIdentity={pid:row.pid,parent:0,group:row.pid,uid:process.getuid!(),start:row.process_start,state:"unknown"};
     await stopScope(root,saved?JSON.parse(saved.processes_json):[],rows=>this.store.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopping') ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,processes_json=excluded.processes_json,state='stopping'").run(name,generation,JSON.stringify(rows)));
@@ -359,8 +390,12 @@ export class AppServerManager {
       if((this.recoveryAfter.get(candidate.name)??0)>Date.now())continue;
       const phase=this.store.db.prepare("SELECT phase FROM startup_phases WHERE agent=? AND generation=?").get(candidate.name,candidate.generation) as {phase:string}|undefined;
       if(candidate.state!=="stopped"&&phase?.phase==="not_sent"){
-        await this.serialized(candidate.name,()=>this.stopAgent(candidate.name,candidate.generation)).catch(()=>{});continue;
+        await this.serialized(candidate.name,async()=>{
+          const stopped=await this.stopAgent(candidate.name,candidate.generation);
+          if(this.store.db.prepare("SELECT 1 FROM stops WHERE agent=? AND generation=? AND state='stopped'").get(stopped.name,stopped.generation))this.releaseUnsentResume(stopped);
+        }).catch(()=>{});continue;
       }
+      if(candidate.state==="stopped"&&phase?.phase==="not_sent"&&this.store.db.prepare("SELECT 1 FROM stops WHERE agent=? AND generation=? AND state='stopped'").get(candidate.name,candidate.generation))this.releaseUnsentResume(candidate);
       if(this.reconnect&&candidate.state!=="stopped"&&candidate.pid&&identity(candidate.pid)?.start===candidate.process_start&&!this.store.db.prepare("SELECT 1 FROM stops WHERE agent=? AND generation=?").get(candidate.name,candidate.generation)){
         this.recoveryAfter.set(candidate.name,Date.now()+30_000);
         await this.serialized(candidate.name,async()=>{
