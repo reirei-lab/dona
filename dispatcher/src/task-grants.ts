@@ -70,7 +70,7 @@ export function installTaskGrantSchema(db: Database.Database): void {
 function encode(input: unknown) {
   assertSynchronousResult(input);
   const state = stateSchema.parse(input);
-  state.grants.sort((a,b) => a.grant_id.localeCompare(b.grant_id));
+  state.grants.sort((a,b) => a.grant_id < b.grant_id ? -1 : a.grant_id > b.grant_id ? 1 : 0);
   const canonical = stableStringify(state);
   if (Buffer.byteLength(canonical) > 4194304) throw Error();
   return { state, canonical, digest: createHash("sha256").update("dona.task-grants.v1\0").update(canonical).digest("hex") };
@@ -217,8 +217,8 @@ export class TaskGrantRepository {
           && subset([query.resource],grant.resources) && grant.operations.includes(query.operation) && subset([query.destination],grant.destinations)
           && (grant.epic?.membership_revision??null)===query.epic_membership_revision && active(grant,value!.state.grants,mark.effective_utc);
         if (allowed) allowed = this.current(grant!,value!.state.grants,state);
-        const event:Omit<AuditEvent,"occurred_at">={scope:this.scope,actor:{kind:"principal",id:query.principal.id},action:"binding_change",operation:"binding.change.v1",resource_id:resourceId,
-          outcome:allowed?"allowed":"denied",reason:allowed?"none":"unauthorized",session_ref:null,receipt_id:null,attempt_id:null,policy_revision:0,binding_revision:query.revision,authz_revision:query.principal.authz_revision};
+        const event:Omit<AuditEvent,"occurred_at">={scope:this.scope,actor:allowed?{kind:"principal",id:query.principal.id}:{kind:"unauthenticated",id:null},action:"binding_change",operation:"binding.change.v1",resource_id:resourceId,
+          outcome:allowed?"allowed":"denied",reason:allowed?"none":"unauthorized",session_ref:null,receipt_id:null,attempt_id:null,policy_revision:0,binding_revision:allowed?query.revision:0,authz_revision:allowed?query.principal.authz_revision:0};
         return {event,resource_digest:null,mutation:()=>allowed};
       });
     } catch { throw Error("task_grant_unverified"); }
