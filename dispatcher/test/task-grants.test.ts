@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createHash } from "node:crypto";
+import { stableStringify } from "../src/validation.js";
 import { setup, scope } from "./web/fixtures.js";
 import { openSecurityDatabase } from "../src/audit/coordination.js";
 import { installTaskGrantSchema, TaskGrantRepository, type TaskGrant, type GrantEvaluation, type GrantWrite, type TaskGrantIssuer } from "../src/task-grants.js";
@@ -142,4 +144,22 @@ test("混在IDの永続canonical orderはICU/localeCompareに依存しない",t=
   assert.deepEqual(stored.grants.map((g:TaskGrant)=>g.grant_id),["A","Z","a","a-","a_","z"]);
   assert.equal(f.repo.evaluate("read",query("A")),true);
  } finally {String.prototype.localeCompare=original;}
+});
+test("1023件の監査済みsnapshotから1024件目を保存し上限でもread/revokeできる",t=>{
+ const f=fixture(t);
+ // 大容量の既存scopeを作るfixture-onlyの認可済みaudit seed。
+ // 検査対象のwrite/evaluate/revokeは実repository APIを通す。
+ const grants=Array.from({length:1023},(_,i)=>grant("grant_"+String(i).padStart(4,"0")));
+ const canonical=stableStringify({version:1,scope,grants});
+ const digest=createHash("sha256").update("dona.task-grants.v1\0").update(canonical).digest("hex");
+ f.transaction.runPrepared("fixture_capacity",()=>({event:{scope,actor:{kind:"system",id:"fixture_issuer"},action:"binding_change",operation:"binding.change.v1",resource_id:"task_grants_v1",
+  outcome:"succeeded",reason:"none",session_ref:null,receipt_id:null,attempt_id:null,policy_revision:1,binding_revision:1,authz_revision:1},resource_digest:digest,
+  mutation:()=>{f.db.prepare("UPDATE task_grant_state SET state_json=?").run(canonical);return null;}}));
+ assert.equal(f.repo.write("at_limit",{kind:"put",expected_revision:0,grant:grant("grant_1023")}).status,"succeeded");
+ assert.equal(f.repo.evaluate("read_limit",query("grant_1023")),true);
+ assert.equal(f.repo.write("over_limit",{kind:"put",expected_revision:0,grant:grant("grant_1024")}).status,"denied");
+ assert.equal(f.repo.write("revoke_limit",{kind:"revoke",grant_id:"grant_0000",expected_revision:1}).status,"succeeded");
+ assert.equal(f.repo.evaluate("revoked",{...query("grant_0000"),revision:2}),false);
+ assert.equal(f.repo.evaluate("existing",query("grant_1023")),true);
+ assert.equal(JSON.parse(f.db.prepare("SELECT state_json FROM task_grant_state").pluck().get() as string).grants.length,1024);
 });
