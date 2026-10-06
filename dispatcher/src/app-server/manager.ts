@@ -7,6 +7,7 @@ import {stableStringify} from "../validation.js";
 import {projectHistory,projectNotification,projectItem,type ConversationIdentity,type ConversationSnapshot} from "./observation.js";
 import { RuntimeStore,type AgentRecord,type QuestionRecord } from "./store.js";
 import { identity,processes,same,stopScope,type ProcessIdentity } from "./process.js";
+import {workerHandoffProtocol,workerHandoffContractBlockers,workerHandoffBlockers,type WorkerHandoffInventory,type WorkerHandoffObservation} from "./worker-handoff.js";
 
 export const hash=(value:unknown)=>createHash("sha256").update(stableStringify(value)).digest("hex");
 export interface StartAgent {attemptId?:string;name:string;role:"main"|"worker";cwd:string;release:string;args:string[];threadConfig:Record<string,unknown>}
@@ -33,6 +34,35 @@ export class AppServerManager {
     store.db.prepare("UPDATE agents SET state='unknown',sequence=sequence+1 WHERE state<>'stopped'").run();
   }
   closeConnections():void {for(const rpc of this.connections.values())rpc.closeConnection();this.connections.clear();}
+  /** 1 pageのDB snapshotと1回のprocess sample。RPCや状態変更を行わない。 */
+  workerHandoffInventory(after=""):WorkerHandoffInventory {
+    if(!/^[A-Za-z0-9_-]{0,128}$/.test(after))throw Error("runtime_worker_handoff_cursor_invalid");
+    return this.store.db.transaction(():WorkerHandoffInventory=>{
+      const rows=this.store.db.prepare("SELECT * FROM agents WHERE role='worker' AND name>? ORDER BY name LIMIT 101").all(after) as AgentRecord[];
+      let sample:ProcessIdentity[]|undefined;
+      try{sample=this.processSample();}catch{/* 観測不能を不在証明へ変換しない。 */}
+      const items=rows.slice(0,100).map(row=>{
+        let attemptId:string|null=null;
+        try{const input=JSON.parse(row.config_json) as StartAgent;if(typeof input.attemptId==="string"&&/^[A-Za-z0-9_-]{1,128}$/.test(input.attemptId))attemptId=input.attemptId;}catch{}
+        const requestExists=(states:string)=>!!(this.store.db.prepare(`SELECT EXISTS(
+          SELECT 1 FROM questions WHERE agent=? AND generation=? AND state IN (${states})
+          UNION ALL SELECT 1 FROM external_tool_requests WHERE agent=? AND generation=? AND state IN (${states})
+        ) AS present`).get(row.name,row.generation,row.name,row.generation) as {present:number}).present;
+        const pending=requestExists("'pending','answering'"),expired=requestExists("'expired'");
+        const live=sample?.find(p=>p.pid===row.pid);
+        const observation:Omit<WorkerHandoffObservation,"blockers">={
+          name:row.name,generation:row.generation,attempt_id:attemptId,thread_id:row.thread_id,turn_id:row.turn_id,
+          state:sample?this.status(row.name,sample)?.state??"unknown":"unknown",
+          connected:!!this.connections.get(row.name)?.connected,
+          process_binding:!sample?"unavailable":!live||live.state.includes("Z")?"absent":live.start===row.process_start&&live.uid===process.getuid?.()?"matched":"mismatch",
+          request_state:pending&&expired?"pending_and_expired":pending?"pending":expired?"expired":"none",
+        };
+        return {...observation,blockers:workerHandoffBlockers(observation)};
+      });
+      return {schema_version:1,protocol:workerHandoffProtocol,handoff_enabled:false,activation_allowed:false,compatibility:"unverified",
+        snapshot_scope:"page",observed_at:new Date().toISOString(),blockers:[...workerHandoffContractBlockers],items,next:rows.length>100?rows[99]!.name:null};
+    }).deferred();
+  }
   serialized<T>(name:string,action:()=>Promise<T>):Promise<T> {
     const previous=this.queues.get(name)??Promise.resolve();const next=previous.catch(()=>{}).then(action);
     this.queues.set(name,next);void next.finally(()=>{if(this.queues.get(name)===next)this.queues.delete(name);}).catch(()=>{});return next;
