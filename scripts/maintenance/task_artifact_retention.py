@@ -270,6 +270,8 @@ class Retention:
                 WHERE m.task_id=? AND (s.state IS NULL OR s.state<>'cancelled') LIMIT 1""",
                                (row["task_id"],)).fetchone():
                 raise Protected("continuation_unsettled")
+        if row["source"] == "dona_schedule":
+            raise Protected("schedule_retention_integration_unverified")
         terminal = ("completed", "failed", "cancelled")
         if row["status"] not in terminal or row["task_state"] not in terminal:
             raise Protected("active_or_needs_review")
@@ -300,6 +302,8 @@ class Retention:
             raise Protected("owner_binding_unverified")
         if object_json(binding["owner_json"]).get("kind") not in ("slack_thread", "local_dashboard", "schedule"):
             raise Protected("owner_binding_unverified")
+        if object_json(binding["owner_json"]).get("kind") == "schedule":
+            raise Protected("schedule_retention_integration_unverified")
         local = binding and object_json(binding["owner_json"]).get("kind") == "local_dashboard"
         if local:
             if object_json(binding["destination_json"]) != {"kind": "none"}:
@@ -310,17 +314,15 @@ class Retention:
             destination = object_json(completion["destination_json"])
             if destination != object_json(binding["destination_json"]):
                 raise Protected("notification_binding_mismatch")
-            superseded = False
             if completion["notification_state"] == "none" and destination != {"kind": "none"}:
-                self.superseded_completion(row, completion, binding, now)
-                superseded = True
+                raise Protected("notification_unsettled")
             if completion["notification_state"] not in ("none", "accepted"):
                 raise Protected("notification_unsettled")
             if completion["notification_state"] == "accepted" and completion["notification_event_id"]:
                 self.settled_event(completion["notification_event_id"], now)
             if timestamp(completion["content_delete_at"]) > now:
                 raise Protected("retention_not_expired")
-            if completion["job_status"] == row["status"] and not superseded:
+            if completion["job_status"] == row["status"]:
                 matching = True
         if local:
             return row
@@ -343,24 +345,6 @@ class Retention:
             # notification. Validate its command receipt and retained DB Result.
             self.regular_notification(row, event_id, now)
         return row
-
-    def superseded_completion(self, row, completion, binding, now):
-        # Only Dispatcher-settled historical schedule notifications qualify.
-        # They cannot stand in for the final accepted notification.
-        if object_json(binding["owner_json"]).get("kind") != "schedule":
-            raise Protected("notification_unsettled")
-        destination = object_json(binding["destination_json"])
-        target = destination.get("target") if destination.get("kind") == "slack" else None
-        if not isinstance(target, dict):
-            raise Protected("notification_binding_mismatch")
-        event = self.db.execute("SELECT * FROM events WHERE event_id=?",
-                                (completion["notification_event_id"],)).fetchone()
-        if not event or event["source"] != "dona_job" or event["status"] != "completed" or event["last_error_code"] != "job_result_superseded":
-            raise Protected("notification_unsettled")
-        subject = object_json(event["subject_json"])
-        if subject.get("job_id") != row["job_id"] or subject.get("source_event_id") != row["source_event_id"] or object_json(event["reply_target_json"]) != target:
-            raise Protected("notification_binding_mismatch")
-        self.settled_event(event["event_id"], now)
 
     def settled_event(self, event_id, now):
         event = self.db.execute("SELECT status,completed_at FROM events WHERE event_id=?", (event_id,)).fetchone()
@@ -467,17 +451,19 @@ class Retention:
 
     def inventory(self, job_id, now, entries=10000, seconds=3):
         budget = getattr(self, "_batch_budget", None) or Budget(entries, seconds)
+        metadata = self.db.execute("SELECT created_at FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         try:
             row = self.eligible(job_id, now)
             candidates = self.candidates(row)
         except (Protected, ValueError, TypeError) as error:
-            return {"job_id": job_id, "protection_reasons": [str(error) if isinstance(error, Protected) else "artifact_contract_unverified"], "artifacts": []}
+            return {"job_id": job_id, **({"created_at": metadata["created_at"]} if metadata else {}), "protection_reasons": [str(error) if isinstance(error, Protected) else "artifact_contract_unverified"], "artifacts": []}
         artifacts = []
         for kind, root_kind, relative in candidates:
             observation = {"kind": kind, "allocated_bytes": None, "cleanup_state": "unsafe"}
-            saved = self.db.execute("SELECT cleanup_state,allocated_bytes,cleanup_error FROM task_artifact_retention WHERE job_id=? AND kind=?", (job_id, kind)).fetchone()
+            saved = self.db.execute("SELECT cleanup_state,allocated_bytes,cleanup_error,identity_json FROM task_artifact_retention WHERE job_id=? AND kind=?", (job_id, kind)).fetchone()
             if saved:
-                observation.update(dict(saved))
+                observation.update({key: saved[key] for key in ("cleanup_state", "allocated_bytes", "cleanup_error")})
+                observation["logical_only"] = object_json(saved["identity_json"]).get("logical_only") is True
                 # Size before purge is historical, not current measured capacity.
                 observation["allocated_bytes"] = 0 if saved["cleanup_state"] == "deleted" else None
                 artifacts.append(observation)
@@ -525,12 +511,16 @@ class Retention:
                         if budget.remaining <= 0 or time.monotonic() >= budget.deadline:
                             artifact.update(cleanup_state="budget_exceeded", allocated_bytes=None)
                             break
-                        if artifact["cleanup_state"] not in ("eligible", "purged"):
+                        if artifact["cleanup_state"] not in ("eligible", "purged") and not (artifact["kind"] == "result" and artifact["cleanup_state"] == "missing"):
                             continue
                         try:
                             artifact["cleanup_state"] = self.cleanup(job_id, artifact["kind"], now,
                                 entries=budget.remaining, seconds=max(0.001, budget.deadline - time.monotonic()))
                             artifact["allocated_bytes"] = 0 if artifact["cleanup_state"] == "deleted" else None
+                            if artifact["cleanup_state"] == "deleted":
+                                saved = self.db.execute("SELECT identity_json FROM task_artifact_retention WHERE job_id=? AND kind=?",
+                                                        (job_id, artifact["kind"])).fetchone()
+                                artifact["logical_only"] = object_json(saved["identity_json"]).get("logical_only") is True
                         except (Protected, OSError) as error:
                             artifact.update(cleanup_state="quarantined", allocated_bytes=None,
                                 cleanup_error=str(error) if isinstance(error, Protected) else "filesystem_unverified")
@@ -555,6 +545,12 @@ class Retention:
         available = min(item["available_bytes"] for item in capacities.values()) if all(
             item["available_bytes"] is not None for item in capacities.values()) else None
         artifacts = [artifact for item in results for artifact in item["artifacts"]]
+        created_times = []
+        for item in results:
+            try:
+                created_times.append((timestamp(item.get("created_at")), item["created_at"]))
+            except Protected:
+                pass
         return {"dry_run": dry_run, "jobs": results, "next_cursor": cursor,
                 "has_more": incomplete or len(rows) > len(results), "available_bytes": available,
                 "root_capacities": capacities, "disk_floor_met": all(item["disk_floor_met"] for item in capacities.values()), "artifact_count": len(artifacts),
@@ -562,7 +558,13 @@ class Retention:
                 "unmeasured_count": sum(item["allocated_bytes"] is None for item in artifacts),
                 "size_is_complete": not any(item["protection_reasons"] for item in results) and
                     all(item["allocated_bytes"] is not None for item in artifacts),
-                "oldest_created_at": min((item["created_at"] for item in results if "created_at" in item), default=None)}
+                "oldest_created_at": min(created_times)[1] if created_times else None,
+                "created_at_unverified_count": len(results) - len(created_times)}
+
+    def purge_result_content(self, row):
+        if row["source"] != "web":
+            self.db.execute("UPDATE jobs SET result_json=NULL WHERE job_id=?", (row["job_id"],))
+        self.db.execute("UPDATE task_attempts SET checkpoint_json=NULL WHERE attempt_id=?", (row["job_id"],))
 
     def cleanup(self, job_id, kind, now, entries=1000, seconds=3, hook=lambda phase: None):
         """DBのpurged commit後だけ隔離renameし、同じidentityをboundedに削除。
@@ -583,12 +585,36 @@ class Retention:
                 self.db.rollback()
                 return saved["cleanup_state"]
             with private_root(self.roots[root_kind]) as root:
-                capacity = os.fstatvfs(root)
                 if not saved:
-                    if capacity.f_bavail * capacity.f_frsize < self.policy.disk_floor_bytes:
-                        raise Protected("disk_floor")
                     with parent_handle(root, relative) as (parent, name, recheck):
-                        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                        try:
+                            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                        except FileNotFoundError:
+                            if kind != "result":
+                                raise
+                            recheck()
+                            scope = {"logical_only": True, "root": identity(os.fstat(root)), "ancestors": recheck.snapshot}
+                            self.db.execute("INSERT INTO task_artifact_retention VALUES(?,?,?,?,?,?,'purged',0,?,NULL)",
+                                (job_id, kind, root_kind, relative, json.dumps(scope), "",
+                                 dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat().replace("+00:00", "Z")))
+                            self.purge_result_content(row)
+                            hook("missing_result")
+                            recheck()
+                            with private_root(self.roots[root_kind]) as live_root:
+                                if identity(os.fstat(live_root)) != identity(os.fstat(root)):
+                                    raise Protected("root_replaced")
+                            try:
+                                os.stat(name, dir_fd=parent, follow_symlinks=False)
+                            except FileNotFoundError:
+                                pass
+                            else:
+                                raise Protected("artifact_reappeared")
+                            self.db.execute("UPDATE task_artifact_retention SET cleanup_state='deleted' WHERE job_id=? AND kind=?", (job_id, kind))
+                            self.db.commit()
+                            return "deleted"
+                        capacity = os.fstatvfs(root)
+                        if capacity.f_bavail * capacity.f_frsize < self.policy.disk_floor_bytes:
+                            raise Protected("disk_floor")
                         checked(info, True)
                         if not hasattr(info, "st_birthtime"):
                             raise Protected("birthtime_unavailable")
@@ -602,9 +628,7 @@ class Retention:
                                         (job_id, kind, root_kind, relative, json.dumps(scope), str(info.st_ctime_ns),
                                          allocated, dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat().replace("+00:00", "Z")))
                         if kind == "result":
-                            if row["source"] != "web":
-                                self.db.execute("UPDATE jobs SET result_json=NULL WHERE job_id=?", (job_id,))
-                            self.db.execute("UPDATE task_attempts SET checkpoint_json=NULL WHERE attempt_id=?", (job_id,))
+                            self.purge_result_content(row)
                     self.db.commit()
                     hook("purged")
                 else:

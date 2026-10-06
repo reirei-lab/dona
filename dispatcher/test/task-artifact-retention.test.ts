@@ -106,7 +106,7 @@ test("retention ledger works with current Dispatcher migrations and Task trigger
         ] }), notification.event_id);
     } finally { sql.close(); }
     const result = spawnSync("python3", ["-B", "-c", `
-import json,sqlite3,sys
+import json,sqlite3,sys,pathlib
 from task_artifact_retention import Retention,Policy
 db=sqlite3.connect(sys.argv[1])
 db.execute('PRAGMA foreign_keys=ON')
@@ -165,10 +165,14 @@ assert engine.inventory(sys.argv[5],1791244800)['protection_reasons']==['notific
 db.execute("UPDATE local_dashboard_command_receipts SET operation='create' WHERE task_id=? AND operation='cancel'",(task,))
 db.commit()
 assert engine.inventory(sys.argv[5],1791244800).get('size_is_complete')
-if sys.platform=='darwin':
-    assert engine.cleanup(sys.argv[5],'result',1791244800)=='deleted'
-    retained=json.loads(db.execute('SELECT result_json FROM jobs WHERE job_id=?',(sys.argv[5],)).fetchone()[0])
-    assert retained['summary']=='local fixture'
+local_result=pathlib.Path(sys.argv[3])/sys.argv[5]
+(local_result/'evidence').unlink()
+local_result.rmdir()
+assert engine.cleanup(sys.argv[5],'result',1791244800)=='deleted'
+logical=json.loads(db.execute("SELECT identity_json FROM task_artifact_retention WHERE job_id=? AND kind='result'",(sys.argv[5],)).fetchone()[0])
+assert logical['logical_only'] is True
+retained=json.loads(db.execute('SELECT result_json FROM jobs WHERE job_id=?',(sys.argv[5],)).fetchone()[0])
+assert retained['summary']=='local fixture'
 cancel=sys.argv[6]
 assert engine.inventory(cancel,1791244800).get('size_is_complete')
 db.execute("UPDATE local_dashboard_command_receipts SET owner_id='other' WHERE attempt_id=? AND operation='cancel'",(cancel,))

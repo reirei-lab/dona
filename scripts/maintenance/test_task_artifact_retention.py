@@ -96,41 +96,85 @@ class RetentionTests(unittest.TestCase):
         self.db.commit()
         self.assertTrue(self.engine.inventory(JOB, NOW)["size_is_complete"])
 
-    def test_superseded_schedule_completion_requires_bound_settled_event_and_final_delivery(self):
-        for column in ("source", "subject_json", "reply_target_json", "last_error_code"):
-            self.db.execute("ALTER TABLE events ADD COLUMN " + column + " TEXT")
-        owner = json.dumps({"kind": "schedule", "run_id": "private-run"})
-        target = json.dumps({"kind": "thread", "workspace_id": "fixture", "channel_id": "fixture", "thread_ts": "1.000001"})
-        destination = json.dumps({"kind": "slack", "target": json.loads(target)})
-        subject = json.dumps({"job_id": JOB, "source_event_id": "event-" + JOB})
-        old_event, final_event = "report-" + JOB, "final-" + JOB
-        self.db.execute("UPDATE job_owner_bindings SET owner_json=?,destination_json=? WHERE job_id=?", (owner, destination, JOB))
-        self.db.execute("UPDATE job_completion_results SET notification_state='none',job_status='needs_review',destination_json=? WHERE job_id=?", (destination, JOB))
-        self.db.execute("UPDATE events SET source='dona_job',last_error_code='job_result_superseded',subject_json=?,reply_target_json=? WHERE event_id=?",
-                        (subject, target, old_event))
-        self.db.execute("INSERT INTO events(event_id,status) VALUES(?,'completed')", (final_event,))
-        self.db.execute("INSERT INTO job_completion_results VALUES(?,'completed',?,'accepted',?,?)", (JOB, destination, OLD, final_event))
-        self.db.execute("UPDATE jobs SET completion_event_id=? WHERE job_id=?", (final_event, JOB))
+    def test_schedule_class_is_protected_before_and_after_metadata_purge(self):
+        self.db.execute("UPDATE job_owner_bindings SET owner_json=? WHERE job_id=?", (json.dumps({"kind": "schedule"}), JOB))
         self.db.commit()
-        self.assertTrue(self.engine.inventory(JOB, NOW)["size_is_complete"])
-        self.db.execute("UPDATE events SET last_error_code=NULL WHERE event_id=?", (old_event,))
+        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["schedule_retention_integration_unverified"])
+        self.db.execute("UPDATE jobs SET source='dona_schedule' WHERE job_id=?", (JOB,))
+        self.db.execute("DELETE FROM job_owner_bindings WHERE job_id=?", (JOB,))
+        self.db.execute("DELETE FROM job_completion_results WHERE job_id=?", (JOB,))
+        self.db.execute("DELETE FROM events")
         self.db.commit()
-        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
-        self.db.execute("UPDATE events SET last_error_code='job_result_superseded',subject_json='{}' WHERE event_id=?", (old_event,))
+        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["schedule_retention_integration_unverified"])
+        with self.assertRaisesRegex(Protected, "schedule_retention_integration_unverified"):
+            self.engine.cleanup(JOB, "result", NOW)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM task_artifact_retention").fetchone()[0], 0)
+        self.assertTrue((self.results / JOB / "data.json").exists())
+        self.db.execute("UPDATE jobs SET source='slack' WHERE job_id=?", (JOB,))
         self.db.commit()
-        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_binding_mismatch"])
-        self.db.execute("UPDATE events SET subject_json=?,completed_at='2026-10-05T00:00:00Z' WHERE event_id=?", (subject, old_event))
+        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["owner_binding_unverified"])
+
+    def test_oldest_age_includes_protected_jobs_and_rejects_invalid_times(self):
+        other = "job_01m48pn0e7hkz6jy1xz6rmfeav"
+        self.add_job(other)
+        oldest = "2026-08-01T00:00:00Z"
+        self.db.execute("UPDATE jobs SET created_at=? WHERE job_id=?", (oldest, JOB))
+        self.db.execute("UPDATE task_attempts SET stop_receipt_json=NULL WHERE attempt_id=?", (JOB,))
         self.db.commit()
-        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["retention_not_expired"])
-        self.db.execute("UPDATE events SET completed_at=? WHERE event_id=?", (OLD, old_event))
-        self.db.execute("UPDATE job_completion_results SET notification_state='pending' WHERE notification_event_id=?", (final_event,))
+        self.assertEqual(self.engine.batch(NOW)["oldest_created_at"], oldest)
+        self.db.execute("UPDATE task_attempts SET stop_receipt_json=NULL")
         self.db.commit()
-        self.assertEqual(self.engine.inventory(JOB, NOW)["protection_reasons"], ["notification_unsettled"])
-        self.db.execute("UPDATE job_completion_results SET notification_state='accepted' WHERE notification_event_id=?", (final_event,))
+        self.assertEqual(self.engine.batch(NOW)["oldest_created_at"], oldest)
+        self.db.execute("UPDATE jobs SET created_at='invalid' WHERE job_id=?", (JOB,))
         self.db.commit()
-        self.assertTrue(self.engine.inventory(JOB, NOW)["size_is_complete"])
-        if HAS_BIRTH:
-            self.assertEqual(self.engine.cleanup(JOB, "result", NOW), "deleted")
+        summary = self.engine.batch(NOW)
+        self.assertEqual(summary["oldest_created_at"], OLD)
+        self.assertEqual(summary["created_at_unverified_count"], 1)
+
+    def test_initially_missing_result_is_logical_purge_with_guards(self):
+        result = self.results / JOB
+        (result / "data.json").unlink()
+        result.rmdir()
+        self.engine.batch(NOW)
+        self.assertIsNotNone(self.db.execute("SELECT result_json FROM jobs WHERE job_id=?", (JOB,)).fetchone()[0])
+        summary = self.engine.batch(NOW, dry_run=False, entries=1000)
+        artifact = next(item for item in summary["jobs"][0]["artifacts"] if item["kind"] == "result")
+        self.assertEqual(artifact["cleanup_state"], "deleted")
+        self.assertTrue(artifact["logical_only"])
+        self.assertIsNone(self.db.execute("SELECT result_json FROM jobs WHERE job_id=?", (JOB,)).fetchone()[0])
+        self.assertIsNone(self.db.execute("SELECT checkpoint_json FROM task_attempts WHERE attempt_id=?", (JOB,)).fetchone()[0])
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "artifact_reference_purged"):
+            self.db.execute("UPDATE jobs SET result_json='{}' WHERE job_id=?", (JOB,))
+        self.db.rollback()
+        result.mkdir()
+        (result / "late").write_text("replacement must survive")
+        self.assertEqual(self.engine.cleanup(JOB, "result", NOW), "deleted")
+        self.assertTrue((result / "late").exists())
+
+    def test_missing_result_reappearance_rolls_back_logical_purge(self):
+        result = self.results / JOB
+        (result / "data.json").unlink()
+        result.rmdir()
+        def replace(phase):
+            if phase == "missing_result":
+                result.mkdir()
+                (result / "late").write_text("replacement")
+        with self.assertRaisesRegex(Protected, "artifact_reappeared"):
+            self.engine.cleanup(JOB, "result", NOW, hook=replace)
+        self.assertIsNotNone(self.db.execute("SELECT result_json FROM jobs WHERE job_id=?", (JOB,)).fetchone()[0])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM task_artifact_retention").fetchone()[0], 0)
+        self.assertTrue((result / "late").exists())
+
+    @unittest.skipUnless(HAS_BIRTH, "Darwin birthtime is required")
+    def test_purged_resume_ignores_capacity_observation_failure(self):
+        def crash(phase):
+            if phase == "purged":
+                raise RuntimeError("crash")
+        with self.assertRaisesRegex(RuntimeError, "crash"):
+            self.engine.cleanup(JOB, "worktree", NOW, hook=crash)
+        with patch("os.fstatvfs", side_effect=OSError("temporary capacity failure")) as capacity:
+            self.assertEqual(self.engine.cleanup(JOB, "worktree", NOW), "deleted")
+            capacity.assert_not_called()
 
     def test_dry_run_measures_without_purge(self):
         inventory = self.engine.batch(NOW)
