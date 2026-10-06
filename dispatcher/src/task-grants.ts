@@ -45,6 +45,12 @@ const stateSchema = z.strictObject({ version: z.literal(1), scope: scopeSchema,
   grants: z.array(grantSchema).max(1024).refine(g => unique(g.map(row => row.grant_id))) });
 type State = z.infer<typeof stateSchema>;
 const resourceId = "task_grants_v1";
+const snapshotMaxBytes = 4194304;
+/** ISO UTCの最大長27文字+引用符からnullの4 byteを引いた25 byte。
+ * revokeでrevisionが最大safe integerの16桁まで増えても保存できる余白。 */
+function revokeReserveBytes(grants: TaskGrant[]): number {
+  return grants.reduce((bytes,g) => bytes + (g.revoked_at === null ? 25 + 16 - String(g.revision).length : 0),0);
+}
 const ddl = `CREATE TABLE task_grant_schema(version INTEGER PRIMARY KEY CHECK(version=1)) STRICT;
 INSERT INTO task_grant_schema VALUES(1);
 CREATE TABLE task_grant_state(instance_id TEXT NOT NULL,tenant_id TEXT NOT NULL,state_json TEXT NOT NULL
@@ -77,7 +83,7 @@ function encode(input: State) {
   const state = stateSchema.parse(input);
   state.grants.sort((a,b) => a.grant_id < b.grant_id ? -1 : a.grant_id > b.grant_id ? 1 : 0);
   const canonical = stableStringify(state);
-  if (Buffer.byteLength(canonical) > 4194304) throw Error();
+  if (Buffer.byteLength(canonical) > snapshotMaxBytes) throw Error();
   return { state, canonical, digest: createHash("sha256").update("dona.task-grants.v1\0").update(canonical).digest("hex") };
 }
 function same(a: unknown,b: unknown) { return stableStringify(a) === stableStringify(b); }
@@ -161,7 +167,7 @@ export class TaskGrantRepository {
         const proof = raw === null ? null : z.strictObject({issuer_id:id,approval:z.strictObject({event_id:id,typed_plan_ref:id,plan_sha256:z.string().regex(/^[a-f0-9]{64}$/)}).nullable()}).parse(raw);
         const event: Omit<AuditEvent,"occurred_at"> = {scope:this.scope,actor:proof?{kind:"system",id:proof.issuer_id}:{kind:"unauthenticated",id:null},
           action:"binding_change",operation:"binding.change.v1",resource_id:resourceId,outcome:"denied",reason:"unauthorized",session_ref:null,receipt_id:null,attempt_id:null,policy_revision:0,binding_revision:0,authz_revision:0};
-        const denied = () => ({event,resource_digest:null,mutation:()=>({status:"denied" as const,revision:null})});
+        const denied = (reason: AuditEvent["reason"] = "unauthorized") => ({event:{...event,reason},resource_digest:null,mutation:()=>({status:"denied" as const,revision:null})});
         if (!proof) return denied();
         let next: State; let resultRevision: number | null = null;
         if (command.kind === "initialize") {
@@ -180,6 +186,8 @@ export class TaskGrantRepository {
             previous.revoked_at = mark.effective_utc; previous.revision++; resultRevision=previous.revision;
           } else {
             const grant = structuredClone(command.grant);
+            // 最後のrevision値はrevoke用に残し、失効不能なactive grantを作らない。
+            if (grant.revision === Number.MAX_SAFE_INTEGER) return denied("revision_mismatch");
             if (grant.revision !== command.expected_revision+1 || grant.revoked_at !== null || !same(grant.approval,proof.approval)
               || Date.parse(grant.expires_at) <= Date.parse(mark.effective_utc)) return denied();
             if (grant.parent) {
@@ -195,10 +203,14 @@ export class TaskGrantRepository {
               if (valid !== true) return denied();
             }
             if (previous) next.grants[next.grants.indexOf(previous)] = grant;
-            else { if (next.grants.length >= 1024) return denied(); next.grants.push(grant); }
+            else { if (next.grants.length >= 1024) return denied("quota_exceeded"); next.grants.push(grant); }
             resultRevision=grant.revision;
           }
         }
+        // 全未失効grantが後からrevokeされてもsnapshotの上限に収まる。
+        // revoke自身をquotaで拒否する代わりに、putのadmission時に予約する。
+        if (command.kind === "put" && Buffer.byteLength(stableStringify(next)) + revokeReserveBytes(next.grants) > snapshotMaxBytes)
+          return denied("quota_exceeded");
         const value=encode(next);
         return {event:{...event,outcome:"succeeded" as const,reason:"none" as const,binding_revision:resultRevision??0},resource_digest:value.digest,
           mutation:()=>{

@@ -12,7 +12,7 @@
 
 既存のowner-only DB、監査schema、approval schema、rollback-resistant外部anchor/clock providerが必要。明示的な`installTaskGrantSchema`はversion 1のschemaだけを追加し、既存rowを推測backfillしない。部分schema、未知version、偽table/trigger/temp shadowは拒否する。既存Task世代DBへの追加とfresh DBの両方を同じ経路で扱う。
 
-新しいscopeのempty rootは信頼済みissuerが`initialize`を認可した場合だけ監査commitする。既存row/rootの片方欠落・改変から自動再初期化しない。`put`/`revoke`はexpected revisionを要求し、revoked IDを再利用しない。revokeは時間上のactiveを要求せず、開始前・expiry後にもissuer認可とCASを確認して失効を記録する。snapshotには最大1024 grants、各grantの明示resource/destination集合は最大128件の上限があり、上限到達は拒否する。revokeやaudit履歴を削除するretentionは提供しない。
+新しいscopeのempty rootは信頼済みissuerが`initialize`を認可した場合だけ監査commitする。既存row/rootの片方欠落・改変から自動再初期化しない。`put`/`revoke`はexpected revisionを要求し、revoked IDを再利用しない。revokeは時間上のactiveを要求せず、開始前・expiry後にもissuer認可とCASを確認して失効を記録する。snapshotには最大1024 grants、4MiB、各grantの明示resource/destination集合は最大128件の上限がある。putは全未失効grantの最大長UTC timestampとrevision桁増加に必要な容量も予約し、超過はquota拒否とする。最後のsafe integer revision値もrevoke用に予約する。容量やrevision枯渇を理由に緊急revokeができなくなる状態を保存しない。revokeやaudit履歴を削除するretentionは提供しない。
 
 ## 発行と評価
 
