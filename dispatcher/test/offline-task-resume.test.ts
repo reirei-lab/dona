@@ -247,3 +247,39 @@ test('回答済みのhuman_input checkpointを更新時に保留へ戻さない'
   assert.equal(f.db.tasks.checkpointAnswered(f.job,checkpoint),true);f.migrate();assert.notEqual(f.db.tasks.get(f.task.task_id)!.current_attempt_id,f.job.job_id);
  }finally{await f.close();}
 });
+
+for(const tracked of [false,true])test(`external回答送信済み・resolved前はcheckpointに基づいて分類する tracked=${tracked}`,async()=>{
+ const f=await fixture();try{
+  const sql=new Database(f.config.databasePath);sql.exec('CREATE TABLE task_external_approval_checkpoints(attempt_id TEXT,runtime_request_id TEXT,request_id TEXT,state TEXT)');if(tracked)sql.prepare('INSERT INTO task_external_approval_checkpoints VALUES(?,?,?,?)').run(f.job.job_id,'request-runtime','approval','succeeded');sql.close();
+  f.runtime.db.prepare("INSERT INTO external_tool_requests(request_id,agent,generation,thread_id,turn_id,call_id,rpc_id_json,role,operation_slot,text,state,created_at) VALUES(?,?,?,?,?,?,?,'worker','slot','hash','answering',?)").run('request-runtime',f.job.agent_name,'original-generation','saved-thread','old-turn','call','2',new Date().toISOString());f.runtime.put({...f.runtime.agent(f.job.agent_name)!,state:'waiting'});
+  assert.equal(f.db.tasks.get(f.task.task_id)!.wait_reason,null);f.migrate();
+  if(tracked){assert.equal(f.db.tasks.offlineResumes.saved(f.job.job_id)!.state,'pending');f.db.tasks.registerExternalApprovalRecoveryVerifier(input=>({effect:'accepted',request_id:input.request_id,attempt_id:input.attempt_id,receipt_ref:'receipt'}));due(f);await supervisor(f).reconcileTasks();assert.notEqual(f.db.tasks.get(f.task.task_id)!.current_attempt_id,f.job.job_id);}
+  else {assert.equal(f.db.tasks.get(f.task.task_id)!.current_attempt_id,f.job.job_id);assert.equal(f.db.tasks.get(f.task.task_id)!.wait_reason,'human_input');}
+ }finally{await f.close();}
+});
+
+for(const boundary of ['count','bytes','allowed'] as const)test(`native snapshotの${boundary}境界は省略して自動再開しない`,async()=>{
+ const f=await fixture();try{
+  const count=boundary==='count'?9:boundary==='allowed'?8:2;
+  for(let i=0;i<count;i++)f.runtime.addQuestion({question_id:`q${i}`,agent:f.job.agent_name,generation:'original-generation',thread_id:'saved-thread',turn_id:'old-turn',rpc_id_json:String(i),kind:'question',payload_json:JSON.stringify({text:boundary==='bytes'?'あ'.repeat(12_000):'質問'}),state:'pending',answer_hash:null,created_at:new Date().toISOString()});
+  f.runtime.put({...f.runtime.agent(f.job.agent_name)!,state:'waiting'});f.migrate();const task=f.db.tasks.get(f.task.task_id)!;
+  if(boundary==='allowed'){assert.notEqual(task.current_attempt_id,f.job.job_id);assert.equal(JSON.parse(f.db.tasks.offlineResumes.saved(f.job.job_id)!.native_requests_json!).length,8);}
+  else {assert.equal(task.current_attempt_id,f.job.job_id);assert.equal(task.wait_reason,'native_requests_overflow');assert.equal(f.db.tasks.offlineResumes.saved(f.job.job_id)!.native_requests_json,null);assert.equal(f.db.tasks.mayNotify(f.db.getJob(f.job.job_id)!),true);}
+ }finally{await f.close();}
+});
+
+for(const newer of [false,true])test(`human_inputへの回答送信中停止は回答対象sequenceを照合する newer=${newer}`,async()=>{
+ const f=await fixture();try{
+  let checkpoint={schema_version:1 as const,task_id:f.task.task_id,attempt_id:f.job.job_id,sequence:1,summary:'質問',remaining:[],artifacts:[],unresolved_operations:[],waiting:'human_input' as const};
+  await fs.mkdir(path.dirname(f.job.result_path),{recursive:true});const file=path.join(path.dirname(f.job.result_path),'checkpoint.json');await fs.writeFile(file,JSON.stringify(checkpoint));f.db.tasks.checkpoint(f.job,checkpoint);f.db.tasks.wait(f.db.tasks.get(f.task.task_id)!,'human_input');
+  f.db.tasks.prepareSteer(f.task.task_id,f.event.event_id,f.db.tasks.get(f.task.task_id)!.revision,'保存済み回答');f.db.beginJobSteer(f.job.job_id,f.event.event_id);
+  if(newer){checkpoint={...checkpoint,sequence:2,summary:'追加の別質問'};await fs.writeFile(file,JSON.stringify(checkpoint));}
+  f.migrate();let task=f.db.tasks.get(f.task.task_id)!;
+  assert.equal(JSON.parse(f.db.tasks.offlineResumes.saved(f.job.job_id)!.steer_json!).state,'dispatching');
+  if(newer){
+   assert.equal(task.current_attempt_id,f.job.job_id);assert.equal(task.wait_reason,'human_input');assert.equal(task.steer_pending_event_id,null);assert.equal(f.db.getJob(f.job.job_id)!.steer_state,null);
+   const event=f.db.enqueue(eventEnvelope('new-answer')).row;f.db.tasks.prepareSteer(task.task_id,event.event_id,task.revision,'新しい質問への回答');await supervisor(f).steer(f.job.job_id,event.event_id,'新しい質問への回答');due(f);await supervisor(f).reconcileTasks();task=f.db.tasks.get(task.task_id)!;
+  }
+  assert.notEqual(task.current_attempt_id,f.job.job_id);assert.match(f.db.getJob(task.current_attempt_id)!.objective,/保存済み回答/);
+ }finally{await f.close();}
+});

@@ -441,7 +441,7 @@ export class TaskRepository {
     const task=this.forAttempt(job.job_id);if(!task)return true;
     if(task.current_attempt_id!==job.job_id)return false;
     if(["completed","failed","cancelled"].includes(task.state))return true;
-    return ["human_input","retry_exhausted","result_conflict","result_reconciliation_required","external_effect_unknown","cancellation_unknown","worker_unknown","steer_acceptance_unknown"].includes(task.wait_reason??"");
+    return ["native_requests_overflow","human_input","retry_exhausted","result_conflict","result_reconciliation_required","external_effect_unknown","cancellation_unknown","worker_unknown","steer_acceptance_unknown"].includes(task.wait_reason??"");
   }
   assertCurrent(job:JobRow):void {const task=this.forAttempt(job.job_id);if(task&&task.current_attempt_id!==job.job_id)throw new Error("task_attempt_superseded");}
   canRun(job:JobRow):boolean {const task=this.forAttempt(job.job_id);return !task||(task.current_attempt_id===job.job_id&&task.state==="active"&&task.desired_state==="running");}

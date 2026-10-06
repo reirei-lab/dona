@@ -35,9 +35,15 @@ export class OfflineTaskResumes {
      }
     }catch{blocker='result_conflict';}
     if(source&&agent){
-     nativeRequests=runtime.db.prepare("SELECT question_id,kind,payload_json FROM questions WHERE agent=? AND generation=? AND turn_id IS ? AND (state IN ('pending','answering') OR (state='expired' AND ?='waiting'))").all(agent.name,agent.generation,agent.turn_id,agent.state) as typeof nativeRequests;
-     const externalPending=runtime.db.prepare("SELECT 1 FROM external_tool_requests WHERE agent=? AND generation=? AND turn_id IS ? AND (state IN ('pending','answering') OR (state='expired' AND ?='waiting')) LIMIT 1").get(agent.name,agent.generation,agent.turn_id,agent.state);
-     if(externalPending)reason=task.wait_reason==='external_approval'?'external_approval':'human_input';
+     const where="agent=? AND generation=? AND turn_id IS ? AND (state IN ('pending','answering') OR (state='expired' AND ?='waiting'))";
+     const args=[agent.name,agent.generation,agent.turn_id,agent.state];
+     const size=runtime.db.prepare(`SELECT count(*) AS count,COALESCE(sum(length(CAST(payload_json AS BLOB))),0) AS bytes FROM questions WHERE ${where}`).get(...args) as {count:number;bytes:number};
+     if(size.count>8||size.bytes>65_536)blocker??='native_requests_overflow';
+     else nativeRequests=runtime.db.prepare(`SELECT question_id,kind,payload_json FROM questions WHERE ${where} ORDER BY question_id LIMIT 8`).all(...args) as typeof nativeRequests;
+     const externalPending=runtime.db.prepare(`SELECT request_id FROM external_tool_requests WHERE ${where} ORDER BY request_id LIMIT 65`).all(...args) as {request_id:string}[];
+     if(externalPending.length>64)blocker??='native_requests_overflow';
+     const approvalTable=this.sql.prepare("SELECT 1 FROM sqlite_master WHERE name='task_external_approval_checkpoints'").get();
+     if(externalPending.length)reason=approvalTable&&externalPending.every(request=>this.sql.prepare("SELECT 1 FROM task_external_approval_checkpoints WHERE attempt_id=? AND runtime_request_id=?").get(job.job_id,request.request_id))?'external_approval':'human_input';
      else if(nativeRequests.length)reason='native_request';
      else if(agent.state==='waiting')reason='human_input';
      else if(agent.state==='stopped'){
@@ -97,17 +103,25 @@ export class OfflineTaskResumes {
    if(job.result_json||fs.existsSync(job.result_path))return;
    // 旧workerの追加指示受付は今後確定しない。元receiptはsnapshotへ保存し、
    // 既知の未解決操作がなければ保存済みobjectiveを新turnへ渡す（旧steerは再送しない）。
-   if(row.steer_json&&row.source_json&&(row.reason==='steer_acceptance_unknown'||row.state==='pending')){
+   if(row.steer_json&&row.source_json&&(['steer_acceptance_unknown','human_input'].includes(row.reason??'')||row.state==='pending')){
     const checkpoint=checkpointSnapshot(job,task.task_id).checkpoint??this.dispatcher.tasks.attemptCheckpoint(job.job_id);
-    if(checkpoint&&(checkpoint.unresolved_operations.length||(checkpoint.waiting==='external_effect_unknown'||checkpoint.waiting==='human_input'&&row.reason!=='native_request'))){
-     this.sql.prepare("UPDATE offline_task_resumes SET state='held',reason=? WHERE attempt_id=?").run(checkpoint.waiting==='human_input'?'human_input':'external_effect_unknown',job.job_id);
+    if(checkpoint&&(checkpoint.unresolved_operations.length||checkpoint.waiting==='external_effect_unknown')){
+     this.sql.prepare("UPDATE offline_task_resumes SET state='held',reason='external_effect_unknown' WHERE attempt_id=?").run(job.job_id);
      this.sql.prepare("UPDATE jobs SET status='needs_review',last_error_code='offline_update_held' WHERE job_id=?").run(job.job_id);
-     this.dispatcher.tasks.wait(task,checkpoint.waiting==='human_input'?'human_input':'external_effect_unknown');return;
+     this.dispatcher.tasks.wait(task,'external_effect_unknown');return;
     }
+    const answer=this.sql.prepare("SELECT checkpoint_sequence FROM task_controls WHERE task_id=? AND source_event_id=?").get(task.task_id,task.steer_pending_event_id) as {checkpoint_sequence:number|null}|undefined;
+    const answered=!!checkpoint&&answer?.checkpoint_sequence!==null&&answer?.checkpoint_sequence!==undefined&&answer.checkpoint_sequence>=checkpoint.sequence;
+    if(answered)this.sql.prepare("UPDATE task_attempts SET checkpoint_ack_sequence=MAX(checkpoint_ack_sequence,?) WHERE attempt_id=?").run(answer!.checkpoint_sequence,job.job_id);
+    const waitForNewAnswer=!!checkpoint&&checkpoint.waiting==='human_input'&&!this.dispatcher.tasks.checkpointAnswered(job,checkpoint)&&row.reason!=='native_request';
     this.sql.prepare("UPDATE jobs SET steer_state=NULL WHERE job_id=?").run(job.job_id);
     this.sql.prepare("UPDATE tasks SET steer_pending_event_id=NULL WHERE task_id=?").run(task.task_id);
     this.sql.prepare("UPDATE offline_task_resumes SET state='pending' WHERE attempt_id=?").run(job.job_id);
     row.state='pending';
+    if(waitForNewAnswer){
+     this.sql.prepare("UPDATE offline_task_resumes SET state='held',reason='human_input' WHERE attempt_id=?").run(job.job_id);
+     row.state='held';row.reason='human_input';
+    }
    }
    const evidence={state:'stopped' as const,reason:'offline_update',observed_at:new Date().toISOString(),process_ids:[],process_groups:[]};
    if(row.state==='held'&&!['capacity_wait','external_approval'].includes(row.reason??'')){
