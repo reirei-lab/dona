@@ -372,7 +372,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("get_job_status", {
     title: "Get background job status",
-    description: "旧same-event読取用です。別threadはget_job_status_summaryのみを使い、not_available時のfallbackに使いません。productionのcurrent contextでは固定状態projectionだけを返し、Resultとlive観測はこの同owner許可に含めません。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
+    description: "旧same-event読取用です。利用者の明示job_idと現在eventで対象を確定します。別threadはget_job_status_summaryのみを使い、not_available時のfallbackに使いません。productionのcurrent contextでは固定状態projectionだけを返し、Resultとlive観測はこの同owner許可に含めません。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
     inputSchema: { job_id: jobId, source_event_id: eventId,
       include_live_session:z.boolean().optional().describe("trueの場合だけ保存済みexact identityへHerdr controlを伴わないbounded live queryを行い、監査receiptを追記する"),
       live_session_receipt_id:liveSessionReceiptId.optional().describe("既存のdurable receiptを再読し、新しいlive queryは行わない") },
