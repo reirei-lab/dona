@@ -2,15 +2,17 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import fs from "node:fs/promises";
 import Database from "better-sqlite3";
+import { buildJobPrompt } from "../src/job-prompt.js";
+import { JobSupervisor } from "../src/job-supervisor.js";
 import { DispatcherDatabase } from "../src/database.js";
 import { taskRequestSchema, type TaskRow } from "../src/task-execution.js";
 import { buildEventPrompt,envelopeFromRow } from "../src/prompt.js";
 import { eventEnvelope,tempConfig } from "./helpers.js";
-async function fixture() {
+async function fixture(options:{projectOwner?:string;longInitial?:boolean}={}) {
   const {root,config}=await tempConfig();let db=new DispatcherDatabase(config.databasePath);
   const event=db.enqueue(eventEnvelope("request")).row;
-  const request=taskRequestSchema.parse({source_event_id:event.event_id,task_key:"audit",objective:"14件を監査し順番に進める",workspace:{kind:"scratch"},
-    continuation_scope:{objective:"監査後、Issue 167/168を並行実装してPR・review・CIまで。次にIssue 229を監査。",targets:[{repository:"org/repo",issue_numbers:[167,168,229]}],allow_scratch:true,operations:["read_only","submit_pr"],max_tasks:4,max_attempts_per_task:3}});
+  const request=taskRequestSchema.parse({source_event_id:event.event_id,task_key:"audit",objective:options.longInitial?"a".repeat(100000):"14件を監査し順番に進める",workspace:{kind:"scratch"},
+    continuation_scope:{objective:"監査後、Issue 167/168を並行実装してPR・review・CIまで。次にIssue 229を監査。",targets:[{repository:"org/repo",issue_numbers:[167,168,229],...(options.projectOwner?{project:{owner:options.projectOwner,number:4}}:{})}],allow_scratch:true,operations:["read_only","submit_pr"],max_tasks:4,max_attempts_per_task:3}});
   const task=db.tasks.create(request,config.jobsWorkspaceRoot,config.jobResultsDir).task;
   const finish=(t:TaskRow)=>{
     const job=db.getJob(t.current_attempt_id)!;
@@ -30,7 +32,7 @@ test("監査完了から並行実装、次段階まで元依頼を引き継ぎ�
   const a=f.create(f.child()),b=f.create(f.child("issue-168",168));
   assert.equal(f.db.getJob(a.current_attempt_id)!.source,"dona_job");assert.equal(a.source_event_id,f.notice.event_id);
   assert.deepEqual(f.db.tasks.projection(a).notification_target,JSON.parse(f.event.reply_target_json!));
-  assert.match(f.db.getJob(a.current_attempt_id)!.objective,/merge・本番反映/);assert.equal(a.objective,f.db.getJob(a.current_attempt_id)!.objective);
+  assert.match(buildJobPrompt(f.db.getJob(a.current_attempt_id)!),/merge・本番反映/);assert.equal(a.objective,f.db.getJob(a.current_attempt_id)!.objective);
   assert.equal(f.db.tasks.assertOwner(a.task_id,f.notice.event_id).task_id,a.task_id);assert.equal(f.db.tasks.list(f.notice.event_id).length,3);
   f.restart();assert.equal(f.create(f.child()).task_id,a.task_id);
   assert.throws(()=>f.create({...f.child(),objective:"別内容"}),/idempotency_conflict/);
@@ -112,5 +114,42 @@ test("既存TaskのDBへ追加tableを移行しても継続権限を自動付与
   f.restart();assert.equal(f.db.tasks.get(plain.task_id)!.current_attempt_id,plain.current_attempt_id);
   assert.equal(f.db.tasks.projection(plain).continuation,undefined);
   assert.throws(()=>f.create(f.child()),/owner_mismatch/);
+ }finally{await f.dispose();}
+});
+
+
+test("100000文字の初回・後続objectiveを契約の追記で拒否せず、別fieldへ保持する",async()=>{
+ const f=await fixture({longInitial:true});try {
+  assert.equal(f.db.getJob(f.task.current_attempt_id)!.objective.length,100000);
+  const child=f.create({...f.child(),objective:"b".repeat(100000)}),job=f.db.getJob(child.current_attempt_id)!;
+  assert.equal(job.objective.length,100000);
+  const prompt=buildJobPrompt(job),data=JSON.parse(prompt.split("job_json:\n")[1]!.split("\n[DONA_JOB_END]")[0]!);
+  assert.equal(data.objective,"b".repeat(100000));assert.equal(data.continuation.scope.max_tasks,4);
+  assert.equal(data.continuation.operation,"submit_pr");
+ }finally{await f.dispose();}
+});
+
+test("Project ownerの大小文字差は同じ対象として扱い、別ownerは拒否する",async()=>{
+ const f=await fixture({projectOwner:"OrG"});try {
+  const input={...f.child(),project:{owner:"org",number:4,completion_status:"Merge Ready" as const}};
+  const task=f.db.tasks.create(input,f.config.jobsWorkspaceRoot,f.config.jobResultsDir,{node_id:"I_167",repository:"org/repo",number:167,project:{completion_status:"Merge Ready"}}).task;
+  assert.equal(task.state,"active");
+  assert.throws(()=>f.create({...f.child("different",168),project:{owner:"Other",number:4,completion_status:"Merge Ready"}}),/scope_mismatch/);
+ }finally{await f.dispose();}
+});
+
+test("自動回復の次Attemptにも独立した継続契約を保持する",async()=>{
+ const f=await fixture();try {
+  const task=f.create(f.child()),job=f.db.getJob(task.current_attempt_id)!;
+  f.db.beginJobPreparation(job.job_id,new Date(job.available_at));f.db.setJobRuntime(job.job_id,"w","p");f.db.beginJobDispatch(job.job_id);f.db.markJobRunning(job.job_id);
+  await fs.mkdir(job.workspace_path,{recursive:true});f.db.markJobNeedsReview(job.job_id,"result_missing","interrupted");
+  const forbidden=async():Promise<never>=>{throw Error("unexpected");};
+  const supervisor=new JobSupervisor(f.db,{prepare:forbidden,prompt:forbidden,get:forbidden,wait:forbidden,cancel:forbidden,
+   observeWorker:async()=>({state:"inactive",reason:"agent_idle",observed_at:new Date().toISOString(),process_ids:[123],process_groups:[123]}),
+   retireWorker:async()=>{},workerRetired:async()=>true},f.config,{debug(){},info(){},warn(){},error(){}},()=>{});
+  await supervisor.reconcileTasks();const current=f.db.tasks.get(task.task_id)!;
+  assert.equal(current.attempt_number,2);const next=f.db.getJob(current.current_attempt_id)!;
+  assert.deepEqual(JSON.parse(next.workspace_json)._dona_continuation,JSON.parse(job.workspace_json)._dona_continuation);
+  assert.match(buildJobPrompt(next),/merge・本番反映/);
  }finally{await f.dispose();}
 });

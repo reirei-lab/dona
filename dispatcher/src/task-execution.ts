@@ -215,7 +215,7 @@ export class TaskRepository {
         const claimed=this.sql.prepare("SELECT task_id FROM tasks WHERE resource_id=?").get(resource) as {task_id:string}|undefined;
         if(claimed){this.assertOwner(claimed.task_id,parsed.source_event_id);throw new Error("task_resource_already_claimed");}
       }
-      const request=parseCreateJobRequest({source_event_id:parsed.source_event_id,...(parsed.task_key==="legacy-default"?{}:{job_key:parsed.task_key}),objective:this.continuations.objective(parsed),workspace:parsed.workspace,...(parsed.display?{display:parsed.display}:{})});
+      const request=parseCreateJobRequest({source_event_id:parsed.source_event_id,...(parsed.task_key==="legacy-default"?{}:{job_key:parsed.task_key}),objective:parsed.objective,workspace:parsed.workspace,...(parsed.display?{display:parsed.display}:{})});
       const created=this.dispatcher.createJob(request,workspaceRoot,resultDir);
       if(created.duplicate)throw new Error("task_attempt_identity_conflict");
       const job=created.row,id=`task_${ulid().toLowerCase()}`,now=new Date().toISOString();

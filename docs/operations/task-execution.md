@@ -101,4 +101,4 @@ Taskの`get_task`応答と完了通知には`continuation`（元依頼ID、root 
 
 `control_task_continuation`は元threadの依頼者のSlackイベントと`continuation.revision`を使い、後続作成を`paused`/`active`/`cancelled`にする。取消は不可逆で、scopeの拡大や予算追加には使えない。この操作は既存workerの停止ではないため、作業全体の停止依頼では各稼働Taskにも`pause_task`/`cancel_task`を行う。作成の最終transactionで状態・revision・対象・上限を再検証する。
 
-対象Issue・Project・作業種別・上限はDispatcherの作成検査、目的の意味と作業種別に沿ったCLI操作は親とworkerの実行契約で守る。任意CLIのコマンド単位の認可をこの機能で新設するものではない。保存scopeはworkerのobjectiveにも付与され、自動回復後も保持する。旧Taskにはscopeを自動付与せず、通常の既存Task操作と履歴を維持する。追加tableのみの移行だが、後続作成を使う世代はこの機能を理解するbinaryで運用する。
+対象Issue・Project・作業種別・上限はDispatcherの作成検査、目的の意味と作業種別に沿ったCLI操作は親とworkerの実行契約で守る。任意CLIのコマンド単位の認可をこの機能で新設するものではない。保存scopeはobjectiveとは独立したworkerの`continuation` fieldへ付与し、100,000文字のobjective上限を圧迫せず、自動回復後も保持する。旧Taskにはscopeを自動付与せず、通常の既存Task操作と履歴を維持する。追加tableのみの移行だが、後続作成を使う世代はこの機能を理解するbinaryで運用する。
