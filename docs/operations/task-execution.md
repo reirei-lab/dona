@@ -117,4 +117,6 @@ Issue claimは引き続き1つのTaskが保持する。同じIssueの調査・�
 
 停止直前のResultは通常の回収経路で確認し、再実行しない。承認・質問待ち、追加指示の受理不明、外部操作の成否不明、pause/cancel、identity不一致は保留する。旧接続の承認回答は新接続へ移植せず、再開後も必要な承認を新しく要求する。既存Attempt予算は増やさず、上限ならretry_exhaustedで待つ。schedule、Taskではない旧job、fresh-generation更新、rollbackには自動再開を適用しない。
 
+利用上限の待機期限は保存し、期限後に通常のSupervisorが再開する。保留中の質問へ届いた追加回答は、旧workerの停止を再照合して後継objectiveへ渡す。外部操作のterminal receiptはサービス起動後の検証器で照合し、検証器がない保守段階だけで恒久保留を決めない。thread再開要求が未送信・拒否と確定し、processの停止も確認できた失敗では再開claimを解放する。受理不明のclaimは保持する。
+
 これは停止更新用の再開であり、[worker handoff契約](worker-handoff-contract.md)のsame-turn継続やonline Updaterのallocated worker gateを有効化しない。実Codex/provider、本番停止更新は別途確認する。

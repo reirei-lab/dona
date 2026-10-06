@@ -310,8 +310,6 @@ export class JobSupervisor {
     let task=this.database.tasks.get(snapshot.task_id)!;
     if(task.revision!==snapshot.revision||task.current_attempt_id!==snapshot.current_attempt_id)return;
     let job=this.database.getJob(task.current_attempt_id)!;
-    const offlineHold=this.database.tasks.offlineResumes.hold(task);
-    if(offlineHold){this.database.tasks.wait(task,offlineHold);return;}
     if(job.last_error_code==="runtime_preparation_unknown"&&!this.database.getJobLiveSessionIdentity(job.job_id)&&this.runtime.reconcilePreparation) {
       const recovered=await this.runtime.reconcilePreparation(job);
       if(recovered?.herdrAgentSessionId)this.database.reconcileJobPreparationRuntime(job.job_id,recovered.herdrWorkspaceId,recovered.herdrPaneId,recovered.herdrAgentSessionId);
@@ -345,6 +343,11 @@ export class JobSupervisor {
     } catch(error) {
       if(!(error instanceof JobResultNotFoundError)) {this.database.tasks.wait(task,"result_conflict");return;}
     }
+    if(await this.resumeOfflineAnswer(job))return;
+    const offlineHold=this.database.tasks.offlineResumes.hold(task);
+    if(offlineHold){this.database.tasks.wait(task,offlineHold);return;}
+    const capacityDelay=this.database.tasks.offlineResumes.capacityDelay(task);
+    if(capacityDelay>0){this.database.tasks.wait(task,"capacity_wait",Math.min(capacityDelay,86_400_000));return;}
     // 外部tool待機が未確定steerのreceipt待ちを上書きしてはいけない。
     if(task.desired_state==="running"&&(task.steer_pending_event_id||task.wait_reason==="steer_acceptance_unknown"||job.steer_state==="dispatching")) {this.database.tasks.wait(task,"steer_acceptance_unknown",60_000);return;}
     const externalRecovery=this.database.tasks.externalApprovalRecovery(job.job_id);
@@ -601,6 +604,15 @@ export class JobSupervisor {
     this.running = false;
   }
 
+  private async resumeOfflineAnswer(job:JobRow):Promise<boolean> {
+    const task=this.database.tasks.forAttempt(job.job_id);
+    if(!task||!this.database.tasks.offlineResumes.canAnswer(task)||job.steer_state)return false;
+    if(!this.runtime.observeWorker||!this.runtime.workerRetired)return false;
+    const observed=await this.observeWorker(job);
+    if(observed.state!=="stopped"||!await this.runtime.workerRetired(job,observed,this.abortController.signal))return false;
+    this.database.tasks.offlineResumes.answer(task);this.wake();return true;
+  }
+
   steer(jobId: string, sourceEventId: string, instruction: string): Promise<JobControlResult> {
     return this.serialized(jobId, async () => {
       const current = this.database.getJob(jobId);
@@ -610,6 +622,7 @@ export class JobSupervisor {
         this.wake();
         return result;
       }
+      if(await this.resumeOfflineAnswer(current))return {row:this.database.getJob(jobId)!,duplicate:false};
       const begun = this.database.beginJobSteer(jobId, sourceEventId);
       if (begun.duplicate) return begun;
       // Steer acceptance is the CLI submission response, not a later worker state change.

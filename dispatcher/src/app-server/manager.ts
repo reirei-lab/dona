@@ -109,6 +109,7 @@ export class AppServerManager {
         if(error instanceof RpcSpawnFailure)this.store.db.transaction(()=>{
           this.store.db.prepare("INSERT INTO stops VALUES(?,?,?,'stopped') ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,processes_json=excluded.processes_json,state='stopped'").run(row.name,row.generation,"[]");
           this.store.change(row.name,row.generation,{state:"stopped",turn_id:null});this.connections.delete(row.name);
+          this.releaseUnsentResume(row);
         }).immediate();
         throw error;
       }
@@ -131,10 +132,14 @@ export class AppServerManager {
         const phase=this.store.db.prepare("SELECT phase FROM startup_phases WHERE agent=? AND generation=?").get(row.name,row.generation) as {phase:string};
         if(phase.phase==="not_sent"||(error instanceof RpcFailure&&["not_sent","rejected"].includes(error.acceptance))){
           this.store.db.prepare("UPDATE startup_phases SET phase='not_sent' WHERE agent=? AND generation=?").run(row.name,row.generation);
-          await this.stopAgent(row.name,row.generation);throw Error("runtime_start_not_sent");
+          await this.stopAgent(row.name,row.generation);this.releaseUnsentResume(row);throw Error("runtime_start_not_sent");
         }
         throw error;
       }
+  }
+  private releaseUnsentResume(row:AgentRecord):void {
+    const source=(JSON.parse(row.config_json) as StartAgent).resumeFrom;
+    if(source)this.store.db.prepare("DELETE FROM thread_resume_claims WHERE source_name=? AND source_generation=? AND target_name=?").run(source.name,source.generation,row.name);
   }
   private bind(row:AgentRecord,rpc:AppServerRpc):void {
       rpc.on("request",(message:RpcMessage)=>this.onRequest(row,message));
