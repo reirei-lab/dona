@@ -108,3 +108,13 @@ Projectを保存したtargetでは、後続Taskにも同じowner/numberのProjec
 Issue claimは引き続き1つのTaskが保持する。同じIssueの調査・実装・提出はそのTask内で完了させ、完了後に同じIssueへ別Taskを作り直さない。複数Issueの順序決め・準備調査はscratchの初回Taskで行い、その後のIssue Taskへ分ける。初回Task自身がclaimするIssueを`continuation_scope.targets`にも指定する設定は、作成前に`task_continuation_initial_issue_conflict`として拒否する。scope付きTaskと後続Taskでは旧通知形式を選ぶ予約key `legacy-default`も使用できない。いずれもTask作成・claim前の拒否なので、親Donaが元依頼の範囲で入力を訂正でき、新しいSlack返信は不要。
 
 `max_attempts_per_task`は自動継続で新しいTaskを作る際の上限であり、既存Taskに対する利用者の明示的な追加実行依頼を無効にしない。既存の`retry_task`は、停止確認・現在revision・依頼者のSlackイベントを検証して、そのTaskだけの予算を増やせる。他のTaskや後続作成の上限には波及しない。
+
+## 停止更新後にCodexスレッドを再開する
+
+`scripts/dona-update`のpreserve更新では、管理下processの終了を確認し、DBとResultをバックアップした後、旧RuntimeのTask/current Attempt・generation・thread ID・cwdを保存する。新Runtimeへの移行で旧要求をexpireする前にsnapshotを永続化する。更新は旧process/turnを生かしたまま移譲するものではない。
+
+実行中の通常Taskは、既存の停止確認済みAttempt置換を通し、同じTaskとworktreeを保った新Attemptへ進む。新Codex processは保存済みthreadを`thread/resume`し、新しいjob ID・Result保存先・現在の権限で残作業を続ける。旧Attemptはinterruptedとして履歴に残り、同じ停止更新の再実行で後継を重複作成しない。Runtimeも旧generationごとに再開先を一つに束縛する。
+
+停止直前のResultは通常の回収経路で確認し、再実行しない。承認・質問待ち、追加指示の受理不明、外部操作の成否不明、pause/cancel、identity不一致は保留する。旧接続の承認回答は新接続へ移植せず、再開後も必要な承認を新しく要求する。既存Attempt予算は増やさず、上限ならretry_exhaustedで待つ。schedule、Taskではない旧job、fresh-generation更新、rollbackには自動再開を適用しない。
+
+これは停止更新用の再開であり、[worker handoff契約](worker-handoff-contract.md)のsame-turn継続やonline Updaterのallocated worker gateを有効化しない。実Codex/provider、本番停止更新は別途確認する。

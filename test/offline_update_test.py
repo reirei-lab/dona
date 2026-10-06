@@ -690,6 +690,24 @@ class FreshGenerationTests(unittest.TestCase):
         self.assertEqual(runner.journal['source_stop_receipt']['processes'],[old])
         self.assertEqual(runner.journal['processes'],[])
 
+    def test_preserve_migration_passes_task_resume_only_with_stopped_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);runner=object.__new__(m.Runner)
+            runner.plan={'mode':'preserve','release':str(root/'release'),'target_sha':'a'*40}
+            runner.g=root/'target';(runner.g/'control').mkdir(parents=True)
+            runner.run=root/'prepared';runner.node='/node'
+            runner.policy={'main_agent':{'runtime':'app_server'}}
+            runner.inv={'databases':[str(root/str(i)) for i in range(4)],
+                        'policy':{'control_root':str(root/'old-control')},'old_results':[str(root/'events'),str(root/'jobs')]}
+            runner.journal={'source_stop_receipt':{'verified_at':'now','processes':[]}}
+            with patch.object(m,'command') as call:
+                runner.migrate()
+                request=m.json.loads(call.call_args.kwargs['input'])
+                self.assertEqual(request['task_resume'],{'result_dir':str(root/'jobs')})
+                self.assertEqual(request['runtime_migration']['stop_receipt'],runner.journal['source_stop_receipt'])
+                call.reset_mock();runner.migrate(retire_only=True)
+                self.assertNotIn('task_resume',m.json.loads(call.call_args.kwargs['input']))
+
     def test_fresh_migration_requires_stop_receipt_and_only_targets_new_paths(self):
         runner=object.__new__(m.Runner)
         runner.plan={'mode':'fresh_generation','release':'/target/release','target_sha':'a'*40}
@@ -702,6 +720,7 @@ class FreshGenerationTests(unittest.TestCase):
             runner.migrate()
             request=m.json.loads(call.call_args.kwargs['input'])
             self.assertTrue(request['fresh_generation'])
+            self.assertNotIn('task_resume',request)
             self.assertTrue(all(p.startswith('/new-generation/') for p in request['databases']))
             call.reset_mock();runner.migrate(retire_only=True);call.assert_not_called()
 

@@ -310,6 +310,8 @@ export class JobSupervisor {
     let task=this.database.tasks.get(snapshot.task_id)!;
     if(task.revision!==snapshot.revision||task.current_attempt_id!==snapshot.current_attempt_id)return;
     let job=this.database.getJob(task.current_attempt_id)!;
+    const offlineHold=this.database.tasks.offlineResumes.hold(task);
+    if(offlineHold){this.database.tasks.wait(task,offlineHold);return;}
     if(job.last_error_code==="runtime_preparation_unknown"&&!this.database.getJobLiveSessionIdentity(job.job_id)&&this.runtime.reconcilePreparation) {
       const recovered=await this.runtime.reconcilePreparation(job);
       if(recovered?.herdrAgentSessionId)this.database.reconcileJobPreparationRuntime(job.job_id,recovered.herdrWorkspaceId,recovered.herdrPaneId,recovered.herdrAgentSessionId);

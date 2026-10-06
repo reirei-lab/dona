@@ -127,7 +127,7 @@ export class AppServerJobRuntime implements JobAgentRuntime {
     const interactive=row.source!=="dona_schedule"&&this.taskOwned(row.job_id);
     serverArgs.push("-c",`features.default_mode_request_user_input=${interactive}`);
     let agent:AgentRecord;
-    try {agent=await this.client.start({attemptId:row.job_id,name:row.agent_name,role:"worker",cwd:row.workspace_path,release:path.resolve(import.meta.dirname,"../../.."),args:serverArgs,
+    try {agent=await this.client.start({...(JSON.parse(row.workspace_json)._dona_resume?{resumeFrom:JSON.parse(row.workspace_json)._dona_resume.source}:{}),attemptId:row.job_id,name:row.agent_name,role:"worker",cwd:row.workspace_path,release:path.resolve(import.meta.dirname,"../../.."),args:serverArgs,
       threadConfig:{model:"gpt-6.1-sol",approvalsReviewer:"user",...(!interactive?{approvalPolicy:"never"}:{}),config:{"sandbox_workspace_write.writable_roots":writeRoots,"features.default_mode_request_user_input":interactive},developerInstructions:!interactive?"このjobには対話回答の経路がありません。native request_user_inputは使わず、承認済みscopeで進められない場合は不足情報をblocked Resultへ記録してください。":"あなたはDonaのworkerです。必要な質問はrequest_user_inputで親Donaへ送れます。hostが質問を親に届けるため、ユーザーへの直接連絡やSlack操作は行わないでください。回答を待つ間も独立した作業は進められます。質問待ちは失敗ではなく、質問のためにfailed Resultを公開しないでください。"}});
     } catch(error) {
       // 接続前の失敗だけが未送信。応答喪失ではstartを再送せず、永続Attempt bindingを照合する。

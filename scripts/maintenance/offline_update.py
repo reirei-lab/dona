@@ -733,6 +733,7 @@ class Runner:
             if len(self.inv['databases'])>4:
                 atomic(target,(self.run/'backup/db-4').read_bytes())
             request['runtime_migration']={'database':str(target),'stop_receipt':self.journal['source_stop_receipt']}
+            request['task_resume']={'result_dir':self.inv['old_results'][1]}
         env = dict(os.environ, DONA_RELEASE_MANIFEST_PATH=str(Path(self.plan['release'])/'release-manifest.json'))
         command([self.node, str(self.run/'offline_state.mjs')], env=env, input=encode(request), timeout=120)
 
