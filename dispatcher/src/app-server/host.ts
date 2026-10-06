@@ -7,6 +7,7 @@ import { AppServerManager,type StartAgent } from "./manager.js";
 import { RuntimeStore } from "./store.js";
 import { AppServerRpc } from "./rpc.js";
 import {identity,same,type ProcessIdentity} from "./process.js";
+import {workerHandoffProtocol} from "./worker-handoff.js";
 
 export interface HostConfig {socket:string;database:string;codex:string;buildSha:string}
 export async function serveRuntime(config:HostConfig):Promise<http.Server> {
@@ -46,10 +47,14 @@ export async function serveRuntime(config:HostConfig):Promise<http.Server> {
     try {
       let text="";for await(const chunk of request){text+=String(chunk);if(Buffer.byteLength(text)>1_048_576)throw Error("runtime_request_limit");}
       const p=JSON.parse(text) as Record<string,unknown>;if(typeof p.action!=="string")throw Error("runtime_action_invalid");
-      if(!["list","start","pendingQuestions","conversations","externalRequests","externalRequest","externalAvailability"].includes(p.action)&&typeof p.name!=="string")throw Error("runtime_name_required");
+      if(!["list","start","pendingQuestions","conversations","workerHandoffInventory","externalRequests","externalRequest","externalAvailability"].includes(p.action)&&typeof p.name!=="string")throw Error("runtime_name_required");
       const name=p.name as string;
       let result:unknown;
       switch(p.action) {
+        case "workerHandoffInventory":
+          if(p.protocol!==workerHandoffProtocol)throw Error("runtime_worker_handoff_protocol_unsupported");
+          if(p.after!==undefined&&typeof p.after!=="string")throw Error("runtime_worker_handoff_cursor_invalid");
+          result=manager.workerHandoffInventory(p.after as string|undefined);break;
         case "externalAvailability":if(typeof p.enabled!=="boolean")throw Error("runtime_external_availability_invalid");result=manager.external.availability(p.enabled);break;
         case "externalRequests":result=manager.externalRequests();break;
         case "externalRequest":if(typeof p.id!=="string")throw Error("runtime_external_id_invalid");result=manager.external.get(p.id)??null;break;

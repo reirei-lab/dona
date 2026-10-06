@@ -65,3 +65,5 @@ routine releaseはstable updater自身を変更しません。policy/schema変�
 ## workload cutoverの決定
 
 ADR 0003を正本とする。現行のquiesce判定だけではrunning worker、旧Result、通知backlogの移譲を証明しない。実装前にepoch付きinventoryとcompletion/notification receiptを導入し、unknownを隔離する。共用fixtureは`docs/adr/fixtures/self-update-epoch-cutover.md`。
+
+App Server/Task世代の読み取り専用worker inventoryと、未証明のsame-turn/grant/release pair/terminal ownerを拒否する診断契約は[worker handoff契約](operations/worker-handoff-contract.md)を参照する。診断interfaceはhandoffを有効化せず、既存allocated worker gateを解除しない。
