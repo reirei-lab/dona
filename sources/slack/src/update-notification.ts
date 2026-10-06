@@ -36,7 +36,7 @@ export interface UpdateNotificationPort {
   confirmScheduleAccess?(input:ScheduleAccessConfirmationRequest):Promise<ScheduleAccessConfirmationResult>;
 }
 export interface ScheduleAccessConfirmationRequest {schema_version:1;event_id:string;workspace_id:string;channel_id:string;user_id:string;}
-export interface ScheduleAccessConfirmationResult extends ScheduleAccessConfirmationRequest {authorized:true;channel_kind:"im"|"other";channel_user_id:string|null;}
+export interface ScheduleAccessConfirmationResult extends ScheduleAccessConfirmationRequest {authorized:true;channel_kind:"im"|"other";channel_user_id:string|null;destination_kind?:"public_channel"|"private_channel"|"im"|"mpim";}
 
 export interface JobDeliveryConfirmationRequest { schema_version:1; event_id:string; workspace_id:string; channel_id:string; thread_ts:string|null; message_ts:string; body_sha256:string; desired_session_status:"active"|"suspended"|null; }
 export interface JobDeliveryConfirmationResult extends Omit<JobDeliveryConfirmationRequest,"schema_version"|"desired_session_status"> { posted_at:string; reply_broadcast:false; identity_block_verified:true; session_status:"active"|"suspended"|null; }
@@ -275,11 +275,13 @@ export class SlackUpdateNotificationReporter implements UpdateNotificationPort {
       body_sha256:input.body_sha256,posted_at:new Date(seconds*1000).toISOString(),reply_broadcast:false,identity_block_verified:true,session_status:sessionStatus};
   }
 
-  async confirmScheduleAccess(input:ScheduleAccessConfirmationRequest):Promise<ScheduleAccessConfirmationResult> {
+  async confirmScheduleAccess(input:ScheduleAccessConfirmationRequest & {status_summary?:boolean}):Promise<ScheduleAccessConfirmationResult> {
     let connection; try { connection=this.registry.getByTeamId(input.workspace_id); } catch { throw new Error("unknown_workspace"); }
     const user=await connection.client.getUser(input.user_id),channel=await connection.client.getChannel(input.channel_id);
+    if(input.status_summary && (user.id!==input.user_id||user.id==="USLACKBOT"||user.isAgentforceBot===true||user.teamId!==connection.teamId||user.stateKnown!==true||(!channel.isIm&&channel.visibilityKnown!==true)||user.isBot||user.isAppUser||channel.id!==input.channel_id||channel.isShared||
+      (channel.isIm?channel.userId!==input.user_id:!channel.isPrivate&&!channel.isMember)))throw new Error("status_access_not_confirmed");
     if(!connection.client.hasChannelMember||user.isDeleted||channel.isArchived||!await connection.client.hasChannelMember(input.channel_id,input.user_id)) throw new Error("schedule_access_not_confirmed");
-    return {...input,workspace_id:connection.teamId,authorized:true,channel_kind:channel.isIm?"im":"other",channel_user_id:channel.isIm?channel.userId??null:null};
+    return {...input,...(input.status_summary?{destination_kind:channel.isIm?"im" as const:channel.isMpim?"mpim" as const:channel.isPrivate?"private_channel" as const:"public_channel" as const}:{}),workspace_id:connection.teamId,authorized:true,channel_kind:channel.isIm?"im":"other",channel_user_id:channel.isIm?channel.userId??null:null};
   }
 
   async settleJobSession(input:JobSessionSettlementRequest):Promise<JobSessionSettlementResult> {

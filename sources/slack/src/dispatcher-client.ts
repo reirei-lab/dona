@@ -1,3 +1,4 @@
+import { signSlackPrincipalProof } from "./principal-proof.js";
 import http from "node:http";
 import fs from "node:fs/promises";
 
@@ -16,9 +17,18 @@ export interface DispatcherClientOptions {
 export class DispatcherClient {
   constructor(private readonly options: DispatcherClientOptions) {}
 
-  postEvent(envelope: unknown): Promise<DispatcherResponse> {
+  async postEvent(envelope: unknown, authenticatedWorkspaceId?:string): Promise<DispatcherResponse> {
+    const value=envelope as Record<string,unknown>;
+    let headers:Record<string,string>={};
+    if(authenticatedWorkspaceId && this.options.internalTokenPath) {
+      const key=(await fs.readFile(this.options.internalTokenPath,"utf8")).trim();
+      const trace={...(value.trace as Record<string,unknown>??{}),ingress_attempt:1};
+      envelope={...value,trace};
+      const signed=signSlackPrincipalProof(envelope as Record<string,unknown>,1,authenticatedWorkspaceId,key);
+      headers={"x-dona-slack-principal-proof":signed.proof,"x-dona-slack-principal-signature":signed.signature};
+    }
     const body = Buffer.from(JSON.stringify(envelope));
-    return this.request("POST", "/v1/events", body);
+    return this.request("POST", "/v1/events", body,undefined,headers);
   }
 
   healthReady(): Promise<boolean> {
@@ -41,7 +51,7 @@ export class DispatcherClient {
     }
   }
 
-  private request(method: "GET" | "POST", path: string, body?: Buffer, internalToken?: string): Promise<DispatcherResponse> {
+  private request(method: "GET" | "POST", path: string, body?: Buffer, internalToken?: string,extraHeaders:Record<string,string>={}): Promise<DispatcherResponse> {
     return new Promise((resolve, reject) => {
       let settled = false;
       let connectTimer: NodeJS.Timeout | undefined;
@@ -61,6 +71,7 @@ export class DispatcherClient {
           method,
           path,
           headers: {
+            ...extraHeaders,
             ...(body ? {
                 "content-type": "application/json",
                 "content-length": body.length,

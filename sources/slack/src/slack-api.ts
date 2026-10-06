@@ -466,6 +466,7 @@ export interface SlackAgentSessionStatusResult {
 }
 
 export interface SlackChannel {
+  visibilityKnown?:boolean;
   id: string;
   name?: string;
   isPrivate: boolean;
@@ -486,6 +487,9 @@ export interface SlackChannelPage {
 }
 
 export interface SlackUser {
+  stateKnown?:boolean;
+  isAgentforceBot?:boolean;
+  teamId?:string;
   id: string;
   username?: string;
   displayName?: string;
@@ -593,6 +597,8 @@ function channelFromResponse(channel: {
   is_archived?: boolean;
   is_member?: boolean;
   is_shared?: boolean;
+  is_org_shared?:boolean;
+  is_pending_ext_shared?:boolean;
   is_ext_shared?: boolean;
   topic?: { value?: string };
   purpose?: { value?: string };
@@ -604,10 +610,11 @@ function channelFromResponse(channel: {
   return {
     id: nonEmpty(channel.id, "channel.id"),
     ...(channel.name ? { name: channel.name } : {}),
+    visibilityKnown:typeof channel.is_private==="boolean"&&typeof channel.is_archived==="boolean"&&(typeof channel.is_shared==="boolean"||typeof channel.is_ext_shared==="boolean"),
     isPrivate: channel.is_private ?? false,
     isArchived: channel.is_archived ?? false,
     isMember: channel.is_member ?? false,
-    isShared: channel.is_shared ?? channel.is_ext_shared ?? false,
+    isShared: channel.is_shared===true||channel.is_ext_shared===true||channel.is_org_shared===true||channel.is_pending_ext_shared===true,
     ...(channel.topic?.value ? { topic: channel.topic.value } : {}),
     ...(channel.purpose?.value ? { purpose: channel.purpose.value } : {}),
     ...(channel.num_members !== undefined ? { memberCount: channel.num_members } : {}),
@@ -618,6 +625,8 @@ function channelFromResponse(channel: {
 }
 
 function userFromResponse(user: {
+  team_id?:string;
+  is_agentforce_bot?:boolean;
   id?: string;
   name?: string;
   real_name?: string;
@@ -636,6 +645,9 @@ function userFromResponse(user: {
       : {}),
     ...(user.profile?.title ? { title: user.profile.title } : {}),
     ...(user.tz ? { timezone: user.tz } : {}),
+    isAgentforceBot:user.is_agentforce_bot===true,
+    stateKnown:typeof user.is_bot==="boolean"&&typeof user.is_app_user==="boolean"&&typeof user.deleted==="boolean",
+    ...(user.team_id?{teamId:user.team_id}:{}),
     isBot: user.is_bot ?? false,
     isAppUser: user.is_app_user ?? false,
     isDeleted: user.deleted ?? false,

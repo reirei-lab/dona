@@ -30,6 +30,8 @@ export interface SocketClientLike {
 
 export interface WorkspaceSocket {
   workspace: string;
+  authenticatedTeamId?:string;
+  statusOriginVisibility?:(channelId:string)=>Promise<string|undefined>;
   client: SocketClientLike;
 }
 
@@ -331,7 +333,10 @@ export class SlackSocketAdapter {
     let response: DispatcherResponse;
     const dispatchStarted = Date.now();
     try {
-      response = await this.dispatcher.postEvent(normalized.envelope);
+      const socket=this.sockets.find(socket=>socket.workspace===workspace);
+      const visibility=await socket?.statusOriginVisibility?.(String(normalized.envelope.subject.channel_id));
+      const value=visibility?{...normalized.envelope,trace:{...normalized.envelope.trace,status_origin_visibility:visibility}}:normalized.envelope;
+      response = await this.dispatcher.postEvent(value,visibility?socket?.authenticatedTeamId:undefined);
     } catch (error) {
       this.logger.error("Dispatcher connection failed; Socket Mode envelope was not acknowledged", {
         workspace,

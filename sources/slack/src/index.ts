@@ -42,6 +42,16 @@ async function main(): Promise<void> {
     internalTokenPath: config.updateInternalTokenPath,
   });
   const registry = await SlackWorkspaceRegistry.load(config.workspaces, keychain, logger);
+  for(const socket of sockets) {
+    const connection=registry.get(socket.workspace);socket.authenticatedTeamId=connection.teamId;
+    socket.statusOriginVisibility=async id=>{
+      try {
+        const channel=await connection.client.getChannel(id);
+        if(channel.id!==id||channel.isShared||channel.isArchived||(!channel.isIm&&channel.visibilityKnown!==true))return undefined;
+        return channel.isIm?"im":channel.isMpim?"mpim":channel.isPrivate?"private_channel":"public_channel";
+      } catch {return undefined;}
+    };
+  }
   const updateNotifications = new SlackUpdateNotificationReporter(registry);
   const adapter = new SlackSocketAdapter(sockets, dispatcher, config, logger);
   const health = new SlackHealthServer(
