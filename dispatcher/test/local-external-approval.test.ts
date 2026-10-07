@@ -140,8 +140,8 @@ test("workerの外部承認checkpointは同じAttempt/callに保持し応答喪�
  const task=dispatcher.tasks.create(taskRequestSchema.parse({source_event_id:event.event_id,task_key:"external",objective:"承認された投稿を行う",workspace:{kind:"scratch"}}),f.filename+"-work",f.filename+"-results").task;
  const job=dispatcher.getJob(task.current_attempt_id)!;dispatcher.beginJobPreparation(job.job_id);dispatcher.setJobRuntime(job.job_id,job.agent_name,job.agent_name,JSON.stringify(["generation","thread"]));dispatcher.beginJobDispatch(job.job_id);dispatcher.markJobRunning(job.job_id);
  const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_worker",operation_key:`attempt:${job.job_id}`,agent:job.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"worker",attempt_id:job.job_id,source_event_id:null,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
- let lost=true;
- const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:job.agent_name,generation:"generation",thread_id:"thread"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{row.state="resolved";row.result_json=JSON.stringify(result);row.text="";if(lost){lost=false;throw Error("response lost");}return {state:"resolved"};}};
+ let lost=true,responses=0;
+ const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:job.agent_name,generation:"generation",thread_id:"thread"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{responses++;row.state="resolved";row.result_json=JSON.stringify(result);row.text="";if(lost){lost=false;throw Error("response lost");}return {state:"resolved"};}};
  const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source));
  await ingress.tick();assert.equal(dispatcher.tasks.get(task.task_id)?.wait_reason,"external_approval");assert.equal(row.state,"pending");
  const requestId=(f.db.prepare("SELECT request_id FROM local_external_ingress").get() as {request_id:string}).request_id,presentation=await f.service.present(actor,requestId);
@@ -149,6 +149,7 @@ test("workerの外部承認checkpointは同じAttempt/callに保持し応答喪�
  await ingress.tick();assert.equal(f.counts().sends,1);assert.equal(dispatcher.tasks.get(task.task_id)?.wait_reason,"external_approval");
  await ingress.tick();assert.equal(f.counts().sends,1);assert.equal(dispatcher.tasks.get(task.task_id)?.state,"active");assert.equal(dispatcher.getJob(job.job_id)?.status,"running");
  assert.equal((f.db.prepare("SELECT state FROM task_external_approval_checkpoints").get() as {state:string}).state,"succeeded");
+ assert.equal(responses,1);
 });
 
 test("先頭20件が解決不能でも21件目のdecisionを次のbounded scanで実行する",async t=>{
@@ -250,6 +251,32 @@ async function workerApprovalFixture(t:{after(fn:()=>void):void},queuedSteer=fal
  const approve=async()=>{const id=requestId(),p=await f.service.present(actor,id);await f.service.decide(actor,{...actor,receipt_id:"decision_"+row.request_id,request_id:id,decision:"approve",presentation_digest:p.presentation_digest,expires_at:"2026-09-19T00:01:00.000Z"});return id;};
  return {...f,dispatcher,enqueue,event,task,job,ingress,runtime,requestId,approve,row:()=>row,beforeResolve:(fn:()=>void)=>{beforeResolve=fn;},newCall:(operation:string)=>{row={...row,request_id:"ext_after",call_id:"after",operation_slot:"after",operation_key:operation,state:"pending",result_json:null,text:"新しい目的の本文"};}};
 }
+
+for(const receipt of ["delayed","conflict","wrong_attempt"] as const)test(`worker回答の${receipt}受領はread-only照合し再回答しない`,async t=>{
+ // 受領の不変条件を検証する。巡回budgetの消費は専用のphaseテストで扱う。
+ t.mock.method(performance,"now",()=>0);
+ const f=await workerApprovalFixture(t);await f.ingress.tick();const id=await f.approve();let responses=0;
+ f.runtime.resolveExternal=async(_name:string,_id:string,result:any)=>{responses++;Object.assign(f.row(),{state:"answering",result_json:JSON.stringify(result),text:""});throw Error("response lost");};
+ await f.ingress.tick();assert.equal(f.counts().sends,1);assert.equal(responses,1);
+ await f.ingress.tick();assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.wait_reason,"external_approval");assert.equal(responses,1);
+ f.row().state="resolved";
+ if(receipt==="conflict")f.row().result_json=JSON.stringify({request_id:id,state:"failed"});
+ if(receipt==="wrong_attempt")f.row().attempt_id="other_attempt";
+ await f.ingress.tick();await f.ingress.tick();
+ assert.equal(responses,1);assert.equal(f.counts().sends,1);
+ assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.state,receipt==="delayed"?"active":"waiting");
+ assert.equal(f.db.prepare("SELECT state FROM task_external_approval_checkpoints").pluck().get(),receipt==="delayed"?"succeeded":"pending");
+});
+
+test("回答前のRuntime照会中にTaskが取消されたら回答writeを開始しない",async t=>{
+ t.mock.method(performance,"now",()=>0);
+ const f=await workerApprovalFixture(t);await f.ingress.tick();await f.approve();const control=f.enqueue("cancel_during_read");let responses=0,cancelled=false;
+ const read=f.runtime.externalRequest;
+ f.runtime.externalRequest=async id=>{const record=await read(id);if(f.counts().sends===1&&!cancelled){const task=f.dispatcher.tasks.get(f.task.task_id)!;f.dispatcher.tasks.control(task.task_id,control.event_id,task.revision,"cancel");cancelled=true;}return record;};
+ const resolve=f.runtime.resolveExternal;f.runtime.resolveExternal=async(...args)=>{responses++;return resolve(...args);};
+ await f.ingress.tick();assert.equal(cancelled,true);assert.equal(responses,0);assert.equal(f.row().state,"pending");assert.equal(f.counts().sends,1);
+ assert.equal(f.dispatcher.tasks.get(f.task.task_id)?.desired_state,"cancelled");
+});
 
 for(const timing of ["before_ingress","during_request"] as const)test(`steer競合(${timing})は旧draftを失効させ正常steer後の新要求だけ許可する`,async t=>{
  const f=await workerApprovalFixture(t),follow=f.enqueue("steer_followup");

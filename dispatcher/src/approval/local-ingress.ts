@@ -115,7 +115,16 @@ export class LocalExternalApprovalIngress {
    const ready=this.sql.prepare("SELECT source_json,request_id FROM local_external_ingress WHERE state='pending' AND request_id IS NOT NULL AND runtime_request_id IN (SELECT value FROM json_each(?)) ORDER BY runtime_request_id LIMIT 128").all(JSON.stringify([...new Set([...rows.map(r=>r.runtime_request_id),...pending.map(r=>r.request_id)])])) as {source_json:string;request_id:string}[];
    for(const row of ready){if(performance.now()>=deadline)break;const source=JSON.parse(row.source_json) as ExternalApprovalSource;if(!this.authorizeSource(source))continue;
     try{const status=this.service.sourceStatus(source,row.request_id),state=status.execution?.state??status.state;if(!terminal.has(state))continue;
-     if(source.source_job_id){const response=await this.runtime.resolveExternal(source.agent,source.runtime_request_id,{request_id:row.request_id,state}) as {state?:string};if(response.state!=="resolved")continue;}
+     if(source.source_job_id){
+      // response loss後は回答writeを繰り返さず、同じcallの保存済み回答と受領証拠を読む。
+      const record=await this.runtime.externalRequest(source.runtime_request_id),result={request_id:row.request_id,state};
+      if(!record||record.request_id!==source.runtime_request_id||record.agent!==source.agent||record.attempt_id!==source.source_job_id||record.generation!==source.generation||record.thread_id!==source.thread_id||record.turn_id!==source.turn_id||record.operation_key!==source.runtime_operation_key||!this.authorizeSource(source))continue;
+      if(record.state==="answering"||record.state==="resolved"){
+       if(!record.result_json||stableStringify(JSON.parse(record.result_json))!==stableStringify(result)||record.state!=="resolved")continue;
+      }else if(record.state==="pending"){
+       const response=await this.runtime.resolveExternal(source.agent,source.runtime_request_id,result) as {state?:string};if(response.state!=="resolved")continue;
+      }else continue;
+     }
      this.finish(source,row.request_id,state);
     }catch{/* response lossは同じrequestのread-only statusから照合 */}
    }
