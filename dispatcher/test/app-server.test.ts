@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {test} from "node:test";
-import {AppServerRpc} from "../src/app-server/rpc.js";
+import {AppServerRpc,RpcFailure} from "../src/app-server/rpc.js";
 import {AppServerManager} from "../src/app-server/manager.js";
 import {RuntimeStore} from "../src/app-server/store.js";
 
@@ -310,4 +310,52 @@ test("worker外部callは同じturn内でも発生時のoperationを保持し未
   assert.equal(queue.source(queue.get(old.request_id)!).operation_key,"attempt:job_fixture");
   queue.expireRestart();assert.equal(queue.get(old.request_id)?.state,"expired");assert.equal(queue.get(next.request_id)?.state,"expired");
  }finally{store.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+for(const kind of ['main','worker','resumed-worker'] as const)test(`起動中のnot_sentを観測したrecoverは直後に起動完了した${kind}を停止しない`,async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'dona-app-server-start-race-')),script=path.join(root,'fake.mjs');await fs.writeFile(script,fake);
+ const store=new RuntimeStore(path.join(root,'runtime.db'));let release!:()=>void,entered=false;
+ const gate=new Promise<void>(resolve=>{release=resolve;});
+ const manager=new AppServerManager(store,(_args,cwd,row)=>{
+  const rpc=new AppServerRpc(process.execPath,[script],cwd);
+  if(row?.name==='target'){const initialize=rpc.initialize.bind(rpc);rpc.initialize=async()=>{entered=true;await gate;return initialize();};}
+  return rpc;
+ });
+ try{
+  let resumeFrom;
+  if(kind==='resumed-worker'){
+   const source=await manager.start({name:'source',role:'worker',attemptId:'old',cwd:root,release:root,args:[],threadConfig:{}});
+   await manager.stop(source.name,source.generation);
+   resumeFrom={name:source.name,generation:source.generation,thread_id:source.thread_id!,attempt_id:'old'};
+  }
+  const starting=manager.start({name:'target',role:kind==='main'?'main':'worker',attemptId:'new',cwd:root,release:root,args:[],threadConfig:{},...(resumeFrom?{resumeFrom}:{})});
+  await until(()=>entered);
+  assert.equal(store.db.prepare("SELECT phase FROM startup_phases WHERE agent='target'").pluck().get(),'not_sent');
+  const recovering=manager.recover();release();
+  const agent=await starting;await recovering;
+  assert.equal(manager.status(agent.name)?.state,'idle');
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM stops WHERE agent='target'").pluck().get(),0);
+  if(resumeFrom)assert.equal(store.db.prepare("SELECT target_name FROM thread_resume_claims WHERE source_name='source'").pluck().get(),'target');
+  assert.deepEqual(await manager.prompt(agent.name,'after-recovery','続行'),{turnId:'turn-test'});
+ }finally{release();for(const row of store.agents())if(row.state!=='stopped')await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+
+test('起動中のnot_sentを観測したrecoverは送信結果が不明になったworkerを未送信として停止しない',async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'dona-app-server-start-unknown-')),script=path.join(root,'fake.mjs');await fs.writeFile(script,fake);
+ const store=new RuntimeStore(path.join(root,'runtime.db'));let release!:()=>void,entered=false;
+ const gate=new Promise<void>(resolve=>{release=resolve;});
+ const manager=new AppServerManager(store,(_args,cwd)=>{
+  const rpc=new AppServerRpc(process.execPath,[script],cwd),initialize=rpc.initialize.bind(rpc),request=rpc.request.bind(rpc);
+  rpc.initialize=async()=>{entered=true;await gate;return initialize();};
+  rpc.request=async(method,...args)=>{const result=await request(method,...args);if(method==='thread/start')throw new RpcFailure('response lost','unknown');return result;};
+  return rpc;
+ });
+ try{
+  const starting=assert.rejects(manager.start({name:'target',role:'worker',cwd:root,release:root,args:[],threadConfig:{}}),/response lost/);
+  await until(()=>entered);const recovering=manager.recover();release();await starting;await recovering;
+  assert.equal(store.agent('target')?.state,'unknown');
+  assert.equal(store.db.prepare("SELECT phase FROM startup_phases WHERE agent='target'").pluck().get(),'sending');
+  assert.equal(store.db.prepare("SELECT COUNT(*) FROM stops WHERE agent='target'").pluck().get(),0);
+ }finally{release();for(const row of store.agents())if(row.state!=='stopped')await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
 });

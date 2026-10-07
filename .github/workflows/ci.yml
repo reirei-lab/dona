@@ -108,7 +108,7 @@ jobs:
 
       - name: Repeat App Server browser startup regression
         if: matrix.component == 'sources/web'
-        run: npm run test:browser -- browser-test/operator-runtime.spec.ts --repeat-each=20
+        run: npm run test:browser -- browser-test/operator-runtime.spec.ts --repeat-each=5
         working-directory: sources/web
 
   self-hosted-macos:

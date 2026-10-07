@@ -7,7 +7,8 @@ import {operatorRuntimeFixture} from '../../../dispatcher/test/operator-runtime-
 import {observerDashboardPage} from '../src/observer-dashboard.js';
 async function freePort(){const s=net.createServer();await new Promise<void>(r=>s.listen(0,'127.0.0.1',r));const port=(s.address() as net.AddressInfo).port;await new Promise<void>(r=>s.close(()=>r()));return port;}
 test('browser依頼から実Dispatcher・Unix App Server subprocessの進捗・最終Resultまで到達する',async({browser})=>{
- test.setTimeout(60000);const port=await freePort(),origin=`https://localhost:${port}`,f=await operatorRuntimeFixture(origin,observerDashboardPage()),context=await browser.newContext({ignoreHTTPSErrors:true});let submits=0;const slow:http.IncomingMessage[]=[];
+ // 1秒周期のRuntime復旧がinitialize待ちを観測する条件を作る。起動成功後に停止されてはいけない。
+ test.setTimeout(60000);const port=await freePort(),origin=`https://localhost:${port}`,f=await operatorRuntimeFixture(origin,observerDashboardPage(),{initializeDelayMs:1100}),context=await browser.newContext({ignoreHTTPSErrors:true});let submits=0;const slow:http.IncomingMessage[]=[];
  const proxy=https.createServer({cert:await fs.readFile(new URL('../../../test-fixtures/tls/loopback-fixture-cert.pem',import.meta.url)),key:await fs.readFile(new URL('../../../test-fixtures/tls/loopback-fixture-key.pem',import.meta.url))},(incoming,outgoing)=>{
   if(incoming.method==='POST'&&incoming.url==='/api/tasks')submits++;
   const upstream=http.request({hostname:'127.0.0.1',port:f.port,path:incoming.url,method:incoming.method,headers:incoming.headers},response=>{outgoing.writeHead(response.statusCode!,response.headers);response.pipe(outgoing);});upstream.on('error',()=>outgoing.destroy());incoming.pipe(upstream);

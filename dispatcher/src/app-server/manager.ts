@@ -391,6 +391,10 @@ export class AppServerManager {
       const phase=this.store.db.prepare("SELECT phase FROM startup_phases WHERE agent=? AND generation=?").get(candidate.name,candidate.generation) as {phase:string}|undefined;
       if(candidate.state!=="stopped"&&phase?.phase==="not_sent"){
         await this.serialized(candidate.name,async()=>{
+          // 起動処理の完了を待つ間に送信済み・readyへ進み得る。停止判断はlock内で再照合する。
+          const current=this.store.agent(candidate.name);
+          const currentPhase=this.store.db.prepare("SELECT phase FROM startup_phases WHERE agent=? AND generation=?").get(candidate.name,candidate.generation) as {phase:string}|undefined;
+          if(!current||current.generation!==candidate.generation||currentPhase?.phase!=="not_sent")return;
           const stopped=await this.stopAgent(candidate.name,candidate.generation);
           if(this.store.db.prepare("SELECT 1 FROM stops WHERE agent=? AND generation=? AND state='stopped'").get(stopped.name,stopped.generation))this.releaseUnsentResume(stopped);
         }).catch(()=>{});continue;

@@ -17,7 +17,7 @@ import {tempConfig} from './helpers.js';
 
 async function freePort(){const s=net.createServer();await new Promise<void>(r=>s.listen(0,'127.0.0.1',r));const port=(s.address() as net.AddressInfo).port;await new Promise<void>(r=>s.close(()=>r()));return port;}
 /** Codexだけを独立JSON-RPC processへ置換。DBとruntimeのmethod/stateは実装を通す。 */
-export async function operatorRuntimeFixture(origin:string,page:{status:number;headers:Record<string,string>;body:string},options:{socketPermissionDelayMs?:number}={}){
+export async function operatorRuntimeFixture(origin:string,page:{status:number;headers:Record<string,string>;body:string},options:{socketPermissionDelayMs?:number;initializeDelayMs?:number}={}){
  if(process.env.DONA_APP_SERVER_SOCKET)throw Error('fixture_requires_unset_runtime_socket');
  const logs:Array<{level:string;message:string;fields?:unknown}>=[];
  const record=(level:string,message:string,fields?:unknown)=>{logs.push({level,message,fields});if(logs.length>100)logs.shift();};
@@ -37,7 +37,7 @@ const root=${JSON.stringify(root)},finish=${JSON.stringify(finish)},calls=${JSON
 const atomic=(file,value)=>{fs.mkdirSync(path.dirname(file),{recursive:true});if(!path.join(fs.realpathSync(path.dirname(file)),path.basename(file)).startsWith(root+path.sep))throw Error('outside_fixture');if(fs.existsSync(file))throw Error('result_exists');fs.writeFileSync(file+'.tmp',JSON.stringify(value),{mode:0o600});fs.renameSync(file+'.tmp',file);};
 const server=http.createServer(),ws=new WebSocketServer({server}),socket=process.argv[process.argv.indexOf('--listen')+1].slice(7);
 ws.on('connection',client=>client.on('message',raw=>{const r=JSON.parse(raw),send=v=>client.send(JSON.stringify(v));fs.appendFileSync(calls,JSON.stringify({method:r.method,pid:process.pid})+'\\n');
- if(r.method==='initialize')send({id:r.id,result:{}});
+ if(r.method==='initialize')setTimeout(()=>send({id:r.id,result:{}}),${JSON.stringify(options.initializeDelayMs??0)});
  else if(r.method==='thread/start'||r.method==='thread/resume')send({id:r.id,result:{thread:{id:thread}}});
  else if(r.method==='thread/read')send({id:r.id,result:{thread:{id:thread,status:{type:working?'active':'idle'}}}});
  else if(r.method==='thread/turns/list')send({id:r.id,result:{data:turn?[{id:'turn_'+turn,items}]:[],nextCursor:null}});
