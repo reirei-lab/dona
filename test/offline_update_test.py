@@ -557,7 +557,6 @@ class ActiveRunTests(unittest.TestCase):
             m.claim_run(run);(run/'plan.json').write_text('{"changed":true}')
             with self.assertRaisesRegex(RuntimeError,'active_run_changed'):m.active_run()
 
-if __name__ == '__main__':unittest.main()
 
 class FreshGenerationTests(unittest.TestCase):
     def test_recreated_source_is_held_before_kill_and_cannot_auto_resume(self):
@@ -791,3 +790,127 @@ class FreshGenerationTests(unittest.TestCase):
             self.assertEqual(plist['EnvironmentVariables']['DONA_DATABASE_PATH'],str(g/'dona.sqlite3'))
             self.assertEqual(plist['EnvironmentVariables']['DONA_JOB_RESULTS_DIR'],str(g/'job-results'))
             self.assertEqual(m.read_json(g/'control/policy.json')['dispatcher_socket'],str(g/'run/d.sock'))
+
+
+class DashboardUpdateTests(unittest.TestCase):
+    def fixture(self, root):
+        release=root/'old';control=root/'control';control.mkdir()
+        entry=release/'dispatcher/dist/dashboard/cli.js';entry.parent.mkdir(parents=True);entry.write_text('')
+        config={'schema_version':1,'origin':'https://dashboard.example','port':4318,
+                'control_socket':str(root/'dashboard.sock'),'dispatcher_database':str(root/'d.sqlite3'),
+                'dispatcher_socket':str(root/'d.sock'),'runtime_socket':str(control/'runtime.sock')}
+        file=root/'dashboard.json';m.atomic(file,m.encode(config))
+        plist={'Label':m.DASHBOARD_LABEL,'ProgramArguments':['/node',str(entry),'serve',str(file)],'KeepAlive':True}
+        target=root/'Library/LaunchAgents'/(m.DASHBOARD_LABEL+'.plist');target.parent.mkdir(parents=True)
+        target.write_bytes(plistlib.dumps(plist))
+        inv={'policy':{'executables':{'node':'/node'},'control_root':str(control),'dispatcher_socket':config['dispatcher_socket']},
+             'old_pointer':str(release),'databases':[config['dispatcher_database']], 'files':{},'plists':{},'services':{}}
+        return inv,config,file,target
+
+    def test_inventory_captures_config_and_live_identity_and_rejects_other_instance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();inv,config,file,plist=self.fixture(root)
+            with patch.object(Path,'home',return_value=root),patch.object(m,'command'),patch.object(m.common,'Launchd') as launch:
+                live=launch.return_value;live.observe.return_value={'pid':42}
+                live.process.return_value=str(os.getuid())+' '+' '.join(plistlib.loads(plist.read_bytes())['ProgramArguments'])
+                m.include_dashboard_inventory(inv)
+                self.assertEqual(inv['dashboard'],config)
+                self.assertIn(str(file),inv['files']);self.assertIn(str(plist),inv['files'])
+                self.assertIn('identity_hash',inv['services'][m.DASHBOARD_LABEL])
+                m.atomic(file,m.encode(dict(config,dispatcher_database='/other/db')))
+                with self.assertRaisesRegex(RuntimeError,'dashboard_instance_mismatch'):m.include_dashboard_inventory(inv)
+                plist.unlink()
+                with self.assertRaisesRegex(RuntimeError,'dashboard_plist_missing'):m.include_dashboard_inventory({})
+                live.observe.return_value=None
+                absent={};m.include_dashboard_inventory(absent);self.assertEqual(absent,{})
+
+    def test_render_install_restore_preserves_old_config_and_targets_new_generation(self):
+        for mode in ('preserve','fresh_generation'):
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory).resolve();inv,config,file,plist=self.fixture(root)
+                inv['dashboard']=config;inv['plists'][m.DASHBOARD_LABEL]=plistlib.loads(plist.read_bytes())
+                before=file.read_bytes();old_plist=plist.read_bytes()
+                g=root/'new';(g/'config').mkdir(parents=True);(g/'control').mkdir();run=root/'run';(run/'plists').mkdir(parents=True)
+                policy={'dispatcher_socket':str(root/'new-d.sock'),'current_pointer':str(g/'runtime/current')}
+                m.atomic(g/'control/policy.json',m.encode(policy))
+                plan={'generation':str(g),'release':str(g/'runtime/releases/sha'),'node':'/new/node','mode':mode}
+                with patch.object(m,'command'):
+                    m.render_dashboard(run,plan,inv)
+                actual=m.read_json(g/'config/dashboard.json')
+                self.assertEqual(actual['runtime_socket'],str(g/'control/runtime.sock'))
+                self.assertEqual(actual['dispatcher_socket'],policy['dispatcher_socket'])
+                self.assertEqual(actual['dispatcher_database'],str(g/'dona.sqlite3') if mode=='fresh_generation' else config['dispatcher_database'])
+                for key in ('origin','port','control_socket'):self.assertEqual(actual[key],config[key])
+                self.assertEqual(file.read_bytes(),before)
+                runner=object.__new__(m.Runner);runner.inv=inv;runner.run=run
+                for label in m.LABELS:
+                    inv['plists'][label]={'Label':label};(run/'plists'/(label+'.plist')).write_bytes(plistlib.dumps({'Label':label}))
+                with patch.object(Path,'home',return_value=root):
+                    runner.install()
+                    args=plistlib.loads(plist.read_bytes())['ProgramArguments']
+                    self.assertEqual(args,['/new/node',str(g/'runtime/current/dispatcher/dist/dashboard/cli.js'),'serve',str(g/'config/dashboard.json')])
+                    runner.install(old=True)
+                self.assertEqual(plist.read_bytes(),old_plist);self.assertEqual(file.read_bytes(),before)
+
+    def test_installed_dashboard_is_started_and_failed_health_resumes_forward(self):
+        runner=FakeRunner(fail='health');runner.inv={'dashboard':{}}
+        with patch.object(m,'herdr_root',return_value=[]):
+            with self.assertRaisesRegex(RuntimeError,'health'):runner.execute()
+            self.assertIn(m.DASHBOARD_LABEL,runner.calls)
+            self.assertNotIn('restore',runner.calls)
+            self.assertEqual(runner.journal['phase'],'activating')
+            runner.fail=None;runner.execute()
+            self.assertEqual(runner.journal['phase'],'succeeded')
+        self.assertIn(m.DASHBOARD_LABEL,runner.labels)
+        self.assertNotIn(m.DASHBOARD_LABEL,FakeRunner().labels)
+
+    def test_dashboard_health_checks_version_and_propagates_conversation_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'config').mkdir()
+            m.atomic(root/'config/dashboard.json',m.encode({'control_socket':'/dashboard.sock'}))
+            runner=object.__new__(m.Runner);runner.g=root;runner.inv={'dashboard':{}};runner.node='/node'
+            runner.plan={'target_sha':'target','release':'/release'}
+            with patch.object(m.common,'http_unix',return_value={'version':'stale','mode':'paired_operator'}),patch.object(m.time,'monotonic',side_effect=[0,61]),patch.object(m,'command') as command:
+                with self.assertRaisesRegex(RuntimeError,'health_timeout_dashboard'):runner.dashboard_health()
+                command.assert_not_called()
+            with patch.object(m.common,'http_unix',return_value={'version':'target','mode':'paired_operator'}),patch.object(m,'command',side_effect=RuntimeError('runtime_unavailable')):
+                with self.assertRaisesRegex(RuntimeError,'runtime_unavailable'):runner.dashboard_health()
+
+    def test_optional_absence_render_has_no_side_effects(self):
+        with patch.object(m,'atomic') as write:m.render_dashboard(Path('/run'),{},{});write.assert_not_called()
+
+
+    def test_config_drift_and_dashboard_added_after_prepare_abort_before_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();inv,config,file,plist=self.fixture(root)
+            inv['dashboard']=config;inv['files'][str(file)]=m.common.file_digest(file)
+            runner=object.__new__(m.Runner);runner.inv=inv;runner.plan={}
+            m.atomic(file,m.encode(dict(config,port=4320)))
+            with self.assertRaisesRegex(RuntimeError,'source_configuration_changed'):runner.validate_source()
+            runner.inv={}
+            with patch.object(Path,'home',return_value=root):
+                with self.assertRaisesRegex(RuntimeError,'dashboard_added_after_prepare'):runner.validate_source()
+
+    def test_dashboard_is_in_stop_receipt_and_unregistered_before_migration(self):
+        runner=FakeRunner();runner.inv={'dashboard':{}};runner.live=unittest.mock.Mock();runner.live.domain='gui/fixture'
+        runner.live.observe.return_value=None
+        with patch.object(m,'herdr_root',return_value=[]),patch.object(m,'herdr_starting',return_value=[]),patch.object(m,'process_table',return_value={}),patch.object(m,'command'):
+            m.Runner.stop(runner)
+        self.assertIn(m.DASHBOARD_LABEL,runner.journal['last_stop_receipt']['launch_agents'])
+        runner.live.stop.assert_any_call(m.DASHBOARD_LABEL)
+
+    def test_archive_uses_private_write_permissions_even_with_permissive_git_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);repo=root/'repo';repo.mkdir();archive=root/'source.tar'
+            subprocess.run(['git','init','-q',str(repo)],check=True)
+            (repo/'source.c').write_text('int main() {}')
+            subprocess.run(['git','-C',str(repo),'add','source.c'],check=True)
+            subprocess.run(['git','-C',str(repo),'-c','user.name=Test','-c','user.email=test@example.com','commit','-qm','fixture'],check=True)
+            subprocess.run(['git','-C',str(repo),'config','tar.umask','0000'],check=True)
+            release=root/'release';release.mkdir()
+            m.archive_source('git',repo,'HEAD',archive,release)
+            self.assertEqual((release/'source.c').stat().st_mode&0o777,0o644)
+            self.assertFalse(archive.exists())
+
+
+if __name__ == '__main__':unittest.main()
