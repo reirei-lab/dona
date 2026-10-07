@@ -44,7 +44,7 @@ schedule・jobを空DBで初期化せず、repository・worktree・未commit成�
 既存のlaunchd plistとdotenvから実際のpathを読むため、標準installと世代別installの両方に対応します。
 停止済みサービスからでも準備できます。Slack tokenなどを標準出力へ出しません。
 
-停止対象は`dev.dona.dispatcher`、`dev.dona.slack-adapter`、`dev.dona.updater`と、
+停止対象は`dev.dona.dispatcher`、`dev.dona.slack-adapter`、`dev.dona.updater`、`dev.dona.runtime`、導入済みの`dev.dona.dashboard`と、
 専用Herdr session **`dona`** のserver/clientおよび観測した子孫です。
 作業中のDona workerも終了するので、外部への操作が途中だったjobは通常の復旧処理で確認対象になり得ます。
 それを成功扱いに変えたり、古いjobを一括再実行したりはしません。
@@ -57,10 +57,18 @@ schedule・jobを空DBで初期化せず、repository・worktree・未commit成�
 すでにDispatcherへ渡った通知やSlackへの投稿を取り消したことにはしません。
 通常self-updateの承認条件を緩める変更ではありません。
 
+## ダッシュボードの切り替え
+
+`dev.dona.dashboard`のLaunchAgentが導入済みなら、停止更新の対象に自動で含めます。準備時に実行版と接続先が同じDonaを指すことを照合し、元設定の変更を停止直前にも検出します。未導入の場合は追加・起動しません。
+
+新世代の`config/dashboard.json`へ設定を生成し、実行版、Runtime socket、Dispatcher socket、DB、release pointerを更新先に揃えます。公開URL、port、control socketは保持し、元の設定ファイルは変更しません。通常更新では端末登録を保持し、空DB切り替えでは新DBを使います。
+
+更新成功にはダッシュボードのexact SHAと、同じ設定・observerを使ったDona本体の会話一覧取得も必要です。起動後にこの確認が失敗した場合は、新データを保持して同じrunの`resume`で前進復旧します。新main起動前の復旧では元のLaunchAgentと設定へ戻します。ブラウザ上の描画確認は別に行います。
+
 ## 更新の順序
 
 1. 設定を読み、mainのSHAと必須CIを確認する。独立領域で各componentの`npm ci`、test、typecheck、buildを完了する。生成した設定で両MCPのinitialize・tools/listも確認し、停止直前にも再確認する。この間はサービスを稼働させたままにする。
-2. 準備物と元設定を照合し、3つのLaunchAgentをdisableする。対象プロセスを親から順に`SIGSTOP`してforkを止めてから子を列挙する。停止対象のPID・UID・開始時刻をjournalへ記録し、launchd登録を外した後、同じidentityの子孫と親を終了する。
+2. 準備物と元設定を照合し、対象のLaunchAgentをdisableする。対象プロセスを親から順に`SIGSTOP`してforkを止めてから子を列挙する。停止対象のPID・UID・開始時刻をjournalへ記録し、launchd登録を外した後、同じidentityの子孫と親を終了する。
 3. 全4DBをDonaと同じNode SQLiteでWAL込みbackupし、integrity checkを行う。Result directoryもcopyし、復旧用hashを記録する。
 4. target版の正規DB migrationを適用する。コード・設定は新しい世代に置き、旧世代を保持する。activeなUpdater ledgerの自動再開を終了する。
 5. run専用のHerdr設定で`resume_agents_on_restore=false`を指定し、旧main・workerのnative conversationを自動再開しない状態でserverを起動する。設定はTOMLとして解析して生成し、元ファイルは変更しない。新しいmainを起動する。両MCPは`required=true`で接続し、target release・pane・interactive readyを確認する。
@@ -104,7 +112,7 @@ python3 -B "$HOME/.dona-maintenance/offline-20261001-1/offline_update.py" status
 ```
 
 `prepared`は準備完了、`rolled_back`は旧版への復旧であり、更新成功ではありません。
-新しいSHAでmain・3サービス・Slack接続を確認した`succeeded`だけが更新成功です。
+新しいSHAでmain・対象サービス・Slack接続・導入済みダッシュボードの会話一覧を確認した`succeeded`だけが更新成功です。
 ログインやネットワーク障害などでhealthが失敗した場合も、起動したというだけで成功と報告しません。
 
 ## 旧process再生成の照合後に復旧する
