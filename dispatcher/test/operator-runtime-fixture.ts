@@ -14,11 +14,14 @@ import {DashboardOperatorClient} from '../src/dashboard/operator-client.js';
 import {DashboardTaskReader} from '../src/dashboard/task-reader.js';
 import {DashboardObserver} from '../src/dashboard/observer.js';
 import {tempConfig} from './helpers.js';
-const logger={debug(){},info(){},warn(){},error(){}};
+
 async function freePort(){const s=net.createServer();await new Promise<void>(r=>s.listen(0,'127.0.0.1',r));const port=(s.address() as net.AddressInfo).port;await new Promise<void>(r=>s.close(()=>r()));return port;}
 /** Codexだけを独立JSON-RPC processへ置換。DBとruntimeのmethod/stateは実装を通す。 */
 export async function operatorRuntimeFixture(origin:string,page:{status:number;headers:Record<string,string>;body:string},options:{socketPermissionDelayMs?:number}={}){
  if(process.env.DONA_APP_SERVER_SOCKET)throw Error('fixture_requires_unset_runtime_socket');
+ const logs:Array<{level:string;message:string;fields?:unknown}>=[];
+ const record=(level:string,message:string,fields?:unknown)=>{logs.push({level,message,fields});if(logs.length>100)logs.shift();};
+ const logger={debug:(m:string,f?:unknown)=>record('debug',m,f),info:(m:string,f?:unknown)=>record('info',m,f),warn:(m:string,f?:unknown)=>record('warn',m,f),error:(m:string,f?:unknown)=>record('error',m,f)};
  const temporary=await tempConfig(),root=await fs.realpath(temporary.root),config=temporary.config;
  const cleanups:Array<()=>Promise<void>>=[()=>fs.rm(root,{recursive:true,force:true})];
  const cleanup=async()=>{const errors:unknown[]=[];for(const fn of cleanups.splice(0).reverse())try{await fn();}catch(e){errors.push(e);}if(errors.length)throw new AggregateError(errors,'fixture_cleanup_failed');};
@@ -61,6 +64,11 @@ ws.on('connection',client=>client.on('message',raw=>{const r=JSON.parse(raw),sen
  const port=await freePort(),control=path.join(root,'b.sock'),backend=new DashboardOperatorClient(config.socketPath);
  const observer=new DashboardObserver(reader,{conversations:after=>client.conversations(after),conversationHistory:(name,after)=>client.conversationHistory(name,after),conversation:(name,generation,after)=>client.conversation(name,generation,after)});
  const bff=new DashboardServer({backend,origin,port,controlSocket:control,version:'fixture',reader,observer,page});await bff.start();cleanups.push(()=>bff.close());
- return {db,config,port,client,worker,supervisor,async pairCode(){const v=await backend.call<{code:string}>('admin/pair',{capabilities:['tasks:read','conversations:worker:read','conversations:main:read','tasks:submit','tasks:cancel']});return v.code;},async finish(){await fs.writeFile(finish,'finish');},async calls(){return (await fs.readFile(calls,'utf8')).trim().split('\n').map(v=>JSON.parse(v) as {method:string;pid:number;mode?:number});},close:cleanup};
+ return {db,config,port,client,worker,supervisor,async diagnostics(){
+  return {logs:[...logs],workerRunning:worker.isRunning(),supervisorRunning:supervisor.isRunning(),
+   tasks:db.tasks.scanSnapshot().map(t=>{const j=db.getJob(t.current_attempt_id);return {state:t.state,waitReason:t.wait_reason,jobStatus:j?.status,errorCode:j?.last_error_code};}),
+   agents:(await client.list()).map(a=>({name:a.name,state:a.state,pid:a.pid})),
+   calls:(await fs.readFile(calls,'utf8')).trim().split('\n').slice(-100).map(v=>JSON.parse(v))};
+ },async pairCode(){const v=await backend.call<{code:string}>('admin/pair',{capabilities:['tasks:read','conversations:worker:read','conversations:main:read','tasks:submit','tasks:cancel']});return v.code;},async finish(){await fs.writeFile(finish,'finish');},async calls(){return (await fs.readFile(calls,'utf8')).trim().split('\n').map(v=>JSON.parse(v) as {method:string;pid:number;mode?:number});},close:cleanup};
  }catch(error){await cleanup();throw error;}
 }

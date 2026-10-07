@@ -31,5 +31,8 @@ test('browser依頼から実Dispatcher・Unix App Server subprocessの進捗・�
   await page.getByRole('button',{name:'更新',exact:true}).click();await expect(page.locator('#detail')).toContainText('保存された最終成果',{timeout:10000});await expect(page.locator('#detail')).toContainText('隔離ワーカーが完了しました');
   expect(submits).toBe(1);expect(f.db.tasks.attempts(task.task_id)).toHaveLength(1);expect(f.db.getJob(task.current_attempt_id)?.status).toBe('completed');
   const calls=await f.calls();expect(calls.filter(c=>c.method==='thread/start')).toHaveLength(2);expect(calls.filter(c=>c.method==='turn/start'&&c.pid===agent.pid)).toHaveLength(1);expect(calls.some(c=>c.method==='thread/read')).toBe(true);expect(calls.some(c=>c.method==='thread/turns/list')).toBe(true);expect(errors).toEqual([]);
+ }catch(error){
+  try{console.error('operator runtime diagnostics:',JSON.stringify(await f.diagnostics()));}catch(diagnosticError){console.error('operator runtime diagnostics unavailable:',diagnosticError);}
+  throw error;
  }finally{for(const response of slow)response.destroy();await context.close();proxy.closeAllConnections();await new Promise<void>(r=>proxy.close(()=>r()));await f.close();}
 });
