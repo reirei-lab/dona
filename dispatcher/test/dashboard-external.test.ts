@@ -31,7 +31,7 @@ for(const lost of [false,true])test(`外部操作のWeb入力から実署名・l
   },{authorize:value=>auth.authorize(value,'approvals:external'),verifyStepUp:value=>security.verifyReceipt(value,value,'approvals:external')},{
     observe:async target=>{if(failObservation)throw Error("fixture_observation_unavailable");return {target,observed_at:start,bot_user_id:'U123',bot_id:'B123',workspace_name:'Fixture',channel_name:'Channel',
       revision:{complete:true,items:[{message_ts:target.thread_ts,edited_ts:null,content_hmac_sha256:'a'.repeat(64)}]}};},
-    send:async(_target,_text,_marker,_observation,before)=>{before();calls++;return {outcome:'accepted',receipt_ref:'fixture_receipt'};},
+    send:async(_target,_text,_marker,_observation,before)=>{const assertCurrent=await before();assertCurrent?.();calls++;return {outcome:'accepted',receipt_ref:'fixture_receipt'};},
     reconcile:async()=>({outcome:'unknown'}),
   });
   // Only the broker's protected clock/Keychain and external network are fixtures.

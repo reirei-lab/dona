@@ -14,9 +14,9 @@ function setup(t:{after(fn:()=>void):void}){
  const revoked=new Set<string>();let sourceAuthorizer:((source:any)=>boolean)|undefined;let beforeAction=()=>{};
  let allowed=true,verified=true,changed=false,sends=0,reconciles=0,sendResult:ExternalSendResult={outcome:"accepted",receipt_ref:"slack_receipt"};
  const slack:ExternalSlackPort={observe:async (target,requesterId)=>({target,...(requesterId?{requester_id:requesterId,requester_authorized:true}:{}),observed_at:start,bot_user_id:"U123",bot_id:"B123",workspace_name:"Workspace",channel_name:"Channel",revision:{complete:true,items:[{message_ts:target.thread_ts,edited_ts:null,content_hmac_sha256:(changed?"b":"a").repeat(64)}]}}),
- send:async(_target,_text,_marker,_observation,before)=>{beforeAction();before();sends++;return sendResult;},reconcile:async()=>{reconciles++;return {outcome:"accepted",receipt_ref:"slack_receipt"};}};
+ send:async(_target,_text,_marker,_observation,before)=>{beforeAction();const assertCurrent=await before();assertCurrent?.();sends++;return sendResult;},reconcile:async()=>{reconciles++;return {outcome:"accepted",receipt_ref:"slack_receipt"};}};
  const keys={content:()=>content,wrapping:()=>wrapping,notification:()=>notification,wrappingVersion:()=>wrapping,notificationVersion:()=>notification,execution:()=>executionKey};
- const auth={authorize:(a:any)=>allowed&&!revoked.has(a.device_id),authorizeSource:(source:any)=>sourceAuthorizer?.(source)===true,verifyStepUp:()=>verified};
+ const auth={authorize:(a:any)=>allowed&&!revoked.has(a.device_id),authorizeSource:(source:any)=>sourceAuthorizer?.(source)===true,refreshSource:async(source:any)=>sourceAuthorizer?.(source)===true,verifyStepUp:()=>verified};
  const make=()=>new LocalExternalApprovalService(f.db,f.providers,scope,keys,auth,slack);
  return {...f,service:make(),make,revoke:(device:string)=>revoked.add(device),beforeSend:(action:()=>void)=>{beforeAction=action;},setSourceAuthorizer:(fn:(source:any)=>boolean)=>{sourceAuthorizer=fn;},setAllowed:(v:boolean)=>{allowed=v;},setVerified:(v:boolean)=>{verified=v;},setChanged:()=>{changed=true;},setSend:(v:ExternalSendResult)=>{sendResult=v;},counts:()=>({sends,reconciles})};
 }

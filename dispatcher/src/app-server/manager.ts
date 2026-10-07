@@ -308,6 +308,7 @@ export class AppServerManager {
       }
     });
   }
+  externalRequest(id:string){const row=this.external.get(id);if(!row)return null;try{return this.external.source(row);}catch{return {...row,source_event_id:null};}}
   externalRequests(){return this.external.pending().map(row=>{try{return this.external.source(row);}catch{return {...row,source_event_id:null};}});}
   resolveExternal(name:string,id:string,result:{request_id:string|null;state:string}){
     const row=this.external.get(id),agent=this.store.agent(name),rpc=this.connections.get(name);

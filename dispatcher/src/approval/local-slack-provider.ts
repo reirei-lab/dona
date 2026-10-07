@@ -1,3 +1,4 @@
+import {approvalDeadline} from "./deadline.js";
 import {createHash,createHmac} from "node:crypto";
 import type {ExternalSlackPort,ExternalTarget,ExternalSendResult,SlackTargetObservation} from "./local-external-types.js";
 import type {SealedApprovalExecutionMarker} from "./execution-marker.js";
@@ -18,9 +19,9 @@ export function externalRichText(text:string){
 export class LocalSlackApprovalProvider implements ExternalSlackPort {
  constructor(private readonly workspaceId:string,private readonly credential:()=>Promise<string>,private readonly revisionKey:Uint8Array,
   private readonly transport:typeof fetch=fetch){if(revisionKey.byteLength!==32)throw Error("external_approval_key_unavailable");}
- private async api(method:string,values:Record<string,unknown>,beforeSend?:()=>void,signal:AbortSignal=AbortSignal.timeout(15000)){
-  const token=await this.credential();if(!token)throw Error("external_approval_credentials_unavailable");
-  signal.throwIfAborted();beforeSend?.();
+ private async api(method:string,values:Record<string,unknown>,beforeSend?:(signal?:AbortSignal)=>void|(()=>void)|Promise<void|(()=>void)>,signal:AbortSignal=AbortSignal.timeout(15000)){
+  const token=await approvalDeadline(()=>this.credential(),signal);if(!token)throw Error("external_approval_credentials_unavailable");
+  signal.throwIfAborted();const assertCurrent=await approvalDeadline(()=>beforeSend?.(signal),signal);signal.throwIfAborted();assertCurrent?.();
   const response=await this.transport(`https://slack.com/api/${method}`,{method:"POST",redirect:"error",headers:{authorization:`Bearer ${token}`,"content-type":"application/json"},body:JSON.stringify(values),signal});
   if(!response.ok)throw Error("external_approval_provider_unavailable");
   const reader=response.body?.getReader();if(!reader)throw Error("external_approval_provider_unavailable");
@@ -71,7 +72,7 @@ export class LocalSlackApprovalProvider implements ExternalSlackPort {
    revision:{complete:true,items:messages.map(m=>({message_ts:m.ts,edited_ts:timestamp(object(m.edited).ts)?object(m.edited).ts:null,
     content_hmac_sha256:createHmac("sha256",this.revisionKey).update("dona.local-approval.thread.v1\0").update(canonical(m)).digest("hex")}))}};
  }
- async send(target:ExternalTarget,text:string,marker:SealedApprovalExecutionMarker,observation:SlackTargetObservation,beforeSend:()=>void):Promise<ExternalSendResult>{
+ async send(target:ExternalTarget,text:string,marker:SealedApprovalExecutionMarker,observation:SlackTargetObservation,beforeSend:(signal?:AbortSignal)=>void|(()=>void)|Promise<void|(()=>void)>):Promise<ExternalSendResult>{
   const block=executionBlockId(marker),rich=externalRichText(text);
   if(marker.marker.scope.workspace_id!==target.workspace_id||canonical(observation.target)!==canonical(target))throw Error("external_approval_marker_mismatch");
   try{

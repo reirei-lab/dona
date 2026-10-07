@@ -251,11 +251,15 @@ test("外部reply dynamic toolは実turnへ束縛しnative質問と分離する"
   const eventId="evt_01m3e2ht7qs79vf480z5qefeat";
   await manager.prompt(agent.name,eventId,"承認を要求");await until(()=>manager.external.pending().length===1);
   const row=manager.externalRequests()[0]!;assert.equal(row.source_event_id,eventId);assert.equal(row.attempt_id,null);assert.equal(row.text,"確認した本文");assert.notEqual((store.db.prepare("SELECT text FROM external_tool_requests WHERE request_id=?").get(row.request_id) as {text:string}).text,row.text);assert.equal(store.questions(agent.name).length,0);
+  assert.equal(manager.external.get(row.request_id)?.source_event_id,null);
+  assert.deepEqual(manager.externalRequest(row.request_id),row);
+  assert.equal(manager.externalRequest("missing"),null);
   manager.external.availability(false);
   assert.equal(manager.external.pending().length,1);
   assert.throws(()=>manager.external.accept({} as never,{} as never),/runtime_external_unavailable/);
   assert.equal(manager.status(agent.name)?.state,"waiting");manager.resolveExternal(agent.name,row.request_id,{request_id:"approval",state:"pending"});
   await until(()=>manager.status(agent.name)?.state==="idle");assert.equal(manager.external.get(row.request_id)?.text,"");
+  assert.equal(manager.externalRequest(row.request_id)?.source_event_id,eventId);
   assert.equal(manager.resolveExternal(agent.name,row.request_id,{request_id:"approval",state:"pending"}).state,"resolved");
   assert.throws(()=>manager.resolveExternal(agent.name,row.request_id,{request_id:"other",state:"pending"}),/conflict/);
  }finally{const row=store.agent("main-external");if(row&&row.state!=="stopped")await manager.stop(row.name,row.generation);store.close();await fs.rm(root,{recursive:true,force:true});}

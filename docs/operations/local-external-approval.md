@@ -132,3 +132,18 @@ Runtimeが消失した場合、Taskの後継Attempt作成は外部checkpointの�
 承認待ちでblockedになった後のpauseは既存Task制御の`task_human_input_pending`拒否を維持します。取消は停止確認へ進めます。保守reconcileによる事実の確認と、未確定な外部操作の再送許可は別です。新たな外部投稿には新たなexact承認が必要です。
 
 結果不明の要求はMacの `operations --operation reconcile --handle ... --reason ...` で固定markerの投稿を照合し、exact confirmation後に監査へ記録できます。現在の監査と一致する受理証拠が確定した場合だけ、Taskは既実行のreceiptを保持して通常の停止確認後に回復します。previewだけ、unknown、矛盾するreceipt、改竄または検証できない証拠では解除しません。照合対象が見つからないだけで未送信とみなして再送する経路はありません。
+
+## typed投稿のruntime policy照合
+
+Issue #20の差分は既存snapshot/coreを再利用し、保存sourceのAttempt有無から期待roleを決めてRuntimeの現在roleと照合し、稼働状態はidle・working・waitingだけを許可する。unknown・stopped・starting・interruptedは拒否する。callerのrole指定や本文を権限根拠にしない。新規受付と保存済み要求の再観測でagent名、generation、thread、要求ID、保存turn、Attemptを照合し、workerは現在turnと受理済みoperationも固定する。executorは既存のdecision event巡回cursorを使い、各要求のSlack観測後・consume直前にRuntime要求とroleを再観測する。providerもcredential取得後のsend直前に同じ15秒deadlineで非同期再照合を待ち、その後の同期grant検証を行う。deadline後の結果から送信guardを実行しない。照会不能では旧cacheを使わず送信しない。全sourceの先頭から一括再観測するloopは設けない。mainはpending handle返却後も通常会話を続けられるため、現在turnの変更だけでは旧要求を失効させない。
+
+| 経路 | policyと検証 |
+| --- | --- |
+| main通常返信・集約・結果通知 | 既存経路を維持し、追加のDona承認を要求しない |
+| workerのtyped投稿 | 保存Task/Attempt、Runtimeのworker role、exact sourceを照合して既存承認coreへ渡す。未承認では送信しない |
+| mainのtyped投稿 | 設定済みmain agent、Attemptなし、Runtimeのmain roleだけを受理。worker要求をmainへ付け替えない |
+| callerのrole追加・別main・Attempt/role不一致 | 保存前またはingressで拒否。承認後のlive role driftも旧要求を失効させる |
+
+canonical snapshotのsemantic hashはtarget、draftのHMAC、通知許可対象、policy/binding/resource revisionを保持する。request期限と表示revisionは既存の保護recordとcanonical Web presentation digestへ束縛する。expiryをsnapshot codecへ重複追加したり、別承認ledgerを作ったりしない。create、decision、consume、provider送信直前の既存authority再検証を維持する。
+
+これはtyped経路の否定試験であり、任意Result本文を意味解析してmain代理投稿を機械的に検出する保証ではない。その未完境界はADR 0001のまま残す。executor側のIssue #21、統合側のIssue #25や、実Keychain・署名profile・実service・別端末・実Slackの最終gateを代替しない。providerや保護状態が未接続なら既存safe-offを維持する。
