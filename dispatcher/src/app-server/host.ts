@@ -57,7 +57,7 @@ export async function serveRuntime(config:HostConfig):Promise<http.Server> {
           result=manager.workerHandoffInventory(p.after as string|undefined);break;
         case "externalAvailability":if(typeof p.enabled!=="boolean")throw Error("runtime_external_availability_invalid");result=manager.external.availability(p.enabled);break;
         case "externalRequests":result=manager.externalRequests();break;
-        case "externalRequest":if(typeof p.id!=="string")throw Error("runtime_external_id_invalid");result=manager.external.get(p.id)??null;break;
+        case "externalRequest":if(typeof p.id!=="string")throw Error("runtime_external_id_invalid");result=manager.externalRequest(p.id);break;
         case "resolveExternal":if(typeof p.id!=="string"||!p.result||typeof p.result!=="object"||Array.isArray(p.result))throw Error("runtime_external_result_invalid");result=manager.resolveExternal(name,p.id,p.result as {request_id:string|null;state:string});break;
         case "conversations":if(p.after!==undefined&&typeof p.after!=="string")throw Error("runtime_conversation_cursor_invalid");result=manager.conversations(p.after as string|undefined);break;
         case "conversationHistory":if(p.afterGeneration!==undefined&&typeof p.afterGeneration!=="string")throw Error("runtime_conversation_cursor_invalid");result=manager.conversationHistory(name,p.afterGeneration as string|undefined);break;
