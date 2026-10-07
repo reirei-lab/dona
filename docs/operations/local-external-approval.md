@@ -135,7 +135,7 @@ Runtimeが消失した場合、Taskの後継Attempt作成は外部checkpointの�
 
 ## typed投稿のruntime policy照合
 
-Issue #20の差分は既存snapshot/coreを再利用し、保存sourceのAttempt有無から期待roleを決めてRuntimeの現在roleと照合する。callerのrole指定や本文を権限根拠にしない。新規受付と保存済み要求の再観測でagent名、generation、thread、要求ID、保存turn、Attemptを照合し、workerは現在turnと受理済みoperationも固定する。mainはpending handle返却後も通常会話を続けられるため、現在turnの変更だけでは旧要求を失効させない。
+Issue #20の差分は既存snapshot/coreを再利用し、保存sourceのAttempt有無から期待roleを決めてRuntimeの現在roleと照合する。callerのrole指定や本文を権限根拠にしない。新規受付と保存済み要求の再観測でagent名、generation、thread、要求ID、保存turn、Attemptを照合し、workerは現在turnと受理済みoperationも固定する。executor段階からtickが再開する場合も、開始前にlive cacheを破棄しRuntime要求とroleを再観測する。照会不能やbudget不足で未観測のsourceへ旧cacheを流用しない。mainはpending handle返却後も通常会話を続けられるため、現在turnの変更だけでは旧要求を失効させない。
 
 | 経路 | policyと検証 |
 | --- | --- |

@@ -388,15 +388,15 @@ for(const scenario of ["main_with_attempt","worker_without_attempt","worker_as_m
  });
 }
 
-for(const role of ["main","worker"] as const)test(`承認後のmain通常turn変更を維持しlive role=${role}を照合する`,async t=>{
+for(const role of ["main","worker"] as const)test(`executor開始phase持越しでもmain通常turn変更を維持しlive role=${role}を照合する`,async t=>{
  const {DispatcherDatabase}=await import("../src/database.js");
  const f=setup(t),dispatcher=new DispatcherDatabase(f.filename);t.after(()=>dispatcher.close());
  const event=dispatcher.enqueue({schema_version:1,source:"slack",external_event_id:"role_drift",type:"app_mention",occurred_at:start,subject:{workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts,actor_id:"U123"},payload:{},reply_target:{kind:"slack_thread",workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts}}).row;
  f.db.prepare("UPDATE events SET status='completed' WHERE event_id=?").run(event.event_id);
  const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_drift",agent:"main",generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"main",attempt_id:null,source_event_id:event.event_id,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
  const live={name:"main",role:"main",generation:"generation",thread_id:"thread",turn_id:"turn"};
- let requestId="";
- const runtime={externalRequests:async()=>row.state==="pending"?[row]:[],externalRequest:async()=>row,status:async()=>live as any,resolveExternal:async(_name:string,_id:string,result:any)=>{requestId=result.request_id;row.state="resolved";return {};}};
+ let requestId="",now=100;const clock=t.mock.method(performance,"now",()=>now);t.after(()=>clock.mock.restore());
+ const runtime={externalRequests:async()=>row.state==="pending"?[row]:[],externalRequest:async()=>row,status:async()=>live as any,resolveExternal:async(_name:string,_id:string,result:any)=>{requestId=result.request_id;row.state="resolved";now+=6000;return {};}};
  const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source));
  await ingress.tick();assert.ok(requestId);assert.equal(f.counts().sends,0);
  const presentation=await f.service.present(actor,requestId);
