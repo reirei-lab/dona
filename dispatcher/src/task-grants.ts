@@ -24,7 +24,7 @@ export const grantResourceSchema = z.strictObject({ task_id: z.string().regex(/^
   issue_node_id: id, issue_number: revision, resource_revision: revision, binding_revision: revision });
 const destinationSchema = z.strictObject({ workspace_id: id, channel_id: id, thread_ts: z.string().regex(/^\d+\.\d+$/) });
 const unique = <T>(values: T[]) => new Set(values.map(stableStringify)).size === values.length;
-const grantSchema = z.strictObject({ grant_id: id, principal: principalSchema,
+export const taskGrantSchema = z.strictObject({ grant_id: id, principal: principalSchema,
   resources: z.array(grantResourceSchema).min(1).max(128).refine(unique),
   epic: z.strictObject({ repository_node_id: id, epic_node_id: id, membership_revision: revision,
     child_issue_node_ids: z.array(id).min(1).max(128).refine(unique) }).nullable(),
@@ -38,11 +38,11 @@ const grantSchema = z.strictObject({ grant_id: id, principal: principalSchema,
     r.repository_node_id !== g.epic!.repository_node_id || !g.epic!.child_issue_node_ids.includes(r.issue_node_id)))
     ctx.addIssue({ code: "custom", message: "invalid grant scope" });
 });
-export type TaskGrant = z.infer<typeof grantSchema>;
+export type TaskGrant = z.infer<typeof taskGrantSchema>;
 export type GrantResource = z.infer<typeof grantResourceSchema>;
 type Scope = z.infer<typeof scopeSchema>;
 const stateSchema = z.strictObject({ version: z.literal(1), scope: scopeSchema,
-  grants: z.array(grantSchema).max(1024).refine(g => unique(g.map(row => row.grant_id))) });
+  grants: z.array(taskGrantSchema).max(1024).refine(g => unique(g.map(row => row.grant_id))) });
 type State = z.infer<typeof stateSchema>;
 const resourceId = "task_grants_v1";
 const snapshotMaxBytes = 4194304;
@@ -157,7 +157,7 @@ export class TaskGrantRepository {
       assertSynchronousResult(input);
       const command = freeze(z.discriminatedUnion("kind",[
         z.strictObject({kind:z.literal("initialize")}),
-        z.strictObject({kind:z.literal("put"),expected_revision:z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),grant:grantSchema}),
+        z.strictObject({kind:z.literal("put"),expected_revision:z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),grant:taskGrantSchema}),
         z.strictObject({kind:z.literal("revoke"),grant_id:id,expected_revision:revision}),
       ]).parse(input));
       return this.transaction.runPrepared<() => {status:"succeeded"|"denied";revision:number|null}>(transactionId,(mark,state) => {
