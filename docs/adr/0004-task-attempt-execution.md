@@ -122,3 +122,8 @@ Attempt中断はTask失敗の最終通知にしない。自動再開中は作業
 `task-execution.ts`がtransaction/CASと回復予算、`job-supervisor.ts`がboundedな自動照合、`task-github.ts`がIssue node identityとProjectのwrite intent/read-back、`task-checkpoint.ts`がcheckpoint契約を担当する。通常Taskの結果通知では中断済みAttemptをgroup snapshotから除き、Task projectionを同じ保存済み通知先へ返す。
 
 通常中断の自動回復と、停止確認済みの予算追加を実装する。結果不正・未解決の外部操作・承認不明を人間の一言だけで成功や未実行へ変換するAPIは設けない。Taskのterminal failureや完了後の別目的への再着手を、元の自動回復許可で行わない。
+
+
+## 完了後の明示的な追加作業
+
+受理済みcompleted Taskの後に新しい作業が依頼された場合は、Task identityを再開して旧Resultの意味を変更せず、明示`followup`により新TaskへIssue claimをtransaction内で移す。元threadの同じ依頼者による新Slack依頼、旧Taskのrevision/current Attempt、worker停止、通知と外部操作の確定を必須とする。前後Taskの関係と旧resource identityを保存し、旧Taskの成果・予算・履歴を残す。Projectの旧同期を止め、記録した直前ownerだけを置換する。自動継続・failed Taskの再試行・旧claimの手動削除には適用しない。実行契約は[Task運用](../operations/task-execution.md#完了済みissue-taskへの追加作業)を参照する。

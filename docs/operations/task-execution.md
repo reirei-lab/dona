@@ -105,7 +105,7 @@ Projectを保存したtargetでは、後続Taskにも同じowner/numberのProjec
 
 同じ完了グループに複数のscopeがある場合、通知を発生させた最後のTaskだけでなく、そのグループの完了済みparentを各scopeの起点にできる。最後のTaskがfailed/cancelledでも、attentionが解消済みのall_terminalなら他の完了済みparentから継続できる。失敗・取消Task自体は起点にしない。`list_tasks`は関係するscopeのTaskを最大100件返す。100件の場合は一覧を完全とみなさず、group内の各parentを`get_task`して確認する。
 
-Issue claimは引き続き1つのTaskが保持する。同じIssueの調査・実装・提出はそのTask内で完了させ、完了後に同じIssueへ別Taskを作り直さない。複数Issueの順序決め・準備調査はscratchの初回Taskで行い、その後のIssue Taskへ分ける。初回Task自身がclaimするIssueを`continuation_scope.targets`にも指定する設定は、作成前に`task_continuation_initial_issue_conflict`として拒否する。scope付きTaskと後続Taskでは旧通知形式を選ぶ予約key `legacy-default`も使用できない。いずれもTask作成・claim前の拒否なので、親Donaが元依頼の範囲で入力を訂正でき、新しいSlack返信は不要。
+Issue claimは引き続き1つのTaskが保持する。同じIssueの調査・実装・提出はそのTask内で完了させ、完了後に同じIssueへ別Taskを自動で作り直さない。元threadの新しい明示依頼による追加作業だけは、下記の`followup`契約でclaimを引き継ぐ。複数Issueの順序決め・準備調査はscratchの初回Taskで行い、その後のIssue Taskへ分ける。初回Task自身がclaimするIssueを`continuation_scope.targets`にも指定する設定は、作成前に`task_continuation_initial_issue_conflict`として拒否する。scope付きTaskと後続Taskでは旧通知形式を選ぶ予約key `legacy-default`も使用できない。いずれもTask作成・claim前の拒否なので、親Donaが元依頼の範囲で入力を訂正でき、新しいSlack返信は不要。
 
 `max_attempts_per_task`は自動継続で新しいTaskを作る際の上限であり、既存Taskに対する利用者の明示的な追加実行依頼を無効にしない。既存の`retry_task`は、停止確認・現在revision・依頼者のSlackイベントを検証して、そのTaskだけの予算を増やせる。他のTaskや後続作成の上限には波及しない。
 
@@ -122,3 +122,23 @@ Issue claimは引き続き1つのTaskが保持する。同じIssueの調査・�
 利用上限の待機期限は保存し、期限不明ならsnapshot時刻からretry_delay_msだけ待って通常のSupervisorが再開する。保留中の質問へ届いた追加回答は、旧workerの停止を再照合して後継objectiveへ渡す。外部操作のterminal receiptはサービス起動後の検証器で照合し、検証器がない保守段階だけで恒久保留を決めない。thread再開要求が未送信・拒否と確定し、processの停止も確認できた失敗では再開claimを解放する。host crash後の永続not_sent phaseも停止確認後に同じ規則で回収し、受理不明のclaimは保持する。
 
 これは停止更新用の再開であり、[worker handoff契約](worker-handoff-contract.md)のsame-turn継続やonline Updaterのallocated worker gateを有効化しない。実Codex/provider、本番停止更新は別途確認する。
+
+
+## 完了済みIssue Taskへの追加作業
+
+PR提出後の競合解消など、完了済みTaskへ利用者が追加作業を依頼した場合は、`find_issue_task`と`get_task`で既存Task・受理済みResult・current Attemptを確認する。元のworkspace/channel/threadと同じ依頼者による、新しいSlackイベントだけが後続作成の入力となる。完了通知や旧依頼の包括的scopeだけで追加作業を開始しない。別threadの場合は返された`notification_target`の元threadで依頼してもらう。
+
+`delegate_task`へ新しい安定した`task_key`、今回の追加作業だけの`objective`、同じrepository/Issue、必要なProjectとpolicyに加え、`followup: {task_id, revision, attempt_id}`を指定する。既存PRを修正する場合は、そのbranchを`workspace.base_ref`へ指定する。通常の自動`continuation`や`continuation_scope`とは併用しない。
+
+Dispatcherはtransaction内で以下を再照合する。
+
+- Issue node ID・依頼者・元thread・Task revision・current Attemptが一致する。
+- 旧Task/AttemptがcompletedでResult受理済み、steerや外部承認・checkpointの未確定操作がない。
+- Runtime hostによるworker停止記録があり、旧完了通知とgroup terminal通知が処理済みで曖昧なwriteがない。
+- Projectがある場合は同じitem/fieldで同期済み、未確定の同期intentがない。
+
+条件を満たすとclaimを新Taskへ原子的に移し、前後Task・旧Attempt・revision・追加依頼eventを履歴tableへ保存する。旧Taskはcompletedのまま、旧Result・Attempt数・予算・作業領域を保持する。旧Project同期はsupersededとなり、後続は記録済みの直前Task IDだけを置換できる。新Taskの予算は今回の明示依頼のpolicyであり、failed/paused/cancelledや再試行上限の迂回には使用できない。
+
+新Taskは新しい作業領域を使い、旧領域を変更せず旧Result・commit・PR・外部操作を照合してから追加作業を行う。未commitの旧差分を黙って捨てたり、応答不明の外部writeを再送したりしない。`get_task`の`followup`投影で前後のidentityを確認できる。応答喪失後は同じevent/task_keyを`list_tasks`で照合し、既存後続のResultを採用する。元のcanonical requestを再取得したときだけ同内容の冪等応答を照合でき、異内容・別key・古いrevisionからの再委任は拒否される。
+
+これはコード提出後に有効になる契約であり、旧稼働世代のDBからclaimを手動削除する手順ではない。
