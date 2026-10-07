@@ -243,9 +243,17 @@ export class TaskRepository {
         if(!stopped)throw Error("task_followup_worker_stop_required");
         const group=this.dispatcher.getJobGroup(old.source_event_id);
         if(!old.completion_event_id||(group?.notification_mode==="grouped"&&!group.all_terminal_event_id))throw Error("task_prior_notification_requires_reconciliation");
+        const notifications=[...new Set([old.completion_event_id,group?.attention_event_id,group?.all_terminal_event_id])]
+          .filter((id):id is string=>!!id).map(id=>this.dispatcher.get(id)!);
+        const requestedAt=Date.parse(event.occurred_at),completedAt=Date.parse(old.completed_at??"");
+        if(!Number.isFinite(requestedAt)||!Number.isFinite(completedAt)||requestedAt<=completedAt||
+          notifications.some(notice=>{const notifiedAt=Date.parse(notice.completed_at??notice.updated_at);
+            return event.sequence<=notice.sequence||!Number.isFinite(notifiedAt)||requestedAt<=notifiedAt;}))throw Error("task_followup_requires_new_slack_request");
         this.dispatcher.assertTaskRetryNotificationsSettled(old.job_id);
         if(this.externalApprovalRecovery(old.job_id).state!=="ready")throw Error("task_external_effect_reconciliation_required");
-        const checkpoint=checkpointSnapshot(old,predecessor.task_id).checkpoint??this.attemptCheckpoint(old.job_id);
+        const snapshot=checkpointSnapshot(old,predecessor.task_id);
+        if(snapshot.checkpoint)this.checkpoint(old,snapshot.checkpoint);
+        const checkpoint=this.attemptCheckpoint(old.job_id);
         if(checkpoint&&(checkpoint.waiting==="external_effect_unknown"||checkpoint.unresolved_operations.length))throw Error("task_external_effect_reconciliation_required");
         if(predecessor.project_json) {
           const oldProject=JSON.parse(predecessor.project_json);

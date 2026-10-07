@@ -20,16 +20,19 @@ async function fixture(project=false,ambiguousResult=false){
   const task=db.tasks.create(request,config.jobsWorkspaceRoot,config.jobResultsDir,issue).task;
   const job=db.getJob(task.current_attempt_id)!;
   db.beginJobPreparation(job.job_id);db.setJobRuntime(job.job_id,"w","p");db.beginJobDispatch(job.job_id);db.markJobRunning(job.job_id);
+  const pendingEnvelope=eventEnvelope("during-task");pendingEnvelope.occurred_at=new Date(Date.now()+2000).toISOString();
+  const pendingMessage=db.enqueue(pendingEnvelope).row;
   db.sealJobGroup(event.event_id);
   db.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"PR提出済み",actions:ambiguousResult?[{tool:"github.push",ambiguous:true}]:[],completed_at:new Date().toISOString()},job.result_path);
   const notification=db.enqueueJobNotification(job.job_id).row;
-  sql.prepare("UPDATE events SET status='completed',result_json=? WHERE event_id=?").run(JSON.stringify({schema_version:1,event_id:notification.event_id,status:"completed",summary:"通知済み",actions:[],completed_at:new Date().toISOString()}),notification.event_id);
+  sql.prepare("UPDATE events SET status='completed',completed_at=?,result_json=? WHERE event_id=?").run(new Date().toISOString(),JSON.stringify({schema_version:1,event_id:notification.event_id,status:"completed",summary:"通知済み",actions:[],completed_at:new Date().toISOString()}),notification.event_id);
   db.markTerminalWorkerStopProof(job.job_id);
   if(project)sql.prepare("UPDATE tasks SET project_state='synced' WHERE task_id=?").run(task.task_id);
-  const follow=db.enqueue(eventEnvelope("followup")).row,current=db.tasks.get(task.task_id)!;
+  const followEnvelope=eventEnvelope("followup");followEnvelope.occurred_at=new Date(Date.now()+1000).toISOString();
+  const follow=db.enqueue(followEnvelope).row,current=db.tasks.get(task.task_id)!;
   const input=taskRequestSchema.parse({...request,source_event_id:follow.event_id,task_key:"resolve-conflict",objective:"既存PRの競合解消とreview/CI",workspace:{kind:"github",repository:"org/repo",base_ref:"existing/pr-branch"},followup:{task_id:task.task_id,revision:current.revision,attempt_id:job.job_id}});
   const create=(value=input,identity=issue)=>db.tasks.create(value,config.jobsWorkspaceRoot,config.jobResultsDir,identity);
-  return {root,config,db,sql,task,current,job,notification,follow,input,issue,create,async dispose(){sql.close();db.close();await fs.rm(root,{recursive:true,force:true});}};
+  return {root,config,db,sql,task,current,job,notification,follow,pendingMessage,input,issue,create,async dispose(){sql.close();db.close();await fs.rm(root,{recursive:true,force:true});}};
 }
 
 test("明示followupがclaimを原子的に引継ぎ、旧成果と予算履歴を保全し、応答喪失後も同じ後続を返す",async()=>{
@@ -158,4 +161,38 @@ printf '%s' '{"data":{"repository":{"nameWithOwner":"org/repo","issue":{"id":"I_
     const reused=await client.createTask(f.input);assert.equal(reused.outcome,"reused");assert.equal((reused.task as any).task_id,task.task_id);
     assert.equal((await client.getTask(task.task_id,f.follow.event_id)).task!==undefined,true);
   }finally{await api.stop();await f.dispose();}
+});
+
+for(const kind of ["before-result","before-notification","delayed-old-message"] as const)test(`完了前の${kind}イベントをfollowup認可へ転用しない`,async()=>{
+  const f=await fixture();try{
+    if(kind==="before-result")f.sql.prepare("UPDATE events SET occurred_at=? WHERE event_id=?").run(f.db.getJob(f.job.job_id)!.completed_at,f.follow.event_id);
+    if(kind==="before-notification")f.sql.prepare("UPDATE events SET completed_at=? WHERE event_id=?").run(f.follow.occurred_at,f.notification.event_id);
+    if(kind==="delayed-old-message")f.sql.prepare("UPDATE events SET occurred_at='2026-09-01T10:20:30Z' WHERE event_id=?").run(f.follow.event_id);
+    assert.throws(()=>f.create(),/task_followup_requires_new_slack_request/);
+    assert.equal(f.db.tasks.get(f.task.task_id)!.resource_id,"github:I_1");assert.equal(f.db.listEventJobs(f.follow.event_id).length,0);
+  }finally{await f.dispose();}
+});
+
+test("永続sequenceで実行中に受信したeventを、完了後に再提出しても拒否する",async()=>{
+  const f=await fixture();try{
+    assert.ok(f.pendingMessage.sequence<f.notification.sequence);
+    assert.throws(()=>f.create({...f.input,source_event_id:f.pendingMessage.event_id}),/task_followup_requires_new_slack_request/);
+    assert.equal(f.db.tasks.get(f.task.task_id)!.resource_id,"github:I_1");
+  }finally{await f.dispose();}
+});
+
+for(const kind of ["regressed","same-sequence-conflict","newer-clean"] as const)test(`followupのcheckpointは${kind}を永続状態と照合する`,async()=>{
+  const f=await fixture();try{
+    const saved={schema_version:1 as const,task_id:f.task.task_id,attempt_id:f.job.job_id,sequence:5,summary:"未確定",remaining:[],artifacts:[],unresolved_operations:["push receipt unknown"],waiting:"external_effect_unknown" as const};
+    f.db.tasks.checkpoint(f.job,saved);
+    const disk={...saved,sequence:kind==="regressed"?4:kind==="same-sequence-conflict"?5:6,summary:"照合済み",unresolved_operations:[],waiting:"none"};
+    await fs.mkdir(f.job.result_path.substring(0,f.job.result_path.lastIndexOf("/")),{recursive:true});
+    await fs.writeFile(f.job.result_path.replace("result.json","checkpoint.json"),JSON.stringify(disk));
+    if(kind==="newer-clean")assert.equal(f.create().outcome,"created");
+    else {
+      assert.throws(()=>f.create(),kind==="regressed"?/task_checkpoint_sequence_regressed/:/task_checkpoint_conflict/);
+      assert.equal(f.db.tasks.attemptCheckpoint(f.job.job_id)!.sequence,5);
+      assert.equal(f.db.tasks.get(f.task.task_id)!.resource_id,"github:I_1");assert.equal(f.db.listEventJobs(f.follow.event_id).length,0);
+    }
+  }finally{await f.dispose();}
 });
