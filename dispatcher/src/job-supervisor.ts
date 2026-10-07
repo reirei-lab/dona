@@ -1,19 +1,21 @@
-import { readCheckpoint } from "./task-checkpoint.js";
+import {stableStringify} from "./validation.js";
+import { checkpointSnapshot,readCheckpoint } from "./task-checkpoint.js";
 import { TaskProjector, githubQuery } from "./task-github.js";
-import { taskRecoveryReason, type TaskRow } from "./task-execution.js";
+import { taskResultReconcileSchema,taskRecoveryReason, type TaskRow } from "./task-execution.js";
 import { jobSnapshot, publicObservation, type WorkerObservation } from "./job-handoff.js";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import type { DispatcherConfig } from "./config.js";
 import type { DispatcherDatabase } from "./database.js";
 import type { HerdrCommandResult } from "./herdr.js";
-import { PreparedWorkspaceCleanupError, type JobAgentRuntime } from "./job-runtime.js";
+import { WorkerStopNotSentError, PreparedWorkspaceCleanupError, type JobAgentRuntime } from "./job-runtime.js";
 import { buildJobPrompt, jobProgressPath } from "./job-prompt.js";
 import { JobResultNotFoundError, readJobResultEnvelope } from "./job-result.js";
 import type { Logger } from "./logger.js";
 import type { JobRow } from "./types.js";
+import type { WebCommandIdentity } from "./database.js";
 import type { JobProgressCoordinator } from "./job-progress.js";
 import { buildLiveSessionReceipt, expectedLiveSessionIdentity, type LiveSessionReceiptProjection } from "./live-session.js";
 
@@ -97,6 +99,7 @@ export interface JobControlResult {
 interface ActiveJob {
   sourceEventId: string;
   operation: Promise<void>;
+  startup: Promise<void>;
 }
 
 interface SupervisorClock {
@@ -189,6 +192,7 @@ export class JobSupervisor {
     private readonly wakeEventWorker: () => void,
     private progress?: JobProgressCoordinator,
     private readonly clock: SupervisorClock = systemClock,
+    private readonly readResult: typeof readJobResultEnvelope = readJobResultEnvelope,
   ) {}
 
   isRunning(): boolean {
@@ -208,6 +212,90 @@ export class JobSupervisor {
   }
 
 
+  private questionCursor:string|undefined;
+  async reconcileQuestions():Promise<void> {
+    if(!this.runtime.pendingQuestions)return;
+    try {
+      const page=await this.runtime.pendingQuestions(this.questionCursor);
+      for(const question of page) {
+        const job=this.database.getJobByAgent(question.agent);
+        if(job)this.database.enqueueWorkerQuestion(job.job_id,question);
+      }
+      this.questionCursor=page.at(-1)?.question_id; // 終端で先頭へ戻り、走査中に追加された小さいIDも次巡回で拾う。
+    } catch {this.logger.warn("Worker question reconciliation deferred",{error_code:"runtime_questions_unavailable"});}
+  }
+  async taskQuestions(id:string,eventId:string):Promise<unknown> {
+    const task=this.database.assertTaskApprovalOwner(id,eventId),job=this.database.getJob(task.current_attempt_id)!;
+    if(!this.runtime.questions)throw Error("task_questions_unavailable");
+    const questions=await this.runtime.questions(job.agent_name,true);
+    const fresh=this.database.assertTaskApprovalOwner(id,eventId);
+    if(fresh.current_attempt_id!==job.job_id)throw Error("task_revision_conflict");
+    const source=this.database.get(eventId)!,operatorApproval=source.source==="web"&&source.event_type==="worker_question_reply"&&JSON.parse(source.payload_json).request_kind==="approval"?JSON.parse(source.payload_json).question_id:undefined;
+    return {task_id:id,revision:fresh.revision,questions:questions.filter(q=>(!operatorApproval||(q.kind==="approval"&&q.question_id===operatorApproval))&&JSON.stringify([q.generation,q.thread_id])===this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id).map(q=>({question_id:q.question_id,kind:q.kind,state:q.state,request:JSON.parse(q.payload_json)}))};
+  }
+  async approveTaskRequest(id:string,eventId:string,revision:number,questionId:string,accepted:boolean):Promise<unknown> {
+    const initial=this.database.assertTaskApprovalOwner(id,eventId,true);
+    return this.serialized(initial.current_attempt_id,async()=>{
+      if(!this.runtime.questions||!this.runtime.approveRequest)throw Error("task_approval_unavailable");
+      const job=this.database.getJob(initial.current_attempt_id)!,request=(await this.runtime.questions(job.agent_name,true)).find(q=>q.question_id===questionId);
+      const task=this.database.assertTaskApprovalOwner(id,eventId,true);
+      if(!request||request.kind!=="approval"||JSON.stringify([request.generation,request.thread_id])!==this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id||task.current_attempt_id!==job.job_id)throw Error("task_approval_not_current");
+      if(!this.database.hasWorkerApprovalReply(job.job_id,questionId,eventId,accepted))throw Error("task_approval_requires_user_reply");
+      if(request.answer_hash===createHash("sha256").update(stableStringify({accepted})).digest("hex")&&["answering","resolved"].includes(request.state))return {task_id:id,question_id:questionId,state:request.state};
+      if(task.revision!==revision||task.desired_state!=="running"||task.stop_state!=="none"||!["active","waiting"].includes(task.state))throw Error("task_approval_not_current");
+      const response=await this.runtime.approveRequest(job.agent_name,questionId,accepted);
+      return {task_id:id,question_id:questionId,state:response.state};
+    });
+  }
+  async answerTaskQuestion(id:string,eventId:string,revision:number,questionId:string,answers:Record<string,{answers:string[]}>):Promise<unknown> {
+    const initial=this.database.tasks.assertOwner(id,eventId);
+    return this.serialized(initial.current_attempt_id,async()=>{
+      let task=this.database.tasks.assertOwner(id,eventId);const job=this.database.getJob(task.current_attempt_id)!;
+      const source=this.database.get(eventId)!;
+      if(source.source==="web"&&source.event_type==="worker_question_reply"){
+        if(!this.database.localDashboard.matchesRecordedReply(eventId,job.job_id,questionId,"question",answers))throw Error("task_question_reply_mismatch");
+      }
+      const old= (await this.runtime.questions?.(job.agent_name,true))?.find(q=>q.question_id===questionId);
+      task=this.database.tasks.assertOwner(id,eventId);
+      if(task.current_attempt_id!==job.job_id)throw Error("task_revision_conflict");
+      if(old&&JSON.stringify([old.generation,old.thread_id])===this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id&&old.answer_hash===createHash("sha256").update(stableStringify(answers)).digest("hex")&&["answering","resolved"].includes(old.state))return {task_id:id,question_id:questionId,state:old.state};
+      if(!old||JSON.stringify([old.generation,old.thread_id])!==this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id)throw Error("task_question_not_current");
+      if(task.revision!==revision||task.current_attempt_id!==initial.current_attempt_id)throw Error("task_revision_conflict");
+      if(task.desired_state!=="running"||task.stop_state!=="none"||!["active","waiting"].includes(task.state))throw Error("task_question_not_current");
+      if(!this.runtime.answerQuestion)throw Error("task_questions_unavailable");
+      const response=await this.runtime.answerQuestion(job.agent_name,questionId,answers);
+      return {task_id:id,question_id:response.question_id,state:response.state};
+    });
+  }
+
+  async inspectTaskRecovery(id:string,eventId:string):Promise<Record<string,unknown>> {
+    const task=this.database.tasks.assertOwner(id,eventId),job=this.database.getJob(task.current_attempt_id)!;
+    const observed=this.runtime.observeWorker?await this.runtime.observeWorker(job,this.abortController.signal):{state:"unknown"};
+    const fresh=this.database.tasks.assertOwner(id,eventId);
+    if(fresh.revision!==task.revision||fresh.current_attempt_id!==job.job_id)throw Error("task_revision_conflict");
+    const result=this.database.readTaskRecoveryResult(job.job_id),checkpoint=checkpointSnapshot(job,id);
+    return {task_id:id,revision:task.revision,attempt_id:job.job_id,worker_state:observed.state,
+      cause:job.last_error_code,result_sha256:result.sha256,unaccepted_result:result.result,
+      checkpoint_sha256:checkpoint.sha256,checkpoint:checkpoint.checkpoint??null,persisted_checkpoint:this.database.tasks.attemptCheckpoint(job.job_id)??null,
+      reconciliation:this.database.tasks.resultRecovery(job.job_id)??null};
+  }
+  async reconcileTaskResult(id:string,value:unknown):Promise<Record<string,unknown>> {
+    const input=taskResultReconcileSchema.parse(value),initial=this.database.tasks.assertOwner(id,input.source_event_id);
+    return this.serialized(input.attempt_id,async()=>{
+      const replay=this.database.tasks.replayResultRecovery(id,input);
+      if(replay)return {task:this.database.tasks.projection(replay)};
+      const task=this.database.tasks.assertOwner(id,input.source_event_id);
+      if(task.revision!==input.revision||task.current_attempt_id!==input.attempt_id||initial.current_attempt_id!==input.attempt_id)throw Error("task_revision_conflict");
+      const job=this.database.getJob(input.attempt_id)!;
+      if(!this.runtime.observeWorker||!this.runtime.workerRetired)throw Error("task_worker_stop_unproven");
+      const observed=await this.observeWorker(job);
+      if(observed.state!=="stopped"||!await this.runtime.workerRetired(job,observed,this.abortController.signal))throw Error("task_worker_stop_unproven");
+      // checkpointを含む全fileは停止照合後、writer transaction内で再読する。
+      const updated=this.database.tasks.reconcileFailedResult(id,input,job.updated_at,observed,this.config.jobResultsDir);
+      this.wake();return {task:this.database.tasks.projection(updated)};
+    });
+  }
+
   async reconcileTasks(): Promise<void> {
     for (const task of this.database.tasks.candidates().slice(0,1)) {
       if(this.stopping) return;
@@ -221,24 +309,72 @@ export class JobSupervisor {
   private async reconcileTask(snapshot:TaskRow):Promise<void> {
     let task=this.database.tasks.get(snapshot.task_id)!;
     if(task.revision!==snapshot.revision||task.current_attempt_id!==snapshot.current_attempt_id)return;
-    const job=this.database.getJob(task.current_attempt_id)!;
+    let job=this.database.getJob(task.current_attempt_id)!;
+    if(job.last_error_code==="runtime_preparation_unknown"&&!this.database.getJobLiveSessionIdentity(job.job_id)&&this.runtime.reconcilePreparation) {
+      const recovered=await this.runtime.reconcilePreparation(job);
+      if(recovered?.herdrAgentSessionId)this.database.reconcileJobPreparationRuntime(job.job_id,recovered.herdrWorkspaceId,recovered.herdrPaneId,recovered.herdrAgentSessionId);
+      job=this.database.getJob(task.current_attempt_id)!;
+    }
     if(task.wait_reason==="steer_acceptance_unknown"&&job.steer_state==="accepted"&&job.steer_event_id&&task.steer_pending_event_id===job.steer_event_id) {
       this.database.tasks.finishSteer(task.task_id,job.steer_event_id);return;
     }
     // A result is evidence belonging to this attempt, never to its successor.
     try {
       const result=await readJobResultEnvelope(job.result_path,job.job_id);
-      this.database.saveJobResult(job.job_id,result,job.result_path);return;
+      if(result.status==="failed"&&job.last_error_code==="steer_acceptance_unknown") {
+        const prior=this.database.tasks.resultRecovery(job.job_id);
+        if(prior&&task.wait_reason==="retry_exhausted")return;
+        if(task.desired_state!=="running"||(prior&&task.wait_reason==="resume_requested")) {
+          const file=this.database.readTaskRecoveryResult(job.job_id);
+          if(!this.runtime.observeWorker||!this.runtime.workerRetired)return;
+          const observed=await this.observeWorker(job);
+          if(observed.state!=="stopped"||!await this.runtime.workerRetired(job,observed,this.abortController.signal))return;
+          try {
+            if(task.desired_state!=="running")this.database.tasks.settleFailedResultControl(task,file.sha256,observed);
+            else this.database.tasks.continueReconciledResult(task,observed,this.config.jobResultsDir);
+            this.wake();
+          }catch {if(task.desired_state==="running")this.database.tasks.wait(task,"result_reconciliation_required");}
+          return;
+        }
+      }
+      try { this.database.saveJobResult(job.job_id,result,job.result_path); }
+      catch { this.database.tasks.wait(task,"result_reconciliation_required"); }
+      return;
     } catch(error) {
       if(!(error instanceof JobResultNotFoundError)) {this.database.tasks.wait(task,"result_conflict");return;}
     }
+    if(await this.resumeOfflineAnswer(job))return;
+    const offlineHold=this.database.tasks.offlineResumes.hold(task);
+    if(offlineHold){this.database.tasks.wait(task,offlineHold);return;}
+    const capacityDelay=this.database.tasks.offlineResumes.capacityDelay(task);
+    if(capacityDelay>0){this.database.tasks.wait(task,"capacity_wait",Math.min(capacityDelay,86_400_000));return;}
+    // 外部tool待機が未確定steerのreceipt待ちを上書きしてはいけない。
+    if(task.desired_state==="running"&&(task.steer_pending_event_id||task.wait_reason==="steer_acceptance_unknown"||job.steer_state==="dispatching")) {this.database.tasks.wait(task,"steer_acceptance_unknown",60_000);return;}
+    const externalRecovery=this.database.tasks.externalApprovalRecovery(job.job_id);
+    if(task.desired_state==="running"&&externalRecovery.state!=="ready") {this.database.tasks.wait(task,externalRecovery.state==="unknown"?"external_effect_unknown":"external_approval",30_000);return;}
+    if(job.last_error_code==="runtime_external_approval_pending"&&task.desired_state==="running"&&task.stop_state==="none"){
+      if(!this.runtime.observeWorker){this.database.tasks.wait(task,"observation_unknown");return;}
+      const observed=await this.observeWorker(job);
+      if(observed.state==="waiting"||observed.state==="working"){this.database.tasks.wait(task,"external_approval",30_000);return;}
+      if(observed.state==="unknown"){this.database.tasks.wait(task,"observation_unknown");return;}
+      // 消失したtool callを人間待ちと偽らない。下の停止確認を経て通常のAttempt回復へ進む。
+    }
+    if(job.last_error_code==="runtime_question_pending"&&task.desired_state==="running"&&task.stop_state==="none"&&this.runtime.questions) {
+      const pending=await this.runtime.questions(job.agent_name);
+      if(pending.length){this.database.tasks.wait(task,"human_input");return;}
+      const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
+      if(observed.ok&&["working","idle","done"].includes(observed.agentStatus??"")){this.database.tasks.reconnect(task);this.wake();return;}
+    }
     if(task.wait_reason==="steer_acceptance_unknown") {this.database.tasks.wait(task,"steer_acceptance_unknown",60_000);return;}
     const checkpoint=await readCheckpoint(job,task.task_id);
-    let capacityWait=false;
+    const recovery=await this.runtime.recoveryHint?.(job);
+    if(task.desired_state==="running"&&task.wait_reason!=="resume_requested"&&recovery&&recovery.reason!=="capacity_wait"){this.database.tasks.wait(task,"human_input");return;}
+    let capacityWait=task.desired_state==="running"&&task.wait_reason!=="resume_requested"&&recovery?.reason==="capacity_wait";
+    if(capacityWait&&recovery?.retry_after&&Date.parse(recovery.retry_after)>Date.now()) {this.database.tasks.wait(task,"capacity_wait",Math.min(Date.parse(recovery.retry_after)-Date.now(),86_400_000));return;}
     if(checkpoint) {
       this.database.tasks.checkpoint(job,checkpoint);
       if(task.desired_state==="running"&&["human_input","external_effect_unknown"].includes(checkpoint.waiting)&&!this.database.tasks.checkpointAnswered(job,checkpoint)) {this.database.tasks.wait(task,checkpoint.waiting);return;}
-      capacityWait=checkpoint.waiting==="usage_limit"&&!this.database.tasks.checkpointAnswered(job,checkpoint);
+      capacityWait=capacityWait||checkpoint.waiting==="usage_limit"&&!this.database.tasks.checkpointAnswered(job,checkpoint);
       if(task.desired_state==="running"&&capacityWait&&checkpoint.retry_after&&Date.parse(checkpoint.retry_after)>Date.now()) {
         this.database.tasks.wait(task,"capacity_wait",Math.min(Date.parse(checkpoint.retry_after)-Date.now(),86_400_000));return;
       }
@@ -246,7 +382,7 @@ export class JobSupervisor {
     if(task.stop_state==="stopped") {this.database.tasks.replaceStopped(task.task_id,this.config.jobResultsDir);this.wake();return;}
     if(task.desired_state==="running"&&task.stop_state==="none") {
       const reason=taskRecoveryReason(job);
-      if(reason!=="observation_unknown"&&task.wait_reason!=="resume_requested"&&!capacityWait) {this.database.tasks.wait(task,reason);return;}
+      if(reason!=="observation_unknown"&&job.last_error_code!=="runtime_question_pending"&&job.last_error_code!=="runtime_external_approval_pending"&&task.wait_reason!=="resume_requested"&&!capacityWait) {this.database.tasks.wait(task,reason);return;}
     }
     if(!this.runtime.observeWorker||!this.runtime.retireWorker||!this.runtime.workerRetired){this.database.tasks.wait(task,"observation_unknown");return;}
     if(task.stop_state==="none"||task.stop_state==="not_sent") {
@@ -257,14 +393,21 @@ export class JobSupervisor {
       if(this.database.getJob(job.job_id)?.updated_at!==job.updated_at)return;
       if(task.stop_state==="none"&&task.desired_state==="running") {
         const fresh=await this.observeWorker(job);
-        if(!["inactive","stopped"].includes(fresh.state)||JSON.stringify(fresh.process_ids)!==JSON.stringify(observed.process_ids)||JSON.stringify(fresh.process_groups)!==JSON.stringify(observed.process_groups)) {
+        if(!["inactive","stopped","unreachable"].includes(fresh.state)||JSON.stringify(fresh.process_ids)!==JSON.stringify(observed.process_ids)||JSON.stringify(fresh.process_groups)!==JSON.stringify(observed.process_groups)) {
           this.database.tasks.wait(task,"observation_unknown");return;
         }
       }
       if(task.stop_state==="none")task=this.database.tasks.claimStop(task,this.database.getWorkerObservation(job)??observed);
       // Last observation before the only control write; current desired state is checked by CAS.
       if(observed.state!=="stopped"&&this.database.tasks.beginStop(task)) {
-        try {await this.runtime.retireWorker(job,this.abortController.signal);}catch{/* reconcile without resending */}
+        try {await this.runtime.retireWorker(job,this.abortController.signal);}catch(error){
+          if(error instanceof WorkerStopNotSentError){
+            const fresh=this.database.tasks.get(task.task_id)!;
+            if(fresh.current_attempt_id===job.job_id){this.database.tasks.stopNotSent(fresh);this.database.tasks.wait(fresh,"worker_stop_pending",3000);}
+            return;
+          }
+          // stop送信後の不明応答では永続intentと実processを照合する。
+        }
       }
     }
     const evidence=JSON.parse(task.stop_evidence_json!) as WorkerObservation;
@@ -461,6 +604,15 @@ export class JobSupervisor {
     this.running = false;
   }
 
+  private async resumeOfflineAnswer(job:JobRow):Promise<boolean> {
+    const task=this.database.tasks.forAttempt(job.job_id);
+    if(!task||!this.database.tasks.offlineResumes.canAnswer(task)||job.steer_state)return false;
+    if(!this.runtime.observeWorker||!this.runtime.workerRetired)return false;
+    const observed=await this.observeWorker(job);
+    if(observed.state!=="stopped"||!await this.runtime.workerRetired(job,observed,this.abortController.signal))return false;
+    this.database.tasks.offlineResumes.answer(task);this.wake();return true;
+  }
+
   steer(jobId: string, sourceEventId: string, instruction: string): Promise<JobControlResult> {
     return this.serialized(jobId, async () => {
       const current = this.database.getJob(jobId);
@@ -470,10 +622,11 @@ export class JobSupervisor {
         this.wake();
         return result;
       }
+      if(await this.resumeOfflineAnswer(current))return {row:this.database.getJob(jobId)!,duplicate:false};
       const begun = this.database.beginJobSteer(jobId, sourceEventId);
       if (begun.duplicate) return begun;
       // Steer acceptance is the CLI submission response, not a later worker state change.
-      const prompted = await this.runtime.prompt(begun.row.agent_name, instruction, this.abortController.signal, undefined, true);
+      const prompted = await this.runtime.prompt(begun.row.agent_name, instruction, this.abortController.signal, undefined, true, `steer:${sourceEventId}`);
       if (prompted.ok) {
         this.database.markJobSteerAccepted(jobId, sourceEventId);
         return { row: this.database.getJob(jobId)!, duplicate: false };
@@ -504,6 +657,7 @@ export class JobSupervisor {
 
   cancel(jobId: string, sourceEventId: string, reason = "Cancelled by Dona"): Promise<JobControlResult> {
     return this.serialized(jobId, async () => {
+      await this.active.get(jobId)?.startup;
       const before = this.database.getJob(jobId);
       if (!before) throw new Error(`Job ${jobId} was not found`);
       this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
@@ -560,7 +714,7 @@ export class JobSupervisor {
       if (!cancelled.ok) {
         this.database.markJobNeedsReview(
           jobId,
-          "cancel_acceptance_unknown",
+          cancelled.errorCode==="cancel_not_sent"?"cancel_not_sent":"cancel_acceptance_unknown",
           commandMessage(cancelled),
         );
         this.wake();
@@ -585,6 +739,35 @@ export class JobSupervisor {
       this.database.markJobCancelled(jobId, reason);
       this.trackCancelledWorkerCleanup(cancelling);
       this.wake();
+      return { row: this.database.getJob(jobId)!, duplicate: false };
+    });
+  }
+
+  cancelWeb(jobId: string, identity: WebCommandIdentity, reason = "Cancelled by verified web owner"): Promise<JobControlResult> {
+    if(this.database.tasks.forAttempt(jobId))return Promise.reject(new Error("task_control_required"));
+    return this.serialized(jobId, async () => {
+      await this.active.get(jobId)?.startup;
+      const before = this.database.assertWebJobOwner(jobId, identity);
+      if (before.status === "cancelled") return { row: before, duplicate: true };
+      if (before.status === "needs_review" && before.last_error_code === "web_cancel_acceptance_unknown") {
+        throw new Error("web_cancel_acceptance_unknown");
+      }
+      const cancelling = this.database.beginWebJobCancellation(jobId, identity);
+      if (["queued", "retryable_failed"].includes(before.status)) {
+        this.database.markJobCancelled(jobId, reason); this.wake();
+        return { row: this.database.getJob(jobId)!, duplicate: false };
+      }
+      const cancelled = await this.runtime.cancel(cancelling.agent_name, this.abortController.signal);
+      if (!cancelled.ok) {
+        if (before.status === "needs_review" && !cancelled.timedOut
+          && ["agent_not_found", "agent_not_running"].includes(cancelled.errorCode ?? "")) {
+          this.database.markJobCancelled(jobId, reason); this.wake();
+          return { row: this.database.getJob(jobId)!, duplicate: false };
+        }
+        this.database.markJobNeedsReview(jobId, "web_cancel_acceptance_unknown", commandMessage(cancelled));
+        this.wake(); throw new Error("web_cancel_acceptance_unknown");
+      }
+      this.database.markJobCancelled(jobId, reason); this.trackCancelledWorkerCleanup(cancelling); this.wake();
       return { row: this.database.getJob(jobId)!, duplicate: false };
     });
   }
@@ -708,6 +891,7 @@ export class JobSupervisor {
       // A name-based Herdr read, including idle/done or agent_not_found, does not
       // prove that the saved agent session was stopped. Keep terminal workers in
       // the update drain gate until an exact-identity stop receipt is available.
+      await this.reconcileQuestions();
       await this.reconcileTasks();
       this.publishNotifications();
       try {
@@ -916,7 +1100,9 @@ export class JobSupervisor {
   }
 
   private launch(row: JobRow): void {
-    const operation = (row.status === "running" ? this.monitor(row) : this.startJob(row))
+    let startupReady!: () => void;
+    const startup = new Promise<void>(resolve => { startupReady = resolve; });
+    const operation = (row.status === "running" ? this.monitor(row, startupReady) : this.startJob(row, startupReady))
       .catch((error: unknown) => {
         this.logger.error("Job operation failed unexpectedly", {
           job_id: row.job_id,
@@ -926,18 +1112,20 @@ export class JobSupervisor {
         });
       })
       .finally(async () => {
-        const finalStatus=this.database.getJob(row.job_id)?.status;
+        const finalJob=this.database.getJob(row.job_id),finalStatus=finalJob?.status;
+        const questionPending=finalStatus==="blocked"&&finalJob?.last_error_code==="runtime_question_pending";
         if(this.progress&&finalStatus==="needs_review")this.trackCancelledWorkerCleanup(row);
-        else if (!this.progress || (finalStatus!==undefined&&["blocked","completed","failed","cancelled"].includes(finalStatus))) await fs.rm(path.dirname(jobProgressPath(row)), { recursive:true, force:true }).catch(() => {
+        else if (!questionPending&&(!this.progress || (finalStatus!==undefined&&["blocked","completed","failed","cancelled"].includes(finalStatus)))) await fs.rm(path.dirname(jobProgressPath(row)), { recursive:true, force:true }).catch(() => {
           this.logger.warn("Disabled job progress terminal cleanup failed", { job_id:row.job_id, error_code:"job_progress_disabled_terminal_cleanup_failed" });
         });
         this.active.delete(row.job_id);
         this.wake();
       });
-    this.active.set(row.job_id, { sourceEventId: row.source_event_id, operation });
+    this.active.set(row.job_id, { sourceEventId: row.source_event_id, operation, startup });
   }
 
-  private async startJob(row: JobRow): Promise<void> {
+  private async startJob(row: JobRow, startupReady: () => void = () => {}): Promise<void> {
+    try {
     if(!this.database.tasks.canRun(row))return;
     if(this.database.tasks.forAttempt(row.job_id)&&!this.runtime.observeWorker) {
       this.database.markJobNeedsReview(row.job_id,"worker_identity_unverified","Runtime cannot record a worker identity");return;
@@ -956,9 +1144,13 @@ export class JobSupervisor {
     try {
       prepared = await this.runtime.prepare(preparing, this.abortController.signal);
     } catch (error) {
+      if(row.source==="web"&&error instanceof Error&&error.message==="runtime_profile_unavailable") {
+        this.database.markJobBlocked(row.job_id,"Web analysis runtime is not configured",["preparing"],"runtime_profile_unavailable");
+        return;
+      }
       if(error instanceof PreparedWorkspaceCleanupError) {
-        this.database.setJobRuntime(row.job_id,error.herdrWorkspaceId,error.herdrPaneId);
-        this.database.markJobNeedsReview(row.job_id,"workspace_cleanup_failed",error.message);
+        this.database.setJobRuntime(row.job_id,error.herdrWorkspaceId,error.herdrPaneId,error.herdrAgentSessionId);
+        this.database.markJobNeedsReview(row.job_id,error.errorCode,error.message);
         return;
       }
       if (this.stopping) return;
@@ -1003,6 +1195,8 @@ export class JobSupervisor {
       buildJobPrompt(dispatching, this.progress !== undefined),
       this.abortController.signal,
       this.config.jobPromptTimeoutMs,
+      true,
+      `attempt:${row.job_id}`,
     );
     if (this.database.getJob(row.job_id)?.status !== "dispatching") return;
     if (prompted.aborted || this.stopping) {
@@ -1015,7 +1209,7 @@ export class JobSupervisor {
           this.database.markJobNeedsReview(row.job_id,"prompt_acceptance_unknown",commandMessage(prompted));
           return;
         }
-        await this.reconcileStalledPrompt(dispatching, promptBaseline ?? prompted);
+        await this.reconcileStalledPrompt(dispatching, promptBaseline ?? prompted, startupReady);
         return;
       }
       if (!prompted.timedOut && ["agent_not_found", "agent_not_running"].includes(prompted.errorCode ?? "")) {
@@ -1044,7 +1238,8 @@ export class JobSupervisor {
     this.database.markJobRunning(row.job_id);
     const running = this.database.getJob(row.job_id)!;
     this.logTransition(dispatching, running);
-    await this.monitor(running);
+    await this.monitor(running, startupReady);
+    } finally { startupReady(); }
   }
 
   private async readPromptBaseline(row: JobRow): Promise<HerdrCommandResult | undefined> {
@@ -1060,7 +1255,11 @@ export class JobSupervisor {
     }
   }
 
-  private async reconcileStalledPrompt(row: JobRow, initial: HerdrCommandResult): Promise<void> {
+  private async reconcileStalledPrompt(
+    row: JobRow,
+    initial: HerdrCommandResult,
+    startupReady: () => void = () => {},
+  ): Promise<void> {
     const startedAt = this.clock.now();
     const deadline = startedAt + this.config.jobPromptReconcileMs;
     let nextTick = startedAt;
@@ -1134,10 +1333,10 @@ export class JobSupervisor {
       if (progressed && ["working", "idle", "done", "blocked"].includes(observed.agentStatus ?? "")) {
         this.database.markJobRunning(row.job_id);
         if (observed.agentStatus === "blocked") {
-          this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
+          this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input",["running"],observed.errorCode??"agent_blocked");
           return;
         }
-        await this.monitor(this.database.getJob(row.job_id)!);
+        await this.monitor(this.database.getJob(row.job_id)!, startupReady);
         return;
       }
     }
@@ -1162,7 +1361,7 @@ export class JobSupervisor {
 
   private async tryCompleteAfterUnknownAcceptance(row: JobRow): Promise<boolean> {
     try {
-      const result = await readJobResultEnvelope(row.result_path, row.job_id);
+      const result = await this.readResult(row.result_path, row.job_id);
       this.database.markJobRunning(row.job_id);
       this.database.saveJobResult(row.job_id, result, row.result_path);
       return true;
@@ -1173,13 +1372,15 @@ export class JobSupervisor {
     }
   }
 
-  private async monitor(row: JobRow): Promise<void> {
+  private async monitor(row: JobRow, startupReady: () => void = () => {}): Promise<void> {
+    try {
     if (this.database.getJob(row.job_id)?.status !== "running") return;
     const initialProgress=this.progress;
     try { await initialProgress?.ingest(this.database.getJob(row.job_id) ?? row); }
     catch (error) { await this.failOpenProgress(initialProgress,row.job_id,"job_progress_initial_ingest_failed",error); }
     if (await this.tryComplete(row, false)) return;
     if(this.database.tasks.forAttempt(row.job_id))await this.observeWorker(this.database.getJob(row.job_id)!);
+    startupReady();
     let keepPolling = true;
     const pollAbort = new AbortController();
     const stopPoll = (): void => pollAbort.abort();
@@ -1203,6 +1404,7 @@ export class JobSupervisor {
     try { waited = await this.runtime.wait(row.agent_name, this.abortController.signal); }
     finally { keepPolling = false; pollAbort.abort(); await pollProgress; this.abortController.signal.removeEventListener("abort", stopPoll); }
     if (waited.aborted || this.stopping) return;
+    await this.serialized(row.job_id, async () => {
     if (this.database.getJob(row.job_id)?.status !== "running") return;
     if (!waited.ok) {
       if (waited.timedOut || waited.errorCode === "timeout") {
@@ -1220,12 +1422,14 @@ export class JobSupervisor {
       return;
     }
     if (waited.agentStatus === "blocked") {
-      this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
+      this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input",["running"],waited.errorCode??"agent_blocked");
       return;
     }
     if (["idle", "done"].includes(waited.agentStatus ?? "")) {
       await this.tryComplete(row, true);
     }
+    });
+    } finally { startupReady(); }
   }
 
   private async failOpenProgress(progress:JobProgressCoordinator|undefined,jobId:string,errorCode:string,error:unknown):Promise<void> {
@@ -1238,7 +1442,7 @@ export class JobSupervisor {
   private async tryComplete(row: JobRow, terminalAgentState: boolean): Promise<boolean> {
     let completed: JobRow;
     try {
-      const result = await readJobResultEnvelope(row.result_path, row.job_id);
+      const result = await this.readResult(row.result_path, row.job_id);
       this.database.saveJobResult(row.job_id, result, row.result_path);
       completed = this.database.getJob(row.job_id)!;
     } catch (error) {

@@ -415,3 +415,22 @@ describe("DispatcherWorker", () => {
     database.close();
   });
 });
+
+test("mainの中断eventを再送せず次eventへ進み、利用上限中は未送信attemptを消費しない",async()=>{
+ const {root,config}=await tempConfig();roots.push(root);await fs.mkdir(config.resultsDir,{recursive:true});
+ const database=new DispatcherDatabase(config.databasePath),first=database.enqueue(eventEnvelope("interrupted-main")).row,second=database.enqueue(eventEnvelope("next-main-event")).row;
+ let capacity=false;const sent:string[]=[];
+ const herdr:HerdrClient={
+  async get(){return capacity?failed("runtime_capacity_wait"):ok("idle");},
+  async prompt(text){const fields=promptFields(text);sent.push(fields.eventId);if(fields.eventId===first.event_id)capacity=true;
+   else await fs.writeFile(fields.resultPath,JSON.stringify({schema_version:1,event_id:fields.eventId,status:"completed",summary:"done",actions:[],memory_candidates:[],completed_at:new Date().toISOString()}));
+   return ok("working");},
+  async wait(){return failed("runtime_turn_interrupted");}
+ };
+ const worker=new DispatcherWorker(database,herdr,config,logger);worker.start();
+ try{
+  await waitFor(()=>database.get(first.event_id)?.status==="needs_review");
+  await new Promise(resolve=>setTimeout(resolve,50));assert.equal(database.get(second.event_id)?.status,"queued");assert.equal(database.get(second.event_id)?.attempt_count,0);assert.deepEqual(sent,[first.event_id]);
+  capacity=false;worker.wake();await waitFor(()=>database.get(second.event_id)?.status==="completed");assert.deepEqual(sent,[first.event_id,second.event_id]);
+ }finally{await worker.stop();database.close();}
+});

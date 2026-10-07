@@ -189,9 +189,10 @@ cleanup_temp() {
 }
 trap cleanup_temp EXIT
 
-$NODE_PATH "$SCRIPT_DIR/render-self-update-templates.mjs" "$INSTALL_TMP/rendered" "$INSTALL_SHA" "$BASE_DIR" "${TARGET_ROOT:+generation}"
+$NODE_PATH "$SCRIPT_DIR/render-self-update-templates.mjs" "$INSTALL_TMP/rendered" "$INSTALL_SHA" "$BASE_DIR" "${TARGET_ROOT:+generation}" "${DONA_SIGNED_HOST_CONFIG:-}" "${DONA_TASK_GENERATION_UPDATE:-}" "${DONA_LOCAL_APPROVAL_CONFIG:-}" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
 if [[ -n "$TARGET_ROOT" ]]; then
   EXPECTED_OLD_UPDATER_SHA=$(/usr/bin/python3 "$SCRIPT_DIR/validate-generation-install-target.py" "$BASE_DIR" "$INSTALL_TMP/rendered" "$LAUNCH_AGENTS_DIR" "$MODE")
+  DISPATCHER_SOCKET=$($NODE_PATH -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).dispatcher_socket)' "$INSTALL_TMP/rendered/policy.json")
 fi
 /usr/bin/plutil -lint "$INSTALL_TMP/rendered/dev.dona.updater.plist" \
   "$INSTALL_TMP/rendered/dev.dona.dispatcher.plist" \
@@ -201,6 +202,10 @@ $NODE_PATH -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8
 if [[ "$MODE" == "--check" ]]; then
   print "self-update policyと3つのLaunchAgent templateは有効です。実環境は変更していません。"
   exit 0
+fi
+
+if [[ -f "$INSTALL_TMP/rendered/signed-host.json" && -d "$RUNTIME_ROOT/current/signed-host/DonaDispatcher.app" && ( "$MODE" == "--bootstrap" || "$MODE" == "--upgrade-control" ) ]]; then
+  $NODE_PATH "$SCRIPT_DIR/verify-signed-dispatcher-release.mjs" "$RUNTIME_ROOT/current" "$INSTALL_TMP/rendered/signed-host.json"
 fi
 
 if [[ "$MODE" == "--bootstrap" ]]; then
@@ -253,7 +258,7 @@ fi
 $GH_PATH api --method GET "repos/hiragram/dona/commits/$INSTALL_SHA/check-runs" -f per_page=100 > "$INSTALL_TMP/check-runs.json"
 $NODE_PATH -e '
 const runs = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).check_runs ?? [];
-for (const name of ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS"]) {
+for (const name of ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS", "Verify sources/web"]) {
   const candidates = runs.filter((run) => run.name === name && run.head_sha === process.argv[2] && run.app?.slug === "github-actions");
   const latest = candidates.sort((a, b) => b.id - a.id)[0];
   if (!latest || latest.status !== "completed" || latest.conclusion !== "success") {
@@ -283,7 +288,7 @@ $GIT_PATH -C "$REPOSITORY_DIR" archive --format=tar --output="$INSTALL_TMP/relea
 
 mkdir -p "$INSTALL_TMP/npm-cache"
 /usr/bin/touch "$INSTALL_TMP/npm-userconfig" "$INSTALL_TMP/npm-globalconfig"
-for component in dispatcher sources/slack updater; do
+for component in dispatcher sources/slack sources/web updater; do
   COMPONENT_DIR="$STAGING_DIR/$component"
   env -i PATH="$(dirname "$NODE_PATH"):$(dirname "$NPM_PATH"):/usr/bin:/bin:/usr/sbin:/sbin" \
     CI=1 NO_COLOR=1 npm_config_cache="$INSTALL_TMP/npm-cache" npm_config_audit=false npm_config_fund=false \
@@ -305,6 +310,9 @@ for component in dispatcher sources/slack updater; do
 done
 NPM_VERSION=$($NPM_PATH --version)
 $NODE_PATH "$SCRIPT_DIR/write-release-manifest.mjs" "$STAGING_DIR" "$INSTALL_SHA" "$NPM_VERSION" "2026-09-03.2"
+if [[ -f "$INSTALL_TMP/rendered/signed-host.json" ]]; then
+  $NODE_PATH "$STAGING_DIR/scripts/prepare-signed-dispatcher-host.mjs" "$STAGING_DIR" "$INSTALL_TMP/rendered/signed-host.json" "$CONTROL_ROOT/host-build-cache"
+fi
 FINAL_RELEASE="$RELEASE_ROOT/$INSTALL_SHA"
 if [[ -e "$FINAL_RELEASE" ]]; then
   if [[ "$MODE" != "--upgrade-control" && "$MODE" != "--stage-recovery" ]] || \
@@ -320,8 +328,7 @@ else
   /bin/mv "$STAGING_DIR" "$FINAL_RELEASE"
   STAGING_DIR=
 fi
-find "$FINAL_RELEASE" -type f -exec chmod 400 {} +
-find "$FINAL_RELEASE" -type d -exec chmod 500 {} +
+"$NODE_PATH" "$FINAL_RELEASE/updater/dist/release-permissions.js" "$FINAL_RELEASE"
 
 if [[ "$MODE" == "--stage-recovery" ]]; then
   print "検証済みimmutable release $INSTALL_SHA を配置しました。service、pointer、DB、Updaterは変更していません。"

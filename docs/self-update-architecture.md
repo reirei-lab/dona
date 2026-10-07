@@ -4,7 +4,7 @@
 
 stable updaterは`runtime/current`の外にinstallし、current releaseのcodeやDB schemaに依存しません。更新要求の自由記述を実行せず、versioned 0600 policyで固定したrepository、branch、root、label、executableだけを使用します。child processは`spawn(..., { shell: false })`、固定argv、minimal environment、timeout、1 MiB output上限で動かします。stagingへSlack本文、Keychain値、private URL、production environmentを渡しません。
 
-`npm ci`はlockfile一致を強制しますがlifecycle scriptを実行し得るため、candidate buildは専用checkout・secret-free environment・非root userに隔離します。user/global npm configは別々のcontroller-owned private empty fileへ固定し、専用cacheだけを使います。target SHAに対して`Verify dispatcher`、`Verify sources/slack`、`Verify updater`がGitHub Actions App由来のterminal successであることをplan時とstage直前に確認します。署名必須化はpolicyで有効にできます。
+`npm ci`はlockfile一致を強制しますがlifecycle scriptを実行し得るため、candidate buildは専用checkout・secret-free environment・非root userに隔離します。user/global npm configは別々のcontroller-owned private empty fileへ固定し、専用cacheだけを使います。target SHAに対して`Verify dispatcher`、`Verify sources/slack`、`Verify sources/web`、`Verify updater`、`Verify self-hosted macOS`がGitHub Actions App由来のterminal successであることをplan時とstage直前に確認します。署名必須化はpolicyで有効にできます。
 
 structured log、永続error、API error、completion payloadはcredential形式とURLを値レベルでもredactします。Slack本文、raw plan、全environmentは監査logやrelease manifestへ保存しません。
 
@@ -65,3 +65,5 @@ routine releaseはstable updater自身を変更しません。policy/schema変�
 ## workload cutoverの決定
 
 ADR 0003を正本とする。現行のquiesce判定だけではrunning worker、旧Result、通知backlogの移譲を証明しない。実装前にepoch付きinventoryとcompletion/notification receiptを導入し、unknownを隔離する。共用fixtureは`docs/adr/fixtures/self-update-epoch-cutover.md`。
+
+App Server/Task世代の読み取り専用worker inventoryと、未証明のsame-turn/grant/release pair/terminal ownerを拒否する診断契約は[worker handoff契約](operations/worker-handoff-contract.md)を参照する。診断interfaceはhandoffを有効化せず、既存allocated worker gateを解除しない。

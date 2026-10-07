@@ -7,7 +7,7 @@ import { DispatcherDatabase } from "./database.js";
 import { eventStatuses, jobStatuses, type EventStatus, type JobStatus } from "./types.js";
 import { runService } from "./service.js";
 import { SlackAdapterJobNotificationVerifier } from "./job-notification-verifier.js";
-import { HerdrJobAgentRuntime } from "./job-runtime.js";
+import { AppServerJobRuntime } from "./app-server/adapters.js";
 import { JobSupervisor } from "./job-supervisor.js";
 import { createLogger } from "./logger.js";
 import { liveSessionReceiptRetentionSeconds } from "./live-session.js";
@@ -112,7 +112,7 @@ async function main(): Promise<void> {
             reconciliation:receipt.reconciliation,receipt:{receipt_id:receipt.receipt_id,observed_at:receipt.observed_at,boot_id:receipt.boot_id,
               durable_status_before:receipt.durable_status_before,durable_status_after:receipt.durable_status_after,
               result_present_before:receipt.result_present_before,result_present_after:receipt.result_present_after}},null,2));return;}
-        if(args.includes("--live-session")){const supervisor=new JobSupervisor(database,new HerdrJobAgentRuntime(config,false),config,createLogger("dispatcher_cli"),()=>{});
+        if(args.includes("--live-session")){const supervisor=new JobSupervisor(database,new AppServerJobRuntime(config,false,id=>database.getJobLiveSessionIdentity(id)?.herdr_agent_session_id??undefined,id=>!!database.tasks.forAttempt(id),id=>database.hasLocalDashboardJobOwner(id)),config,createLogger("dispatcher_cli"),()=>{});
           const receipt=await supervisor.observeLiveSession(jobId);const refreshed=database.getJob(jobId);if(!refreshed)throw new Error(`Job ${jobId} disappeared during live observation`);console.log(JSON.stringify({schema_version:1,job:projectLiveJob(refreshed as unknown as Record<string,unknown>),live_session:receipt.live_session,
             reconciliation:receipt.reconciliation,receipt:{receipt_id:receipt.receipt_id,observed_at:receipt.observed_at,boot_id:receipt.boot_id,
               durable_status_before:receipt.durable_status_before,durable_status_after:receipt.durable_status_after,

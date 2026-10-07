@@ -24,3 +24,10 @@ coverage/
 *.swp
 *~
 .dona-job-progress.json
+
+# Web browser fixture output
+sources/web/test-results/
+sources/web/playwright-report/
+
+# Shiki browser bundle generated from pinned dependencies
+sources/web/src/generated/

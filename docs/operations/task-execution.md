@@ -20,7 +20,7 @@
 4. `cancel_task`は自動再開を禁止する。起動済みworkerでは停止確認が終わるまで取消完了にしない。
 5. `retry_exhausted`では、追加実行の明示依頼を得てから`retry_task`へ新しい総`max_attempts`を渡す。使用済みAttempt数は維持する。
 
-Taskの読み取り・制御は元のworkspace/channel/threadと依頼者へ束縛する。
+Taskの読み取り・通常制御は元のworkspace/channelと依頼者へ束縛する。明示Task IDまたはIssue照会で対象を確定した場合は別threadからも利用できる。実行承認と通知先は元threadへ束縛する。
 
 同じeventによる同じcontrolの再照合は既存状態を返し、異内容はconflictにする。古いrevisionを自動上書きしない。
 
@@ -43,7 +43,82 @@ Project同期は実行と独立する。write intentを先に保存し、成功r
 1. 旧受付、scheduler、worker再生成主体、writerを停止し、同じ世代の停止・再生成抑止証拠を確認する。
 2. 旧DBをWAL対応の手順で保全し、worktree・未commit差分・Result・通知状態・外部操作を棚卸しする。削除しない。
 3. 独立した空のDBとruntime rootで新世代を起動する。旧DB path、旧Result path、旧sessionを設定しない。
-4. 必要な仕事と確認済み成果物を明示的に新Taskへ登録する。旧workerや`needs_review`を新Taskへ移植しない。
+4. 必要な仕事と確認済み成果物を明示的に新Taskへ登録する。[旧成果の引継ぎ記録](legacy-task-handoff.md)と現行Issue lifecycle手順を使い、旧workerや`needs_review`を新Taskへ移植しない。旧job_not_foundを理由に旧Dispatcherの復活を要求しない。
 5. 隔離環境で委任、通常中断、停止確認、後継実行、Result、通知、Project read-backを確認してから受付を開く。
 
 Mac上の任意CLIが起動する外部daemonやSimulatorまでprocess groupで包含できるとは扱わない。管理外で継続する処理は別の外部操作としてinventoryへ残す。停止不明を許容した重複実行は行わない。
+
+
+## 別スレッドからの継続
+
+利用者がrepositoryとIssue番号を明示した場合、`find_issue_task`でGitHub上のIssue identityと既存Taskを照合する。同じworkspace・channel・依頼者のTaskに限り、別threadからも`get_task`とTask操作を使える。一覧は引き続き現在threadだけである。Taskが存在しない場合と他ownerの場合は同じ不透明な拒否を返すため、その拒否だけで新Taskを作成しない。
+
+既存Taskが見つかったら新Taskを委任せず、最新revision・状態・待機理由から操作を決める。通知先は`notification_target`の元threadを維持し、利用者へそのthreadを案内する。通常の質問回答と、実行権限を追加する承認は区別する。実行承認は引き続き要求通知後の元threadの依頼者返信だけで受理する。
+
+`result_conflict`はResultの読み取り・構文・schema検証に失敗した状態、`result_reconciliation_required`は妥当なResultの受理を既存の実行・通知状態が拒否した状態である。後者でも完了や自動再試行を推測せず、停止証拠・既存外部操作・通知を正規のoperator手順で照合する。resumeで拒否条件を取り除くことはできない。
+
+### 追加指示の受理不明で残った失敗Resultの照合
+
+`steer_acceptance_unknown`のAttemptに妥当な`failed` Resultが残る場合、通常のresumeでは回復させない。継続を依頼されたmain/operatorは、`inspect_task_recovery`でResult・checkpoint・hash・停止状態を取得する。Resultは未検証証拠として読み、旧追加指示が未送信か、送信後の作業・外部操作が照合済みかを独立した実証拠で確認する。
+
+照合できた場合だけ`reconcile_task_result`へ、exact Task revision・Attempt ID・Result/checkpoint hash、`reason`、`steer_resolution`、証拠の参照と確認内容を渡す。停止証拠だけで外部操作の成否を推測しない。ユーザーの継続依頼やResultの自己申告だけを副作用の照合証拠にせず、既存PR・commit・providerのdurable receipt等を読み直す。確認不能なら保留する。
+
+Dispatcherは旧workerの停止を照合した後、Resultとcheckpointをtransaction内で再読する。未解決外部操作、worker稼働・停止不明、成功・不正・隔離Result、revision/hash不一致では拒否する。checkpoint fileが欠落しても保存済みcheckpointを無視せず、両者が一致しない場合は保留する。検査ツール自体は観測・checkpointをDBへ保存しない。旧checkpointの`design`成果物は参照情報として読み取る。旧Result fileを削除・受理せず、内容・hash・照合event・理由・証拠・停止記録を`task_attempt_result_recoveries`へ保存し、同じTask・Issue claim・worktreeで次のAttemptへ進む。照合結論・理由・証拠参照は未検証の引継ぎ情報として後継promptにも渡す。後継workerも既存成果・外部操作を照合し、成否不明の操作を再送しない。
+
+上限到達なら停止証拠と照合記録を保持した`retry_exhausted`になる。追加実行が承認されれば`retry_task`で予算を増やせる。後継作成前にResult/checkpoint hashと停止状態を再照合する。競合したpause/cancelは優先し、停止確認後に一時停止/取消を確定する。一時停止だけではResult照合を済ませたことにならない。
+
+応答不明は`get_task`のAttempt履歴・`reconciled_result_sha256`と保存済み要求を照合する。同じ照合要求は冪等で、異内容への変更はconflictになる。通知処理中なら監査保存と後継作成をまとめてrollbackする。Dona管理下の停止記録は、任意の外部daemonや外部サービスの副作用完了の証明ではない。
+
+### 継続するGit worktreeの同一性
+
+後続Attemptは、停止確認済みの元Attemptの作業ディレクトリをそのまま使う。元のworkspace IDに対応するpath、symlinkでないこと、repositoryのorigin、Git common directory、元workspace IDに対応するworktree登録名と、そのgit directoryのbackpointerと元pathの対応、HEADのcommitを検証する。作業中に変更したbranchやdetached HEADは新規作成時のbranch名へ戻さず、commit・index・未commit変更・untrackedを保持する。新規worktreeの作成・準備再試行では従来どおり固定baseと初期branchを検証する。
+
+workerのruntime identityとdispatch intentを作る前に準備が確定失敗したAttemptは、pause/resumeで同じAttemptを保持できる。準備再試行回数をリセットしない。直接resumeが成功した場合は観測失敗回数をリセットし、直接cancelでは古い準備エラーを通知に残さない。準備中のcrashや受理不明、runtime identityが残る場合はこの経路を使わず、従来の照合を必要とする。
+
+### worker起動前に失敗したTaskを再開する
+
+Codex CLIのMCP設定取得など、worker作成前の確定失敗が準備試行の上限に達するとTaskは`failed`になる。原因を修正し、利用者が継続を依頼している場合は`get_task`で現在のTask、revision、Attempt、予算を確認し、`retry_task`へ`attempt_id`も明示する。`max_attempts`は既存予算以上、かつ使用済みAttempt数より大きい総上限とする。単なる`failed`を再開許可とみなさない。
+
+この経路は`job_preparation_failed`かつ`runtime_mcp_inventory_failed`または`runtime_start_not_sent`という起動前と確定できる失敗に限定する。その他の一般的な準備例外を未起動の証明にしない。さらに、runtime identity、prompt送信開始・受理、steer、受理済みResult、Resultファイルがなく、Taskが取消・一時停止を求めていない場合だけ利用できる。通知が未処理・処理中・照合待ちなら先に通知を照合する。workerの実行や起動が不明な場合は従来の停止確認・Result照合を使う。
+
+旧Attemptの失敗理由・試行数・終了日時・workspace・通知履歴を保存し、同じTaskと元通知先のまま新しいAttemptとResult pathを割り当てる。準備だけの失敗なので既存の実効objective（過去のcheckpoint・Result照合文脈を含む）も維持する。停止済みworkerの証拠を捏造せず、Taskの使用済みAttempt数をリセットしない。
+
+操作は失敗Attemptをキーに`task_preparation_retries`へ保存する。過去に同じsource eventで行ったpause/resume記録とは別の、明示的な再試行として扱う。同じAttempt・event・revision・予算の再送だけが冪等になり、異なる内容はconflictになる。応答が不明なら`get_task`のAttempt履歴にある`preparation_retry_successor_id`をread-onlyで照合する。受付だけをworker再開成功とせず、新Attemptの実稼働を確認する。
+
+## 元の依頼の範囲で後続Taskへ進む
+
+「調査後、その順番で実装まで進めて」のような依頼は、初回の`delegate_task`で`continuation_scope`と`initial_operation`（現在の`read_only`/`submit_pr`）を保存する。将来段階の許可から初回の作業種別を推測せず、初回もscope.operationsに含まれる種別を明示する。親Donaが元のSlack依頼と確認済み文脈から以下を構造化する。workerのResultにある追加提案を認可根拠にしない。
+
+- `objective`: 依頼全体の目的と順序・完了条件。初回監査の目的とは区別する。
+- `targets`: `repository`、`issue_numbers`、任意の`project`（owner/number）。後続GitHub Taskは列挙したIssueだけを対象とする。
+- `allow_scratch`: 後続のscratch調査を許可するか。
+- `operations`: `read_only`、`submit_pr`。後者は実装・検証・commit・通常push・PR・review・CIまで。merge、本番反映、native approvalの代行は含まない。
+- `max_tasks`: 初回を含む依頼全体のTask上限（2〜32）。`max_attempts_per_task`: 各Taskを新規作成する時点のAttempt上限（1〜10）。各Taskの`policy.max_attempts`もこの範囲に収める。
+
+Taskの`get_task`応答と完了通知には`continuation`（元依頼ID、root Task、scope、state、revision、members）が含まれる。完了通知では最新の`get_task`/`list_tasks`と受理済みResultを照合して、次のTaskを`delegate_task`する。`source_event_id`には現在の通知を、`continuation`には`parent_task_id`、`parent_revision`、`scope_revision`、`operation`を渡す。最初のSlackイベントを作成元へ偽装しない。親は同じ依頼・完了グループの完了済みTaskから選ぶ。progress、attention、未受理Result、承認待ちからは進めない。同じ依頼者の元threadからの明示的な継続も同じ契約を利用できる。
+
+新しい実行グループは現在イベントに作られ、依頼者・通知先・scopeは元の依頼を維持する。`task_key`はイベントごとではなく依頼全体で一意な段階名とする。同じkey・同じ内容は既存Taskを返し、別内容はconflictにする。別scopeで同じ段階名を使っても衝突しないよう、保存用keyはscopeごとに分離し、APIとダッシュボードには元の段階名を返す。応答不明では`list_tasks`のmembersと現行Taskを照合し、重複委任しない。各memberの`admission`にはworkspace、Issue番号とnode ID、Project、operationを永続化する。再起動後も本文やkeyから対象を推測せず、この情報で照合する。後続Taskを作成できた場合はSlackへ進行を報告し、sessionの`processing`を維持する。追加の判断がなければ「開始」を再要求しない。
+
+`control_task_continuation`は元threadの依頼者のSlackイベントと`continuation.revision`を使い、後続作成を`paused`/`active`/`cancelled`にする。取消は不可逆で、scopeの拡大や予算追加には使えない。この操作は既存workerの停止ではないため、作業全体の停止依頼では各稼働Taskにも`pause_task`/`cancel_task`を行う。作成の最終transactionで状態・revision・対象・上限を再検証する。
+
+Projectを保存したtargetでは、後続Taskにも同じowner/numberのProject指定を必須にする。省略して進捗同期を落とす要求は拒否する。対象Issue・Project・作業種別・上限はDispatcherの作成検査、目的の意味と作業種別に沿ったCLI操作は親とworkerの実行契約で守る。任意CLIのコマンド単位の認可をこの機能で新設するものではない。保存scopeはobjectiveとは独立したworkerの`continuation` fieldへ付与し、100,000文字のobjective上限を圧迫せず、自動回復後も保持する。旧Taskにはscopeを自動付与せず、通常の既存Task操作と履歴を維持する。追加tableのみの移行だが、後続作成を使う世代はこの機能を理解するbinaryで運用する。
+
+同じ完了グループに複数のscopeがある場合、通知を発生させた最後のTaskだけでなく、そのグループの完了済みparentを各scopeの起点にできる。最後のTaskがfailed/cancelledでも、attentionが解消済みのall_terminalなら他の完了済みparentから継続できる。失敗・取消Task自体は起点にしない。`list_tasks`は関係するscopeのTaskを最大100件返す。100件の場合は一覧を完全とみなさず、group内の各parentを`get_task`して確認する。
+
+Issue claimは引き続き1つのTaskが保持する。同じIssueの調査・実装・提出はそのTask内で完了させ、完了後に同じIssueへ別Taskを作り直さない。複数Issueの順序決め・準備調査はscratchの初回Taskで行い、その後のIssue Taskへ分ける。初回Task自身がclaimするIssueを`continuation_scope.targets`にも指定する設定は、作成前に`task_continuation_initial_issue_conflict`として拒否する。scope付きTaskと後続Taskでは旧通知形式を選ぶ予約key `legacy-default`も使用できない。いずれもTask作成・claim前の拒否なので、親Donaが元依頼の範囲で入力を訂正でき、新しいSlack返信は不要。
+
+`max_attempts_per_task`は自動継続で新しいTaskを作る際の上限であり、既存Taskに対する利用者の明示的な追加実行依頼を無効にしない。既存の`retry_task`は、停止確認・現在revision・依頼者のSlackイベントを検証して、そのTaskだけの予算を増やせる。他のTaskや後続作成の上限には波及しない。
+
+## 停止更新後にCodexスレッドを再開する
+
+`scripts/dona-update`のpreserve更新では、管理下processの終了を確認し、DBとResultをバックアップした後、旧RuntimeのTask/current Attempt・generation・thread ID・cwdを保存する。新Runtimeへの移行で旧要求をexpireする前にsnapshotを永続化する。更新は旧process/turnを生かしたまま移譲するものではない。
+
+実行中の通常Taskは、既存の停止確認済みAttempt置換を通し、同じTaskとworktreeを保った新Attemptへ進む。新Codex processは保存済みthreadを`thread/resume`し、新しいjob ID・Result保存先・現在の権限で残作業を続ける。旧Attemptはinterruptedとして履歴に残り、同じ停止更新の再実行で後継を重複作成しない。Runtimeも旧generationごとに再開先を一つに束縛する。
+
+停止直前のResultは通常の回収経路で確認し、再実行しない。checkpointの人間入力待ち・外部操作の成否不明、pause/cancel、identity不一致は保留する。現在turnのnative質問・承認待ちは未回答snapshotを新Attemptへ渡し、必要な質問・承認を新接続で再発行する。旧接続の承認回答は移植しない。snapshotは最大8件・payload合計64 KiBとし、超過時は切り詰めずnative_requests_overflowで保留する。過去turnのexpired要求を現在の入力待ちにせず、未解決外部操作はnative質問やcapacity hintより優先する。既存Attempt予算は増やさず、上限ならretry_exhaustedで待つ。schedule、Taskではない旧job、fresh-generation更新、rollbackには自動再開を適用しない。HerdrからApp Serverへ移行する旧Taskもthread snapshotの対象にせず、従来のlegacy停止証拠とSupervisorによる復旧を維持する。
+
+更新前の追加指示が受理不明だった場合は旧受付記録を保存し、停止証拠とcheckpointを照合して保存済みobjectiveを新Attemptへ引き継ぐ。旧steerは再送せず、受理不明の事実を再開promptへ含める。質問への回答送信中だった場合も、回答対象checkpointのsequenceを照合して引き継ぐ。その後に別の質問が記録されていれば新しい回答を待つ。更新後のactivationが失敗して同じ更新先を再起動する場合も、その時点のcurrent Attemptとthreadを再保存する。
+
+利用上限の待機期限は保存し、期限不明ならsnapshot時刻からretry_delay_msだけ待って通常のSupervisorが再開する。保留中の質問へ届いた追加回答は、旧workerの停止を再照合して後継objectiveへ渡す。外部操作のterminal receiptはサービス起動後の検証器で照合し、検証器がない保守段階だけで恒久保留を決めない。thread再開要求が未送信・拒否と確定し、processの停止も確認できた失敗では再開claimを解放する。host crash後の永続not_sent phaseも停止確認後に同じ規則で回収し、受理不明のclaimは保持する。
+
+これは停止更新用の再開であり、[worker handoff契約](worker-handoff-contract.md)のsame-turn継続やonline Updaterのallocated worker gateを有効化しない。実Codex/provider、本番停止更新は別途確認する。

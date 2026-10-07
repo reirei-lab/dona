@@ -44,14 +44,20 @@ const preservedCounts = {
 } as const;
 
 export function countSnapshot(db: Database.Database): Record<string, number> {
-  return Object.fromEntries(Object.entries(preservedCounts).map(([name, sql]) => [
+  const snapshot = Object.fromEntries(Object.entries(preservedCounts).map(([name, sql]) => [
     name,
     (db.prepare(sql).get() as { count: number }).count,
   ]));
+  const hasWebReceipts = db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='web_command_receipts'").get() !== undefined;
+  return { ...snapshot, web_command_receipts: hasWebReceipts
+    ? (db.prepare("SELECT COUNT(*) AS count FROM web_command_receipts").get() as { count: number }).count : 0 };
 }
 
 export function contentSnapshot(db: Database.Database): Record<string, string> {
-  const digestRows = (table: "events" | "jobs", orderBy: string): string => {
+  const digestRows = (table: "events" | "jobs" | "web_command_receipts", orderBy: string): string => {
+    if (db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(table) === undefined) {
+      return crypto.createHash("sha256").update("[]").digest("hex");
+    }
     const columns = (db.pragma(`table_info(${table})`) as Array<{ name: string }>).map(({ name }) => name);
     const canonicalColumns = [...columns];
     if (table === "jobs" && !columns.includes("job_key")) {
@@ -65,7 +71,13 @@ export function contentSnapshot(db: Database.Database): Record<string, string> {
     const rows = db.prepare(`SELECT ${projection} FROM ${table} ORDER BY ${orderBy}`).all();
     return crypto.createHash("sha256").update(JSON.stringify(rows)).digest("hex");
   };
-  return { events: digestRows("events", "sequence"), jobs: digestRows("jobs", "job_id") };
+  return { events: digestRows("events", "sequence"), jobs: digestRows("jobs", "job_id"),
+    web_command_receipts: digestRows("web_command_receipts", "receipt_id") };
+}
+
+function preservationDigestName(name: string): "events" | "jobs" | "web_command_receipts" {
+  if (name === "web_command_receipts") return name;
+  return name === "events" || name.startsWith("event_") ? "events" : "jobs";
 }
 
 export function verifyDatabase(db: Database.Database, expectedVersion: number): void {
@@ -77,11 +89,23 @@ export function verifyDatabase(db: Database.Database, expectedVersion: number): 
   if (version !== expectedVersion) throw new Error(`database_schema_${String(version)}_does_not_match_${expectedVersion}`);
 }
 
+/** Full-file SQLite backups cannot exclude individual tables, including their
+ * freed pages. A persistent history marker also rejects renamed/dropped stores.
+ * Schema markers conservatively reject pre-marker and damaged security schemas. */
+export function assertFullBackupHasNoPayloadStore(db: Database.Database): void {
+  if (db.pragma("main.application_id", { simple: true }) !== 0
+    || db.prepare("SELECT 1 FROM main.sqlite_schema WHERE lower(name) IN ('approval_schema','web_auth_schema','approval_payload_secrets','web_auth_payloads') LIMIT 1").get()) {
+    throw new Error("schema_full_backup_payload_store_forbidden");
+  }
+}
+
 export function assertReceiptMatchesDatabases(
   receipt: MigrationReceipt,
   migrated: Database.Database,
   backup: Database.Database,
 ): void {
+  assertFullBackupHasNoPayloadStore(migrated);
+  assertFullBackupHasNoPayloadStore(backup);
   verifyDatabase(migrated, 3);
   verifyDatabase(backup, 2);
   const backupCounts = countSnapshot(backup);
@@ -92,7 +116,7 @@ export function assertReceiptMatchesDatabases(
     receipt.preservation[name]?.before !== receipt.preservation[name]?.after ||
     receipt.preservation[name]?.before_digest !== receipt.preservation[name]?.after_digest ||
     receipt.preservation[name]?.before !== backupCounts[name] ||
-    receipt.preservation[name]?.before_digest !== backupDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]
+    receipt.preservation[name]?.before_digest !== backupDigests[preservationDigestName(name)]
   )) throw new Error("schema_rollout_receipt_state_mismatch");
 }
 
@@ -133,6 +157,10 @@ export async function migrateV2ToV3WithBackup(input: {
   const source = new Database(input.databasePath, { fileMustExist: true });
   source.pragma("foreign_keys = ON");
   try {
+    // Pin the exclusion check and Online Backup to the same read snapshot.
+    // A write transaction on this connection would make backup return LOCKED.
+    source.exec("BEGIN");
+    assertFullBackupHasNoPayloadStore(source);
     const actual = source.pragma("user_version", { simple: true }) as number;
     assertSchemaActivationSafe(input.previous, input.target, actual);
     verifyDatabase(source, 2);
@@ -147,6 +175,7 @@ export async function migrateV2ToV3WithBackup(input: {
     const backup = new Database(input.backupPath, { readonly: true, fileMustExist: true });
     try {
       backup.pragma("foreign_keys = ON");
+      assertFullBackupHasNoPayloadStore(backup);
       verifyDatabase(backup, 2);
       if (JSON.stringify(countSnapshot(backup)) !== JSON.stringify(before) ||
         JSON.stringify(contentSnapshot(backup)) !== JSON.stringify(beforeDigests)) {
@@ -156,17 +185,22 @@ export async function migrateV2ToV3WithBackup(input: {
       backup.close();
     }
 
+    source.exec("COMMIT");
+
     let preservation!: MigrationReceipt["preservation"];
     source.transaction(() => {
+      // A writer may have changed the schema after the backup snapshot.
+      assertFullBackupHasNoPayloadStore(source);
       migrateDispatcherDatabase(source, () => {}, true, 3);
       input.postMigrationHook?.();
+      assertFullBackupHasNoPayloadStore(source);
       verifyDatabase(source, 3);
       const after = countSnapshot(source);
       const afterDigests = contentSnapshot(source);
       preservation = Object.fromEntries(Object.keys(before).map((name) => [name, {
         before: before[name]!, after: after[name]!,
-        before_digest: beforeDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!,
-        after_digest: afterDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!,
+        before_digest: beforeDigests[preservationDigestName(name)]!,
+        after_digest: afterDigests[preservationDigestName(name)]!,
       }]));
       if (Object.values(preservation).some(({ before: left, after: right, before_digest: leftDigest, after_digest: rightDigest }) =>
         left !== right || leftDigest !== rightDigest)) {
@@ -188,6 +222,7 @@ export async function migrateV2ToV3WithBackup(input: {
       completed_at: input.completedAt ?? new Date().toISOString(),
     };
   } finally {
-    source.close();
+    try { if (source.inTransaction) source.exec("ROLLBACK"); }
+    finally { source.close(); }
   }
 }

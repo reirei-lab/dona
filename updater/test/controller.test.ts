@@ -1,3 +1,4 @@
+import {DispatcherHostTransition} from '../src/dispatcher-host-transition.js';
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -2955,4 +2956,168 @@ describe("UpdateController isolated end-to-end", () => {
     assert.deepEqual(f.runtime.calls, []);
     f.database.close();
   });
+});
+
+async function signedFixture() {
+  const f=await fixture();const profile=path.join(f.policy.control_root,'test.provisionprofile');await fs.writeFile(profile,'profile-original',{mode:0o600});
+  f.policy.signed_host={team_id:'ABCDEFGHIJ',access_group:'ABCDEFGHIJ.dev.dona.approval',signing_identity_sha1:'a'.repeat(40),provisioning_profile:profile};
+  const health=f.runtime.dispatcherHealth.bind(f.runtime);f.runtime.dispatcherHealth=async()=>({...await health(),runtime_host:'signed-v1'});
+  return {...f,profile};
+}
+test('署名profile driftはapply前に拒否してplanへprivate設定を公開しない',async()=>{
+ const f=await signedFixture();try{
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string;signed_host_digest:string};
+ assert.match(plan.signed_host_digest,/^[a-f0-9]{64}$/);assert.equal(JSON.stringify(response).includes(f.profile),false);assert.equal(JSON.stringify(response).includes('ABCDEFGHIJ'),false);
+ await fs.writeFile(f.profile,'profile-replaced');
+ assert.throws(()=>f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,plan_id:plan.plan_id,plan_hash:plan.plan_hash,approval_id:'signed-host-approval'}),/signed_host_plan_drift/);
+ assert.equal(f.runtime.calls.includes('quiesceDispatcher'),false);
+ }finally{f.database.close();}
+});
+test('署名設定は承認後prepare直前にも照合して停止操作を始めない',async()=>{
+ const f=await signedFixture();try{
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string};
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'signed-host-approval'});f.dispatcher.terminal=true;
+ f.policy.signed_host!.signing_identity_sha1='b'.repeat(40);await f.controller.processNext();
+ assert.equal(f.database.get(response.request_id as string)?.state,'failed');assert.equal(f.runtime.calls.includes('quiesceDispatcher'),false);assert.equal(f.runtime.calls.includes('stopDispatcher'),false);
+ }finally{f.database.close();}
+});
+test('署名済みrelease更新はprepareとrollback元検証を経て通常activationを完了する',async()=>{
+ const f=await signedFixture();try{
+ const checks:string[]=[];
+ Object.assign(f.build,{prepareSignedHost:async(_p:string,m:{sha:string})=>{checks.push('prepare:'+m.sha);},verifySignedHost:async(_p:string,m:{sha:string})=>{checks.push('verify:'+m.sha);}});
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string};
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'signed-host-approval'});f.dispatcher.terminal=true;await f.controller.processNext();
+ assert.ok(checks.includes('verify:'+currentSha));assert.ok(checks.includes('prepare:'+targetSha));
+ assert.equal(f.database.get(response.request_id as string)?.state,'succeeded');
+ }finally{f.database.close();}
+});
+test('初回署名host切替はplan-bound plistを停止後に変更し署名host healthで完了する',async()=>{
+ const f=await signedFixture();try{
+ const digest='e'.repeat(64),changes:string[]=[];const health=f.runtime.dispatcherHealth.bind(f.runtime);
+ f.runtime.dispatcherHealth=async()=>{const h=await health();return {...h,runtime_host:h.build_sha===targetSha?'signed-v1':'node'};};
+ Object.assign(f.runtime,{
+ planDispatcherHostTransition:async()=>digest,
+ verifyDispatcherHostOriginal:async()=>{changes.push('verify');},
+ applyDispatcherHostTransition:async(t:{digest:string},direction:string)=>{
+ assert.equal(t.digest,digest);assert.equal(await f.runtime.dispatcherRegistered(),false);changes.push(direction);
+ },
+ });
+ Object.assign(f.build,{prepareSignedHost:async()=>{},verifySignedHost:async()=>{}});
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string;signed_host_transition:string};
+ assert.equal(plan.signed_host_transition,digest);
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'first-signed-host'});f.dispatcher.terminal=true;await f.controller.processNext();
+ assert.equal(f.database.get(response.request_id as string)?.state,'succeeded');assert.ok(changes.includes('target'));assert.equal(changes.includes('original'),false);
+ }finally{f.database.close();}
+});
+test('初回署名hostのplist復元可能性はDB rollback_safe falseを上書きしない',async()=>{
+ const f=await signedFixture();try{
+ Object.assign(f.runtime,{planDispatcherHostTransition:async()=>'e'.repeat(64)});
+ f.git.targetCompatibility={...f.git.targetCompatibility,rollback_safe:false};f.policy.compatibility=f.git.targetCompatibility;
+ await assert.rejects(f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget}),/target_is_not_rollback_compatible/);
+ assert.equal(f.runtime.calls.includes('stopDispatcher'),false);
+ }finally{f.database.close();}
+});
+test('target SHAが一致してもNodeで起動した場合はsigned update成功としない',async()=>{
+ const f=await signedFixture();try{
+ const health=f.runtime.dispatcherHealth.bind(f.runtime);f.runtime.dispatcherHealth=async()=>{const h=await health();return {...h,runtime_host:h.build_sha===targetSha?'node':'signed-v1'};};
+ Object.assign(f.build,{prepareSignedHost:async()=>{},verifySignedHost:async()=>{}});
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string};
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'wrong-target-host'});f.dispatcher.terminal=true;await f.controller.processNext();
+ assert.notEqual(f.database.get(response.request_id as string)?.state,'succeeded');
+ }finally{f.database.close();}
+});
+async function taskGenerationFixture(){
+ const f=await signedFixture();
+ const {schema_version:_,...compatibility}=JSON.parse(await fs.readFile(new URL('../../config/release-compatibility.json',import.meta.url),'utf8'));
+ const rollout=JSON.parse(await fs.readFile(new URL('../../config/schema-rollout.json',import.meta.url),'utf8'));
+ f.policy.compatibility=compatibility;f.policy.task_generation_update={mode:'forward_only',schema:4,task_execution_version:1};
+ f.git.targetCompatibility=compatibility;f.git.targetRollout=rollout;f.build.compatibility=compatibility;
+ const current=await f.store.readCurrentManifest();await fs.writeFile(path.join(f.policy.release_root,currentSha,'release-manifest.json'),JSON.stringify({...current,compatibility}));
+ f.runtime.setHealthCompatibility(currentSha,compatibility);f.runtime.setHealthCompatibility(targetSha,compatibility);f.runtime.actualAppSchema=4;f.runtime.appSchemaStateResult={user_version:4,integrity_ok:true,foreign_key_violations:0};
+ Object.assign(f.build,{prepareSignedHost:async()=>{},verifySignedHost:async()=>{}});
+ return f;
+}
+test('実schema4 manifestの明示forward-only更新はDB保持/rollback不可をexact planへ表示して完了する',async()=>{
+ const f=await taskGenerationFixture();try{
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string;activation_mode:string;database_policy:string;automatic_rollback:boolean;rollback_compatible:boolean};
+ assert.equal(plan.activation_mode,'forward_only');assert.equal(plan.database_policy,'preserve');assert.equal(plan.automatic_rollback,false);assert.equal(plan.rollback_compatible,false);
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'task-generation-forward'});f.dispatcher.terminal=true;await f.controller.processNext();
+ assert.equal(f.database.get(response.request_id as string)?.state,'succeeded');assert.equal(f.runtime.calls.includes('migrateAppSchema'),false);
+ }finally{f.database.close();}
+});
+test('実schema4は明示policy無し/DB異世代/承認後policy driftを拒否する',async()=>{
+ const f=await taskGenerationFixture();try{
+ delete f.policy.task_generation_update;await assert.rejects(f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget}),/rollback_compatible/);
+ f.policy.task_generation_update={mode:'forward_only',schema:4,task_execution_version:1};f.runtime.appSchemaStateResult.user_version=3;
+ await assert.rejects(f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget}),/database_unverified/);
+ f.runtime.appSchemaStateResult.user_version=4;const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});delete f.policy.task_generation_update;
+ const plan=response.plan as {plan_id:string;plan_hash:string};assert.throws(()=>f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'drift'}),/policy_drift/);
+ assert.equal(f.runtime.calls.includes('stopDispatcher'),false);
+ }finally{f.database.close();}
+});
+test('実schema4 target開始後の失敗は旧payload/DBへrollbackせずneeds_reviewを維持する',async()=>{
+ const f=await taskGenerationFixture();try{
+ f.runtime.targetMainStartRejectedOnce=true;const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string};
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'no-rollback'});f.dispatcher.terminal=true;await f.controller.processNext();
+ assert.equal(f.database.get(response.request_id as string)?.state,'needs_review');assert.equal((await f.store.observe()).current_sha,targetSha);
+ assert.equal(f.database.runtimeOperation(response.request_id as string,'start_previous_dispatcher'),undefined);assert.equal(f.database.runtimeOperation(response.request_id as string,'start_previous_main_agent'),undefined);
+ }finally{f.database.close();}
+});
+test('実schema4 unsignedからsignedへの初回forward-only切替も同じplan契約で完了する',async()=>{
+ const f=await taskGenerationFixture();try{
+ const health=f.runtime.dispatcherHealth.bind(f.runtime);f.runtime.dispatcherHealth=async()=>{const h=await health();return {...h,runtime_host:h.build_sha===targetSha?'signed-v1':'node'};};
+ const directions:string[]=[];Object.assign(f.runtime,{planDispatcherHostTransition:async()=>'f'.repeat(64),verifyDispatcherHostOriginal:async()=>{},applyDispatcherHostTransition:async(_t:unknown,d:string)=>{directions.push(d);}});
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string;activation_mode:string;signed_host_transition:string};
+ assert.equal(plan.activation_mode,'forward_only');assert.equal(plan.signed_host_transition,'f'.repeat(64));f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'schema4-initial-signed'});f.dispatcher.terminal=true;await f.controller.processNext();
+ assert.equal(f.database.get(response.request_id as string)?.state,'succeeded');assert.equal(directions.includes('original'),false);assert.ok(directions.includes('target'));
+ }finally{f.database.close();}
+});
+test('実schema4 target開始の応答不明は再送せずneeds_reviewでread-only照合する',async()=>{
+ const f=await taskGenerationFixture();try{
+ let starts=0;f.runtime.startDispatcher=async()=>{starts++;return {...ok,exit_code:null,timed_out:true};};
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string};
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'forward-unknown-start'});f.dispatcher.terminal=true;await f.controller.processNext();
+ assert.equal(f.database.get(response.request_id as string)?.state,'needs_review');assert.equal(starts,1);assert.equal((await f.store.observe()).current_sha,targetSha);
+ await f.controller.reconcile(response.request_id as string);assert.equal(starts,1);assert.equal(f.database.get(response.request_id as string)?.state,'needs_review');
+ }finally{f.database.close();}
+});
+
+for(const failure of ['before_pointer','after_pointer','unknown_pointer'] as const)test(`初回signed host activation失敗をpointer照合する: ${failure}`,async()=>{
+ const f=await taskGenerationFixture();try{
+ f.runtime.rotateMainAgentSessionOnStart=true;
+ const directions:string[]=[];const health=f.runtime.dispatcherHealth.bind(f.runtime);
+ f.runtime.dispatcherHealth=async()=>{const h=await health();return {...h,runtime_host:h.build_sha===targetSha?'signed-v1':'node'};};
+ Object.assign(f.runtime,{planDispatcherHostTransition:async()=>'f'.repeat(64),verifyDispatcherHostOriginal:async()=>{},applyDispatcherHostTransition:async(_t:unknown,d:string)=>{assert.equal(await f.runtime.dispatcherRegistered(),false);directions.push(d);}});
+ const activate=f.store.activate.bind(f.store),observe=f.store.observe.bind(f.store);let calls=0,failed=false;
+ f.store.activate=async(...args)=>{calls++;if(failure==='after_pointer')await activate(...args);failed=true;throw Error('injected_activation_failure');};
+ f.store.observe=async()=>{if(failed&&failure==='unknown_pointer')throw Error('injected_pointer_unavailable');return observe();};
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string};
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'host-activation-failure'});f.dispatcher.terminal=true;await f.controller.processNext();
+ const id=response.request_id as string,row=f.database.get(id)!;assert.equal(calls,1);assert.equal(directions[0],'target');
+ assert.equal(f.database.runtimeOperation(id,'start_target_dispatcher'),undefined);
+ if(failure==='before_pointer'){
+  assert.equal(row.state,'failed');assert.equal(row.last_error_code,'host_activation_failed_current_preserved');assert.ok(directions.includes('original'));assert.equal((await observe()).current_sha,currentSha);assert.equal(f.database.runtimeOperation(id,'restart_current_dispatcher')?.phase,'observed');assert.equal((await f.runtime.dispatcherHealth()).build_sha,currentSha);
+ }else{assert.equal(row.state,'needs_review');assert.equal(directions.includes('original'),false);assert.equal(f.database.runtimeOperation(id,'restart_current_dispatcher'),undefined);assert.equal((await observe()).current_sha,failure==='after_pointer'?targetSha:currentSha);}
+ }finally{f.database.close();}
+});
+
+test('plist変更後pointer前のprocess中断は次bootのreconcileでexact旧plistとruntimeを復元する',async()=>{
+ const f=await taskGenerationFixture();try{
+ const file=path.join(path.dirname(f.policy.release_root),'crash-dispatcher.plist');
+ const old=Buffer.from(JSON.stringify({Label:'dev.dona.dispatcher',ProgramArguments:[f.policy.executables.node,path.join(f.policy.current_pointer,'dispatcher/dist/cli.js'),'serve'],EnvironmentVariables:{DONA_LOCAL_APPROVAL_CONFIG:'/private/approval.json'}}));
+ await fs.writeFile(file,old,{mode:0o600});
+ const transition=new DispatcherHostTransition(f.policy,file,{decode:b=>JSON.parse(b.toString()),encode:v=>Buffer.from(JSON.stringify(v))});
+ Object.assign(f.runtime,{planDispatcherHostTransition:async()=>transition.plan(currentSha,targetSha),verifyDispatcherHostOriginal:async(t:Parameters<typeof transition.verifyOriginal>[0])=>transition.verifyOriginal(t),applyDispatcherHostTransition:async(t:Parameters<typeof transition.apply>[0],direction:'target'|'original')=>transition.apply(t,direction,await f.runtime.dispatcherRegistered())});
+ const health=f.runtime.dispatcherHealth.bind(f.runtime);f.runtime.dispatcherHealth=async()=>({...await health(),runtime_host:'node'});
+ const response=await f.controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});const plan=response.plan as {plan_id:string;plan_hash:string};
+ f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,...plan,approval_id:'host-crash'});
+ let row=f.database.claim(response.request_id as string,'controller-test',f.policy.timeouts.lease_ms,new Date('2026-09-02T00:00:00.000Z'))!;
+ for(const state of ['staged','quiescing','activating'] as const)row=f.database.transition(row.request_id,row.fence,state,'crash_fixture');
+ for(const [kind,ref,sha,session] of [['stop_main_agent','w1:p1',currentSha,`session-${currentSha}`],['stop_slack','slack_adapter',null,null],['stop_dispatcher','dispatcher',null,null]] as const){f.database.prepareRuntimeOperation(row.request_id,row.fence,kind,ref,sha,session);f.database.recordRuntimeOperation(row.request_id,row.fence,kind,'observed',null,{});}
+ f.runtime.simulateStoppedRuntime();f.runtime.rotateMainAgentSessionOnStart=true;
+ transition.apply({digest:row.signed_host_transition!,from_sha:currentSha,to_sha:targetSha},'target',false);
+ assert.notDeepEqual(await fs.readFile(file),old);
+ f.advance(f.policy.timeouts.lease_ms+1);await f.controller.processNext();
+ assert.deepEqual(await fs.readFile(file),old);assert.equal(f.database.get(row.request_id)?.state,'failed');assert.equal(f.database.get(row.request_id)?.last_error_code,'pre_activation_stop_recovery');assert.equal((await f.store.observe()).current_sha,currentSha);assert.equal(f.database.runtimeOperation(row.request_id,'start_target_dispatcher'),undefined);
+ }finally{f.database.close();}
 });

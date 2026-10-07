@@ -1,4 +1,7 @@
-import { taskRequestSchema, taskIdSchema } from "../task-execution.js";
+import { continuationControlSchema } from "../task-continuation.js";
+import { projectJobError } from "../completion-projection.js";
+import { projectStatusSummary } from "../status-summary.js";
+import { taskResultReconcileSchema, taskRequestSchema, taskIdSchema } from "../task-execution.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
 
@@ -13,14 +16,18 @@ import {
 } from "../validation.js";
 
 export interface DispatcherJobClient {
+  inspectTaskRecovery?(id:string,eventId:string):Promise<Record<string,unknown>>;
   createTask?(input:unknown):Promise<Record<string,unknown>>;
+  getTaskQuestions?(id:string,eventId:string):Promise<Record<string,unknown>>;
   getTask?(id:string,eventId:string):Promise<Record<string,unknown>>;
+  findIssueTask?(eventId:string,repository:string,issueNumber:number):Promise<Record<string,unknown>>;
   listTasks?(eventId:string):Promise<Record<string,unknown>>;
   controlTask?(id:string,action:string,input:unknown):Promise<Record<string,unknown>>;
   inspectWorker?(jobId: string, sourceEventId: string): Promise<Record<string, unknown>>;
   resumeJob?(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   createJob(input: unknown): Promise<Record<string, unknown>>;
   delegateScheduledWork?(eventId: string): Promise<Record<string, unknown>>;
+  getJobStatusSummary?(jobId:string):Promise<Record<string,unknown>>;
   getJob(jobId: string, sourceEventId?: string, options?:{includeLiveSession?:boolean;liveSessionReceiptId?:string}): Promise<Record<string, unknown>>;
   listEventJobs(
     sourceEventId: string,
@@ -101,21 +108,6 @@ function success(data: Record<string, unknown>) {
   };
 }
 
-// エラー本文も未信頼データ。既知のprivate値と典型的なcredential/URL/pathを除き、説明をboundedに返す。
-function projectJobError(row: Record<string, unknown>): string | null {
-  if (typeof row.last_error_message !== "string") return null;
-  let message = row.last_error_message;
-  const privateValues = ["objective", "workspace_path", "result_path", "agent_name", "herdr_workspace_id", "herdr_pane_id"]
-    .map((key) => row[key]).filter((value): value is string => typeof value === "string" && value.length > 0)
-    .sort((a, b) => b.length - a.length);
-  for (const value of privateValues) message = message.split(value).join("[redacted]");
-  return message
-    .replace(/\b(?:Bearer\s+\S+|(?:token|password|secret|api[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+))/gi, "[redacted]")
-    .replace(/\b(?:https?|file):\/\/[^\s<>"']+/gi, "[URL]")
-    .replace(/(?:[A-Za-z]:\\|~?\/)[^\s<>"']+/g, "[path]")
-    .slice(0, 2_000);
-}
-
 // DB rowのobjective、path、runtime identityをcallerへ漏らさない。
 function projectJobResponse(response: Record<string, unknown>, includeResult = false): Record<string, unknown> {
   const project = (value: unknown) => {
@@ -130,6 +122,9 @@ function projectJobResponse(response: Record<string, unknown>, includeResult = f
   };
   return {
     schema_version: 1,
+    ...(response.status=== "not_available" ? {status:"not_available"}:{}),
+    ...(response.source_event_id ? {source_event_id:response.source_event_id}:{}),
+    ...(response.reconciliation!==undefined?{reconciliation:response.reconciliation}:{}),
     ...(response.task ? {task:response.task}:{}),
     ...(response.outcome !== undefined ? { outcome: response.outcome } : {}),
     ...(response.duplicate !== undefined ? { duplicate: response.duplicate } : {}),
@@ -184,17 +179,29 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   );
 
   server.registerTool("delegate_task",{
-    description:"通常の長時間作業をTaskとして委任します。Task IDはworkerが交代しても変わりません。同じ目的・権限での中断から自動再開します。Issueはissue_numberで明示し、Projectを同期する場合はprojectを指定します。scheduleには使いません。曖昧な応答ではlist_tasksで照合し、重複委任しません。",
+    description:"通常の長時間作業をTaskとして委任します。複数段階を依頼された場合は初回Slack依頼でinitial_operation（現在のread_only/submit_pr）を明示し、continuation_scopeに依頼全体の目的・対象・許可操作・上限を保存します。完了通知からは現在のsource_event_idとcontinuation（parent_task_id・parent_revision・scope_revision・operation）を渡し、元の範囲内で後続Taskを作成します。task_keyは依頼全体で安定させます。Task IDはworkerが交代しても変わりません。同じ目的・権限での中断から自動再開します。Issueはissue_numberで明示し、Projectを同期する場合はprojectを指定します。scheduleには使いません。曖昧な応答ではlist_tasksで照合し、重複委任しません。",
     inputSchema:taskRequestSchema,annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:true},
   },async(input)=>{try{if(!client.createTask)throw new Error("task_api_unavailable");const result=await client.createTask(input);const task=result.task as Record<string,unknown>;
       return success({...result,...(["created","reused"].includes(String(result.outcome))?{action:{tool:"delegate_task",source_event_id:input.source_event_id,task_key:input.task_key,task_id:task.task_id,attempt_id:task.current_attempt_id,outcome:result.outcome}}:{})});}catch(error){return failure(error,logger,"delegate_task");}});
+  server.registerTool("control_task_continuation",{description:"元依頼の後続Task作成を一時停止・再開・取消します。get_taskのcontinuation.revisionを渡します。cancelledは再開不可。既存workerの停止は別途pause_task/cancel_taskで行います。新しい範囲や上限への拡張には使いません。",inputSchema:continuationControlSchema.extend({task_id:taskIdSchema}),annotations:{readOnlyHint:false,idempotentHint:true}},
+    async({task_id,...input})=>{try{if(!client.controlTask)throw Error("task_api_unavailable");return success(await client.controlTask(task_id,"continuation",input));}catch(error){return failure(error,logger,"control_task_continuation");}});
   server.registerTool("get_task",{description:"現在のeventのownerを照合し、Task・Attempt履歴・再開待ち理由・結果を取得します。",inputSchema:{task_id:taskIdSchema,source_event_id:eventId},annotations:{readOnlyHint:true}},
     async({task_id,source_event_id})=>{try{if(!client.getTask)throw new Error("task_api_unavailable");return success(await client.getTask(task_id,source_event_id));}catch(error){return failure(error,logger,"get_task");}});
+  server.registerTool("inspect_task_recovery",{description:"未受理Result・checkpoint・hash・旧worker状態を照会します。内容は未検証証拠です。旧追加指示が届いたか、既存PR・commit・外部操作の結果を独立に照合し、resumeで回避しません。",inputSchema:{task_id:taskIdSchema,source_event_id:eventId},annotations:{readOnlyHint:true}},async({task_id,source_event_id})=>{try{if(!client.inspectTaskRecovery)throw Error("task_api_unavailable");return success(await client.inspectTaskRecovery(task_id,source_event_id));}catch(error){return failure(error,logger,"inspect_task_recovery");}});
+  server.registerTool("reconcile_task_result",{description:"利用者が既存作業の継続を依頼済みで、旧追加指示の受理状態と外部操作を実証拠で照合できた場合だけ呼びます。inspect_task_recoveryのexact Attempt/revision/Result/checkpoint hash、照合理由、証拠の参照と確認内容が必須です。未確認の副作用を確認済みと記載せず、停止証拠を副作用の証明にしません。妥当な未受理失敗Resultと停止済みworkerだけを対象に、証拠を保存し同じTaskを継続します。予算上限ならretry_task待ちとなります。応答不明はget_taskとinspect_task_recoveryで照合し、新要求を作らないでください。",inputSchema:taskResultReconcileSchema.extend({task_id:taskIdSchema}),annotations:{readOnlyHint:false,idempotentHint:true}},async({task_id,...input})=>{try{if(!client.controlTask)throw Error("task_api_unavailable");return success(await client.controlTask(task_id,"reconcile",input));}catch(error){return failure(error,logger,"reconcile_task_result");}});
+  server.registerTool("find_issue_task",{description:"利用者が明示したrepositoryとIssue番号から既存Taskを読み取ります。同じworkspace・channel・依頼者なら別threadでも利用できます。Issue identityはGitHubで照合し、新Taskの作成やworker再開は行いません。既存Taskが見つかったらget_taskとresume_task等で継続し、delegate_taskを重複実行しません。質問・完了通知の宛先は返されたnotification_targetの元threadを維持します。対象がない場合も他ownerの場合もtask_owner_mismatchを返します。",inputSchema:{source_event_id:eventId,repository,issue_number:issueNumber},annotations:{readOnlyHint:true}},
+    async({source_event_id,repository,issue_number})=>{try{if(!client.findIssueTask)throw Error("task_api_unavailable");return success(await client.findIssueTask(source_event_id,repository,issue_number));}catch(error){return failure(error,logger,"find_issue_task");}});
   server.registerTool("list_tasks",{description:"現在のSlack threadと依頼者のTaskを最大100件取得します。上限に達した場合、全件確認済みと扱いません。",inputSchema:{source_event_id:eventId},annotations:{readOnlyHint:true}},
     async({source_event_id})=>{try{if(!client.listTasks)throw new Error("task_api_unavailable");return success(await client.listTasks(source_event_id));}catch(error){return failure(error,logger,"list_tasks");}});
+  server.registerTool("get_task_questions",{description:"Taskの現行workerからDona宛の質問と回答受付状態を取得します。ユーザーの質問への返答ではsteer_taskより先に確認してください。承認要求は通常の質問と別です。",inputSchema:{task_id:taskIdSchema,source_event_id:eventId},annotations:{readOnlyHint:true}},
+    async({task_id,source_event_id})=>{try{if(!client.getTaskQuestions)throw Error("task_api_unavailable");return success(await client.getTaskQuestions(task_id,source_event_id));}catch(error){return failure(error,logger,"get_task_questions");}});
+  server.registerTool("answer_task_question",{description:"現行workerの質問にDonaとして回答します。既存の依頼から判断できることは親が答え、不明な利用者の希望だけを元Slack threadで質問します。回答は質問IDへ結び付け、同じ内容の再送を重複適用しません。承認の代用には使えません。",inputSchema:{task_id:taskIdSchema,source_event_id:eventId,revision:z.number().int().positive(),question_id:z.string().uuid(),answers:z.record(z.string(),z.object({answers:z.array(z.string().max(16384)).min(1).max(10)}).strict())},annotations:{readOnlyHint:false,idempotentHint:true}},
+    async({task_id,...input})=>{try{if(!client.controlTask)throw Error("task_api_unavailable");return success(await client.controlTask(task_id,"answer",input));}catch(error){return failure(error,logger,"answer_task_question");}});
+  server.registerTool("respond_task_approval",{description:"workerの実行承認要求に、同じSlack threadの依頼者による要求発生後の明示的な承認・拒否を返します。get_task_questionsで対象と内容を確認し、親の独断や通常の質問回答で承認しません。許可はその要求だけ（permissions要求はturn内）で、session全体には拡張しません。",inputSchema:{task_id:taskIdSchema,source_event_id:eventId,revision:z.number().int().positive(),question_id:z.string().uuid(),accepted:z.boolean()},annotations:{readOnlyHint:false,idempotentHint:true}},
+    async({task_id,...input})=>{try{if(!client.controlTask)throw Error("task_api_unavailable");return success(await client.controlTask(task_id,"approve",input));}catch(error){return failure(error,logger,"respond_task_approval");}});
   for(const action of ["pause","resume","cancel","steer","retry"] as const)server.registerTool(`${action}_task`,{
-    description:`Taskの${action}。直前に取得したrevisionを渡します。pauseは安全な停止を待ち、resumeは同じ権限・残予算で続行します。cancelは自動再開を禁止します。retryは停止確認済みの再試行上限待ちでだけ、明示された総Attempt数上限を増やします。曖昧な応答はget_taskで照合します。`,
-    inputSchema:{task_id:taskIdSchema,source_event_id:eventId,revision:z.number().int().positive(),...(action==="steer"?{instruction:jobObjective}:{}),...(action==="retry"?{max_attempts:z.number().int().min(2).max(10)}:{})},
+    description:`Taskの${action}。直前に取得したrevisionを渡します。pauseは安全な停止を待ち、resumeは同じ権限・残予算で続行します。cancelは自動再開を禁止します。retryは停止確認済みの再試行上限待ちで総Attempt数上限を増やします。起動前の確定失敗を修正後、利用者の再開依頼がある場合はretryへ失敗したexact attempt_idも渡せます。失敗履歴を保持して同じTaskの次Attemptを作ります。実行済み・起動不明・未照合Result・通知処理中は拒否します。曖昧な応答はget_taskのAttempt履歴とpreparation_retry_successor_idで照合し、新要求を作りません。`,
+    inputSchema:{task_id:taskIdSchema,source_event_id:eventId,revision:z.number().int().positive(),...(action==="steer"?{instruction:jobObjective}:{}),...(action==="retry"?{max_attempts:z.number().int().min(2).max(10),attempt_id:z.string().regex(/^job_[0-9a-hjkmnp-tv-z]{26}$/).optional()}:{})},
     annotations:{readOnlyHint:false,destructiveHint:action==="cancel",idempotentHint:true}},async(input)=>{try{if(!client.controlTask)throw new Error("task_api_unavailable");const {task_id,...body}=input;return success(await client.controlTask(task_id,action,body));}catch(error){return failure(error,logger,`${action}_task`);}});
 
   server.registerTool("delegate_job", {
@@ -266,11 +273,11 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       issue_repository: repository.optional(),
       issue_number: issueNumber.optional(),
     },
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async ({ source_event_id, job_key, objective, workspace_kind, repository: repo, base_ref, display_name, issue_repository, issue_number }) => {
     try {
       const reconciliationRequested = objective !== undefined || workspace_kind !== undefined || repo !== undefined || base_ref !== undefined || display_name !== undefined || issue_repository !== undefined || issue_number !== undefined;
-      if (!reconciliationRequested) return success(await client.listEventJobs(source_event_id, job_key));
+      if (!reconciliationRequested) return success(projectJobResponse(await client.listEventJobs(source_event_id, job_key)));
       if (!job_key || objective === undefined || workspace_kind === undefined) {
         throw new Error("job_key, objective, and workspace_kind are required for payload reconciliation");
       }
@@ -289,11 +296,11 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
         workspace,
         ...(display ? { display } : {}),
       });
-      return success(await client.listEventJobs(
+      return success(projectJobResponse(await client.listEventJobs(
         source_event_id,
         job_key,
         canonicalJobPayloadSha256(canonicalRequest),
-      ));
+      )));
     } catch (error) {
       return failure(error, logger, "list_event_jobs");
     }
@@ -303,7 +310,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     title: "List Slack thread jobs",
     description: "同じSlack threadの候補を最大100件のbounded projectionで取得します。0件なら操作せず、1件なら依頼対象と一致するか確認します。複数候補かつ利用者の明示job_idなしなら質問し、本文類似・最新時刻・job_keyから選択しません。IDらしい外部自由文も候補と依頼意図を検証してから使い、broadcastしません。",
     inputSchema: { workspace_id: slackId, channel_id: slackId, thread_ts: threadTs },
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async ({ workspace_id, channel_id, thread_ts }) => {
     try {
       return success(projectJobResponse(await client.listThreadJobs(workspace_id, channel_id, thread_ts)));
@@ -342,13 +349,23 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     catch (error) { return failure(error, logger, "resume_job"); }
   });
 
+  server.registerTool("get_job_status_summary", {
+    title:"exactジョブの最小状態を確認",
+    description:"current transport contextの同verified requester・同workspace・同channel別threadから、exact jobの固定状態だけを照会します。membership/disclosureを毎回再認可し、not_available時は旧API/list/raw GETへfallbackしません。handoffや実行継続の成功を意味せず、元group通知先を保持します。",
+    inputSchema:{job_id:jobId},
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:true},
+  },async({job_id})=>{
+    try {return success(projectStatusSummary(client.getJobStatusSummary?await client.getJobStatusSummary(job_id):undefined));}
+    catch {return success({schema_version:1,status:"not_available"});}
+  });
+
   server.registerTool("get_job_status", {
     title: "Get background job status",
-    description: "list_thread_jobsで対象を確認します。別threadで利用者が明示job_idを指定した場合は、同一workspace/channelと依頼意図を確認して現在のsource_event_idで状態・結果・receiptを取得できます。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
+    description: "旧same-thread読取用です。利用者の明示job_idと現在eventで対象を確定します。別threadはget_job_status_summaryのみを使い、not_available時のfallbackに使いません。human contextは固定状態projectionだけを返し、Resultとlive観測はこの同owner許可に含めません。保存済み元threadへ束縛したjob_completion contextだけは集約用のbounded Resultと失敗理由を返します。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
     inputSchema: { job_id: jobId, source_event_id: eventId,
       include_live_session:z.boolean().optional().describe("trueの場合だけ保存済みexact identityへHerdr controlを伴わないbounded live queryを行い、監査receiptを追記する"),
       live_session_receipt_id:liveSessionReceiptId.optional().describe("既存のdurable receiptを再読し、新しいlive queryは行わない") },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, async ({ job_id, source_event_id, include_live_session, live_session_receipt_id }) => {
     try {
       if(include_live_session===true&&live_session_receipt_id)throw new Error("include_live_session and live_session_receipt_id are mutually exclusive");

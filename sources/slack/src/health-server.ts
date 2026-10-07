@@ -365,9 +365,13 @@ export class SlackHealthServer {
       if(!(await this.authorized(request))) { send(response,403,{schema_version:1,error:{code:"forbidden",message:"Internal authentication failed"}});return; }
       try {
         const body=await this.readJson(request) as Record<string,unknown>;
-        const input={schema_version:1 as const,event_id:String(body.event_id??""),workspace_id:String(body.workspace_id??""),channel_id:String(body.channel_id??""),user_id:String(body.user_id??"")};
+        const input={schema_version:1 as const,event_id:String(body.event_id??""),workspace_id:String(body.workspace_id??""),channel_id:String(body.channel_id??""),user_id:String(body.user_id??""),...(body.status_summary===true?{status_summary:true}:{})};
         if(this.rejectStopping(response)) return;
-        const result=await this.updateNotifications.confirmScheduleAccess(input); send(response,200,result);
+        const controller=new AbortController(),abort=()=>controller.abort(),closed=()=>{if(!response.writableEnded)abort();};
+        const timer=input.status_summary?setTimeout(abort,5000):undefined;
+        request.once("aborted",abort);response.once("close",closed);
+        try {const result=await this.updateNotifications.confirmScheduleAccess(input,input.status_summary?controller.signal:undefined);controller.signal.throwIfAborted();send(response,200,result);}
+        finally {if(timer)clearTimeout(timer);request.off("aborted",abort);response.off("close",closed);}
       } catch { send(response,409,{schema_version:1,error:{code:"schedule_access_not_confirmed",message:"Current Slack access could not be confirmed"}}); }
       return;
     }

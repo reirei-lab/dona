@@ -1,3 +1,4 @@
+import {assertLinkedWorktreeRegistration} from "./job-worktree-identity.js";
 import { workspaceJobId, processGroups, type WorkerObservation } from "./job-handoff.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
@@ -17,11 +18,19 @@ export interface PreparedJobRuntime {
   herdrAgentSessionId?: string;
 }
 
+export class WorkerStopNotSentError extends Error {}
+
 export class PreparedWorkspaceCleanupError extends Error {
-  constructor(message:string,readonly herdrWorkspaceId:string,readonly herdrPaneId:string) { super(message);this.name="PreparedWorkspaceCleanupError"; }
+  constructor(message:string,readonly herdrWorkspaceId:string,readonly herdrPaneId:string,readonly herdrAgentSessionId?:string,readonly errorCode="workspace_cleanup_failed") { super(message);this.name="PreparedWorkspaceCleanupError"; }
 }
 
 export interface JobAgentRuntime {
+  reconcilePreparation?(row:JobRow):Promise<PreparedJobRuntime|undefined>;
+  recoveryHint?(row:JobRow):Promise<import("./app-server/store.js").AgentRecord["recovery_hint"]>;
+  pendingQuestions?(after?:string): Promise<import("./app-server/store.js").QuestionRecord[]>;
+  questions?(name:string,includeResolved?:boolean): Promise<import("./app-server/store.js").QuestionRecord[]>;
+  approveRequest?(name:string,id:string,accepted:boolean):Promise<import("./app-server/store.js").QuestionRecord>;
+  answerQuestion?(name:string,id:string,answers:Record<string,{answers:string[]}>): Promise<import("./app-server/store.js").QuestionRecord>;
   observeWorker?(row: JobRow, signal?: AbortSignal): Promise<WorkerObservation>;
   retireWorker?(row: JobRow, signal?: AbortSignal): Promise<void>;
   workerRetired?(row: JobRow, evidence: WorkerObservation, signal?: AbortSignal): Promise<boolean>;
@@ -29,7 +38,7 @@ export interface JobAgentRuntime {
   prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime>;
   get(agentName: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult>;
   listAgents?(signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult>;
-  prompt(agentName: string, text: string, signal?: AbortSignal, timeoutMs?: number, submissionOnly?: boolean): Promise<HerdrCommandResult>;
+  prompt(agentName: string, text: string, signal?: AbortSignal, timeoutMs?: number, submissionOnly?: boolean, operationKey?: string): Promise<HerdrCommandResult>;
   wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   closeAgent?(agentName:string,signal?:AbortSignal):Promise<HerdrCommandResult>;
@@ -43,7 +52,8 @@ function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void
   }
 }
 
-export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disabledMcpServers:readonly string[] = [], progressEnabled = true, executablePaths:readonly string[] = []): string[] {
+export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disabledMcpServers:readonly string[] = [], progressEnabled = true, executablePaths:readonly string[] = [], localDashboardOwned=false): string[] {
+  if(row.source==="web"&&!localDashboardOwned)throw Error("runtime_profile_unavailable");
   const resultDirectory=path.dirname(row.result_path);
   const expectedResultPath=path.join(config.jobResultsDir,row.job_id,"result.json");
   if(row.result_path!==expectedResultPath) throw new Error("Job result path does not match the Dispatcher-generated job path");
@@ -159,16 +169,22 @@ function resultFromProcess(base: Omit<HerdrCommandResult, "errorCode" | "agentSt
   };
 }
 
-function runProcess(
+export function runProcess(
   executable: string,
   args: string[],
   timeoutMs: number,
   signal?: AbortSignal,
   settleBeforeClose = false,
   stdin = "",
+  cwd?: string,
+  env?: NodeJS.ProcessEnv,
 ): Promise<HerdrCommandResult> {
   return new Promise((resolve) => {
-    const child = spawn(executable, args, { shell: false, stdio: ["pipe", "pipe", "pipe"] });
+    // 入力不要の短命コマンドは、終了後の空 write による EPIPE を避ける。
+    // update-ref --stdin など実データを渡す場合だけ pipe を作る。
+    const child = stdin === ""
+      ? spawn(executable, args, { shell: false, stdio: ["ignore", "pipe", "pipe"], ...(cwd?{cwd}:{}), ...(env?{env}:{}) })
+      : spawn(executable, args, { shell: false, stdio: ["pipe", "pipe", "pipe"], ...(cwd?{cwd}:{}), ...(env?{env}:{}) });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -207,7 +223,7 @@ function runProcess(
     child.stderr.on("data", (chunk: Buffer) => {
       if (stderr.length < 1_048_576) stderr += chunk.toString("utf8");
     });
-    child.stdin.on("error", (error) => {
+    child.stdin?.on("error", (error) => {
       stderr = error.message;
       terminate();
       finish({ ok: false, stdout, stderr, exitCode: child.exitCode, timedOut, aborted });
@@ -219,11 +235,11 @@ function runProcess(
     child.once("close", (code) => {
       finish({ ok: code === 0 && !timedOut && !aborted, stdout, stderr, exitCode: code, timedOut, aborted });
     });
-    child.stdin.end(stdin);
+    child.stdin?.end(stdin);
   });
 }
 
-function resolveCommitPrefix(
+export function resolveCommitPrefix(
   executable: string,
   args: string[],
   prefix: string,
@@ -277,26 +293,26 @@ function resolveCommitPrefix(
   });
 }
 
-function commandError(label: string, result: HerdrCommandResult): Error {
+export function commandError(label: string, result: HerdrCommandResult): Error {
   const detail = (result.stderr || result.stdout || "command failed").trim().slice(0, 2_000);
   const error = new Error(`${label}: ${detail}`);
   (error as Error & { code?: string }).code = result.errorCode ?? (result.timedOut ? "command_timeout" : "command_failed");
   return error;
 }
 
-function safeCommandError(label: string, result: Pick<HerdrCommandResult, "timedOut"> & Partial<Pick<HerdrCommandResult, "errorCode">>): Error {
+export function safeCommandError(label: string, result: Pick<HerdrCommandResult, "timedOut"> & Partial<Pick<HerdrCommandResult, "errorCode">>): Error {
   const error = new Error(label);
   (error as Error & { code?: string }).code = result.errorCode ?? (result.timedOut ? "command_timeout" : "command_failed");
   return error;
 }
 
-function normalizedRepository(value: string): string | undefined {
+export function normalizedRepository(value: string): string | undefined {
   const stripped = value.trim().replace(/\.git$/, "");
   const match = /(?:github\.com[/:])([^/]+\/[^/]+)$/.exec(stripped);
   return match?.[1]?.toLowerCase();
 }
 
-async function exists(filePath: string): Promise<boolean> {
+export async function exists(filePath: string): Promise<boolean> {
   try {
     await fs.access(filePath);
     return true;
@@ -847,7 +863,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     if (!origin.ok || normalizedRepository(origin.stdout) !== repository.toLowerCase()) throw new Error("handoff_repository_mismatch");
     const head = await runProcess(this.config.gitPath, ["-C", row.workspace_path, "rev-parse", "--verify", "HEAD^{commit}"], this.config.jobCommandTimeoutMs, signal);
     if (!head.ok) throw new Error("handoff_head_unavailable");
-    await this.verifyWorktreeIdentity({ ...row, job_id: originId }, repositoryPath, head.stdout.trim(), signal);
+    // 継続先の所有権はpathとrepositoryで照合する。workerが選んだbranch/HEADは保持する。
+    await this.verifyWorktreeIdentity({ ...row, job_id: originId }, repositoryPath, head.stdout.trim(), signal, "continuation");
   }
 
   private async verifyExistingGitHubWorktree(
@@ -979,6 +996,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     repositoryPath: string,
     expectedSha: string,
     signal?: AbortSignal,
+    mode: "initial" | "continuation" = "initial",
   ): Promise<void> {
     const head = await runProcess(
       this.config.gitPath,
@@ -990,15 +1008,17 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     if (!head.ok || actualSha !== expectedSha) {
       throw new Error(`Git worktree HEAD mismatch for dona/${row.job_id}: expected ${expectedSha}, got ${actualSha || "unresolved"}`);
     }
-    const branch = await runProcess(
-      this.config.gitPath,
-      ["-C", row.workspace_path, "symbolic-ref", "--quiet", "HEAD"],
-      this.config.jobCommandTimeoutMs,
-      signal,
-    );
-    const expectedBranch = `refs/heads/dona/${row.job_id}`;
-    if (!branch.ok || branch.stdout.trim() !== expectedBranch) {
-      throw new Error(`Git worktree branch mismatch for dona/${row.job_id}`);
+    if (mode === "initial") {
+      const branch = await runProcess(
+        this.config.gitPath,
+        ["-C", row.workspace_path, "symbolic-ref", "--quiet", "HEAD"],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      const expectedBranch = `refs/heads/dona/${row.job_id}`;
+      if (!branch.ok || branch.stdout.trim() !== expectedBranch) {
+        throw new Error(`Git worktree branch mismatch for dona/${row.job_id}`);
+      }
     }
     const commonDir = await runProcess(
       this.config.gitPath,
@@ -1010,6 +1030,12 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     const expectedCommonDir = await fs.realpath(path.join(repositoryPath, ".git")).catch(() => "");
     if (!actualCommonDir || actualCommonDir !== expectedCommonDir) {
       throw new Error(`Git worktree repository mismatch for dona/${row.job_id}`);
+    }
+    if (mode === "continuation") {
+      const gitDirectory = await runProcess(this.config.gitPath,
+        ["-C", row.workspace_path, "rev-parse", "--path-format=absolute", "--git-dir"], this.config.jobCommandTimeoutMs, signal);
+      if (!gitDirectory.ok) throw new Error("handoff_worktree_registration_unavailable");
+      await assertLinkedWorktreeRegistration(row.workspace_path, gitDirectory.stdout.trim(), expectedCommonDir, row.job_id);
     }
   }
 }

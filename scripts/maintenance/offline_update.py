@@ -18,7 +18,9 @@ import time
 
 import reset_upgrade as common
 
-LABELS = common.LABELS
+DASHBOARD_LABEL = 'dev.dona.dashboard'
+RUNTIME_LABEL = 'dev.dona.runtime'
+LABELS = (*common.LABELS, RUNTIME_LABEL)
 require = common.require
 atomic = common.atomic
 encode = common.encode
@@ -26,19 +28,41 @@ read_json = common.read_json
 command = common.command
 
 
+def recreation_observation_hash(journal):
+    return common.digest(encode({key: journal.get(key, []) for key in
+        ('source_recreation_processes', 'source_recreation_services')}))
+
+
+def recreation_reconciled(journal):
+    receipt = journal.get('source_recreation_reconciliation') or {}
+    return (receipt.get('plan_hash') == journal.get('plan_hash') and
+            receipt.get('observation_hash') == recreation_observation_hash(journal) and
+            receipt.get('effects_reconciled') is True and receipt.get('cause_removed') is True and
+            isinstance(receipt.get('summary'), str) and bool(receipt['summary'].strip()) and
+            receipt.get('operator_uid') == os.getuid())
+
+
+def canonical_owner(owner):
+    if owner is None:
+        return None
+    run = Path(owner['run'])
+    require(run.is_absolute(), 'absolute_owner_run_required')
+    return {**owner, 'run': str(run.resolve())}
+
+
 def progress(message):
     print(message, flush=True)
 
 
 def process_table():
-    body = command(['/bin/ps', '-axo', 'pid=,ppid=,uid=,lstart=,stat='])
+    body = command(['/bin/ps', '-axo', 'pid=,ppid=,uid=,pgid=,lstart=,stat='])
     table = {}
     for line in body.splitlines():
         fields = line.split()
-        require(len(fields) == 9, 'process_table_format')
+        require(len(fields) == 10, 'process_table_format')
         pid, parent, uid = map(int, fields[:3])
         table[pid] = {'pid': pid, 'parent': parent, 'uid': uid,
-                      'start': ' '.join(fields[3:8]), 'state': fields[8]}
+                      'group':int(fields[3]), 'start': ' '.join(fields[4:9]), 'state': fields[9]}
     return table
 
 
@@ -187,6 +211,7 @@ def render(run, plan, inv):
         protected = [Path(p).resolve() for p in inv['databases'] + inv['old_results']]
         for target in [Path(p) for p in fresh_databases(g)] + [g/'results', g/'job-results', g/'run']:
             require(not any(target.resolve() == old or old in target.resolve().parents or target.resolve() in old.parents for old in protected), 'fresh_paths_overlap_source')
+        render_runtime(run, plan)
         return
     for name in ('config', 'control', 'logs', 'run'):
         common.private_dir(g/name)
@@ -204,7 +229,7 @@ def render(run, plan, inv):
     atomic(g/'control/policy.json', encode(policy))
     os.symlink(release, g/'runtime/current')
     common.private_dir(run/'plists')
-    for label in LABELS:
+    for label in common.LABELS:
         plist = copy.deepcopy(inv['plists'][label])
         env = plist['EnvironmentVariables']
         if label == 'dev.dona.updater':
@@ -219,6 +244,7 @@ def render(run, plan, inv):
             values.update(DONA_RELEASE_MANIFEST_PATH=str(Path(policy['current_pointer'])/'release-manifest.json'),
                           DONA_CODEX_PATH=policy['executables']['codex'],
                           DONA_UPDATER_SOCKET_PATH=str(g/'control/updater.sock'),
+                          DONA_APP_SERVER_SOCKET=str(g/'control/runtime.sock'),
                           DONA_UPDATE_INTERNAL_TOKEN_PATH=policy['dispatcher_internal_token_file'])
             file = g/'config'/(key+'.env')
             atomic(file, common.dotenv(values).encode())
@@ -245,6 +271,26 @@ await import({json.dumps((Path(policy['current_pointer'])/component/'dist/mcp/in
         old = inv['configs'][component]['config']
         keys = ('databasePath', 'resultsDir', 'jobResultsDir', 'jobProgressDatabasePath', 'updateNotificationDatabasePath', 'socketPath') if component == 'dispatcher' else ('healthSocketPath', 'dispatcherSocketPath')
         require(all(config[k] == old[k] for k in keys) and config['buildSha'] == plan['target_sha'], 'rendered_paths_mismatch')
+    render_runtime(run, plan)
+
+
+def render_runtime(run, plan):
+    """runtime hostはUpdaterと同じstable controlに置き、受付再起動から独立させる。"""
+    g, release = Path(plan['generation']), Path(plan['release'])
+    policy_file = g/'control/policy.json'
+    policy = read_json(policy_file)
+    policy['main_agent']['runtime'] = 'app_server'
+    atomic(policy_file, encode(policy))
+    shutil.copytree(release/'dispatcher', g/'control/runtime', symlinks=True)
+    config = {'socket':str(g/'control/runtime.sock'), 'database':str(g/'control/runtime.sqlite3'),
+              'codex':policy['executables']['codex'], 'buildSha':plan['target_sha']}
+    atomic(g/'control/runtime-config.json', encode(config))
+    plist = {'Label':RUNTIME_LABEL, 'ProgramArguments':[plan['node'], str(g/'control/runtime/dist/app-server/cli.js'),
+             str(g/'control/runtime-config.json')], 'WorkingDirectory':str(g/'control/runtime'),
+             'RunAtLoad':True, 'KeepAlive':True, 'ThrottleInterval':10,
+             'EnvironmentVariables':{'HOME':str(Path.home()), 'PATH':os.environ.get('PATH','/usr/bin:/bin')},
+             'StandardOutPath':str(g/'logs/runtime.log'), 'StandardErrorPath':str(g/'logs/runtime.error.log')}
+    atomic(run/'plists'/(RUNTIME_LABEL+'.plist'), plistlib.dumps(plist))
 
 
 
@@ -254,6 +300,9 @@ def prepare_rollback(run, inv, plan):
     control = common.private_dir(root/'control')
     policy = copy.deepcopy(inv['policy'])
     policy['executables']['codex'] = common.installed_codex()
+    # 復旧用control-planeも新版binaryと同じ必須CI集合を使う。旧release/stateは保持する。
+    # prepare()でtarget SHAの旧集合とtarget集合を検証済み。
+    policy['required_checks'] = common.target_required_checks(plan['release'])
     atomic(control/'policy.json', encode(policy))
     # 復旧対象は旧releaseのまま、main lifecycleの実装は検証済みの新版を使う。
     shutil.copytree(Path(plan['release'])/'updater', control/'updater', symlinks=True)
@@ -276,7 +325,8 @@ await import({json.dumps((release/component/'dist/mcp/index.js').as_uri())});
 
 def asset_seal(g):
     return common.digest(encode({name: common.tree_seal(g/name) if (g/name).is_dir() else common.file_digest(g/name)
-        for name in ('config', 'control/updater', 'control/policy.json', 'control/dispatcher.token', 'runtime')}))
+        for name in ('config', 'control/updater', 'control/policy.json', 'control/dispatcher.token', 'runtime',
+                     *(['control/runtime', 'control/runtime-config.json'] if (g/'control/runtime-config.json').exists() else []))}))
 
 
 
@@ -315,6 +365,116 @@ def probe_main(run, plan):
     require({row['server'] for row in results if row.get('initialized')} == {'dispatcher','slack'}, 'mcp_probe_failed')
 
 
+def include_runtime_inventory(inv, require_running=False):
+    """plistが指定するruntime設定と観測したprocessをread-onlyで照合する。"""
+    runtime_plist = Path.home()/'Library/LaunchAgents'/(RUNTIME_LABEL+'.plist')
+    if not runtime_plist.exists():
+        require(inv['policy'].get('main_agent', {}).get('runtime') != 'app_server', 'runtime_plist_missing')
+        return
+    data = common.regular(runtime_plist).read_bytes()
+    plist = plistlib.loads(data)
+    require(plist.get('Label') == RUNTIME_LABEL, 'runtime_plist_identity')
+    root = Path(inv['policy']['control_root'])
+    args = plist.get('ProgramArguments', [])
+    require(len(args) == 3 and args[1] == str(root/'runtime/dist/app-server/cli.js') and
+            args[2] == str(root/'runtime-config.json'), 'runtime_plist_arguments')
+    config_file = common.regular(args[2])
+    require(not config_file.stat().st_mode & 0o022, 'runtime_config_unsafe')
+    config_bytes = config_file.read_bytes()
+    config = json.loads(config_bytes)
+    require(config.get('database') == str(root/'runtime.sqlite3') and
+            config.get('socket') == str(root/'runtime.sock'), 'runtime_storage_mismatch')
+    runtime_database = common.regular(config['database'])
+    live = common.Launchd(service_labels=LABELS)
+    observation = live.observe(RUNTIME_LABEL)
+    if require_running:
+        require(observation and observation.get('pid'), 'runtime_service_not_running')
+    if observation and observation.get('pid'):
+        process = live.process(observation['pid'])
+        require(process and process.split()[0] == str(os.getuid()) and
+                all(argument in process for argument in args), 'runtime_process_identity')
+        require(live.observe(RUNTIME_LABEL) == observation, 'runtime_process_changed')
+        inv['services'][RUNTIME_LABEL] = {**observation, 'identity_hash':common.digest(process.encode())}
+    else:
+        inv['services'][RUNTIME_LABEL] = observation
+    require(common.regular(runtime_plist).read_bytes() == data and
+            common.regular(config_file).read_bytes() == config_bytes, 'runtime_configuration_drift')
+    inv['plists'][RUNTIME_LABEL] = plist
+    inv['files'][str(runtime_plist)] = common.digest(data)
+    inv['files'][str(config_file)] = common.digest(config_bytes)
+    inv['databases'].append(str(runtime_database))
+
+
+def include_dashboard_inventory(inv):
+    """導入済みのダッシュボードだけを停止・復旧の所有範囲へ含める。"""
+    file = Path.home()/'Library/LaunchAgents'/(DASHBOARD_LABEL+'.plist')
+    live = common.Launchd(service_labels=(*LABELS, DASHBOARD_LABEL))
+    observed = live.observe(DASHBOARD_LABEL)
+    if not file.exists():
+        require(observed is None, 'dashboard_plist_missing')
+        return
+    data = common.regular(file).read_bytes()
+    plist = plistlib.loads(data)
+    args = plist.get('ProgramArguments', [])
+    require(plist.get('Label') == DASHBOARD_LABEL and len(args) == 4 and args[2] == 'serve',
+            'dashboard_plist_arguments')
+    require(Path(args[1]).resolve() == Path(inv['old_pointer'])/'dispatcher/dist/dashboard/cli.js',
+            'dashboard_release_mismatch')
+    config_file = common.regular(args[3])
+    config_bytes = config_file.read_bytes()
+    # 実際のreaderでowner、mode、schemaも検査する。
+    command([inv['policy']['executables']['node'], '--input-type=module', '-e',
+             f'import {{readDashboardConfig}} from {json.dumps((Path(args[1]).parent/"config.js").as_uri())};readDashboardConfig(process.argv[1]);',
+             str(config_file)])
+    config = json.loads(config_bytes)
+    require(config['dispatcher_database'] == inv['databases'][0] and
+            config['dispatcher_socket'] == inv['policy']['dispatcher_socket'] and
+            config['runtime_socket'] == str(Path(inv['policy']['control_root'])/'runtime.sock'),
+            'dashboard_instance_mismatch')
+    if observed and observed.get('pid'):
+        process = live.process(observed['pid'])
+        require(process and process.split()[0] == str(os.getuid()) and all(arg in process for arg in args),
+                'dashboard_process_identity')
+        inv['services'][DASHBOARD_LABEL] = {**observed, 'identity_hash':common.digest(process.encode())}
+    else:
+        inv['services'][DASHBOARD_LABEL] = observed
+    require(live.observe(DASHBOARD_LABEL) == observed and file.read_bytes() == data and
+            config_file.read_bytes() == config_bytes, 'dashboard_configuration_drift')
+    inv['plists'][DASHBOARD_LABEL] = plist
+    inv['files'][str(file)] = common.digest(data)
+    inv['files'][str(config_file)] = common.digest(config_bytes)
+    inv['dashboard'] = config
+
+
+def render_dashboard(run, plan, inv):
+    if 'dashboard' not in inv:
+        return
+    g, release = Path(plan['generation']), Path(plan['release'])
+    policy = read_json(g/'control/policy.json')
+    config = dict(inv['dashboard'], dispatcher_database=fresh_databases(g)[0] if fresh(plan) else inv['databases'][0],
+                  dispatcher_socket=policy['dispatcher_socket'], runtime_socket=str(g/'control/runtime.sock'),
+                  active_release_pointer=policy['current_pointer'])
+    file = g/'config/dashboard.json'
+    atomic(file, encode(config))
+    command([plan['node'], '--input-type=module', '-e',
+             f'import {{readDashboardConfig}} from {json.dumps((release/"dispatcher/dist/dashboard/config.js").as_uri())};readDashboardConfig(process.argv[1]);', str(file)])
+    plist = copy.deepcopy(inv['plists'][DASHBOARD_LABEL])
+    plist.update(ProgramArguments=[plan['node'], str(Path(policy['current_pointer'])/'dispatcher/dist/dashboard/cli.js'), 'serve', str(file)],
+                 WorkingDirectory=str(release/'dispatcher'),
+                 StandardOutPath=str(g/'logs/dashboard.log'), StandardErrorPath=str(g/'logs/dashboard.error.log'))
+    atomic(run/'plists'/(DASHBOARD_LABEL+'.plist'), plistlib.dumps(plist))
+
+
+def archive_source(git, repository, sha, archive, release):
+    # Gitの既定umaskではnative clockのsourceがgroup writableになる。
+    command([git, '-C', str(repository), '-c', 'tar.umask=0022', 'archive', '--format=tar', '-o', str(archive), sha])
+    with tarfile.open(archive) as tar:
+        for member in tar.getmembers():
+            require(not member.issym() and not member.islnk() and not member.name.startswith('/') and '..' not in Path(member.name).parts, 'archive_path')
+        tar.extractall(release)
+    archive.unlink()
+
+
 def prepare(run, repository, fresh_generation=False):
     require(not run.exists(), 'run_already_exists')
     common.private_dir(run.parent)
@@ -323,6 +483,8 @@ def prepare(run, repository, fresh_generation=False):
         atomic(run/name, Path(__file__).with_name(name).read_bytes())
     progress('設定を確認しています（サービス停止中でも準備できます）。')
     inv = common.inventory(require_running=False)
+    include_runtime_inventory(inv)
+    include_dashboard_inventory(inv)
     atomic(run/'inventory.json', encode(inv))
     executables = inv['policy']['executables']
     git = executables['git']
@@ -342,18 +504,15 @@ def prepare(run, repository, fresh_generation=False):
         for protected in (run.resolve(), g.resolve(), Path(inv['old_pointer']), Path(inv['policy']['config_root'])):
             require(root != protected and root not in protected.parents, 'result_directory_overlaps_update')
     release = common.private_dir(g/'runtime/releases'/sha)
+    previous_owner = Path.home()/'.dona-maintenance/offline-active.json'
     plan = {'schema_version': 1, 'target_sha': sha, 'generation': str(g), 'release': str(release),
+            'previous_offline_run': canonical_owner(read_json(common.regular(previous_owner))) if previous_owner.exists() else None,
             'node': node, 'mode': 'fresh_generation' if fresh_generation else 'preserve', 'created_at': common.stamp(), 'inventory_hash': common.file_digest(run/'inventory.json')}
     common.staging_space(g, inv['policy'])
     archive = run/'source.tar'
-    command([git, '-C', str(repository), 'archive', '--format=tar', '-o', str(archive), sha])
-    with tarfile.open(archive) as tar:
-        for member in tar.getmembers():
-            require(not member.issym() and not member.islnk() and not member.name.startswith('/') and '..' not in Path(member.name).parts, 'archive_path')
-        tar.extractall(release)
-    archive.unlink()
+    archive_source(git, repository, sha, archive, release)
     common.verify_trust(sha, dict(inv['policy'], required_checks=common.target_required_checks(release)))
-    for component in ('dispatcher', 'sources/slack', 'updater'):
+    for component in ('dispatcher', 'sources/slack', 'sources/web', 'updater'):
         progress(component + ' の依存関係・テスト・型検査・ビルドを確認しています。')
         for args in (['ci'], ['test'], ['run', 'typecheck'], ['run', 'build']):
             common.staging_space(g, inv['policy'])
@@ -364,11 +523,13 @@ def prepare(run, repository, fresh_generation=False):
     build_command([node, str(Path(__file__).resolve().parents[2]/'test/offline-state-integration.mjs'), str(release)] + (['--fresh-generation'] if fresh_generation else []), release, run)
     progress('更新用の設定と復旧用の設定を検証しています。')
     render(run, plan, inv)
+    render_dashboard(run, plan, inv)
     probe_main(run, plan)
     prepare_herdr_config(run, plan, inv['policy']['executables']['herdr'])
     prepare_rollback(run, inv, plan)
     common.make_immutable(release)
     common.make_immutable(g/'control/updater')
+    common.make_immutable(g/'control/runtime')
     plan['rollback_seal'] = common.tree_seal(run/'rollback')
     plan['seal'] = asset_seal(g)
     plan['plists_seal'] = common.tree_seal(run/'plists')
@@ -390,10 +551,19 @@ class Runner:
         for name, expected in self.plan['bundle'].items():
             require(common.file_digest(run/name) == expected, 'runner_changed')
         require(Path(__file__).resolve() == (run/'offline_update.py').resolve(), 'use_prepared_runner')
-        self.live = common.Launchd()
+        self.live = common.Launchd(service_labels=self.labels)
         self.g = Path(self.plan['generation'])
         self.node = self.plan['node']
         self.policy = read_json(self.g/'control/policy.json')
+
+    @property
+    def labels(self):
+        return (*LABELS, DASHBOARD_LABEL) if 'dashboard' in self.inv else LABELS
+
+    @property
+    def serving_labels(self):
+        labels = ('dev.dona.dispatcher', 'dev.dona.slack-adapter', 'dev.dona.updater')
+        return (*labels, DASHBOARD_LABEL) if 'dashboard' in self.inv else labels
 
     def record(self, phase=None, **fields):
         if phase:
@@ -408,6 +578,10 @@ class Runner:
         require(common.tree_seal(self.run/'plists') == self.plan['plists_seal'], 'staged_plists_changed')
 
     def validate_source(self):
+        if 'dashboard' not in self.inv:
+            require(not (Path.home()/'Library/LaunchAgents'/(DASHBOARD_LABEL+'.plist')).exists() and
+                    common.Launchd(service_labels=(DASHBOARD_LABEL,)).observe(DASHBOARD_LABEL) is None,
+                    'dashboard_added_after_prepare')
         for file, expected in self.inv['files'].items():
             require(common.file_digest(file) == expected, 'source_configuration_changed')
         require(str(Path(self.inv['policy']['current_pointer']).resolve()) == self.inv['old_pointer'], 'source_release_changed')
@@ -434,7 +608,7 @@ class Runner:
                 require(current['uid'] == os.getuid(), 'process_thaw_scope')
                 os.kill(expected['pid'], signal.SIGCONT)
         for label, disabled in guard['disabled'].items():
-            require(label in LABELS, 'launchd_restore_scope')
+            require(label in self.labels, 'launchd_restore_scope')
             command(['/bin/launchctl', 'disable' if disabled else 'enable', self.live.domain+'/'+label])
         self.record(processes=[], source_stop_guard=None)
 
@@ -443,29 +617,111 @@ class Runner:
 
     def switch_disabled(self, disabled):
         # login/rebootが途中に入ってもLaunchAgentを勝手に起動させない。
-        for label in LABELS:
+        for label in self.labels:
             command(['/bin/launchctl', 'disable' if disabled else 'enable', self.live.domain+'/'+label])
+
+    def record_recreation(self, roots, observations, table):
+        captured = {p['pid']: p for p in roots}
+        for value in observations.values():
+            if value and value.get('pid') in table:
+                row = table[value['pid']]
+                require(row['uid'] == os.getuid(), 'service_process_owner')
+                captured[row['pid']] = row
+        while True:
+            descendants = {pid: row for pid, row in table.items() if row['parent'] in captured and row['uid'] == os.getuid()}
+            previous = len(captured); captured.update(descendants)
+            if len(captured) == previous: break
+        history = list(self.journal.get('source_recreation_history', []))
+        if self.journal.get('source_recreation_detected'):
+            history.append({key:self.journal.get(key) for key in ('source_recreation_processes', 'source_recreation_services', 'source_recreation_reconciliation')})
+        self.record(source_recreation_detected=True, source_recreation_processes=list(captured.values()),
+                    source_recreation_services=[label for label,value in observations.items() if value is not None],
+                    source_recreation_reconciliation=None, source_recreation_history=history)
+
+    def verify_reconciliation_stopped(self):
+        roots = list(herdr_root(self.policy['executables']['herdr'])) + list(herdr_starting(self.policy['executables']['herdr']))
+        observations = {label:self.live.observe(label) for label in self.labels}
+        table = process_table()
+        recorded = self.journal.get('source_recreation_processes', []) + self.journal.get('source_stop_receipt', {}).get('processes', [])
+        alive = [table[row['pid']] for row in recorded if same_process(row, table.get(row['pid'])) and 'Z' not in table[row['pid']]['state']]
+        if roots or any(value is not None for value in observations.values()) or alive:
+            self.record_recreation(roots + alive, observations, table)
+            raise RuntimeError('reconciliation_process_still_alive' if alive else 'reconciliation_source_not_stopped')
+        listing = command(['/bin/launchctl', 'print-disabled', self.live.domain])
+        states = dict(re.findall(r'"([^"]+)"\s*=>\s*(enabled|disabled|true|false)', listing))
+        if not all(states.get(label) in ('disabled', 'true') for label in self.labels):
+            self.record(source_recreation_reconciliation=None)
+            raise RuntimeError('reconciliation_services_not_disabled')
+
+    def reconcile_source(self, evidence_file):
+        require(self.journal.get('source_recreation_detected') and not self.journal.get('activation_started') and
+                not self.journal.get('rollback_activation_started'), 'reconciliation_phase_invalid')
+        require(self.journal['phase'] in ('stopping', 'stopped', 'backed_up', 'migrating', 'migrated', 'installed', 'restoring'), 'reconciliation_phase_invalid')
+        evidence_bytes = common.regular(evidence_file).read_bytes()
+        evidence = json.loads(evidence_bytes)
+        require(evidence.get('schema_version') == 1 and evidence.get('plan_hash') == self.journal['plan_hash'] and
+                evidence.get('observation_hash') == recreation_observation_hash(self.journal) and
+                evidence.get('effects_reconciled') is True and evidence.get('cause_removed') is True and
+                isinstance(evidence.get('summary'), str) and 0 < len(evidence['summary'].strip()) <= 4000,
+                'reconciliation_evidence_invalid')
+        self.verify_reconciliation_stopped()
+        receipt = {key: evidence[key] for key in ('plan_hash', 'observation_hash', 'effects_reconciled', 'cause_removed', 'summary')}
+        receipt.update(operator_uid=os.getuid(), verified_at=common.stamp(), evidence_hash=common.digest(evidence_bytes))
+        # 再生成の事実は消さず、旧版への復旧だけを許可する。更新先への続行には使わない。
+        self.record('restoring', source_recreation_reconciliation=receipt)
+
+    def assert_source_stopped(self, roots=None):
+        if (not self.journal.get('source_stop_receipt') or self.journal.get('activation_started')
+                or self.journal.get('rollback_activation_started')):
+            return
+        require(not self.journal.get('source_recreation_detected') or
+                (self.journal['phase'] == 'restoring' and recreation_reconciled(self.journal)), 'source_recreation_requires_reconciliation')
+        if roots is None:
+            roots = list(herdr_root(self.policy['executables']['herdr']))
+            roots.extend(herdr_starting(self.policy['executables']['herdr']))
+        observations = {label:self.live.observe(label) for label in self.labels}
+        if roots or any(value is not None for value in observations.values()):
+            # 初回停止後の再生成は、その間の外部作用が不明。killして証拠を消さない。
+            self.record_recreation(roots, observations, process_table())
+            raise RuntimeError('source_recreation_requires_reconciliation')
 
     def stop(self, check_source=False):
         roots = list(herdr_root(self.policy['executables']['herdr']))
         roots.extend(herdr_starting(self.policy['executables']['herdr']))
         table = process_table()
+        # hostが先にcrashして孤児化したApp Serverも保存済み開始identityで拾う。
+        for root in {self.policy.get('control_root'),self.inv.get('policy',{}).get('control_root')} - {None}:
+            database = Path(root)/'runtime.sqlite3'
+            if not database.exists(): continue
+            reader = common.NodeDatabase(self.node, Path(self.plan['release'])/'dispatcher/node_modules/better-sqlite3/lib/index.js')
+            for pid, started in reader.read(database,"SELECT pid,process_start FROM agents WHERE state<>'stopped' AND pid IS NOT NULL"):
+                observed = table.get(pid)
+                if observed and observed['start'] == started:
+                    require(observed['uid']==os.getuid(), 'runtime_process_owner')
+                    roots.append(observed)
+                elif observed is None:
+                    # rootのcrash後も元のprocess groupに残る子を停止対象へ含める。
+                    for child in table.values():
+                        if child['group'] == pid:
+                            require(child['uid']==os.getuid(), 'runtime_process_owner')
+                            roots.append(child)
         ancestor = os.getpid()
         while ancestor in table:
             require(all(ancestor != p['pid'] for p in roots), 'run_from_terminal_outside_dona')
             ancestor = table[ancestor]['parent']
-        for label in LABELS:
+        for label in self.labels:
             observation = self.live.observe(label)
             if observation and observation['pid']:
                 p = table.get(observation['pid'])
                 require(p and p['uid'] == os.getuid(), 'service_process_owner')
                 roots.append(p)
+        self.assert_source_stopped(roots)
         if check_source and not self.journal.get('source_stop_guard'):
             listing = command(['/bin/launchctl', 'print-disabled', self.live.domain])
             require('disabled services = {' in listing, 'launchd_disabled_state_unknown')
             states = dict(re.findall(r'"([^"]+)"\s*=>\s*(enabled|disabled|true|false)', listing))
             self.record(source_stop_guard={'phase':'freezing',
-                'disabled':{label:states.get(label) in ('disabled','true') for label in LABELS}})
+                'disabled':{label:states.get(label) in ('disabled','true') for label in self.labels}})
         self.switch_disabled(True)
         def unregister():
             if check_source:
@@ -477,17 +733,20 @@ class Runner:
                         self.record('aborted')
                     raise
                 self.record(source_stop_guard={**self.journal['source_stop_guard'], 'phase':'committed'})
-            for label in LABELS:
+            for label in self.labels:
                 self.live.stop(label)
         ProcessStop(lambda processes: self.record(processes=processes)).stop(roots, self.journal.get('processes', []), unregister)
         require(not herdr_root(self.policy['executables']['herdr']) and
                 not herdr_starting(self.policy['executables']['herdr']), 'herdr_still_running')
-        receipt = {'verified_at': common.stamp(), 'processes': self.journal.get('processes', []),
-                   'launch_agents': list(LABELS), 'herdr_session': 'dona',
+        # receipt保存後・phase遷移前のcrashでも、確認済みidentityを空で上書きしない。
+        previous = self.journal.get('source_stop_receipt', {}).get('processes', []) if check_source else []
+        identities = {(p['pid'], p['uid'], p['start']): p for p in previous + self.journal.get('processes', [])}
+        receipt = {'verified_at': common.stamp(), 'processes': list(identities.values()),
+                   'launch_agents': list(self.labels), 'herdr_session': 'dona',
                    'herdr_config_sha256': self.plan['bundle']['herdr-config.toml'] if check_source else None}
-        for label in LABELS:
+        for label in self.labels:
             require(self.live.observe(label) is None, 'service_still_registered')
-        self.record(processes=[], server_start_intent=False, server_pid=None,
+        self.record(processes=[], server_start_intent=False, server_pid=None,last_stop_receipt=receipt,
                     **({'source_stop_receipt': receipt} if check_source else {}))
 
     def backup(self):
@@ -549,11 +808,22 @@ class Runner:
                 shutil.copytree(diagnostics, target, symlinks=True, dirs_exist_ok=True)
         request = {'release': self.plan['release'], 'databases': databases,
                    'run_id': self.run.name, 'target_sha': self.plan['target_sha'], 'retire_only': retire_only}
+        if not retire_only and self.policy.get('main_agent',{}).get('runtime') == 'app_server':
+            target = self.g/'control/runtime.sqlite3'
+            for suffix in ('','-wal','-shm'): Path(str(target)+suffix).unlink(missing_ok=True)
+            if len(self.inv['databases'])>4:
+                atomic(target,(self.run/'backup/db-4').read_bytes())
+            request['runtime_migration']={'database':str(target),'stop_receipt':self.journal['source_stop_receipt']}
+            if self.inv['policy'].get('main_agent',{}).get('runtime') == 'app_server':
+                request['task_resume']={'result_dir':self.inv['old_results'][1]}
         env = dict(os.environ, DONA_RELEASE_MANIFEST_PATH=str(Path(self.plan['release'])/'release-manifest.json'))
         command([self.node, str(self.run/'offline_state.mjs')], env=env, input=encode(request), timeout=120)
 
     def install(self, old=False):
-        for label in LABELS:
+        for label in self.labels:
+            if old and label not in self.inv['plists']:
+                (Path.home()/'Library/LaunchAgents'/(label+'.plist')).unlink(missing_ok=True)
+                continue
             data = plistlib.dumps(self.inv['plists'][label]) if old else (self.run/'plists'/(label+'.plist')).read_bytes()
             atomic(Path.home()/'Library/LaunchAgents'/(label+'.plist'), data)
 
@@ -578,6 +848,9 @@ class Runner:
             time.sleep(.2)
 
     def start_main(self, old=False):
+        policy = self.inv['policy'] if old else self.policy
+        if policy['main_agent'].get('runtime') == 'app_server':
+            return self.start_app_server_main(old)
         self.ensure_herdr()
         release = self.inv['old_pointer'] if old else self.plan['release']
         # 専用serverの起動はHerdr自身の--session起動経路を使う。
@@ -625,6 +898,43 @@ class Runner:
         state['session_id'] = result['observation']['session_id']
         self.record(**{key: state})
 
+    def start_app_server_main(self, old=False):
+        policy = self.inv['policy'] if old else self.policy
+        runtime_database = Path(policy['control_root'])/'runtime.sqlite3'
+        if runtime_database.exists() and self.journal.get('last_stop_receipt') and self.live.observe(RUNTIME_LABEL) is None:
+            dispatcher_database = fresh_databases(self.g)[0] if fresh(self.plan) and not old else self.inv['databases'][0]
+            request = {'runtime_only':True,'release':self.plan['release'],'databases':[dispatcher_database],
+                       'runtime_migration':{'database':str(runtime_database),'stop_receipt':self.journal['last_stop_receipt']}}
+            if not old and not fresh(self.plan):
+                request['run_id'] = self.run.name
+                request['task_resume'] = {'result_dir':self.inv['old_results'][1]}
+            command([self.node,str(self.run/'offline_state.mjs')],input=encode(request),timeout=120)
+        self.start_service(RUNTIME_LABEL)
+        socket_path = str(Path(policy['control_root'])/'runtime.sock')
+        deadline = time.monotonic()+30
+        while True:
+            try:
+                health = common.http_unix(socket_path, '/health/version')
+                expected = read_json(Path(policy['control_root'])/'runtime-config.json')['buildSha']
+                if health.get('service') == 'runtime' and health.get('status') == 'ready' and health.get('build_sha') == expected: break
+            except (OSError, RuntimeError): pass
+            require(time.monotonic()<deadline, 'runtime_start_not_confirmed')
+            time.sleep(.2)
+        key = 'old_main' if old else 'main'
+        release = self.inv['old_pointer'] if old else self.plan['release']
+        control = self.run/'rollback/control' if old else self.g/'control'
+        def bridge(request):
+            return json.loads(command([self.node,str(self.run/'main_bridge.mjs'),str(control)],input=encode(request),timeout=180))
+        observed = bridge({'action':'status','release':release})
+        if not observed.get('exists'):
+            require(not self.journal.get(key,{}).get('start_intent'), 'main_start_unknown')
+            self.record(**{key:{'pane':'dona-main','start_intent':True}})
+            result = bridge({'action':'start','pane':'dona-main','release':release})
+            require(result['outcome']=='started', 'main_start_not_confirmed')
+            observed = result['observation']
+        require(observed.get('matches_release') and observed.get('interactive_ready') and observed.get('status')=='idle', 'main_not_ready')
+        self.record(**{key:{'pane':'dona-main','session_id':observed['session_id']}})
+
     def start_service(self, label):
         command(['/bin/launchctl', 'enable', self.live.domain+'/'+label])
         self.live.start(label, Path.home()/'Library/LaunchAgents'/(label+'.plist'))
@@ -660,9 +970,45 @@ class Runner:
                 except Exception:
                     require(time.monotonic() < deadline, 'health_timeout_'+service)
                     time.sleep(.5)
+        self.dashboard_health(old)
         self.verify_main(old)  # serviceの起動待ち中にmainが異常化していないか最後に照合。
 
+    def dashboard_health(self, old=False):
+        if 'dashboard' not in self.inv:
+            return
+        config = self.inv['dashboard'] if old else read_json(self.g/'config/dashboard.json')
+        sha = Path(self.inv['old_pointer']).name if old else self.plan['target_sha']
+        deadline = time.monotonic()+60
+        while True:
+            try:
+                value = common.http_unix(config['control_socket'], '/health/version')
+                require(value.get('version') == sha and value.get('mode') == 'paired_operator', 'dashboard_version_not_ready')
+                break
+            except Exception:
+                require(time.monotonic() < deadline, 'health_timeout_dashboard')
+                time.sleep(.5)
+        # serviceの起動だけでなく、dashboardと同じ設定・observerで会話一覧を取得する。
+        release = Path(self.inv['old_pointer']) if old else Path(self.plan['release'])
+        config_file = self.inv['plists'][DASHBOARD_LABEL]['ProgramArguments'][3] if old else str(self.g/'config/dashboard.json')
+        script = f'''import {{readDashboardConfig}} from {json.dumps((release/'dispatcher/dist/dashboard/config.js').as_uri())};
+import {{RuntimeClient}} from {json.dumps((release/'dispatcher/dist/app-server/client.js').as_uri())};
+import {{DashboardTaskReader}} from {json.dumps((release/'dispatcher/dist/dashboard/task-reader.js').as_uri())};
+import {{DashboardObserver}} from {json.dumps((release/'dispatcher/dist/dashboard/observer.js').as_uri())};
+const config=readDashboardConfig(process.argv[1]),client=new RuntimeClient(config.runtime_socket,5000);
+const reader=new DashboardTaskReader(config.dispatcher_database);
+try {{
+ const observer=new DashboardObserver(reader,{{conversations:a=>client.conversations(a),conversationHistory:(n,a)=>client.conversationHistory(n,a)}});
+ const result=await observer.mainList(()=>({{revision:'offline-health',mainConversation:()=>true}}));
+ if(!result?.items.some(row=>row.role==='main'&&row.connected))throw Error('dashboard_main_unavailable');
+}} finally {{reader.close();}}
+'''
+        command([self.node, '--input-type=module', '-e', script, config_file], timeout=20)
+
     def restore(self):
+        require(not self.journal.get('source_recreation_detected') or
+                (self.journal['phase'] == 'restoring' and recreation_reconciled(self.journal)), 'source_recreation_requires_reconciliation')
+        if self.journal.get('source_recreation_detected') and not self.journal.get('rollback_activation_started'):
+            self.verify_reconciliation_stopped()
         require(common.tree_seal(self.run/'rollback') == self.plan['rollback_seal'], 'rollback_files_changed')
         require(not self.journal.get('activation_started'), 'rollback_after_activation_forbidden')
         if (self.journal.get('source_stop_guard') or {}).get('phase') == 'freezing':
@@ -701,13 +1047,15 @@ class Runner:
         self.journal.pop('old_main', None)
         self.record(rollback_activation_started=True)
         self.start_main(old=True)
-        for label in ('dev.dona.dispatcher', 'dev.dona.slack-adapter', 'dev.dona.updater'):
+        for label in self.serving_labels:
             self.start_service(label)
         self.health(old=True)
         self.record('rolled_back')
 
     def execute(self):
         phase = self.journal['phase']
+        require(not self.journal.get('source_recreation_detected') or
+                (self.journal['phase'] == 'restoring' and recreation_reconciled(self.journal)), 'source_recreation_requires_reconciliation')
         require(phase in ('prepared','stopping','stopped','backed_up','migrating','migrated','installed','main_ready','activating','restarting_target','succeeded','restoring','rolled_back','aborted'), 'unknown_phase')
         if phase == 'succeeded':
             self.health()
@@ -744,13 +1092,14 @@ class Runner:
                     # 停止intent直後のcrashでも、別更新後のサービスを先に止めない。
                     self.source_preflight()
                     self.probe()
-                progress('Donaの3サービスと専用Herdrプロセスを停止しています。')
+                progress('Donaのサービスと管理対象agentプロセスを停止しています。')
                 self.stop(check_source=True)
                 self.record('stopped')
             if self.journal['phase'] == 'stopped':
                 progress('DBとResultをバックアップしています。')
                 self.backup()
             if self.journal['phase'] in ('backed_up', 'migrating'):
+                self.assert_source_stopped()  # backup中の再生成もmigration前に照合。
                 self.record('migrating')
                 self.migrate()
                 self.record('migrated')
@@ -758,6 +1107,7 @@ class Runner:
                 self.install()
                 self.record('installed')
             if self.journal['phase'] == 'installed':
+                self.assert_source_stopped()  # main起動intentを記録する直前にも再照合。
                 progress('新しいmain agentとMCPを起動しています。')
                 # mainの必須MCPにも書き込み権限がある。起動応答を失っても巻き戻さない。
                 self.record(activation_started=True)
@@ -767,14 +1117,16 @@ class Runner:
                 # Dispatcherの起動だけでもschedule/jobが動く。この後はDBを巻き戻さない。
                 self.record('activating', activation_started=True)
                 progress('新しいサービスを起動し、バージョンとSlack接続を確認しています。')
-                for label in ('dev.dona.dispatcher', 'dev.dona.slack-adapter', 'dev.dona.updater'):
+                for label in self.serving_labels:
                     self.start_service(label)
                 self.health()
                 self.record('succeeded')
         except Exception as error:
             self.record(error=type(error).__name__ + ': ' + str(error))
             # 受付開始後は新データを保ち、同じrunで前進復旧する。
-            if self.journal.get('activation_started'):
+            if self.journal.get('source_recreation_detected'):
+                progress('旧世代processの再生成を検出しました。副作用の照合が必要なため切替・自動復旧を保留します。')
+            elif self.journal.get('activation_started'):
                 progress('起動確認に失敗しました。データを保持しています。同じrunのresumeで再確認できます。')
             elif self.journal['phase'] not in ('prepared', 'stopping', 'aborted'):
                 progress('起動前の失敗のため、バックアップから復元します。')
@@ -788,8 +1140,8 @@ def active_run():
     if not file.exists():
         return None
     owner = read_json(common.regular(file))
-    run = Path(owner['run'])
-    require(run.is_absolute() and common.file_digest(common.regular(run/'plan.json')) == owner['plan_hash'], 'active_run_changed')
+    run = Path(owner['run']).resolve()
+    require(Path(owner['run']).is_absolute() and common.file_digest(common.regular(run/'plan.json')) == owner['plan_hash'], 'active_run_changed')
     journal = read_json(common.regular(run/'journal.json'))
     if journal['phase'] in ('succeeded', 'rolled_back', 'aborted'):
         return None
@@ -797,18 +1149,27 @@ def active_run():
 
 
 def claim_run(run):
+    run = run.resolve()
     active = active_run()
     require(active is None or active == run, '別の停止更新が未完了です。./scripts/dona-update resumeで既存runを再開してください')
-    atomic(Path.home()/'.dona-maintenance/offline-active.json',
-           encode({'run': str(run), 'plan_hash': common.file_digest(run/'plan.json')}))
+    owner_file = Path.home()/'.dona-maintenance/offline-active.json'
+    current = canonical_owner(read_json(common.regular(owner_file))) if owner_file.exists() else None
+    target = {'run': str(run), 'plan_hash': common.file_digest(run/'plan.json')}
+    if current == target:
+        return  # 同じrunのcrash再開ではprepare時のownerへ戻さない。
+    plan = read_json(common.regular(run/'plan.json'))
+    require(canonical_owner(plan.get('previous_offline_run')) == current, 'offline_owner_changed; 最新状態で新しいrunを準備してください')
+    atomic(owner_file, encode(target))
 
 def main():
     parser = argparse.ArgumentParser(description='Dona停止更新CLI。Donaの外のターミナルで実行してください。')
-    parser.add_argument('action', choices=('update', 'prepare', 'resume', 'status', 'restore'))
+    parser.add_argument('action', choices=('update', 'prepare', 'resume', 'status', 'restore', 'reconcile-source'))
     parser.add_argument('--run', type=Path)
+    parser.add_argument('--reconciliation', type=Path, help='外部operatorが作成した再生成原因・副作用の照合記録')
     parser.add_argument('--fresh-generation', action='store_true', help='旧履歴を保全し、独立した空DBへ切り替える')
     parser.add_argument('--repository', type=Path, default=Path(__file__).resolve().parents[2])
     args = parser.parse_args()
+    require(bool(args.reconciliation) == (args.action == 'reconcile-source'), 'reconciliation_argument_required_only_for_reconcile_source')
     require(sys.platform == 'darwin' and os.getuid() != 0, 'macos_gui_user_required')
     require(not args.fresh_generation or args.action in ('prepare', 'update'), 'fresh_mode_only_on_prepare')
     previous = active_run() if args.run is None else None
@@ -818,10 +1179,12 @@ def main():
         os.execv(sys.executable, [sys.executable, str(previous/'offline_update.py'), 'resume', '--run', str(previous)])
     run = args.run or previous or Path.home()/'.dona-maintenance'/('offline-'+time.strftime('%Y%m%d-%H%M%S'))
     require(run.is_absolute(), 'absolute_run_required')
+    run = run.resolve()
     if args.action == 'status':
         journal = read_json(run/'journal.json')
         print(json.dumps({'phase': journal['phase'], 'target_sha': read_json(run/'plan.json')['target_sha'],
-                          'error': journal.get('error')}, ensure_ascii=False))
+                          'error': journal.get('error'), 'plan_hash': journal.get('plan_hash'),
+                          'recreation_observation_hash': recreation_observation_hash(journal) if journal.get('source_recreation_detected') else None}, ensure_ascii=False))
         return
     if args.action in ('prepare', 'update'):
         # prepare中も既存maintenanceとの競合を防ぐ。外部online updaterは停止直前に照合。
@@ -837,11 +1200,14 @@ def main():
         os.execv(sys.executable, [sys.executable, str(run/'offline_update.py'), 'resume', '--run', str(run)])
     require(args.run is not None or previous is not None, 'run_required')
     if Path(__file__).resolve() != (run/'offline_update.py').resolve():
-        os.execv(sys.executable, [sys.executable, str(run/'offline_update.py'), args.action, '--run', str(run)])
+        os.execv(sys.executable, [sys.executable, str(run/'offline_update.py'), args.action, '--run', str(run)] +
+                 (['--reconciliation', str(args.reconciliation.resolve())] if args.reconciliation else []))
     with common.locked(run):
         runner = Runner(run)
         claim_run(run)
-        if args.action == 'restore':
+        if args.action == 'reconcile-source':
+            runner.reconcile_source(args.reconciliation.resolve())
+        elif args.action == 'restore':
             runner.restore()
         else:
             runner.execute()

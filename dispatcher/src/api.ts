@@ -1,4 +1,15 @@
+import { continuationControlSchema } from "./task-continuation.js";
+import { resolveVerifiedSlackOwner } from "./verified-owner-origin.js";
+import { projectCompletionJob } from "./completion-projection.js";
+import { verifySlackPrincipalProof } from "./principal-proof.js";
+import type { AgentContextManager } from "./agent-context.js";
+import { StatusSummaryService } from "./status-summary.js";
 import { taskRequestSchema, taskIdSchema } from "./task-execution.js";
+import { operatorRequest } from "./dashboard/operator-api.js";
+import { OperatorAuthError } from "./dashboard/operator-auth.js";
+import { RuntimeClient } from "./app-server/client.js";
+import { runtimeSocket } from "./app-server/adapters.js";
+import type { LocalExternalApprovalService } from "./approval/local-external-service.js";
 import { githubQuery, verifyTaskIssue } from "./task-github.js";
 import fs from "node:fs/promises";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
@@ -99,6 +110,11 @@ export interface ApiWorkerState {
 }
 
 export interface ApiJobController {
+  inspectTaskRecovery?(id:string,eventId:string):Promise<unknown>;
+  reconcileTaskResult?(id:string,input:unknown):Promise<unknown>;
+  approveTaskRequest?(id:string,eventId:string,revision:number,questionId:string,accepted:boolean):Promise<unknown>;
+  taskQuestions?(id:string,eventId:string):Promise<unknown>;
+  answerTaskQuestion?(id:string,eventId:string,revision:number,questionId:string,answers:Record<string,{answers:string[]}>):Promise<unknown>;
   inspectWorker?(jobId: string, sourceEventId: string): Promise<Record<string, unknown>>;
   resumeJob?(jobId: string, sourceEventId: string, instruction: string): Promise<Record<string, unknown>>;
   isRunning(): boolean;
@@ -138,7 +154,12 @@ export interface ApiJobProgressResolver {
 }
 
 export class DispatcherApi {
+  private externalApproval:LocalExternalApprovalService|undefined;
+  private externalHealth:()=>{configured:boolean;ready:boolean;reason?:string}=()=>({configured:false,ready:false,reason:"setup_required"});
+  setExternalHealth(check:()=>{configured:boolean;ready:boolean;reason?:string}):void {this.externalHealth=check;}
+  setExternalApproval(service:LocalExternalApprovalService|undefined):void {this.externalApproval=service;}
   private server: http.Server | undefined;
+  private ownsStatusContext=false;
   private shuttingDown = false;
   private quiesceOperationId: string | undefined;
   private quiescePromise: Promise<void> | undefined;
@@ -159,6 +180,7 @@ export class DispatcherApi {
     scheduleNow: () => Date = () => new Date(),
     wakeScheduler: () => void = () => {},
     private readonly schedulerState?: ApiSchedulerState,
+    private readonly agentContexts?:AgentContextManager,
   ) { this.schedules = new ScheduleApiService(database, scheduleNow, () => { wakeScheduler(); jobs.wake(); }); }
 
   disableJobProgress(): void { this.jobProgress = undefined; }
@@ -189,6 +211,7 @@ export class DispatcherApi {
       });
     });
     await fs.chmod(this.config.socketPath, 0o600);
+    if(this.agentContexts) {await this.agentContexts.initialize();this.ownsStatusContext=true;}
     this.logger.info("Dispatcher API started", { socket_path: this.config.socketPath });
   }
 
@@ -213,6 +236,7 @@ export class DispatcherApi {
   async stop(): Promise<void> {
     this.beginShutdown();
     const ownsSocket = this.server?.listening === true;
+    if(this.ownsStatusContext) {await this.agentContexts?.revoke();this.ownsStatusContext=false;}
     if (this.server?.listening) {
       await new Promise<void>((resolve, reject) => {
         this.server!.close((error) => (error ? reject(error) : resolve()));
@@ -231,6 +255,24 @@ export class DispatcherApi {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
+      if(url.pathname.startsWith("/v1/dashboard/")) {
+        if(this.shuttingDown)throw new ApiRequestError(503,"shutting_down","Dispatcher is shutting down");
+        if(request.method!=="POST"||url.search)throw new ApiRequestError(400,"invalid_request","Invalid dashboard request");
+        const result=await operatorRequest(this.database,url.pathname.slice("/v1/dashboard/".length),await this.readJson(request),{
+          jobsWorkspaceRoot:this.config.jobsWorkspaceRoot,jobResultsDir:this.config.jobResultsDir,
+          readQuestions:agent=>new RuntimeClient(runtimeSocket(this.config),5000).questions(agent),
+          wake:()=>{this.jobs.wake();this.worker.wake();},
+          health:async()=>{
+            let database:"ready"|"unavailable"="ready",runtime:"ready"|"unavailable"="ready";
+            try{this.database.operatorAuth.status();}catch{database="unavailable";}
+            try{await new RuntimeClient(runtimeSocket(this.config),3000).list();}catch{runtime="unavailable";}
+            let external;try{external=this.externalHealth();}catch{external={configured:true,ready:false,reason:"protected_state_unverified"};}
+            return {database,runtime,operator:database,external};
+          },
+          ...(this.externalApproval?{external:this.externalApproval}:{}),
+        });
+        sendJson(response,200,result);return;
+      }
       if (request.method === "GET" && url.pathname === "/health/live") {
         sendJson(response, 200, { schema_version: 1, status: "live" });
         return;
@@ -252,6 +294,7 @@ export class DispatcherApi {
           schema_version: 1,
           status: health.ready ? "ready" : "not_ready",
           service: "dispatcher",
+          runtime_host: (process as NodeJS.Process & {donaHost?:string}).donaHost==='signed-v1'?'signed-v1':'node',
           build_sha: this.config.buildSha,
           protocol: 1,
           app_schema: appSchema.actual,
@@ -280,6 +323,9 @@ export class DispatcherApi {
         sendJson(response, 200, { schema_version: 1, event_id: eventId, terminal: this.database.isEventCompleted(eventId) });
         return;
       }
+      if(this.agentContexts && request.method==="GET" && (/^\/v1\/events\/[^/]+\/jobs$/.test(url.pathname)||url.pathname==="/v1/jobs"||(/^\/v1\/jobs\/[^/]+(?:\/live-session-receipts\/[^/]+|\/worker)?$/.test(url.pathname)))) {
+        if(!await this.authorizeLegacyRead(request,url)) {sendJson(response,200,{schema_version:1,status:"not_available"});return;}
+      }
       if (request.method === "GET" && /^\/v1\/events\/[^/]+\/jobs$/.test(url.pathname)) {
         const sourceEventId = decodeURIComponent(url.pathname.split("/")[3]!);
         if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId)) {
@@ -300,7 +346,7 @@ export class DispatcherApi {
         sendJson(response, 200, {
           schema_version: 1,
           source_event_id: sourceEventId,
-          jobs: this.database.listEventJobs(sourceEventId, jobKey),
+          jobs: this.database.listEventJobs(sourceEventId, jobKey).map(row=>this.agentContexts?{job_id:row.job_id,status:row.status,created_at:row.created_at,updated_at:row.updated_at,completed_at:row.completed_at}:row),
           ...(canonicalPayloadSha256 !== undefined && jobKey !== undefined
             ? { reconciliation: this.database.reconcileEventJob(sourceEventId, jobKey, canonicalPayloadSha256) }
             : {}),
@@ -448,6 +494,20 @@ export class DispatcherApi {
       if (url.pathname === "/v1/tasks" || url.pathname.startsWith("/v1/tasks/")) {
         await this.handleTasks(request,response,url);return;
       }
+      const summaryMatch=/^\/v1\/jobs\/([^/]+)\/status-summary$/.exec(url.pathname);
+      if(summaryMatch) {
+        const eventId=request.headers["x-dona-agent-event-id"],token=request.headers["x-dona-agent-token"];
+        const context=typeof eventId==="string"&&typeof token==="string"?this.agentContexts?.authorize(token,eventId,"get_job_status_summary"):undefined;
+        const service=new StatusSummaryService(this.database,async input=>{
+          const key=await readPrivateToken(this.config.updateInternalTokenPath);
+          if(!key)throw new Error("status_provider_unavailable");
+          return confirmScheduleAccess(this.config.slackAdapterSocketPath,key,{...input,status_summary:true},5000);
+        });
+        const result=request.method==="GET" && [...url.searchParams.keys()].length===0
+          ?await service.read((()=>{try{return decodeURIComponent(summaryMatch[1]!);}catch{return "";}})(),context,()=>typeof token==="string"&&typeof eventId==="string"?this.agentContexts?.authorize(token,eventId,"get_job_status_summary"):undefined)
+          :{schema_version:1,status:"not_available"};
+        sendJson(response,200,result);return;
+      }
       if (url.pathname === "/v1/jobs" || url.pathname.startsWith("/v1/jobs/")) {
         await this.handleJobs(request, response, url);
         return;
@@ -479,7 +539,13 @@ export class DispatcherApi {
       const envelope = parseEventEnvelope(input);
       let result;
       try {
-        result = this.database.enqueue(envelope);
+        let principal;
+        if(envelope.source==="slack" && request.headers["x-dona-slack-principal-proof"]) {
+          const key=await readPrivateToken(this.config.updateInternalTokenPath);
+          if(!key)throw new Error("status_provider_unavailable");
+          principal=verifySlackPrincipalProof(envelope,request.headers["x-dona-slack-principal-proof"],request.headers["x-dona-slack-principal-signature"],key);
+        }
+        result = this.database.enqueue(envelope,new Date(),principal);
       } catch (error) {
         throw new PersistenceUnavailableError(
           error instanceof Error ? error.message : "Event could not be persisted",
@@ -510,7 +576,9 @@ export class DispatcherApi {
         duplicate: result.duplicate,
       });
     } catch (error) {
-      if (error instanceof BodyTooLargeError) {
+      if(error instanceof OperatorAuthError) {
+        sendJson(response,error.code==="denied"?403:error.code==="limit"?429:error.code==="conflict"?409:400,{error:`operator_auth_${error.code}`});
+      } else if (error instanceof BodyTooLargeError) {
         sendJson(response, 413, errorBody("request_too_large", "Request body exceeds the configured limit"));
       } else if (error instanceof RequestValidationError) {
         sendJson(response, 400, errorBody("invalid_request", error.message));
@@ -663,6 +731,7 @@ export class DispatcherApi {
       if(request.method==="POST"&&url.pathname==="/v1/tasks") {
         const input=taskRequestSchema.parse(await this.readJson(request));
         const existing=this.database.tasks.lookupRequest(input);
+        if(!existing)this.database.tasks.continuations.validate(input);
         const issue=existing?undefined:await verifyTaskIssue(input,githubQuery(this.config.ghPath));
         const result=existing?{outcome:"reused" as const,task:existing}:this.database.tasks.create(input,this.config.jobsWorkspaceRoot,this.config.jobResultsDir,issue);
         this.jobs.wake();sendJson(response,result.outcome==="created"?202:200,{schema_version:1,outcome:result.outcome,task:this.database.tasks.projection(result.task)});return;
@@ -671,14 +740,42 @@ export class DispatcherApi {
       if(request.method==="GET"&&url.pathname==="/v1/tasks") {
         sendJson(response,200,{schema_version:1,tasks:this.database.tasks.list(source).map(task=>this.database.tasks.projection(task)),limit:100});return;
       }
-      const match=/^\/v1\/tasks\/([^/]+)(?:\/(pause|resume|cancel|steer|retry))?$/.exec(url.pathname);
+      if(request.method==="GET"&&url.pathname==="/v1/tasks/issue") {
+        const input=taskRequestSchema.parse({source_event_id:source,task_key:"lookup",objective:"Issue lookup",
+          workspace:{kind:"github",repository:url.searchParams.get("repository")},issue_number:Number(url.searchParams.get("issue_number"))});
+        const issue=await verifyTaskIssue(input,githubQuery(this.config.ghPath));
+        if(!issue)throw new Error("task_issue_identity_unverified");
+        sendJson(response,200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.findIssue(source,issue),true)});return;
+      }
+      const match=/^\/v1\/tasks\/([^/]+)(?:\/(pause|resume|cancel|steer|retry|questions|answer|approve|recovery|reconcile|continuation))?$/.exec(url.pathname);
       if(!match)throw new Error("task_route_not_found");
       const id=taskIdSchema.parse(match[1]),action=match[2];
+      if(request.method==="GET"&&action==="recovery"){if(!this.jobs.inspectTaskRecovery)throw Error("task_recovery_unavailable");sendJson(response,200,await this.jobs.inspectTaskRecovery(id,source));return;}
+      if(request.method==="GET"&&action==="questions"){if(!this.jobs.taskQuestions)throw Error("task_questions_unavailable");sendJson(response,200,await this.jobs.taskQuestions(id,source));return;}
       if(request.method==="GET"&&!action){sendJson(response,200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.assertOwner(id,source),true)});return;}
-      if(request.method==="POST"&&action) {
+      if(request.method==="POST"&&action==="continuation") {
+        const input=continuationControlSchema.parse(await this.readJson(request));
+        sendJson(response,200,{schema_version:1,continuation:this.database.tasks.continuations.control(id,input)});return;
+      }
+      if(request.method==="POST"&&action&&action!=="questions") {
         const input=await this.readJson(request) as Record<string,unknown>;
         if(typeof input.source_event_id!=="string"||!Number.isSafeInteger(input.revision))throw new Error("task_control_invalid");
-        if(action==="retry")this.database.tasks.retry(id,input.source_event_id,input.revision as number,input.max_attempts as number);
+        if(action==="reconcile"){if(!this.jobs.reconcileTaskResult)throw Error("task_recovery_unavailable");sendJson(response,200,await this.jobs.reconcileTaskResult(id,input));return;}
+        if(action==="approve") {
+          if(!this.jobs.approveTaskRequest||typeof input.question_id!=="string"||typeof input.accepted!=="boolean")throw Error("task_approval_invalid");
+          sendJson(response,200,await this.jobs.approveTaskRequest(id,input.source_event_id,input.revision as number,input.question_id,input.accepted));this.jobs.wake();return;
+        }
+        if(action==="answer") {
+          if(!this.jobs.answerTaskQuestion)throw Error("task_questions_unavailable");
+          if(typeof input.question_id!=="string"||!input.answers||typeof input.answers!=="object"||Array.isArray(input.answers))throw Error("task_answer_invalid");
+          sendJson(response,200,await this.jobs.answerTaskQuestion(id,input.source_event_id,input.revision as number,input.question_id,input.answers as Record<string,{answers:string[]}>));this.jobs.wake();return;
+        }
+        if(action==="retry") {
+          if(input.attempt_id!==undefined) {
+            if(typeof input.attempt_id!=="string"||!/^job_[0-9a-hjkmnp-tv-z]{26}$/.test(input.attempt_id))throw Error("task_control_invalid");
+            this.database.tasks.retryPreparation(id,input.source_event_id,input.revision as number,input.max_attempts as number,input.attempt_id,this.config.jobResultsDir);
+          } else this.database.tasks.retry(id,input.source_event_id,input.revision as number,input.max_attempts as number);
+        }
         else if(action==="steer") {
           const task=this.database.tasks.assertOwner(id,input.source_event_id);
           if(typeof input.instruction!=="string"||!input.instruction.trim())throw new Error("task_control_invalid");
@@ -695,6 +792,65 @@ export class DispatcherApi {
       const code=/^task_[a-z_]+$/.test(message)?message:"task_request_failed";
       throw new ApiRequestError(code==="task_owner_mismatch"?403:409,code,code);
     }
+  }
+
+  private currentReadPurpose(request:IncomingMessage) {
+    const token=request.headers["x-dona-agent-token"],eventId=request.headers["x-dona-agent-event-id"];
+    return typeof token==="string"&&typeof eventId==="string"?this.agentContexts?.authorize(token,eventId,"get_job_status")?.purpose:undefined;
+  }
+
+  private async authorizeLegacyRead(request:IncomingMessage,url:URL):Promise<boolean> {
+    try {
+      const token=request.headers["x-dona-agent-token"],eventId=request.headers["x-dona-agent-event-id"];
+      if(typeof token!=="string"||typeof eventId!=="string")return false;
+      const isEvents=/^\/v1\/events\/[^/]+\/jobs$/.test(url.pathname);
+      const operation=isEvents?"list_event_jobs":url.pathname==="/v1/jobs"?(url.searchParams.has("source_event_id")?"list_owner_jobs":"list_thread_jobs"):"get_job_status";
+      const context=this.agentContexts?.authorize(token,eventId,operation);if(!context)return false;
+      const sourceEventId=isEvents?decodeURIComponent(url.pathname.split("/")[3]!):url.searchParams.get("source_event_id");
+      if(url.pathname.endsWith("/worker")||url.searchParams.get("include_live_session")==="true"||url.pathname.includes("/live-session-receipts/"))return false;
+      if(context.purpose==="job_completion") {
+        const event=this.database.get(context.event_id);if(!event||event.source!=="dona_job")return false;
+        const source=JSON.parse(event.subject_json).source_event_id??(event.trace_json?JSON.parse(event.trace_json).source_event_id:undefined);
+        const resolved=typeof source==="string"?resolveVerifiedSlackOwner(this.database,source):undefined,original=resolved?.origin;
+        const destination=event.reply_target_json?JSON.parse(event.reply_target_json):undefined;
+        const origin=original?.reply_target_json?JSON.parse(original.reply_target_json):undefined;
+        const originKind=original?.trace_json?JSON.parse(original.trace_json).status_origin_visibility:undefined;
+        if(!destination||!origin||destination.workspace_id!==context.workspace_id||destination.channel_id!==origin.channel_id||destination.thread_ts!==origin.thread_ts)return false;
+        const key=await readPrivateToken(this.config.updateInternalTokenPath);if(!key)return false;
+        const access=await confirmScheduleAccess(this.config.slackAdapterSocketPath,key,{event_id:context.event_id,workspace_id:context.workspace_id,channel_id:destination.channel_id,user_id:context.principal_id,status_summary:true},5000);
+        if(this.database.get(context.event_id)?.reply_target_json!==event.reply_target_json||this.database.get(context.event_id)?.subject_json!==event.subject_json||(resolved&&stableStringify(resolveVerifiedSlackOwner(this.database,source))!==stableStringify(resolved)))return false;
+        if(access.authorized!==true||access.event_id!==context.event_id||access.workspace_id!==context.workspace_id||access.channel_id!==destination.channel_id||access.user_id!==context.principal_id||access.destination_kind!==originKind||!this.agentContexts?.authorize(token,eventId,operation))return false;
+        if(isEvents)return sourceEventId===source;
+        const job=this.database.getJob(decodeURIComponent(url.pathname.split("/")[3]!));
+        return !!job && job.source_event_id===source && sourceEventId===context.event_id;
+      }
+      if(context.purpose!=="human_command")return false;
+      if(operation!=="list_thread_jobs"&&sourceEventId!==context.event_id)return false;
+      if(operation==="list_thread_jobs") {
+        const row=this.database.get(context.event_id),destination=row?.reply_target_json?JSON.parse(row.reply_target_json):undefined;
+        if(!destination||url.searchParams.get("workspace_id")!==context.workspace_id||url.searchParams.get("channel_id")!==destination.channel_id||url.searchParams.get("thread_ts")!==destination.thread_ts)return false;
+        const key=await readPrivateToken(this.config.updateInternalTokenPath);if(!key)return false;
+        const access=await confirmScheduleAccess(this.config.slackAdapterSocketPath,key,{event_id:context.event_id,workspace_id:context.workspace_id,channel_id:destination.channel_id,user_id:context.principal_id,status_summary:true},5000);
+        return access.authorized===true&&access.event_id===context.event_id&&access.workspace_id===context.workspace_id&&access.channel_id===destination.channel_id&&access.user_id===context.principal_id&&access.destination_kind===(row?.trace_json?JSON.parse(row.trace_json).status_origin_visibility:undefined)&&this.database.get(context.event_id)?.reply_target_json===row?.reply_target_json&&!!this.agentContexts?.authorize(token,eventId,operation);
+      }
+      // owner-wide discoveryは別Issue。同threadの旧readだけを維持する。
+      if(operation==="list_owner_jobs")return false;
+      if(isEvents) {
+        const event=this.database.get(context.event_id),destination=event?.reply_target_json?JSON.parse(event.reply_target_json):undefined;
+        if(!destination||destination.workspace_id!==context.workspace_id||typeof destination.channel_id!=="string")return false;
+        const key=await readPrivateToken(this.config.updateInternalTokenPath);if(!key)return false;
+        const access=await confirmScheduleAccess(this.config.slackAdapterSocketPath,key,{event_id:context.event_id,workspace_id:context.workspace_id,channel_id:destination.channel_id,user_id:context.principal_id,status_summary:true},5000);
+        return access.authorized===true&&access.workspace_id===context.workspace_id&&access.channel_id===destination.channel_id&&access.user_id===context.principal_id&&access.event_id===context.event_id&&access.destination_kind===(event?.trace_json?JSON.parse(event.trace_json).status_origin_visibility:undefined)&&!!this.agentContexts?.authorize(token,eventId,operation);
+      }
+      const jobId=decodeURIComponent(url.pathname.split("/")[3]!),job=this.database.getJob(jobId);
+      // 別threadのfull ResultやTask Attemptはsummary認可を迂回できない。
+      const resolved=job?resolveVerifiedSlackOwner(this.database,job.source_event_id):undefined,event=this.database.get(context.event_id);
+      if(!job||!resolved||!event?.reply_target_json||!resolved.origin.reply_target_json||JSON.parse(event.reply_target_json).thread_ts!==JSON.parse(resolved.origin.reply_target_json).thread_ts)return false;
+      const key=await readPrivateToken(this.config.updateInternalTokenPath);if(!key)return false;
+      const result=await new StatusSummaryService(this.database,input=>confirmScheduleAccess(this.config.slackAdapterSocketPath,key,{...input,status_summary:true},5000))
+        .read(jobId,context,()=>this.agentContexts?.authorize(token,eventId,operation));
+      return result.status!=="not_available";
+    } catch {return false;}
   }
 
   private async handleJobs(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
@@ -761,10 +917,15 @@ export class DispatcherApi {
       if (!workspaceId || !channelId || !threadTs) {
         throw new ApiRequestError(400, "invalid_request", "workspace_id, channel_id, and thread_ts are required");
       }
-      const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs, 101);
+      const token=request.headers["x-dona-agent-token"],eventId=request.headers["x-dona-agent-event-id"],context=typeof token==="string"&&typeof eventId==="string"?this.agentContexts?.authorize(token,eventId,"list_thread_jobs"):undefined;
+      if(this.agentContexts&&!context){sendJson(response,200,{schema_version:1,status:"not_available"});return;}
+      const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs, 101,context?.principal_id);
+      const current=this.database.get(context?.event_id??""),kind=current?.trace_json?JSON.parse(current.trace_json).status_origin_visibility:undefined;
+      const visible=this.agentContexts?candidates.filter(job=>{const resolved=resolveVerifiedSlackOwner(this.database,job.source_event_id);return !!resolved&&resolved.principal.principal_id===context?.principal_id&&resolved.principal.workspace_id===context?.workspace_id&&!!resolved.origin.trace_json&&JSON.parse(resolved.origin.trace_json).status_origin_visibility===kind;}).map(job=>({job_id:job.job_id,status:job.status,created_at:job.created_at,updated_at:job.updated_at,completed_at:job.completed_at})):candidates;
+      if(this.agentContexts&&!(typeof token==="string"&&typeof eventId==="string"&&this.agentContexts.authorize(token,eventId,"list_thread_jobs"))){sendJson(response,200,{schema_version:1,status:"not_available"});return;}
       sendJson(response, 200, {
         schema_version: 1,
-        jobs: candidates.slice(0,100),
+        jobs: visible.slice(0,100),
         truncated: candidates.length > 100,
       });
       return;
@@ -776,7 +937,7 @@ export class DispatcherApi {
     const managedTask=this.database.tasks.forAttempt(jobId);
     if(managedTask&&request.method==="POST")throw new ApiRequestError(409,"task_control_required","Use the Task ID and revision for control");
     if(managedTask&&request.method==="GET"&&url.searchParams.has("source_event_id")) {
-      try{this.database.tasks.assertOwner(managedTask.task_id,url.searchParams.get("source_event_id")!);}
+      try{this.database.tasks.assertOwner(managedTask.task_id,url.searchParams.get("source_event_id")!,true);}
       catch{throw new ApiRequestError(403,"task_owner_mismatch","Task does not belong to this event owner");}
     }
     const liveReceiptId=match[3];
@@ -830,7 +991,9 @@ export class DispatcherApi {
           sendJson(response,200,projectLiveJobResponse({...refreshed,...this.database.jobNotificationState(jobId)},receipt));
         }
         catch{throw new ApiRequestError(503,"live_session_audit_unavailable","Live session observation could not be durably audited");}
-      }else sendJson(response, 200, { schema_version: 1, job: {...job,...this.database.jobNotificationState(jobId)} });
+      }else sendJson(response, 200, { schema_version: 1, job: this.agentContexts
+        ?(this.currentReadPurpose(request)==="job_completion"?projectCompletionJob(job as unknown as Record<string,unknown>):{job_id:job.job_id,status:job.status,created_at:job.created_at,updated_at:job.updated_at,completed_at:job.completed_at})
+        :{...job,...this.database.jobNotificationState(jobId)} });
       return;
     }
     if (request.method === "POST" && action === "steer") {

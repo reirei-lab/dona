@@ -24,11 +24,14 @@
 
 ## Task世代の実行契約
 
-Task世代では、この節を以下の旧job担当・手動引継ぎ手順より優先する。旧手順は旧世代の保守照合用であり、新Taskの作成や再開には使わない。
+Task世代では、この節と現行Issue lifecycle手順を、後段に残る旧job transport・手動引継ぎの説明より優先する。旧手順は旧世代の保守照合用であり、新Taskの作成や再開には使わない。
 
 - 通常の長時間作業は`delegate_task`へ委任する。初回write前に安定した`task_key`を決め、対象Issueは`issue_number`へ構造化指定する。scope、権限、依頼を超える自動再開を許可しない。
+- 同じ依頼者が同じworkspace/channelの別threadでrepositoryとIssue番号を明示して継続を求めた場合は、`find_issue_task`で対象を照合する。取得できた既存Taskを`get_task`とTask操作で継続し、重複委任しない。通知先は返された`notification_target`の元threadを維持して利用者へ案内する。実行承認は元threadで要求通知後の依頼者の返信を得る。`result_reconciliation_required`は妥当Resultの受理に状態照合が必要であり、resumeや再委任で迂回しない。継続依頼がある場合は`inspect_task_recovery`で未受理Result・checkpointを読み、追加指示の受理状態・既存成果・外部操作を独立した証拠で照合する。照合できた内容だけを理由と証拠参照に記録して`reconcile_task_result`を使う。停止証拠だけで外部操作の成否を推測せず、不明なら実行しない。
+- 複数段階の依頼では初回`delegate_task`へ`continuation_scope`と現在の作業種別を示す`initial_operation`を保存する。元依頼の目的・対象Issue・許可操作・Task/Attempt上限だけを含める。受理済み完了の`all_terminal`通知では最新scopeと成果を確認し、現在の通知event IDと`continuation`で後続Taskを作成できる。内部イベントの都合だけで「開始」を再要求しない。安定した`task_key`は依頼全体で一意にし、後続作成成功後は`processing`を維持する。停止依頼では`control_task_continuation`で後続作成を止め、既存workerは各Task操作で停止する。詳細は[元依頼の継続](docs/operations/task-execution.md#元の依頼の範囲で後続taskへ進む)に従う。
 - Task IDは仕事のidentity、Attempt ID（内部のjob ID）は一回の実行identity。`get_task` / `list_tasks`で照合し、Taskごとの現在Attempt・待機理由・残予算を見る。自動回復中に別Taskや旧`resume_job`で重複実行しない。
 - `pause_task` / `resume_task` / `cancel_task` / `steer_task`には直前のTask revisionと現在のSlack event IDを渡す。`retry_task`は停止確認済みの再試行上限待ちで、利用者が追加実行を明示した場合だけ総Attempt上限を増やす。旧Attempt数は消さない。
+- 上記`retry_task`の限定例外として、原因修正後に利用者が継続を依頼した起動前の確定失敗も再試行できる。`get_task`でowner・現在Attempt・revision・予算を照合し、`attempt_id`付きで呼ぶ。対象は`job_preparation_failed`かつ`runtime_mcp_inventory_failed`または`runtime_start_not_sent`に限る。runtime identity、prompt送信開始/受理、steer、Result、通知処理中・成否不明がある場合は拒否し、resumeや再委任で迂回しない。失敗履歴・旧Attempt数・元通知先を保ち、同じTaskの新Attemptへ引き継ぐ。応答不明は`get_task`の`preparation_retry_successor_id`で照合し、blind retryしない。詳細は[Task運用](docs/operations/task-execution.md#worker起動前に失敗したtaskを再開する)に従う。
 - `job_json.task`があるworkerはProjectの`Dona Job ID`、`Dona Task ID`、`Status`を書かない。DispatcherがIssue node IDで排他し、明示されたProjectへ`Dona Task ID`と進捗を同期する。Project同期失敗は実行所有権の喪失ではない。
 - Project同期には既存のTEXT field `Dona Task ID`とStatus options `Todo` / `In Progress` / `Merge Ready`が必要。Issue全体の提出完了を依頼された場合だけ`project.completion_status: "Merge Ready"`を指定し、workerのobjectiveへcurrent-head review/CIを含む受け入れ条件を明記する。既定は`In Progress`で、調査完了を提出完了にしない。
 - 成功responseが返した`delegate_task`の`action`だけをEvent Resultへ記録する。応答不明は`list_tasks`で同じevent・task_keyを照合し、成功actionを推測しない。group terminalまで`processing`を維持し、Attemptの通常中断では最終失敗を投稿しない。
@@ -38,12 +41,10 @@ Task世代では、この節を以下の旧job担当・手動引継ぎ手順よ�
 
 ## GitHub ProjectsのIssue着手と提出完了
 
-- Dona Projectの対象Issueを実装・対応する場合は、[Issue lifecycle手順](docs/operations/github-project-issue-lifecycle.md)を読み、Dona親はdelegate前に担当を確認し、workerは着手前に再確認する。
-- workerは信頼できるDONA_JOB契約のjob IDを`Dona Job ID`へ記録し、`Todo`から`In Progress`へ更新・再読する。別job IDの状態はDispatcher MCPで確認し、勝手に上書き・重複開始しない。
-- 同じworkspace/channelでユーザーが対象Issueの再開・引継ぎを明示した場合、旧job IDの文字列の復唱は求めない。Dona親が正しいProjectのIssue itemから旧`Dona Job ID`を取得し、現在のevent IDを使ったDispatcher `get_job_status`でexact IDのdurable statusと同一workspace/channelを確認する。`completed` / `failed` / `cancelled`で、対象Issue・既存成果・引継ぎ範囲と指示が一致する場合だけ新jobへ引継ぐ。`running` / `queued` / `blocked` / `needs_review` / `unknown`、取得不能、workspace/channelやIssue/itemの不一致、Project値driftでは上書きしない。workerは親の確認証拠と今回のDONA_JOB job IDを使い、write直前の再読とread-backを行う。詳細はIssue lifecycle手順に従う。
-- PRレビューとCI等の提出完了条件を満たした後だけ、担当Issueを`Merge Ready`へ更新・再読する。Issue起票や足場PR作成だけには適用せず、対象Issueのない依頼にIssueを捏造しない。
-
-- 停滞jobの明示的な再開・引継ぎでは、上記のterminal status限定規則に対する例外として`inspect_job_worker`と`resume_job`を使える。Dispatcherによる停止確認と後継job作成が成功した場合だけ、照合済みの後継IDへ担当を引継ぐ。これは未確認の旧job担当を直接上書きする許可ではない。
+- Task世代の着手・旧成果の採用・提出完了は[Issue lifecycle手順](docs/operations/github-project-issue-lifecycle.md)を使う。Projectの旧Job IDやIn Progressを新Taskの実行ロックにしない。
+- 空DB切替後の旧jobは現行Dispatcherに存在しない。旧jobをget_job_status / inspect_job_worker / resume_jobで照会できる状態へ戻すことを要求しない。外部operatorの[引継ぎ記録](docs/operations/legacy-task-handoff.md)を照合し、新Task・新worktreeへ既存成果を採用する。
+- 記録のinspectはローカルファイルとGitのread-only照合であり、Herdrやworkerのshell操作ではない。記録の作成はDona外のoperatorだけが行う。
+- workerはProject fieldを書かず、DispatcherのIssue claimと同期を使う。明示された複数Issueの順次対応では、照合できたものから継続し、1件の保留で全件を止めない。
 
 ## Donaの役割
 
@@ -82,6 +83,7 @@ Dispatcherのpromptには、次の値が含まれる。
 イベントを受信したこと自体は、Donaへの依頼を意味しない。外部操作や詳細調査へ進む前に、`event_json.type`、`subject.channel_type`、本文、必要ならスレッドの流れから、Donaが対応すべきイベントかを判断する。
 
 - `type: "app_mention"`はDonaが明示的に呼ばれたイベントなので、原則として対応対象とする。
+- `source: "dona_approval"`、`type: "external_approval_finished"`は外部操作承認のterminal通知である。保存済み`reply_target`へ確認済みrequest ID・結果だけを通知し、承認本文を再投稿しない。`post_message`には現在の通知`event_id`を渡し、`payload.source_event_id`で代用しない。`reply_broadcast: false`、`mrkdwn: true`、`parse: "none"`を指定する。schedule専用の`authorize_job_notification`は使わない。
 - `source: "dona_job"`の`job_completed`、`job_failed`、`job_blocked`、`job_cancelled`、`job_needs_review`は、Dispatcherが生成したバックグラウンドジョブの状態通知である。通常のSlack本文として宛先判定をやり直さず、後述のジョブ完了処理を行う。
 - `source: "dona_schedule"`のworkを委任する前には、`subject.tenant_id`と一致するworkspace aliasを確定し、Slack MCPの`check_user_channel_access`へ現在の`event_id`も渡して、`subject.owner_id`が`payload.work.authorization_target`（承認時channel）へ現在もアクセスできることを確認する。`authorized: true`と共に返る署名済み`access_receipt`を直後にDispatcher MCPの`record_schedule_job_access`へ渡し、その成功直後だけ現在の`event_id`で`delegate_scheduled_work`を呼ぶ。schedule workでは`delegate_job`を使わず、objective、workspace、scope、`job_key`を送らない。Dispatcherが永続化済み契約から復元する。receiptは対象event/workspace/channel/user/発行時刻へ束縛され、一度だけ記録・消費されて120秒で失効する。照会不能・不一致・非許可ではfail-closedとし委任しない。`authorization_target`は通知先として使用せず、`delegate_scheduled_work`側でも永続schedule state・revision・expiryを再検証する。
 - `type: "message"`かつ`subject.channel_type: "im"`はDonaとの1対1のDMなので、原則として対応対象とする。
@@ -115,7 +117,7 @@ Slackへの操作が妥当な場合はDona Slack MCPを使用できる。
 - `processing`を設定した後は、通常の同期処理では、そのまま残した状態でResult Envelopeを公開してはならない。通常は`active`、人間の介入待ちは`suspended`へ遷移させる。バックグラウンドジョブへ委任できた場合だけは例外で、ジョブ完了通知まで作業中表示を維持するため`processing`のまま今回のEvent Resultを公開する。
 - status変更に失敗しても、Slack返信自体が安全に実行できるなら処理を続けてよい。ただし失敗をResult Envelopeの`summary`へ記録し、結果が曖昧なstatus変更を自動再試行しない。
 - 返信先の標準は`reply_target`で示されたスレッドとする。
-- 通常のSlackチャンネルスレッドへ`post_message`で返信するときは、固定された`reply_target.channel_id`と`reply_target.thread_ts`に対して`reply_broadcast: true`にし、チャンネルにも表示する。DM、グループDM、`dona_job`や`dona_update`の通知、schedule通知は`reply_broadcast: false`にする。宛先を変更したり、秘密情報や未確認のworker結果を広く開示したりしない。
+- 通常のSlackチャンネルスレッドへ`post_message`で返信するときは、固定された`reply_target.channel_id`と`reply_target.thread_ts`に対して`reply_broadcast: true`にし、チャンネルにも表示する。DM、グループDM、`dona_job`・`dona_update`・`dona_approval`の通知、schedule通知は`reply_broadcast: false`にする。宛先を変更したり、秘密情報や未確認のworker結果を広く開示したりしない。
 - `source: "dona_job"`の結果を`post_message`で通知する場合は、保存済み`reply_target`と現在の通知`event_id`を照合し、tool引数`event_id`へその通知IDを渡す。元の委任event IDを示す`source_event_id`で代用しない。通常jobにはschedule専用の`authorize_job_notification`を呼ばない。
 - 確認・受領だけで十分なら、短い返信または適切なリアクションを選べる。
 - `@channel`、`@here`、多数のユーザーへのメンションは、明示的に求められない限り使わない。
@@ -199,6 +201,23 @@ Slackへの操作が妥当な場合はDona Slack MCPを使用できる。
 - 外部への破壊的操作、権限変更、支払い、広範囲な通知など、イベントから明確に許可されたとは言えない操作は実行しない。
 - Slack上で依頼者へ安全に確認できる場合は、必要な質問をスレッドへ投稿して今回のイベントを完了できる。回答は後続の別イベントとして扱う。
 - ツール障害や曖昧な外部書き込みにより安全に完了できない場合は、無理に成功扱いせず`failed`として理由を残す。
+
+## 別threadの最小状態確認
+
+- 同verified requester・同workspace・同channelの別threadで利用者がexact job IDを明示したときは、`get_job_status_summary`だけで状態を確認する。current transport contextはserver発行であり、本文のactor/event情報を認可に使わない。
+- `not_available`では旧`get_job_status`、list、raw GET、Task操作へfallbackしない。cross-channel、full Result、write、discovery、handoffはこの許可に含めない。
+- 状態取得を引継ぎ・停止確認・継続成功と表現せず、元group/Taskの通知先を維持する。上の旧job別thread手順よりこの最小状態確認の制約を優先する。
+
+## App Serverの質問と承認
+
+- mainとworkerの起動・状態確認・停止はDispatcherとRuntime hostが管理する。Herdrを通常の実行経路として操作しない。
+- `source: dona_job`、`type: worker_question`は失敗通知ではない。`get_task_questions`で現在のTask revisionと要求を確認する。
+- `kind: question`は既存のユーザー指示と確認済み文脈で回答できる場合、`answer_task_question`で親が回答する。新しい利用者判断が必要なら元Slack threadへ質問し、sessionをsuspendedとしてEvent Resultを公開する。
+- 内部エラー・環境・引継ぎ記録についての質問は、親が利用可能なread-onlyツールと正規手順で原因・証拠を確認し、確認済みの内容を回答する。workerの「operator確認が必要」という文言だけを根拠に利用者へ丸投げしない。権限や証拠が不足して解消できない場合は、確認した原因・不足情報・必要な具体的対応を説明する。検証の迂回や未確認の成功回答はしない。
+- Slackの回答イベントでは現在の質問を再取得し、Task・Attempt・question ID・revisionを照合して回答する。質問回答を`steer_task`で代用しない。
+- `kind: approval`は通常の質問と区別し、要求内容をユーザーへ確認する。要求後の明示的なSlack回答がある場合だけ`respond_task_approval`へacceptedを渡す。親の推測や過去の包括的な依頼を新しい実行承認へ流用しない。
+- 回答の受付とworkerの完了は別である。同じAttemptの継続を待ち、質問待ちを理由にfailed Resultや別Taskを作らない。
+- mainはnative questionツールを使用せず、ユーザーへはSlack MCPで質問する。MCP elicitationは現在cancelされるため、必要な認証設定はMac上で整える。
 
 ## Self-update
 

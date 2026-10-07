@@ -1,0 +1,27 @@
+# Task grantの永続化と縮小委譲
+
+`task-grants.ts`は#168の内部domain/repository/typed evaluation portであり、発行UX・本人intent検証・外部実行は提供しない。API/MCPへwriterを登録しない。新規grantを作る信頼済みissuerは、現在のprincipal、exact binding、typed approvalを同一security transactionのread phaseで確認する。issuerが未設定の場合に許可するdefault実装はない。
+
+## 採用元とTaskへの適合
+
+#164のPR #266（integration merge `46d0fc4`）から、GitHub repository/Issue node、resource revision、binding revisionとverified principalをrouting ownerから分離する契約を採用する。旧job/event用schema全体は移植せず、grantのresourceへ永続Task IDを明示する。Attempt IDはgrant resourceに含めない。再Attemptで別Issueや別principalへ拡張しない。currentBinding portは現在Taskのexact resource、principal証跡、渡されたEpic membership revisionを確認し、unknown、矛盾、失効時にはfalseを返す。単なるTask IDの所持やrouting ownerは検証証拠にならない。
+
+共有audit/CASはPR #156由来の現main `AuditRepository`、時計はPR #157由来の現main保護時計と`ApprovalTransaction`をそのまま使う。新しいlock・時計・監査ledgerは作らない。root digest、SQL snapshot、scope、canonical codecを同じread phaseで照合し、commit時はclock provenanceとsnapshot CASを再確認する。共有audit recordの`binding_change`を使用するためaudit codecのoperation集合を変更しない。
+
+## 設置と移行
+
+既存のowner-only DB、監査schema、approval schema、rollback-resistant外部anchor/clock providerが必要。明示的な`installTaskGrantSchema`はversion 1のschemaだけを追加し、既存rowを推測backfillしない。部分schema、未知version、偽table/trigger/temp shadowは拒否する。既存Task世代DBへの追加とfresh DBの両方を同じ経路で扱う。
+
+新しいscopeのempty rootは信頼済みissuerが`initialize`を認可した場合だけ監査commitする。既存row/rootの片方欠落・改変から自動再初期化しない。`put`/`revoke`はexpected revisionを要求し、revoked IDを再利用しない。revokeは時間上のactiveを要求せず、開始前・expiry後にもissuer認可とCASを確認して失効を記録する。snapshotには最大1024 grants、4MiB、各grantの明示resource/destination集合は最大128件の上限がある。putは全未失効grantの最大長UTC timestampとrevision桁増加に必要な容量も予約し、超過はquota拒否とする。最後のsafe integer revision値もrevoke用に予約する。容量やrevision枯渇を理由に緊急revokeができなくなる状態を保存しない。revokeやaudit履歴を削除するretentionは提供しない。
+
+## 発行と評価
+
+issuer capabilityは信頼済みprocessのcomposition rootが注入する同期callbackであり、MCPのJSON、LLMが渡すID・role文字列、自己申告approvalをcapabilityに変換しない。`authorize`はwriter lock取得後に要求全体と現在のstate/保護時計を評価する。`put`のapprovalはissuerが返したevent、typed plan、plan hashと完全一致する必要がある。集合変更には新grant revisionと、その新内容を承認するissuer結果が必要である。
+
+Epic membershipは発行時のrevisionと明示child node集合を保存する。未来child、cancel/merge/production、公開先を推測追加しない。委譲はresource/operation/destination/期間を親の部分集合に限定し、親のexact revisionを保存する。別bot/service principalへのact-asは別grant発行とissuer認可を必要とする。祖先のcurrentBindingも毎回再評価する。親revoke・expiry・revision変更は既存子と今後の委譲の両方を拒否する。cycleを作る親変更も拒否する。
+
+`evaluate`はcurrent principal/revision、exact Task binding、操作、公開先、Epic membership revisionを受け、保護時計と現在bindingを再評価してbooleanだけを返す。currentBinding providerはserver注入のverified current contextから照会者の本人性も照合する。queryのprincipal文字列や既存bindingの存在だけを本人性の証明にしない。grant全文をmodelへ開示しない。authority/disclosure両方の許可を確認後も外部操作を行う責務は別componentにある。異常時計、監査不一致、非同期callback、commit/receipt不明はredacted errorで停止し、同一transaction IDを自動再送しない。read-only照合・operatorによる既存共有primitiveの回復手順を使う。
+
+## 検証境界
+
+`test/task-grants.test.ts`は実SQLiteと共有audit/保護時計transactionを通し、fresh/追加migration/reopen、expiry、tamper、明示service委譲、縮小matrix、親失効/revision、複数connectionのstale CASを検証する。issuerとcurrentBindingはfixture専用である。実principal発行、Slack、GitHub外部操作、本番providerの初期化・activationは行わない。

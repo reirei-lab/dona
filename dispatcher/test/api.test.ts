@@ -675,3 +675,41 @@ describe("DispatcherApi", () => {
     await api.stop(); database.close();
   });
 });
+
+
+test("Issue lookupから別threadのTaskを取得し制御、外部ownerを拒否",async()=>{
+ const {root,config}=await tempConfig();roots.push(root);
+ const gh=path.join(root,"fake-gh");await fs.writeFile(gh,`#!/bin/sh\nprintf '%s' '{"data":{"repository":{"nameWithOwner":"org/repo","issue":{"id":"I_api","number":24}}}}'\n`,{mode:0o700});config.ghPath=gh;
+ const database=new DispatcherDatabase(config.databasePath);
+ const source=database.enqueue(eventEnvelope("issue-source")).row;
+ const task=database.tasks.create({source_event_id:source.event_id,task_key:"issue",objective:"work",policy:{max_attempts:3,retry_delay_ms:1000},workspace:{kind:"github",repository:"org/repo"},issue_number:24},config.jobsWorkspaceRoot,config.jobResultsDir,{node_id:"I_api",repository:"org/repo",number:24}).task;
+ const follow=eventEnvelope("issue-follow");follow.subject.thread_ts="1700000000.000003";follow.reply_target!.thread_ts=follow.subject.thread_ts;
+ const event=database.enqueue(follow).row;
+ const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger);await api.start();try{
+  const route=`/v1/tasks/issue?repository=org%2Frepo&issue_number=24&source_event_id=${event.event_id}`;
+  const found=await request(config.socketPath,"GET",route);assert.equal(found.status,200);assert.equal((found.body.task as {task_id:string}).task_id,task.task_id);
+  assert.equal((await request(config.socketPath,"GET",`/v1/jobs/${task.current_attempt_id}?source_event_id=${event.event_id}`)).status,403);
+  assert.equal((await request(config.socketPath,"GET",`/v1/jobs/${task.current_attempt_id}?source_event_id=${source.event_id}`)).status,200);
+  const paused=await request(config.socketPath,"POST",`/v1/tasks/${task.task_id}/pause`,{source_event_id:event.event_id,revision:task.revision});assert.equal(paused.status,200);
+  const foreign=eventEnvelope("issue-other");foreign.subject.actor_id="U_OTHER";const other=database.enqueue(foreign).row;
+  assert.equal((await request(config.socketPath,"GET",route.replace(event.event_id,other.event_id))).status,403);
+  assert.equal(database.listEventJobs(event.event_id).length,0);
+ }finally{await api.stop();database.close();}
+});
+
+test("retry APIはexact準備失敗Attemptを同じTaskへ引継ぎ、再送を重複作成しない",async()=>{
+ const {root,config}=await tempConfig();roots.push(root);const database=new DispatcherDatabase(config.databasePath);
+ const event=database.enqueue(eventEnvelope("preparation-retry-api")).row;
+ const task=database.tasks.create({source_event_id:event.event_id,task_key:"retry",objective:"work",workspace:{kind:"scratch"},policy:{max_attempts:3,retry_delay_ms:1000}},config.jobsWorkspaceRoot,config.jobResultsDir).task;
+ database.beginJobPreparation(task.current_attempt_id);database.recordJobPreparationFailure(task.current_attempt_id,"job_preparation_failed","runtime_mcp_inventory_failed",1);
+ const revision=database.tasks.get(task.task_id)!.revision,input={source_event_id:event.event_id,revision,max_attempts:3,attempt_id:task.current_attempt_id};
+ const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger);await api.start();try{
+  const route=`/v1/tasks/${task.task_id}/retry`;
+  assert.equal((await request(config.socketPath,"POST",route,{...input,attempt_id:42})).status,409);
+  const first=await request(config.socketPath,"POST",route,input);assert.equal(first.status,200,JSON.stringify(first.body));
+  const successor=(first.body.task as {current_attempt_id:string}).current_attempt_id;assert.notEqual(successor,task.current_attempt_id);
+  assert.equal(((await request(config.socketPath,"POST",route,input)).body.task as {current_attempt_id:string}).current_attempt_id,successor);
+  assert.equal(database.getJob(task.current_attempt_id)!.status,"failed");assert.equal(database.getJob(successor)!.status,"queued");
+  assert.equal((await request(config.socketPath,"POST",route,{...input,max_attempts:4})).status,409);
+ }finally{await api.stop();database.close();}
+});

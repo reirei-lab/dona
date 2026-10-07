@@ -330,6 +330,51 @@ describe("DispatcherDatabase", () => {
     reopened.close();
   });
 
+  test("v2からv3への移行中も既存web projection cursor以後の更新を欠落させない", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    await createSchemaV2Fixture(config.databasePath);
+    const owner = { instance_id: "instance", tenant_id: "T_TEST", principal_id: "U-1",
+      identity_binding_revision:1,authz_revision:1,authorization_kind: "own" as const };
+    const fixture = new Database(config.databasePath);
+    fixture.prepare("UPDATE events SET source='web',subject_json=? WHERE event_id='evt-source-running'")
+      .run(JSON.stringify(owner));
+    fixture.prepare("UPDATE jobs SET source='web' WHERE job_id='job-running'").run();
+    fixture.close();
+
+    const v2 = new DispatcherDatabase(config.databasePath);
+    assert.equal(v2.schemaCompatibility().actual, 2);
+    assert.deepEqual(v2.listWebJobs(owner, 20).rows.map((row) => row.job_id), ["job-running"]);
+    const cursor = v2.webJobEventCursor(owner, "job-running", new Date("2026-09-03T00:10:00.000Z"));
+    v2.close();
+
+    const migration = new Database(config.databasePath);
+    migrateDispatcherDatabase(migration, () => {}, false, 3);
+    migration.prepare("UPDATE jobs SET updated_at=? WHERE job_id='job-running'")
+      .run("2026-09-03T01:00:00.000Z");
+    assert.notEqual(migration.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='web_job_projection_update'").get(), undefined);
+    assert.notEqual(migration.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='web_task_projection_update'").get(), undefined);
+    migration.close();
+
+    const v3 = new DispatcherDatabase(config.databasePath);
+    const changes = v3.listWebJobChanges(owner, "job-running", cursor, 50, new Date("2026-09-03T01:00:01.000Z"));
+    assert.equal(changes.reset_required, false);
+    assert.equal(changes.rows.some((row) => row.event_kind === "updated"), true);
+    v3.close();
+  });
+
+  test("未知のweb projection schemaではv2 jobs rebuild前にfail closedする", async () => {
+    const { root, config } = await tempConfig(); roots.push(root); await createSchemaV2Fixture(config.databasePath);
+    const v2 = new DispatcherDatabase(config.databasePath);
+    v2.listWebJobs({ instance_id:"instance",tenant_id:"T_TEST",principal_id:"U-1",identity_binding_revision:1,authz_revision:1,authorization_kind:"own" },20);
+    v2.close();
+    const fixture = new Database(config.databasePath); fixture.prepare("UPDATE web_job_projection_schema SET version=5").run();
+    const before = fixture.prepare("SELECT sql,rootpage FROM sqlite_master WHERE type='table' AND name='jobs'").get();
+    assert.throws(() => migrateDispatcherDatabase(fixture,()=>{},false,3),/schema_unsupported/);
+    assert.deepEqual(fixture.prepare("SELECT sql,rootpage FROM sqlite_master WHERE type='table' AND name='jobs'").get(),before);
+    assert.equal(fixture.pragma("user_version",{simple:true}),2); fixture.close();
+  });
+
   test("rolls back every v2 table-rebuild phase without leaving intermediate schema", async () => {
     for (const failureStep of ["jobs_copied", "indexes_recreated", "groups_backfilled"] satisfies DispatcherMigrationStep[]) {
       const { root, config } = await tempConfig();
@@ -1845,6 +1890,30 @@ describe("DispatcherDatabase", () => {
     assert.equal(database.getJob(job.job_id)?.last_error_code, "schedule_reconciled_failed");
     assert.equal(database.updateSafetyStatus().active_worker_count, 0);
     database.close();
+  });
+
+  test("runtime binding survives terminal cleanup and database reopen", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    let database = new DispatcherDatabase(config.databasePath);
+    try {
+      const source = database.enqueue(eventEnvelope("Ev-runtime-archive-cleanup")).row;
+      const job = database.createJob({ source_event_id: source.event_id, objective: "履歴保持",
+        workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+      database.beginJobPreparation(job.job_id);
+      database.setJobRuntime(job.job_id,"workspace","pane",JSON.stringify(["generation","thread"]));
+      const binding=database.getJobRuntimeBinding(job.job_id,"generation");
+      assert.equal(binding?.thread_id,"thread");
+      assert.throws(()=>database.setJobRuntime(job.job_id,"workspace","pane",JSON.stringify(["generation","swapped"])),/runtime_binding_conflict/);
+      assert.equal(database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id,JSON.stringify(["generation","thread"]));
+      const raw = new Database(config.databasePath);
+      raw.prepare("UPDATE jobs SET status='completed' WHERE job_id=?").run(job.job_id);raw.close();
+      database.markJobRuntimeCleaned(job.job_id);
+      assert.equal(database.getJobLiveSessionIdentity(job.job_id),undefined);
+      assert.equal(database.getJob(job.job_id)?.herdr_workspace_id,null);
+      database.close();database=new DispatcherDatabase(config.databasePath);
+      assert.deepEqual(database.getJobRuntimeBinding(job.job_id,"generation"),binding);
+      assert.deepEqual(database.listJobRuntimeBindings(job.job_id).items,[binding]);
+    } finally {database.close();}
   });
 
   test("workspace cleanup does not clear a prepared worker from the drain gate", async () => {

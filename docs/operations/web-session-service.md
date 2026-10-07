@@ -1,0 +1,40 @@
+# Web session確認の専用UDS
+
+`WebSessionService`とBFFの`WebSessionClient`は、現在のsessionを確認する専用の通信境界である。固定の`POST /v1/web/session/verify`だけを扱い、渡せるbrowser routeはempty bodyの`GET /`と`GET /api/session`だけとする。login、registry変更、job、approvalの汎用proxyにはしない。
+
+## 認証と監査
+
+service credentialは`web_bff_service`用途の32 byte secret、version、instance/tenant、active/verification-only/revoked、90日以内のsigning期間を持つ。runtimeは`web_ingress_context`とは別のkey/refを供給する必要がある。secretそのものを通信へ含めず、requestの固定method/path、body digest、scope、credential version、32 byte nonce、最大10秒の有効期間をHMACへ結ぶ。responseにも別のdomain prefixを使い、元requestのproof digest・body digest・nonceと結果を署名する。他requestのresponseや偽socketの未署名応答を採用しない。
+
+このcredentialが証明するのはBFF serviceとしての接続であり、principalの操作許可ではない。Dispatcherは`WebAuthRepository.verifySessionIngress`で現在のsession、identity revision、context key、対象route、期限を照合する。nonce消費と監査のfinalizeが成功した後だけprincipalを返す。再送したcontextは、同じnonceが確定済みなので拒否する。既定のsession確認ではidle期限を延長しない。固定dashboardを対象とする署名済み`user_navigation: true`だけ、[画面遷移のactivity](web-session-activity.md)として同じ監査transactionで更新する。
+
+serviceのinstance/tenantとrepositoryの構築scopeが異なる場合は、listenerを作る前に拒否する。返したprincipalはsession確認結果であり、jobやapprovalのcapabilityではない。後続routeには、それぞれのfresh contextとresourceごとの認可が引き続き必要である。
+
+## 後続routeの共通filter
+
+`prepareSessionIngress`はdashboard/sessionだけでなく、固定route表のcommand、read/SSE、approval routeにも同じcurrent session filterを適用する。POSTはBFFで完了したCSRF確認を認証済み内部callのgateとして必須にし、approval decisionはさらに独立step-upの確認を必須にする。roleとscopeはcurrent registryから再構成し、requesterへapproval権限、supervisorへjob権限を暗黙付与しない。成功した明示user commandだけがidle activityを進め、poll/SSEは進めない。
+
+route-level成功は後続adapterへverified principal contextを渡すための前提であり、resource認可の完了ではない。job owner/grant、approval binding/hash、receipt/cursor等は各routeのauthoritative transactionで再検証する。現在のsession service UDS endpointはdashboard/session確認専用のままとし、後続command/read/approval APIがbrowser本文をこのendpointへproxyする用途には広げない。
+
+## 通信と失敗時の扱い
+
+serverは専用UDSだけをbindする。socketのparentはcanonicalでowner-onlyの0700、socketはowner-onlyの0600とし、既存pathを自動削除・上書きしない。起動時に記録したsocket identityと属性をrequestの受信時、repository呼出前、応答前に再確認する。clientも送信前と応答の採用前にsocketの属性とidentityを確認する。credentialや保護providerのprovisioning、directory作成、stale socketの運用処理はこのmoduleの責務ではない。
+
+request/responseは16 KiB以内、request headerは4 KiB以内、接続は最大32、1接続1requestとする。固定Host、content type、Content-Length、Connectionを検証し、duplicate/未知header、chunked body、query付きpath、CONNECT/upgradeを拒否する。bodyを最後まで受け取るまでrepositoryを呼ばない。
+
+通信deadlineは最大5秒で、部分送受信が続いても延長しない。[Node HTTP](https://nodejs.org/api/http.html)と[Unix domain socket](https://nodejs.org/api/net.html)を使用し、clientはAgentを再利用せず、redirectやPOSTの自動再試行を行わない。同期のkey/clock/repository provider自体をこのtimerで強制中断できるわけではないため、runtime側でboundedなproviderを供給する必要がある。処理後にdeadlineを越えていた場合も成功responseを採用しない。
+
+timeout、接続切断、MAC不一致、監査anchorの結果不明は`web_service_unverified`で停止する。接続が失われたことをbusiness transactionの取消として扱わず、確定済みnonceを戻さない。HTTP POSTが失敗しても同じ操作を暗黙に再送しない。serviceはrequest/responseや低水準errorをlogへ書かない。
+
+## 検証と未接続部分
+
+BFF clientの実UDS fixtureと、file-backed SQLiteの実Web repositoryに接続するDispatcher service fixtureを、それぞれのpackageで検証する。両者が共有する公開golden wireは、production実装とは独立したHMAC計算で作成し、双方のcodecと照合する。正常確認、再送、header/proof/response改変、scope不一致、anchor応答喪失、dribbling、不完全request、socket属性を確認する。
+
+fixtureのcredentialはテスト専用の公開値であり、実credentialを作成・使用しない。loopback TLS frontend、browser login/logout、BFF起動時のepoch確定はisolated fixtureで接続するが、OS保護store、実IdP、installer、production runtime readinessは未検証である。importでlistenerを起動せず、既存production設定も変更しない。
+
+
+## 拒否理由の保持
+
+session確認のsigned denialは固定enumの`reason`を必須にする。BFF clientは`SessionServiceResult`を返し、`null`へ畳み込まない。principalは成功分岐だけに含め、拒否にはresourceやcredentialを添えない。未知reasonや理由が欠ける旧応答はcodecで拒否する。両peerを同じreleaseへ揃える必要があり、旧新の混在を成功互換としない。
+
+contextは保存sessionに結ばれた元のrevisionを署名検証し、その後、同じ監査transaction内で現行principal/runtimeのrevision・失効・期限を評価する。古いbindingに権限を付与せず、変更を`proof_invalid`へ潰さずに`session_revoked`または`revision_mismatch`として監査できる。署名不正・別session等は引き続き`proof_invalid`。BFFは失効/revision変更を401 `session_revoked`へ写像し、基盤不明は503にする。署名検証・response binding・deadline・nonce一回性・no retryの条件は維持する。

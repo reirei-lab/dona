@@ -1,5 +1,7 @@
 """停止更新の順序、crash再開、復旧境界を本番に触れず検証する。"""
 import copy
+import json
+import plistlib
 import os
 from pathlib import Path
 import signal
@@ -16,6 +18,49 @@ import offline_update as m
 
 def proc(pid, parent=1, state='S', start='Thu Oct 1 12:00:00 2026'):
     return dict(pid=pid, parent=parent, uid=os.getuid(), state=state, start=start)
+
+
+class RuntimeLaunchdScopeTests(unittest.TestCase):
+    def test_offline_runtime_observation_uses_four_service_scope(self):
+        live = m.common.Launchd(service_labels=m.LABELS)
+        with patch.object(m.common.subprocess, 'run', return_value=subprocess.CompletedProcess([],1,b'',b'Could not find service')) as run:
+            self.assertIsNone(live.observe(m.RUNTIME_LABEL))
+            self.assertTrue(run.call_args.args[0][-1].endswith('/'+m.RUNTIME_LABEL))
+            with self.assertRaisesRegex(RuntimeError,'label_scope'):
+                live.observe('dev.unrelated.service')
+            with self.assertRaisesRegex(RuntimeError,'label_scope'):
+                m.common.Launchd().observe(m.RUNTIME_LABEL)
+
+    def test_runtime_inventory_reads_actual_config_and_checks_live_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory);root=home/'control';root.mkdir()
+            plist_path=home/'Library/LaunchAgents'/(m.RUNTIME_LABEL+'.plist');plist_path.parent.mkdir(parents=True)
+            args=['/node',str(root/'runtime/dist/app-server/cli.js'),str(root/'runtime-config.json')]
+            plist={'Label':m.RUNTIME_LABEL,'ProgramArguments':args}
+            plist_path.write_bytes(plistlib.dumps(plist))
+            config={'database':str(root/'runtime.sqlite3'),'socket':str(root/'runtime.sock')}
+            config_path=Path(args[2]);config_path.write_text(json.dumps(config));config_path.chmod(0o600)
+            Path(config['database']).write_bytes(b'db')
+            def inventory():return {'policy':{'control_root':str(root),'main_agent':{'runtime':'app_server'}},'plists':{},'files':{},'services':{},'databases':['/db'+str(i) for i in range(4)]}
+            with patch.object(Path,'home',return_value=home),patch.object(m.common,'Launchd') as launch:
+                live=launch.return_value;live.observe.return_value={'pid':123}
+                live.process.return_value=str(os.getuid())+' Sun Oct 4 12:00:00 2026 '+' '.join(args)
+                inv=inventory();m.include_runtime_inventory(inv,require_running=True)
+                self.assertEqual(inv['databases'][-1],config['database'])
+                self.assertIn(str(config_path),inv['files'])
+                self.assertEqual(inv['services'][m.RUNTIME_LABEL]['pid'],123)
+                config_path.write_text(json.dumps({**config,'database':'/retired/runtime.sqlite3'}))
+                with self.assertRaisesRegex(RuntimeError,'runtime_storage_mismatch'):m.include_runtime_inventory(inventory(),True)
+                config_path.write_text(json.dumps(config))
+                live.process.return_value=str(os.getuid())+' /node /other/cli.js /other/config.json'
+                with self.assertRaisesRegex(RuntimeError,'runtime_process_identity'):m.include_runtime_inventory(inventory(),True)
+                live.observe.return_value=None
+                with self.assertRaisesRegex(RuntimeError,'runtime_service_not_running'):m.include_runtime_inventory(inventory(),True)
+                m.include_runtime_inventory(inventory(),False)  # 停止中の更新準備は可能。
+                plist_path.write_bytes(plistlib.dumps({**plist,'ProgramArguments':args[:2]+['/retired/runtime-config.json']}))
+                with self.assertRaisesRegex(RuntimeError,'runtime_plist_arguments'):m.include_runtime_inventory(inventory(),False)
+                plist_path.unlink()
+                with self.assertRaisesRegex(RuntimeError,'runtime_plist_missing'):m.include_runtime_inventory(inventory(),True)
 
 
 class ProcessTests(unittest.TestCase):
@@ -75,6 +120,7 @@ class FakeRunner(m.Runner):
     def __init__(self, phase='prepared', fail=None):
         self.journal={'phase':phase,'steps':[]}
         self.policy={'executables':{'herdr':'herdr'}}
+        self.inv={}
         self.calls=[]
         self.fail=fail
     def hit(self,name):
@@ -178,7 +224,7 @@ class SourceFreezeTests(unittest.TestCase):
         self.assertEqual(signals,[signal.SIGSTOP,signal.SIGCONT])
         runner.live.stop.assert_not_called()
         self.assertEqual(runner.journal['phase'],'aborted')
-        self.assertEqual(commands[-3:],[[ '/bin/launchctl','disable' if label=='dev.dona.slack-adapter' else 'enable','gui/fixture/'+label] for label in m.LABELS])
+        self.assertEqual(commands[-len(m.LABELS):],[[ '/bin/launchctl','disable' if label=='dev.dona.slack-adapter' else 'enable','gui/fixture/'+label] for label in m.LABELS])
         self.assertFalse(runner.journal['processes']);self.assertIsNone(runner.journal['source_stop_guard'])
 
     def test_crash_during_freeze_is_undone_before_source_preflight(self):
@@ -222,19 +268,21 @@ class RollbackPreparationTests(unittest.TestCase):
                  'plists':{'dev.dona.updater':{'WorkingDirectory':'/old/broken-updater'}},
                  'configs':{key:{'values':{'KEEP':'old'}} for key in ('dispatcher','slack')}}
             plan={'release':str(release),'node':'/new/node'}
-            with patch.object(m.common,'installed_codex',return_value='/new/codex'),patch.object(m,'command') as command:
+            with patch.object(m.common,'installed_codex',return_value='/new/codex'),patch.object(m.common,'target_required_checks',return_value=['old-required','Verify sources/web']),patch.object(m,'command') as command:
                 m.prepare_rollback(run,inv,plan)
             staged=run/'rollback/control/updater'
             self.assertFalse(staged.is_symlink())
             self.assertEqual((staged/'dist/adapters.js').read_text(),'current adapter accepts wBR:p1')
             self.assertEqual(m.read_json(run/'rollback/control/policy.json')['release_root'],'/old/releases')
+            self.assertEqual(m.read_json(run/'rollback/control/policy.json')['required_checks'],['old-required','Verify sources/web'])
+            self.assertNotIn('required_checks',inv['policy'])
             self.assertIn('/old/releases/sha', (run/'rollback/config/mcp-dispatcher.mjs').read_text())
             self.assertEqual(command.call_args.args[0][0],'/new/node')
             self.assertIn(str(staged/'dist/policy.js'),command.call_args.args[0][3])
 
     def test_rollback_main_start_uses_current_node_and_adapter_with_old_release(self):
         runner=FakeRunner();runner.run=Path('/fixture/run');runner.g=Path('/fixture/g')
-        runner.node='/new/node';runner.inv={'old_pointer':'/old/release','policy':{'executables':{'node':'/old/node'}}}
+        runner.node='/new/node';runner.inv={'old_pointer':'/old/release','policy':{'main_agent':{},'executables':{'node':'/old/node'}}}
         runner.policy['executables']={'herdr':'/fixture/herdr'}
         runner.journal['old_main']={'pane':'wBR:p1'}
         runner.ensure_herdr=lambda:None
@@ -325,13 +373,13 @@ class RenderTests(unittest.TestCase):
     def test_manifest_and_mcp_follow_the_next_current_pointer(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);g=root/'generation';release=g/'runtime/releases/first'
-            (release/'config').mkdir(parents=True);(release/'updater').mkdir()
+            (release/'config').mkdir(parents=True);(release/'updater').mkdir();(release/'dispatcher').mkdir()
             (release/'config/release-compatibility.json').write_text('{}')
             (release/'config/update-compatibility-transitions.json').write_text('{"transitions":[]}')
             (release/'release-manifest.json').write_text('first')
             token=root/'token';token.write_text('fixture-token')
             run=root/'run';run.mkdir()
-            policy={'executables':{},'dispatcher_internal_token_file':str(token)}
+            policy={'executables':{},'main_agent':{},'dispatcher_internal_token_file':str(token)}
             configs={'dispatcher':{'values':{},'config':{k:'fixture' for k in ('databasePath','resultsDir','jobResultsDir','jobProgressDatabasePath','updateNotificationDatabasePath','socketPath')}},
                      'slack':{'values':{},'config':{k:'fixture' for k in ('healthSocketPath','dispatcherSocketPath')}}}
             inv={'policy':policy,'configs':configs,'plists':{label:{'EnvironmentVariables':{}} for label in m.LABELS}}
@@ -369,6 +417,27 @@ class RestoreTests(unittest.TestCase):
         runner.health=lambda **_:None
         runner.migrate=lambda **_:None
         return runner
+
+    def test_reconciled_recreation_restores_and_retains_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);runner=self.fixture(root)
+            runner.policy={'executables':{'herdr':'herdr'}}
+            runner.live=unittest.mock.Mock();runner.live.observe.return_value=None;runner.live.domain='gui/test'
+            runner.validate_source=lambda:None
+            runner.journal.update(phase='stopped',plan_hash='plan',source_recreation_detected=True,
+                                  source_recreation_processes=[],source_recreation_services=[])
+            evidence={'schema_version':1,'plan_hash':'plan','observation_hash':m.recreation_observation_hash(runner.journal),
+                      'effects_reconciled':True,'cause_removed':True,'summary':'照合済み'}
+            file=root/'evidence.json';m.atomic(file,m.encode(evidence))
+            disabled='\n'.join('"'+label+'" => disabled' for label in m.LABELS)
+            with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]), \
+                 patch.object(m,'process_table',return_value={}), patch.object(m,'command',return_value=disabled):
+                runner.reconcile_source(file)
+                runner.restore()
+            saved=m.read_json(root/'journal.json')
+            self.assertEqual(saved['phase'],'rolled_back')
+            self.assertTrue(saved['source_recreation_detected'])
+            self.assertTrue(m.recreation_reconciled(saved))
 
     def test_corrupt_backup_is_rejected_before_any_database_is_replaced(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -438,11 +507,47 @@ class ActiveRunTests(unittest.TestCase):
             m.atomic(first/'journal.json',m.encode({'phase':'migrating'}))
             second=root/'second';second.mkdir();(second/'plan.json').write_text('{}')
             m.claim_run(first)
-            self.assertEqual(m.active_run(),first)
+            self.assertEqual(m.active_run(),first.resolve())
             with self.assertRaisesRegex(RuntimeError,'未完了'):m.claim_run(second)
             m.atomic(first/'journal.json',m.encode({'phase':'aborted'}))
             self.assertIsNone(m.active_run())
+            m.atomic(second/'plan.json',m.encode({'previous_offline_run':m.read_json(root/'.dona-maintenance/offline-active.json')}))
             m.claim_run(second)
+
+    def test_stale_prepared_run_cannot_replace_successful_owner(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(Path,'home',return_value=Path(directory)):
+            root=Path(directory);(root/'.dona-maintenance').mkdir()
+            owner=root/'.dona-maintenance/offline-active.json'
+            def prepare(name, previous):
+                run=root/name;run.mkdir()
+                m.atomic(run/'plan.json',m.encode({'previous_offline_run':previous}))
+                m.atomic(run/'journal.json',m.encode({'phase':'prepared'}))
+                return run
+            seed=prepare('seed',None);m.claim_run(seed)
+            m.atomic(seed/'journal.json',m.encode({'phase':'succeeded'}))
+            previous=m.read_json(owner)
+            stale=prepare('stale',previous);newer=prepare('newer',previous)
+            m.claim_run(newer)
+            current=owner.read_bytes()
+            m.claim_run(newer)  # 同じrunの再開は冪等。
+            self.assertEqual(owner.read_bytes(),current)
+            m.atomic(newer/'journal.json',m.encode({'phase':'succeeded'}))
+            with self.assertRaisesRegex(RuntimeError,'offline_owner_changed'):m.claim_run(stale)
+            self.assertEqual(owner.read_bytes(),current)
+            self.assertEqual(m.read_json(stale/'journal.json')['phase'],'prepared')
+            successor=prepare('successor',m.read_json(owner));m.claim_run(successor)
+            self.assertEqual(m.active_run(),successor.resolve())
+
+    def test_run_aliases_share_one_canonical_owner(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(Path,'home',return_value=Path(directory)):
+            root=Path(directory);(root/'.dona-maintenance').mkdir()
+            run=root/'run';run.mkdir();alias=root/'alias';alias.symlink_to(run)
+            m.atomic(run/'plan.json',m.encode({'previous_offline_run':None}))
+            m.atomic(run/'journal.json',m.encode({'phase':'stopped'}))
+            m.claim_run(alias)
+            self.assertEqual(m.read_json(root/'.dona-maintenance/offline-active.json')['run'],str(run.resolve()))
+            m.claim_run(run)
+            self.assertEqual(m.active_run(),run.resolve())
 
     def test_changed_plan_is_not_resumed_implicitly(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(Path,'home',return_value=Path(directory)):
@@ -452,9 +557,180 @@ class ActiveRunTests(unittest.TestCase):
             m.claim_run(run);(run/'plan.json').write_text('{"changed":true}')
             with self.assertRaisesRegex(RuntimeError,'active_run_changed'):m.active_run()
 
-if __name__ == '__main__':unittest.main()
 
 class FreshGenerationTests(unittest.TestCase):
+    def test_recreated_source_is_held_before_kill_and_cannot_auto_resume(self):
+        for phase in ('stopping','stopped','backed_up','migrating','migrated'):
+            runner=FakeRunner(phase);runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+            runner.journal['source_stop_receipt']={'processes':[proc(800001)]}
+            new=proc(800002)
+            with patch.object(m,'herdr_root',return_value=[new]), patch.object(m,'herdr_starting',return_value=[]), \
+                 patch.object(m,'process_table',return_value={new['pid']:new}), patch.object(m,'ProcessStop') as stop, \
+                 patch.object(runner,'switch_disabled') as disable:
+                with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):
+                    m.Runner.stop(runner)
+                stop.assert_not_called();disable.assert_not_called()
+            self.assertTrue(runner.journal['source_recreation_detected'])
+            self.assertEqual(runner.journal['source_recreation_processes'],[new])
+            with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):runner.execute()
+            self.assertNotIn('restore',runner.calls)
+            self.assertNotIn('main',runner.calls)
+
+    def test_execute_does_not_restore_after_source_recreation(self):
+        runner=FakeRunner('backed_up');runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+        runner.journal['source_stop_receipt']={'processes':[proc(800001)]}
+        runner.stop=m.Runner.stop.__get__(runner,m.Runner)
+        new=proc(800002)
+        with patch.object(m,'herdr_root',return_value=[new]), patch.object(m,'herdr_starting',return_value=[]), \
+             patch.object(m,'process_table',return_value={new['pid']:new}):
+            with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):runner.execute()
+        self.assertTrue(runner.journal['source_recreation_detected'])
+        self.assertNotIn('restore',runner.calls)
+        self.assertNotIn('main',runner.calls)
+
+    def test_known_rollback_activation_can_resume_but_unreconciled_source_cannot_restore(self):
+        runner=FakeRunner('restoring');runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+        runner.journal.update(source_stop_receipt={'processes':[proc(800001)]},rollback_activation_started=True)
+        root=proc(800002)
+        with patch.object(m,'herdr_root',side_effect=[[root],[]]), patch.object(m,'herdr_starting',return_value=[]), \
+             patch.object(m,'process_table',return_value={root['pid']:root}), patch.object(m,'ProcessStop') as stop, \
+             patch.object(runner,'switch_disabled'):
+            m.Runner.stop(runner)
+            stop.return_value.stop.assert_called_once()
+        self.assertNotIn('source_recreation_detected',runner.journal)
+        runner.journal['source_recreation_detected']=True
+        with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):m.Runner.restore(runner)
+
+    def test_normal_execution_checks_recreation_after_backup_and_before_activation(self):
+        for phase in ('stopped','migrated'):
+            runner=FakeRunner(phase);runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+            runner.journal['source_stop_receipt']={'processes':[proc(800001)]}
+            root=proc(800002)
+            with patch.object(m,'herdr_root',return_value=[root]), patch.object(m,'herdr_starting',return_value=[]):
+                with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):runner.execute()
+            self.assertTrue(runner.journal['source_recreation_detected'])
+            self.assertNotIn('main',runner.calls)
+            self.assertNotIn('migrate',runner.calls)
+            self.assertNotIn('restore',runner.calls)
+
+    def test_reconciliation_requires_matching_evidence_and_stopped_runtime_then_only_restores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner=FakeRunner('backed_up');runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+            runner.live.domain='gui/test'
+            runner.journal.update(plan_hash='sealed-plan',source_recreation_detected=True,
+                                  source_recreation_processes=[proc(800001)],source_recreation_services=[])
+            evidence={'schema_version':1,'plan_hash':'sealed-plan','observation_hash':m.recreation_observation_hash(runner.journal),
+                      'effects_reconciled':True,'cause_removed':True,'summary':'再生成原因と外部処理を照合済み。'}
+            file=Path(directory)/'evidence.json';m.atomic(file,m.encode(evidence))
+            disabled='\n'.join('"'+label+'" => disabled' for label in m.LABELS)
+            with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]), \
+                 patch.object(m,'process_table',return_value={800001:proc(800001)}), patch.object(m,'command',return_value=disabled):
+                with self.assertRaisesRegex(RuntimeError,'reconciliation_process_still_alive'):runner.reconcile_source(file)
+                self.assertEqual(runner.journal['phase'],'backed_up')
+            with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]), \
+                 patch.object(m,'process_table',return_value={}), patch.object(m,'command',return_value=''):
+                with self.assertRaisesRegex(RuntimeError,'services_not_disabled'):runner.reconcile_source(file)
+            with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]), \
+                 patch.object(m,'process_table',return_value={}), patch.object(m,'command',return_value=disabled):
+                evidence['observation_hash']='stale';m.atomic(file,m.encode(evidence))
+                with self.assertRaisesRegex(RuntimeError,'evidence_invalid'):runner.reconcile_source(file)
+                evidence['observation_hash']=m.recreation_observation_hash(runner.journal);m.atomic(file,m.encode(evidence))
+                runner.reconcile_source(file)
+            self.assertTrue(runner.journal['source_recreation_detected'])
+            self.assertTrue(m.recreation_reconciled(runner.journal))
+            self.assertEqual(runner.journal['phase'],'restoring')
+            runner.execute()
+            self.assertEqual(runner.calls,['restore'])
+            self.assertEqual(runner.journal['phase'],'rolled_back')
+
+    def test_recurrence_invalidates_reconciliation_and_captures_descendants(self):
+        runner=FakeRunner('restoring');runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+        runner.journal.update(plan_hash='plan',source_stop_receipt={'processes':[]},source_recreation_detected=True)
+        runner.journal['source_recreation_reconciliation']={'plan_hash':'plan','observation_hash':m.recreation_observation_hash(runner.journal),
+            'effects_reconciled':True,'cause_removed':True,'summary':'照合済み','operator_uid':os.getuid()}
+        root=proc(800001);child=proc(800002,800001)
+        with patch.object(m,'herdr_root',return_value=[root]), patch.object(m,'herdr_starting',return_value=[]), \
+             patch.object(m,'process_table',return_value={800001:root,800002:child}):
+            with self.assertRaisesRegex(RuntimeError,'requires_reconciliation'):runner.assert_source_stopped()
+        self.assertFalse(m.recreation_reconciled(runner.journal))
+        self.assertEqual(runner.journal['source_recreation_processes'],[root,child])
+        with self.assertRaisesRegex(RuntimeError,'requires_reconciliation'):runner.execute()
+
+    def test_registered_service_without_pid_is_also_recreation(self):
+        runner=FakeRunner('backed_up');runner.live=unittest.mock.Mock()
+        runner.live.observe.return_value={'registered':True,'pid':None}
+        runner.journal['source_stop_receipt']={'processes':[proc(800001)]}
+        with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]):
+            with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):runner.assert_source_stopped()
+        self.assertEqual(runner.journal['source_recreation_services'],list(m.LABELS))
+
+    def test_stops_orphan_group_when_app_server_root_already_exited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'runtime.sqlite3').touch()
+            runner=FakeRunner('prepared');runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+            runner.policy['control_root']=str(root);runner.node='node';runner.plan={'release':str(root)}
+            child={**proc(800002),'group':800001}
+            with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]), \
+                 patch.object(m,'process_table',return_value={800002:child}), patch.object(m,'ProcessStop') as stop, \
+                 patch.object(m.common,'NodeDatabase') as database, patch.object(runner,'switch_disabled'):
+                database.return_value.read.return_value=[(800001,'old-root')]
+                m.Runner.stop(runner)
+                self.assertEqual(stop.return_value.stop.call_args.args[0],[child])
+
+    def test_stopping_resume_keeps_previous_stop_receipt(self):
+        runner=FakeRunner('stopping');runner.live=unittest.mock.Mock()
+        runner.live.observe.return_value=None
+        runner.plan={'bundle':{'herdr-config.toml':'config-hash'}}
+        old=proc(800001)
+        runner.journal.update(source_stop_guard={'phase':'committed'},source_stop_receipt={'processes':[old]},processes=[])
+        with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]), \
+             patch.object(m,'process_table',return_value={}), patch.object(m,'ProcessStop'), patch.object(runner,'switch_disabled'):
+            m.Runner.stop(runner,check_source=True)
+        self.assertEqual(runner.journal['source_stop_receipt']['processes'],[old])
+        self.assertEqual(runner.journal['processes'],[])
+
+    def test_preserve_migration_passes_task_resume_only_with_stopped_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);runner=object.__new__(m.Runner)
+            runner.plan={'mode':'preserve','release':str(root/'release'),'target_sha':'a'*40}
+            runner.g=root/'target';(runner.g/'control').mkdir(parents=True)
+            runner.run=root/'prepared';runner.node='/node'
+            runner.policy={'main_agent':{'runtime':'app_server'}}
+            runner.inv={'databases':[str(root/str(i)) for i in range(4)],
+                        'policy':{'control_root':str(root/'old-control'),'main_agent':{'runtime':'app_server'}},'old_results':[str(root/'events'),str(root/'jobs')]}
+            runner.journal={'source_stop_receipt':{'verified_at':'now','processes':[]}}
+            with patch.object(m,'command') as call:
+                runner.migrate()
+                request=m.json.loads(call.call_args.kwargs['input'])
+                self.assertEqual(request['task_resume'],{'result_dir':str(root/'jobs')})
+                self.assertEqual(request['runtime_migration']['stop_receipt'],runner.journal['source_stop_receipt'])
+                call.reset_mock();runner.migrate(retire_only=True)
+                self.assertNotIn('task_resume',m.json.loads(call.call_args.kwargs['input']))
+                runner.inv['policy']['main_agent']['runtime']='herdr'
+                call.reset_mock();runner.migrate()
+                self.assertNotIn('task_resume',m.json.loads(call.call_args.kwargs['input']))
+
+    def test_runtime_restart_snapshots_current_tasks_except_rollback_and_fresh(self):
+        for old, mode in [(False,'preserve'),(True,'preserve'),(False,'fresh_generation')]:
+            with self.subTest(old=old, mode=mode), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);runner=object.__new__(m.Runner)
+                runner.plan={'mode':mode,'release':str(root/'release')}
+                runner.g=root/'target';runner.run=root/'prepared-run';runner.node='/node'
+                control=root/'control';control.mkdir();(control/'runtime.sqlite3').touch()
+                runner.policy={'control_root':str(control)}
+                runner.inv={'policy':runner.policy,'databases':[str(root/'dispatcher')],
+                            'old_results':[str(root/'events'),str(root/'jobs')]}
+                runner.journal={'last_stop_receipt':{'processes':[],'verified_at':'now'}}
+                runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+                with patch.object(m,'command',side_effect=RuntimeError('migration captured')) as call:
+                    with self.assertRaisesRegex(RuntimeError,'migration captured'):runner.start_app_server_main(old)
+                    request=m.json.loads(call.call_args.kwargs['input'])
+                    self.assertTrue(request['runtime_only'])
+                    if not old and mode=='preserve':
+                        self.assertEqual(request['run_id'],'prepared-run')
+                        self.assertEqual(request['task_resume'],{'result_dir':str(root/'jobs')})
+                    else:self.assertNotIn('task_resume',request)
+
     def test_fresh_migration_requires_stop_receipt_and_only_targets_new_paths(self):
         runner=object.__new__(m.Runner)
         runner.plan={'mode':'fresh_generation','release':'/target/release','target_sha':'a'*40}
@@ -467,6 +743,7 @@ class FreshGenerationTests(unittest.TestCase):
             runner.migrate()
             request=m.json.loads(call.call_args.kwargs['input'])
             self.assertTrue(request['fresh_generation'])
+            self.assertNotIn('task_resume',request)
             self.assertTrue(all(p.startswith('/new-generation/') for p in request['databases']))
             call.reset_mock();runner.migrate(retire_only=True);call.assert_not_called()
 
@@ -496,11 +773,11 @@ class FreshGenerationTests(unittest.TestCase):
     def test_fresh_render_uses_isolated_state_and_preserves_source_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);g=root/'new';release=g/'runtime/releases/target'
-            (release/'updater').mkdir(parents=True);(release/'config').mkdir()
+            (release/'updater').mkdir(parents=True);(release/'config').mkdir();(release/'dispatcher').mkdir()
             m.atomic(release/'config/release-compatibility.json',m.encode({'schema_version':1,'app_schema_write':4}))
             m.atomic(release/'config/update-compatibility-transitions.json',m.encode({'transitions':[]}))
             run=root/'run';run.mkdir();(run/'main_bridge.mjs').write_text('fixture')
-            inv={'policy':{'executables':{'node':'/old-node','codex':'/old-codex'}},
+            inv={'policy':{'main_agent':{},'executables':{'node':'/old-node','codex':'/old-codex'}},
                  'configs':{key:{'values':{'DONA_DATABASE_PATH':'/old/db'}} for key in ('dispatcher','slack')},
                  'databases':['/old/db'], 'old_results':['/old/results'],
                  'plists':{label:{'EnvironmentVariables':{}} for label in m.LABELS}}
@@ -513,3 +790,127 @@ class FreshGenerationTests(unittest.TestCase):
             self.assertEqual(plist['EnvironmentVariables']['DONA_DATABASE_PATH'],str(g/'dona.sqlite3'))
             self.assertEqual(plist['EnvironmentVariables']['DONA_JOB_RESULTS_DIR'],str(g/'job-results'))
             self.assertEqual(m.read_json(g/'control/policy.json')['dispatcher_socket'],str(g/'run/d.sock'))
+
+
+class DashboardUpdateTests(unittest.TestCase):
+    def fixture(self, root):
+        release=root/'old';control=root/'control';control.mkdir()
+        entry=release/'dispatcher/dist/dashboard/cli.js';entry.parent.mkdir(parents=True);entry.write_text('')
+        config={'schema_version':1,'origin':'https://dashboard.example','port':4318,
+                'control_socket':str(root/'dashboard.sock'),'dispatcher_database':str(root/'d.sqlite3'),
+                'dispatcher_socket':str(root/'d.sock'),'runtime_socket':str(control/'runtime.sock')}
+        file=root/'dashboard.json';m.atomic(file,m.encode(config))
+        plist={'Label':m.DASHBOARD_LABEL,'ProgramArguments':['/node',str(entry),'serve',str(file)],'KeepAlive':True}
+        target=root/'Library/LaunchAgents'/(m.DASHBOARD_LABEL+'.plist');target.parent.mkdir(parents=True)
+        target.write_bytes(plistlib.dumps(plist))
+        inv={'policy':{'executables':{'node':'/node'},'control_root':str(control),'dispatcher_socket':config['dispatcher_socket']},
+             'old_pointer':str(release),'databases':[config['dispatcher_database']], 'files':{},'plists':{},'services':{}}
+        return inv,config,file,target
+
+    def test_inventory_captures_config_and_live_identity_and_rejects_other_instance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();inv,config,file,plist=self.fixture(root)
+            with patch.object(Path,'home',return_value=root),patch.object(m,'command'),patch.object(m.common,'Launchd') as launch:
+                live=launch.return_value;live.observe.return_value={'pid':42}
+                live.process.return_value=str(os.getuid())+' '+' '.join(plistlib.loads(plist.read_bytes())['ProgramArguments'])
+                m.include_dashboard_inventory(inv)
+                self.assertEqual(inv['dashboard'],config)
+                self.assertIn(str(file),inv['files']);self.assertIn(str(plist),inv['files'])
+                self.assertIn('identity_hash',inv['services'][m.DASHBOARD_LABEL])
+                m.atomic(file,m.encode(dict(config,dispatcher_database='/other/db')))
+                with self.assertRaisesRegex(RuntimeError,'dashboard_instance_mismatch'):m.include_dashboard_inventory(inv)
+                plist.unlink()
+                with self.assertRaisesRegex(RuntimeError,'dashboard_plist_missing'):m.include_dashboard_inventory({})
+                live.observe.return_value=None
+                absent={};m.include_dashboard_inventory(absent);self.assertEqual(absent,{})
+
+    def test_render_install_restore_preserves_old_config_and_targets_new_generation(self):
+        for mode in ('preserve','fresh_generation'):
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory).resolve();inv,config,file,plist=self.fixture(root)
+                inv['dashboard']=config;inv['plists'][m.DASHBOARD_LABEL]=plistlib.loads(plist.read_bytes())
+                before=file.read_bytes();old_plist=plist.read_bytes()
+                g=root/'new';(g/'config').mkdir(parents=True);(g/'control').mkdir();run=root/'run';(run/'plists').mkdir(parents=True)
+                policy={'dispatcher_socket':str(root/'new-d.sock'),'current_pointer':str(g/'runtime/current')}
+                m.atomic(g/'control/policy.json',m.encode(policy))
+                plan={'generation':str(g),'release':str(g/'runtime/releases/sha'),'node':'/new/node','mode':mode}
+                with patch.object(m,'command'):
+                    m.render_dashboard(run,plan,inv)
+                actual=m.read_json(g/'config/dashboard.json')
+                self.assertEqual(actual['runtime_socket'],str(g/'control/runtime.sock'))
+                self.assertEqual(actual['dispatcher_socket'],policy['dispatcher_socket'])
+                self.assertEqual(actual['dispatcher_database'],str(g/'dona.sqlite3') if mode=='fresh_generation' else config['dispatcher_database'])
+                for key in ('origin','port','control_socket'):self.assertEqual(actual[key],config[key])
+                self.assertEqual(file.read_bytes(),before)
+                runner=object.__new__(m.Runner);runner.inv=inv;runner.run=run
+                for label in m.LABELS:
+                    inv['plists'][label]={'Label':label};(run/'plists'/(label+'.plist')).write_bytes(plistlib.dumps({'Label':label}))
+                with patch.object(Path,'home',return_value=root):
+                    runner.install()
+                    args=plistlib.loads(plist.read_bytes())['ProgramArguments']
+                    self.assertEqual(args,['/new/node',str(g/'runtime/current/dispatcher/dist/dashboard/cli.js'),'serve',str(g/'config/dashboard.json')])
+                    runner.install(old=True)
+                self.assertEqual(plist.read_bytes(),old_plist);self.assertEqual(file.read_bytes(),before)
+
+    def test_installed_dashboard_is_started_and_failed_health_resumes_forward(self):
+        runner=FakeRunner(fail='health');runner.inv={'dashboard':{}}
+        with patch.object(m,'herdr_root',return_value=[]):
+            with self.assertRaisesRegex(RuntimeError,'health'):runner.execute()
+            self.assertIn(m.DASHBOARD_LABEL,runner.calls)
+            self.assertNotIn('restore',runner.calls)
+            self.assertEqual(runner.journal['phase'],'activating')
+            runner.fail=None;runner.execute()
+            self.assertEqual(runner.journal['phase'],'succeeded')
+        self.assertIn(m.DASHBOARD_LABEL,runner.labels)
+        self.assertNotIn(m.DASHBOARD_LABEL,FakeRunner().labels)
+
+    def test_dashboard_health_checks_version_and_propagates_conversation_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'config').mkdir()
+            m.atomic(root/'config/dashboard.json',m.encode({'control_socket':'/dashboard.sock'}))
+            runner=object.__new__(m.Runner);runner.g=root;runner.inv={'dashboard':{}};runner.node='/node'
+            runner.plan={'target_sha':'target','release':'/release'}
+            with patch.object(m.common,'http_unix',return_value={'version':'stale','mode':'paired_operator'}),patch.object(m.time,'monotonic',side_effect=[0,61]),patch.object(m,'command') as command:
+                with self.assertRaisesRegex(RuntimeError,'health_timeout_dashboard'):runner.dashboard_health()
+                command.assert_not_called()
+            with patch.object(m.common,'http_unix',return_value={'version':'target','mode':'paired_operator'}),patch.object(m,'command',side_effect=RuntimeError('runtime_unavailable')):
+                with self.assertRaisesRegex(RuntimeError,'runtime_unavailable'):runner.dashboard_health()
+
+    def test_optional_absence_render_has_no_side_effects(self):
+        with patch.object(m,'atomic') as write:m.render_dashboard(Path('/run'),{},{});write.assert_not_called()
+
+
+    def test_config_drift_and_dashboard_added_after_prepare_abort_before_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();inv,config,file,plist=self.fixture(root)
+            inv['dashboard']=config;inv['files'][str(file)]=m.common.file_digest(file)
+            runner=object.__new__(m.Runner);runner.inv=inv;runner.plan={}
+            m.atomic(file,m.encode(dict(config,port=4320)))
+            with self.assertRaisesRegex(RuntimeError,'source_configuration_changed'):runner.validate_source()
+            runner.inv={}
+            with patch.object(Path,'home',return_value=root):
+                with self.assertRaisesRegex(RuntimeError,'dashboard_added_after_prepare'):runner.validate_source()
+
+    def test_dashboard_is_in_stop_receipt_and_unregistered_before_migration(self):
+        runner=FakeRunner();runner.inv={'dashboard':{}};runner.live=unittest.mock.Mock();runner.live.domain='gui/fixture'
+        runner.live.observe.return_value=None
+        with patch.object(m,'herdr_root',return_value=[]),patch.object(m,'herdr_starting',return_value=[]),patch.object(m,'process_table',return_value={}),patch.object(m,'command'):
+            m.Runner.stop(runner)
+        self.assertIn(m.DASHBOARD_LABEL,runner.journal['last_stop_receipt']['launch_agents'])
+        runner.live.stop.assert_any_call(m.DASHBOARD_LABEL)
+
+    def test_archive_uses_private_write_permissions_even_with_permissive_git_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);repo=root/'repo';repo.mkdir();archive=root/'source.tar'
+            subprocess.run(['git','init','-q',str(repo)],check=True)
+            (repo/'source.c').write_text('int main() {}')
+            subprocess.run(['git','-C',str(repo),'add','source.c'],check=True)
+            subprocess.run(['git','-C',str(repo),'-c','user.name=Test','-c','user.email=test@example.com','commit','-qm','fixture'],check=True)
+            subprocess.run(['git','-C',str(repo),'config','tar.umask','0000'],check=True)
+            release=root/'release';release.mkdir()
+            m.archive_source('git',repo,'HEAD',archive,release)
+            self.assertEqual((release/'source.c').stat().st_mode&0o777,0o644)
+            self.assertFalse(archive.exists())
+
+
+if __name__ == '__main__':unittest.main()

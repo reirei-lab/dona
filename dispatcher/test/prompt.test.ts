@@ -48,3 +48,17 @@ test("通常のSlack eventとdona_jobだけにスレッド開示方針と安全�
   assert.doesNotMatch(scheduledResult, /automatic approvalで拒否された場合/);
   assert.match(scheduledResult, /schedule ownerの通知だけはAGENTS.mdに定めた二段階認可/);
 });
+
+test('外部承認terminalだけを保存sourceと固定宛先でmainへ渡し、不明型やdraft注入を拒否する',async()=>{
+ const {envelopeFromRow}=await import('../src/prompt.js');
+ const subject={workspace_id:'T_TEST',channel_id:'C_TEST',thread_ts:'1.0',actor_id:'U_TEST'},payload={request_id:'request_one',source_event_id:'evt_'+'0'.repeat(26),state:'succeeded'};
+ const row={schema_version:1,source:'dona_approval',external_event_id:'external:request_one:terminal',event_type:'external_approval_finished',occurred_at:'2026-10-05T00:00:00Z',subject_json:JSON.stringify(subject),payload_json:JSON.stringify(payload),reply_target_json:JSON.stringify({kind:'slack_thread',workspace_id:subject.workspace_id,channel_id:subject.channel_id,thread_ts:subject.thread_ts}),trace_json:null};
+ assert.equal(envelopeFromRow(row).source,'dona_approval');
+ for(const change of [{schema_version:2},{event_type:'post_message'},{external_event_id:'external:other:terminal'},{payload_json:JSON.stringify({...payload,state:'pending'})},{payload_json:JSON.stringify({...payload,text:'draft'})},{payload_json:JSON.stringify({...payload,source_event_id:'unbound'})},{reply_target_json:JSON.stringify({kind:'slack_thread',workspace_id:'T_OTHER',channel_id:'C_TEST',thread_ts:'1.0'})},{trace_json:JSON.stringify({text:'untrusted draft'})}])assert.throws(()=>envelopeFromRow({...row,...change}));
+});
+
+
+test('外部承認通知は現在通知IDと保存宛先への非broadcast投稿を指示する',()=>{
+ const prompt=buildEventPrompt('evt_current','/tmp/result.json',{...envelope,source:'dona_approval'});
+ for(const instruction of ['保存reply_targetのworkspace/channel/thread','今回の通知event_id','payload.source_event_idで代用しない','reply_broadcast:false','mrkdwn:true','parse:none','schedule専用authorize_job_notificationは呼ばない','同じ本文を再投稿しない'])assert.ok(prompt.includes(instruction));
+});

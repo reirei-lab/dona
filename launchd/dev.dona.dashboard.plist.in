@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>dev.dona.dashboard</string>
+<key>ProgramArguments</key><array><string>__NODE__</string><string>__RELEASE__/dispatcher/dist/dashboard/cli.js</string><string>serve</string><string>__CONFIG__</string></array>
+<key>WorkingDirectory</key><string>__RELEASE__</string>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+<key>ThrottleInterval</key><integer>30</integer>
+<key>ExitTimeOut</key><integer>10</integer>
+<key>Umask</key><integer>63</integer>
+<key>ProcessType</key><string>Background</string>
+<key>StandardOutPath</key><string>__LOG_ROOT__/dashboard.log</string>
+<key>StandardErrorPath</key><string>__LOG_ROOT__/dashboard.error.log</string>
+</dict></plist>

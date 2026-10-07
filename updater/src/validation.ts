@@ -171,7 +171,8 @@ export function parseReleaseManifest(input: unknown): ReleaseManifest {
   }
   const policyVersion = string(value.policy_version, /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/, "release manifest policy_version");
   const locks = object(value.lock_hashes, "release manifest lock_hashes");
-  exactKeys(locks, ["dispatcher", "sources/slack", "updater"], "release manifest lock_hashes");
+  // Legacy releases remain inspectable for rollback; newly built releases include Web.
+  exactKeys(locks, ["dispatcher", "sources/slack", "updater", ...(Object.hasOwn(locks, "sources/web") ? ["sources/web"] : [])], "release manifest lock_hashes");
   const builtAt = string(value.built_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/, "release manifest built_at");
   if (Number.isNaN(Date.parse(builtAt))) throw new ValidationError("release manifest built_at is invalid");
   const version = /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$/;
@@ -188,6 +189,7 @@ export function parseReleaseManifest(input: unknown): ReleaseManifest {
       dispatcher: string(locks.dispatcher, hashPattern, "dispatcher lock hash"),
       "sources/slack": string(locks["sources/slack"], hashPattern, "sources/slack lock hash"),
       updater: string(locks.updater, hashPattern, "updater lock hash"),
+      ...(Object.hasOwn(locks, "sources/web") ? { "sources/web": string(locks["sources/web"], hashPattern, "sources/web lock hash") } : {}),
     },
     node_version: string(value.node_version, version, "release manifest node_version"),
     npm_version: string(value.npm_version, version, "release manifest npm_version"),

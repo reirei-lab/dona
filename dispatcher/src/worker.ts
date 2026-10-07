@@ -1,3 +1,4 @@
+import type { AgentContextManager } from "./agent-context.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -55,6 +56,7 @@ export class DispatcherWorker {
     private readonly logger: Logger,
     private readonly notificationVerifier?:JobNotificationVerifier,
     private readonly wakeJobSupervisor: () => void = () => {},
+    private readonly agentContexts?: AgentContextManager,
   ) {}
 
   isRunning(): boolean {
@@ -129,6 +131,7 @@ export class DispatcherWorker {
     if (this.stopping || preflight.aborted) return;
     const current=this.database.get(row.event_id);
     if(current?.status!==row.status) return;
+    if(preflight.errorCode==="runtime_capacity_wait")return;
     if (!preflight.ok || !preflight.agentStatus) {
       const updated = this.database.recordPreDispatchFailure(
         row.event_id,
@@ -174,8 +177,9 @@ export class DispatcherWorker {
 
     const dispatching = this.database.beginDispatch(row.event_id, resultPath);
     if(dispatching.status==="completed") return;
+    await this.prepareStatusContext(dispatching);
     const prompt = buildEventPrompt(row.event_id, resultPath, envelopeFromRow(row));
-    const prompted = await this.herdr.prompt(prompt, this.abortController.signal);
+    const prompted = await this.herdr.prompt(prompt, this.abortController.signal, `event:${row.event_id}`);
     const afterPrompt=this.database.get(row.event_id);
     if(!afterPrompt||!["dispatching","waiting_agent"].includes(afterPrompt.status)) return;
     if (prompted.aborted || this.stopping) {
@@ -226,6 +230,13 @@ export class DispatcherWorker {
     await this.resumeWaiting(waiting);
   }
 
+  private async prepareStatusContext(row:EventRow):Promise<void> {
+    if(!this.agentContexts)return;
+    // 未署名eventの既存処理は保持し、status権限だけをdefault denyにする。
+    if(row.source!=="dona_job"&&(row.source!=="slack"||!this.database.getVerifiedPrincipalBinding(row.event_id))) { await this.agentContexts.revoke(); return; }
+    try { await this.agentContexts.ensure(row); } catch { await this.agentContexts.revoke(); }
+  }
+
   private async resumeWaiting(row: EventRow): Promise<void> {
     if (!row.result_path) {
       this.database.markNeedsReview(row.event_id, "missing_result_path", "waiting_agent event has no result path");
@@ -234,12 +245,18 @@ export class DispatcherWorker {
 
     const existing = await this.tryComplete(row, false);
     if (existing) return;
+    await this.prepareStatusContext(row);
     const started = Date.now();
     const waited = await this.herdr.wait(this.abortController.signal);
     if(this.database.get(row.event_id)?.status!=="waiting_agent") return;
     if (waited.aborted || this.stopping) return;
     if (!waited.ok) {
       const errorCode = waited.errorCode ?? (waited.timedOut ? "agent_wait_timeout" : "agent_wait_failed");
+      if(errorCode==="runtime_turn_interrupted") {
+        // turnの終端は既知だが、外部操作の完了はResultでしか確定しない。再送せず次eventへ進む。
+        if(!await this.tryComplete(row,false))this.database.markNeedsReview(row.event_id,errorCode,"Main turn ended without a Result; accepted prompt was not resent");
+        this.logCurrentTransition(row,started);return;
+      }
       if (unavailableAgentErrors.has(errorCode)) {
         const unavailableSince = unavailableAgentErrors.has(row.last_error_code ?? "")
           ? Date.parse(row.updated_at)

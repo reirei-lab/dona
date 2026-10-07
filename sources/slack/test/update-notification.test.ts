@@ -314,3 +314,33 @@ describe("SlackUpdateNotificationReporter", () => {
     assert.equal(client.statusCount, 1);
   });
 });
+
+test("status membershipはbot・不明state・shared・private/public開示を現在値で再確認する",async()=>{
+ const {client,reporter}=await reporterFixture();
+ const input={schema_version:1 as const,event_id:"evt_01m1zfewbjx8v0844yrrkqwzc7",workspace_id:"T123",channel_id:"C123",user_id:"U_TEST",status_summary:true};
+ let user:SlackUser={id:"U_TEST",teamId:"T123",stateKnown:true,isBot:false,isAppUser:false,isDeleted:false};
+ let channel:SlackChannel={id:"C123",visibilityKnown:true,isPrivate:false,isArchived:false,isMember:true,isShared:false};
+ let member=true,reads=0;
+ client.getUser=async()=>{reads++;return user;};client.getChannel=async()=>channel;client.hasChannelMember=async()=>member;
+ assert.equal((await reporter.confirmScheduleAccess(input)).authorized,true);
+ assert.equal((await reporter.confirmScheduleAccess(input)).authorized,true);assert.equal(reads,2);
+ for(const patch of [{isBot:true},{isAgentforceBot:true},{isAppUser:true},{isDeleted:true},{stateKnown:false},{teamId:"T_OTHER"},{id:"U_OTHER"}]) {
+  const saved=user;user={...user,...patch};await assert.rejects(reporter.confirmScheduleAccess(input));user=saved;
+ }
+ for(const patch of [{isShared:true},{isArchived:true},{visibilityKnown:false},{isMember:false},{id:"C_OTHER"}]) {
+  const saved=channel;channel={...channel,...patch};await assert.rejects(reporter.confirmScheduleAccess(input));channel=saved;
+ }
+ const human=user;user={...user,id:"USLACKBOT"};await assert.rejects(reporter.confirmScheduleAccess({...input,user_id:"USLACKBOT"}));user=human;
+ member=false;await assert.rejects(reporter.confirmScheduleAccess(input));member=true;
+ channel={...channel,isPrivate:true,isMember:false};assert.equal((await reporter.confirmScheduleAccess(input)).authorized,true);
+ channel={...channel,id:"D123",isIm:true,userId:"U_OTHER"};await assert.rejects(reporter.confirmScheduleAccess({...input,channel_id:"D123"}));
+ client.getUser=async()=>{throw Error("provider stopped");};await assert.rejects(reporter.confirmScheduleAccess(input));
+});
+
+test("status cancellation reaches user/channel/member reads and refuses a late answer",async()=>{
+ const {client,reporter}=await reporterFixture(),controller=new AbortController();let active=0;const reads:SlackApiClient=client;
+ reads.getUser=async(_id,signal)=>{assert.ok(signal);return {id:"U_TEST",teamId:"T123",stateKnown:true,isBot:false,isAppUser:false,isDeleted:false};};
+ reads.getChannel=async(_id,signal)=>{assert.ok(signal);return {id:"C123",visibilityKnown:true,isPrivate:false,isArchived:false,isMember:true,isShared:false};};
+ reads.hasChannelMember=async(_channel,_user,signal)=>{assert.ok(signal);active++;return new Promise<boolean>((_resolve,reject)=>{signal.addEventListener("abort",()=>{active--;reject(signal.reason);},{once:true});setTimeout(()=>controller.abort(),25);});};
+ await assert.rejects(reporter.confirmScheduleAccess({schema_version:1,event_id:"evt_01m1zfewbjx8v0844yrrkqwzc7",workspace_id:"T123",channel_id:"C123",user_id:"U_TEST",status_summary:true},controller.signal));assert.equal(active,0);
+});

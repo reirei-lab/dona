@@ -135,6 +135,9 @@ const db=new Database(source,{{readonly:true,fileMustExist:true}});
 try {{
   if(operation==='read') console.log(JSON.stringify(db.prepare(args.sql).raw().all(...args.values)));
   else {{
+    // Pin the exclusion and backup to one snapshot, including WAL history.
+    db.exec('BEGIN');
+    if(db.pragma('main.application_id',{{simple:true}})!==0 || db.prepare("SELECT 1 FROM main.sqlite_schema WHERE lower(name) IN ('approval_schema','web_auth_schema','approval_payload_secrets','web_auth_payloads') LIMIT 1").get()) throw Error('schema_full_backup_payload_store_forbidden');
     const start=Date.now();
     await db.backup(args.destination,{{progress:()=>{{if(Date.now()-start>60000)throw Error('backup_timeout');return 256;}}}});
     const snapshot=new Database(args.destination,{{readonly:true,fileMustExist:true}});
@@ -171,12 +174,13 @@ class LaunchdRejected(RuntimeError):
 
 
 class Launchd:
-    def __init__(self, maintenance_label=None):
+    def __init__(self, maintenance_label=None, service_labels=LABELS):
         self.maintenance_label = maintenance_label
+        self.service_labels = frozenset(service_labels)
         self.domain = 'gui/' + str(os.getuid())
 
     def observe(self, label):
-        require(label in LABELS or label == self.maintenance_label, 'label_scope')
+        require(label in self.service_labels or label == self.maintenance_label, 'label_scope')
         r = subprocess.run(['/bin/launchctl', 'print', self.domain + '/' + label], capture_output=True, timeout=5)
         if r.returncode != 0:
             # 他のエラー（権限やdomain不在）を未登録と取り違えない。
@@ -315,6 +319,17 @@ def cleanup_unpublished_generation(generation, identity):
     shutil.rmtree(generation)
 
 
+def build_release_components(release, generation, policy):
+    """manifestが要求する全componentを同じ隔離release内に配置する。"""
+    npm = policy['executables']['npm']
+    for component in ('dispatcher', 'sources/slack', 'sources/web', 'updater'):
+        staging_space(generation, policy)
+        command([npm, 'ci'], cwd=release/component, timeout=900)
+        staging_space(generation, policy)
+        command([npm, 'run', 'build'], cwd=release/component, timeout=180)
+        staging_space(generation, policy, reserve=False)
+
+
 def prepare(run, repository, event_id, job_id, snapshot_old_databases=False):
     require(re.fullmatch(r'evt_[0-9A-HJKMNP-TV-Z]{26}', event_id, re.I), 'event_id')
     require(re.fullmatch(r'job_[0-9a-hjkmnp-tv-z]{26}', job_id, re.I), 'job_id')
@@ -351,12 +366,7 @@ def prepare(run, repository, event_id, job_id, snapshot_old_databases=False):
         target_trust = verify_trust(sha, dict(inv['policy'], required_checks=target_checks))
         npm = inv['policy']['executables']['npm']
         node = inv['policy']['executables']['node']
-        for component in ('dispatcher', 'sources/slack', 'updater'):
-            staging_space(generation, inv['policy'])
-            command([npm, 'ci'], cwd=release/component, timeout=900)
-            staging_space(generation, inv['policy'])
-            command([npm, 'run', 'build'], cwd=release/component, timeout=180)
-            staging_space(generation, inv['policy'], reserve=False)
+        build_release_components(release, generation, inv['policy'])
         command([node, str(release/'scripts/write-release-manifest.mjs'), str(release), sha,
                  command([npm, '--version']), inv['policy']['policy_version']])
         for p in ('config', 'control', 'results', 'job-results', 'run', 'logs'):

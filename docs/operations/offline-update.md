@@ -25,6 +25,7 @@ schema 3以前からschema 4へ移る場合、履歴保持の通常モードは�
 - 3サービスの自動起動を抑止し、Dona専用Herdr sessionとその時点の子孫を凍結・終了する。PID/start identityと停止確認をrunへ保存する。管理外daemonや外部サービスの停止は別の確認対象である。
 - 旧4DBとResultをbackupし、原位置にも保持する。旧DBをmigration・削除・retireしない。
 - 新世代の4DB・Result・socketを独立したpathにする。schedule、Task、旧job、未処理eventは自動移行・再送しない。worktreeと未commit成果を残し、残作業は別途棚卸しして登録する。
+- このresetは旧workerの完了を前提にせず、停止直前に受理されたqueued eventも旧DB snapshotへ保全する。operatorは停止時点のsnapshotから受付済み未完了依頼も棚卸しし、必要な作業を新しい依頼として登録する。受付履歴をそのまま継続する更新には、DBを保持する通常モードを使う。
 - 新mainの起動前の失敗では旧設定へ戻せる。旧DBをsnapshotで上書きしない。新main起動intent以後は新世代を保持して同じrunで前進復旧する。
 
 ```sh
@@ -43,7 +44,7 @@ schedule・jobを空DBで初期化せず、repository・worktree・未commit成�
 既存のlaunchd plistとdotenvから実際のpathを読むため、標準installと世代別installの両方に対応します。
 停止済みサービスからでも準備できます。Slack tokenなどを標準出力へ出しません。
 
-停止対象は`dev.dona.dispatcher`、`dev.dona.slack-adapter`、`dev.dona.updater`と、
+停止対象は`dev.dona.dispatcher`、`dev.dona.slack-adapter`、`dev.dona.updater`、`dev.dona.runtime`、導入済みの`dev.dona.dashboard`と、
 専用Herdr session **`dona`** のserver/clientおよび観測した子孫です。
 作業中のDona workerも終了するので、外部への操作が途中だったjobは通常の復旧処理で確認対象になり得ます。
 それを成功扱いに変えたり、古いjobを一括再実行したりはしません。
@@ -56,10 +57,18 @@ schedule・jobを空DBで初期化せず、repository・worktree・未commit成�
 すでにDispatcherへ渡った通知やSlackへの投稿を取り消したことにはしません。
 通常self-updateの承認条件を緩める変更ではありません。
 
+## ダッシュボードの切り替え
+
+`dev.dona.dashboard`のLaunchAgentが導入済みなら、停止更新の対象に自動で含めます。準備時に実行版と接続先が同じDonaを指すことを照合し、元設定の変更を停止直前にも検出します。未導入の場合は追加・起動しません。
+
+新世代の`config/dashboard.json`へ設定を生成し、実行版、Runtime socket、Dispatcher socket、DB、release pointerを更新先に揃えます。公開URL、port、control socketは保持し、元の設定ファイルは変更しません。通常更新では端末登録を保持し、空DB切り替えでは新DBを使います。
+
+更新成功にはダッシュボードのexact SHAと、同じ設定・observerを使ったDona本体の会話一覧取得も必要です。起動後にこの確認が失敗した場合は、新データを保持して同じrunの`resume`で前進復旧します。新main起動前の復旧では元のLaunchAgentと設定へ戻します。ブラウザ上の描画確認は別に行います。
+
 ## 更新の順序
 
 1. 設定を読み、mainのSHAと必須CIを確認する。独立領域で各componentの`npm ci`、test、typecheck、buildを完了する。生成した設定で両MCPのinitialize・tools/listも確認し、停止直前にも再確認する。この間はサービスを稼働させたままにする。
-2. 準備物と元設定を照合し、3つのLaunchAgentをdisableする。対象プロセスを親から順に`SIGSTOP`してforkを止めてから子を列挙する。停止対象のPID・UID・開始時刻をjournalへ記録し、launchd登録を外した後、同じidentityの子孫と親を終了する。
+2. 準備物と元設定を照合し、対象のLaunchAgentをdisableする。対象プロセスを親から順に`SIGSTOP`してforkを止めてから子を列挙する。停止対象のPID・UID・開始時刻をjournalへ記録し、launchd登録を外した後、同じidentityの子孫と親を終了する。
 3. 全4DBをDonaと同じNode SQLiteでWAL込みbackupし、integrity checkを行う。Result directoryもcopyし、復旧用hashを記録する。
 4. target版の正規DB migrationを適用する。コード・設定は新しい世代に置き、旧世代を保持する。activeなUpdater ledgerの自動再開を終了する。
 5. run専用のHerdr設定で`resume_agents_on_restore=false`を指定し、旧main・workerのnative conversationを自動再開しない状態でserverを起動する。設定はTOMLとして解析して生成し、元ファイルは変更しない。新しいmainを起動する。両MCPは`required=true`で接続し、target release・pane・interactive readyを確認する。
@@ -90,7 +99,7 @@ python3 -B "$HOME/.dona-maintenance/offline-20261001-1/offline_update.py" resume
 途中の再起動でもLaunchAgentのdisableが残るため、migration中のDBでサービスが勝手に起動しません。
 
 - 通常Updaterが停止直前にsourceを切り替えた場合は、凍結中に不一致を検出し、kill前にprocessを再開してLaunchAgentのenable/disableを元へ戻します。runは`aborted`となり、`./scripts/dona-update`で新しいsourceから準備し直せます。凍結途中のcrashでも、次のresumeでまず凍結を取り消します。
-- 停止確認前の失敗ではDBに進まず、保存したプロセスidentityを次回照合します。
+- 停止確認前の失敗ではDBに進まず、保存したプロセスidentityを次回照合します。停止receipt保存後に旧サービス・Herdrが再生成された場合は `source_recreation_requires_reconciliation` として保留します。その間の外部操作が不明なので、再停止・自動rollback・resumeによる続行は行わず、外部operatorが再生成の原因と副作用を照合します。
 - 新mainの起動を試みる前に失敗した場合は、確定backupからDB・Result・plistを戻して旧版を起動します。復旧にも失敗した場合は`restoring`に残し、同じrunから復旧を再開します。
 - mainの起動intent以後は必須MCPから書き込まれた可能性があり、その後はDispatcherのscheduleやjobも実行され得るため、DBを巻き戻しません。次回の`resume`でtarget側を停止・再起動し、更新後のデータを保持したまま前進復旧します。
 - `succeeded`のrunを再開した場合は正常性を再確認するだけです。
@@ -103,8 +112,35 @@ python3 -B "$HOME/.dona-maintenance/offline-20261001-1/offline_update.py" status
 ```
 
 `prepared`は準備完了、`rolled_back`は旧版への復旧であり、更新成功ではありません。
-新しいSHAでmain・3サービス・Slack接続を確認した`succeeded`だけが更新成功です。
+新しいSHAでmain・対象サービス・Slack接続・導入済みダッシュボードの会話一覧を確認した`succeeded`だけが更新成功です。
 ログインやネットワーク障害などでhealthが失敗した場合も、起動したというだけで成功と報告しません。
+
+## 旧process再生成の照合後に復旧する
+
+`source_recreation_requires_reconciliation`で保留した場合は、外部operatorが再生成原因を除去し、記録されたprocessとその子孫の停止、3サービスの未登録・disable、途中の外部操作を照合する。Dona親・workerにこの照合記録の作成を委任しない。未確認事項を「確認済み」にせず、外部操作の重複や完了を個別に確認する。
+
+`status --run ...`が返す`plan_hash`と`recreation_observation_hash`を使い、次のJSONをprivateな通常fileへ保存する。`summary`に原因と照合結果を記す。tokenや秘密情報は含めない。
+
+```json
+{
+  "schema_version": 1,
+  "plan_hash": "statusで確認したplan hash",
+  "observation_hash": "statusで確認した再生成観測hash",
+  "effects_reconciled": true,
+  "cause_removed": true,
+  "summary": "再生成の原因、除去方法、外部操作の照合結果"
+}
+```
+
+```sh
+python3 -B /absolute/run/offline_update.py reconcile-source \
+  --run /absolute/run --reconciliation /absolute/reconciliation.json
+python3 -B /absolute/run/offline_update.py restore --run /absolute/run
+```
+
+`reconcile-source`は実runtimeの停止を再確認し、operator UID・照合時刻・evidence hashをjournalへ保存して`restoring`へ進める。サービスの起動や更新先への続行は行わない。以後`restore`または同じrunの`resume`で旧版へ復旧する。応答が曖昧ならjournalの`source_recreation_reconciliation`とphaseをread-onlyで照合し、記録writeを繰り返さない。
+
+再生成のflagは監査のため保持する。再発時は照合recordを無効化する。正規の復旧が`rolled_back`となった後だけ、新しいrunを準備できる。引継ぎ検証も、照合済みで復旧完了したrunを更新履歴として認める。新main起動intent以後にはこの復旧経路を使えない。
 
 ## 検証
 
