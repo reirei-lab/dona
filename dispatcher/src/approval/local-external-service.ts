@@ -71,9 +71,9 @@ export class LocalExternalApprovalService {
   if(this.binding(a)!==request.row.binding_id||("kind" in a?a.requester_id:a.owner_id)!==this.snapshot(request).request_source.owner_id)throw Error("external_approval_context_unverified");return a;}
  private readable(request:Request,actor:ExternalApprovalAuthority){const source=this.context(request);return source.instance_id===actor.instance_id&&source.owner_id===actor.owner_id&&this.auth.authorize(actor)===true;}
  private permitted(request:Request,actor:ExternalApprovalAuthority){return this.readable(request,actor)&&this.sourceAllowed(this.context(request));}
- private async refresh(request:Request):Promise<boolean>{return this.refreshAuthority(this.context(request));}
- private async refreshAuthority(source:ExternalApprovalAuthority|ExternalApprovalSource):Promise<boolean>{
-  try{return "kind" in source?await this.auth.refreshSource?.(source)===true&&this.sourceAllowed(source):this.sourceAllowed(source);}catch{return false;}
+ private async refresh(request:Request,signal?:AbortSignal):Promise<boolean>{return this.refreshAuthority(this.context(request),signal);}
+ private async refreshAuthority(source:ExternalApprovalAuthority|ExternalApprovalSource,signal?:AbortSignal):Promise<boolean>{
+  try{return "kind" in source?await this.auth.refreshSource?.(source,signal)===true&&this.sourceAllowed(source):this.sourceAllowed(source);}catch{return false;}
  }
  private sourceAllowed(source:ExternalApprovalAuthority|ExternalApprovalSource){return "kind" in source?this.auth.authorizeSource?.(source)===true:this.auth.authorize(source)===true;}
  private observe(request:Request){const source=this.context(request);return this.slack.observe({workspace_id:this.scope.workspace_id,...this.snapshot(request).target},"kind" in source?source.requester_id:undefined);}
@@ -313,8 +313,8 @@ export class LocalExternalApprovalService {
     const text=this.text(request,"attempt",execution.row.attempt_id),started=broker.start(tx(),command());
     if(started.status==="started"){
      const marker=this.markers.read(execution.row.attempt_id);if(!marker)throw Error("external_approval_marker_missing");
-     try{receipt=await this.slack.send(target,text,marker,observation,async()=>{
-      if(!await this.refresh(this.requestRecord(request.row.request_id)))throw Error("external_approval_authority_changed");
+     try{receipt=await this.slack.send(target,text,marker,observation,async(signal)=>{
+      if(!await this.refresh(this.requestRecord(request.row.request_id),signal))throw Error("external_approval_authority_changed");
       return ()=>{const mark=this.now(),current=this.requestRecord(request.row.request_id),g=this.grant(current,observation,mark);
       if(!g||g.stale_reason!==null||Date.parse(mark.effective_utc)>=Date.parse(execution.row.execution_expires_at))throw Error("external_approval_authority_changed");};
      });}catch{receipt={outcome:"unknown"};}

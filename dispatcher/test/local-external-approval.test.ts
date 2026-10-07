@@ -432,3 +432,15 @@ for(const timing of ["async","sync"] as const)test(`Slack providerはcredential�
  await provider.send(target,intent.text,marker,{target,observed_at:start,bot_user_id:"U123",bot_id:"B123",workspace_name:"W",channel_name:"C",revision:{complete:true,items:[]}},async()=>{await Promise.resolve();if(timing==="async"){checked=true;throw Error("source_changed");}return ()=>{checked=true;throw Error("source_changed");};});
  assert.equal(checked,true);assert.equal(calls,0);
 });
+
+test("provider deadlineはauthority待ちを中断し遅い結果でも送信guardを実行しない",async t=>{
+ const controller=new AbortController();t.mock.method(AbortSignal,"timeout",()=>controller.signal);
+ let calls=0,guards=0,release!:()=>void,entered!:()=>void;
+ const waiting=new Promise<void>(resolve=>{release=resolve;}),started=new Promise<void>(resolve=>{entered=resolve;});
+ const provider=new LocalSlackApprovalProvider("T123",async()=>"fixture_token",Buffer.alloc(32,7),(async()=>{calls++;throw Error("unexpected_send");}) as typeof fetch);
+ const marker={marker:{codec_version:1 as const,scope:{instance_id:"instance",workspace_id:"T123"},request_id:"r",consume_id:"c",attempt_id:"a",operation:"slack.post_thread_reply.v1" as const,semantic_hash:"a".repeat(64),execution_fence:2,created_at:start,clock_transaction_id:"tx",key_version:1},mac:"b".repeat(64)};
+ const target={workspace_id:"T123",channel_id:"C123",thread_ts:intent.thread_ts};
+ const pending=provider.send(target,intent.text,marker,{target,observed_at:start,bot_user_id:"U123",bot_id:"B123",workspace_name:"W",channel_name:"C",revision:{complete:true,items:[]}},async signal=>{assert.equal(signal,controller.signal);entered();await waiting;return ()=>{guards++;};});
+ await started;controller.abort(Error("fixture_deadline"));assert.deepEqual(await pending,{outcome:"unknown"});assert.equal(calls,0);
+ release();await new Promise<void>(resolve=>setImmediate(resolve));assert.equal(guards,0);assert.equal(calls,0);
+});

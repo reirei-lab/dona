@@ -1,3 +1,4 @@
+import {approvalDeadline} from "./deadline.js";
 import {createHash} from "node:crypto";
 import type Database from "better-sqlite3";
 import {stableStringify} from "../validation.js";
@@ -43,12 +44,13 @@ export class LocalExternalApprovalIngress {
   return true;
  }
  authorizeSource(source:ExternalApprovalSource){const current=this.live.get(source.runtime_request_id);return !!current&&current.until>Date.now()&&stableStringify(current.source)===stableStringify(source)&&this.durable(source);}
- async refreshSource(source:ExternalApprovalSource):Promise<boolean>{
+ async refreshSource(source:ExternalApprovalSource,signal=AbortSignal.timeout(15000)):Promise<boolean>{
   this.live.delete(source.runtime_request_id);
   try{
    const saved=this.sql.prepare("SELECT source_json FROM local_external_ingress WHERE runtime_request_id=? AND state='pending'").get(source.runtime_request_id) as {source_json:string}|undefined;
    if(!saved||saved.source_json!==stableStringify(source))return false;
-   const row=await this.runtime.externalRequest(source.runtime_request_id),agent=await this.runtime.status(source.agent);
+   const row=await approvalDeadline(()=>this.runtime.externalRequest(source.runtime_request_id),signal),agent=await approvalDeadline(()=>this.runtime.status(source.agent),signal);
+   signal.throwIfAborted();
    if(!row||row.state==="expired"||!this.runtimeMatches(source,row,agent)||!this.durable(source))return false;
    this.live.set(source.runtime_request_id,{source,until:Date.now()+30000});return true;
   }catch{return false;}
