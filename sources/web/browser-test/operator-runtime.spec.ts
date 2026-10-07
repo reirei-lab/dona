@@ -7,7 +7,8 @@ import {operatorRuntimeFixture} from '../../../dispatcher/test/operator-runtime-
 import {observerDashboardPage} from '../src/observer-dashboard.js';
 async function freePort(){const s=net.createServer();await new Promise<void>(r=>s.listen(0,'127.0.0.1',r));const port=(s.address() as net.AddressInfo).port;await new Promise<void>(r=>s.close(()=>r()));return port;}
 test('browser依頼から実Dispatcher・Unix App Server subprocessの進捗・最終Resultまで到達する',async({browser})=>{
- test.setTimeout(60000);const port=await freePort(),origin=`https://localhost:${port}`,f=await operatorRuntimeFixture(origin,observerDashboardPage()),context=await browser.newContext({ignoreHTTPSErrors:true});let submits=0;const slow:http.IncomingMessage[]=[];
+ // 1秒周期のRuntime復旧がinitialize待ちを観測する条件を作る。起動成功後に停止されてはいけない。
+ test.setTimeout(60000);const port=await freePort(),origin=`https://localhost:${port}`,f=await operatorRuntimeFixture(origin,observerDashboardPage(),{initializeDelayMs:1100}),context=await browser.newContext({ignoreHTTPSErrors:true});let submits=0;const slow:http.IncomingMessage[]=[];
  const proxy=https.createServer({cert:await fs.readFile(new URL('../../../test-fixtures/tls/loopback-fixture-cert.pem',import.meta.url)),key:await fs.readFile(new URL('../../../test-fixtures/tls/loopback-fixture-key.pem',import.meta.url))},(incoming,outgoing)=>{
   if(incoming.method==='POST'&&incoming.url==='/api/tasks')submits++;
   const upstream=http.request({hostname:'127.0.0.1',port:f.port,path:incoming.url,method:incoming.method,headers:incoming.headers},response=>{outgoing.writeHead(response.statusCode!,response.headers);response.pipe(outgoing);});upstream.on('error',()=>outgoing.destroy());incoming.pipe(upstream);
@@ -31,5 +32,8 @@ test('browser依頼から実Dispatcher・Unix App Server subprocessの進捗・�
   await page.getByRole('button',{name:'更新',exact:true}).click();await expect(page.locator('#detail')).toContainText('保存された最終成果',{timeout:10000});await expect(page.locator('#detail')).toContainText('隔離ワーカーが完了しました');
   expect(submits).toBe(1);expect(f.db.tasks.attempts(task.task_id)).toHaveLength(1);expect(f.db.getJob(task.current_attempt_id)?.status).toBe('completed');
   const calls=await f.calls();expect(calls.filter(c=>c.method==='thread/start')).toHaveLength(2);expect(calls.filter(c=>c.method==='turn/start'&&c.pid===agent.pid)).toHaveLength(1);expect(calls.some(c=>c.method==='thread/read')).toBe(true);expect(calls.some(c=>c.method==='thread/turns/list')).toBe(true);expect(errors).toEqual([]);
+ }catch(error){
+  try{console.error('operator runtime diagnostics:',JSON.stringify(await f.diagnostics()));}catch(diagnosticError){console.error('operator runtime diagnostics unavailable:',diagnosticError);}
+  throw error;
  }finally{for(const response of slow)response.destroy();await context.close();proxy.closeAllConnections();await new Promise<void>(r=>proxy.close(()=>r()));await f.close();}
 });

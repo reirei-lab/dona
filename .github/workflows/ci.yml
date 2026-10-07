@@ -106,6 +106,11 @@ jobs:
         run: npm run test:browser
         working-directory: sources/web
 
+      - name: Repeat App Server browser startup regression
+        if: matrix.component == 'sources/web'
+        run: npm run test:browser -- browser-test/operator-runtime.spec.ts --repeat-each=5
+        working-directory: sources/web
+
   self-hosted-macos:
     name: Verify self-hosted macOS
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
