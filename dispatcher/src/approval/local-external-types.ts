@@ -19,6 +19,8 @@ export type ExternalApprovalSource=z.infer<typeof externalSourceSchema>;
 export interface ExternalApprovalAuthPort {
  /** 登録済みruntime/source/現在Task scopeをserver-sideで再照合する。 */
  authorizeSource?(source:ExternalApprovalSource):boolean;
+ /** 非同期provider観測後とcredential取得後のsend直前にRuntimeを再観測する。未接続なら送信不可。 */
+ refreshSource?(source:ExternalApprovalSource):Promise<boolean>;
  /** 信頼済みMac grantの現在値を同一process内で再読。引数だけを認可証拠にしない。 */
  authorize(authority:ExternalApprovalAuthority):boolean;
  /** WebAuthn検証済みdurable receiptの全claimを照合。同じdecisionのread-only再照合を許す。 */
@@ -30,6 +32,6 @@ export type SlackTargetObservation={target:ExternalTarget;observed_at:string;bot
 export type ExternalSendResult={outcome:"accepted";receipt_ref:string}|{outcome:"rejected";receipt_ref:string;reason:"unauthorized"|"resource_not_visible"|"invalid_input"|"scope_denied"}|{outcome:"unknown"}|{outcome:"ambiguous"};
 export interface ExternalSlackPort {
  observe(target:ExternalTarget,requesterId?:string):Promise<SlackTargetObservation>;
- send(target:ExternalTarget,text:string,marker:SealedApprovalExecutionMarker,observation:SlackTargetObservation,beforeSend:()=>void):Promise<ExternalSendResult>;
+ send(target:ExternalTarget,text:string,marker:SealedApprovalExecutionMarker,observation:SlackTargetObservation,beforeSend:()=>void|(()=>void)|Promise<void|(()=>void)>):Promise<ExternalSendResult>;
  reconcile(target:ExternalTarget,marker:SealedApprovalExecutionMarker):Promise<ExternalSendResult>;
 }

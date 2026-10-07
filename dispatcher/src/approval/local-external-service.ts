@@ -71,6 +71,10 @@ export class LocalExternalApprovalService {
   if(this.binding(a)!==request.row.binding_id||("kind" in a?a.requester_id:a.owner_id)!==this.snapshot(request).request_source.owner_id)throw Error("external_approval_context_unverified");return a;}
  private readable(request:Request,actor:ExternalApprovalAuthority){const source=this.context(request);return source.instance_id===actor.instance_id&&source.owner_id===actor.owner_id&&this.auth.authorize(actor)===true;}
  private permitted(request:Request,actor:ExternalApprovalAuthority){return this.readable(request,actor)&&this.sourceAllowed(this.context(request));}
+ private async refresh(request:Request):Promise<boolean>{return this.refreshAuthority(this.context(request));}
+ private async refreshAuthority(source:ExternalApprovalAuthority|ExternalApprovalSource):Promise<boolean>{
+  try{return "kind" in source?await this.auth.refreshSource?.(source)===true&&this.sourceAllowed(source):this.sourceAllowed(source);}catch{return false;}
+ }
  private sourceAllowed(source:ExternalApprovalAuthority|ExternalApprovalSource){return "kind" in source?this.auth.authorizeSource?.(source)===true:this.auth.authorize(source)===true;}
  private observe(request:Request){const source=this.context(request);return this.slack.observe({workspace_id:this.scope.workspace_id,...this.snapshot(request).target},"kind" in source?source.requester_id:undefined);}
  private approverCurrent(request:Request,state?:VerifiedAuditState){
@@ -98,7 +102,7 @@ export class LocalExternalApprovalService {
  private async create(actor:ExternalApprovalAuthority|ExternalApprovalSource,input:ExternalApprovalIntent){
   const intent=externalIntentSchema.parse(input);if(intent.workspace_id!==this.scope.workspace_id)throw Error("external_approval_scope_mismatch");
   const rich=externalRichText(intent.text),target={workspace_id:intent.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts},observation=await this.slack.observe(target,"kind" in actor?actor.requester_id:undefined);
-  if(!this.sourceAllowed(actor))throw Error("external_approval_unauthorized");const sourceId="kind" in actor?actor.source_event_id:"loe_"+hash([actor,intent.idempotency_key]),binding=this.binding(actor);
+  if(!await this.refreshAuthority(actor))throw Error("external_approval_unauthorized");const sourceId="kind" in actor?actor.source_event_id:"loe_"+hash([actor,intent.idempotency_key]),binding=this.binding(actor);
   const broker=new ApprovalCreateBroker(this.db,this.providers,this.scope,(_input,mark)=>{
    if(!this.sourceAllowed(actor)||("kind" in actor&&(observation.requester_authorized!==true||observation.requester_id!==actor.requester_id))||!this.observationValid(observation,mark))return denied;
    return {status:"authorized",binding_id:binding,model_version:"local_operator_v1",snapshot:{codec_version:1,operation_kind:"slack.post_thread_reply.v1",...this.scope,
@@ -125,7 +129,7 @@ export class LocalExternalApprovalService {
  async present(authority:ExternalApprovalAuthority,requestId:string):Promise<ExternalApprovalPresentation>{
   const actor=this.checked(authority),request=this.requestRecord(requestId);if(!this.permitted(request,actor))throw Error("external_approval_unauthorized");
   const snapshot=this.snapshot(request),observation=await this.observe(request);
-  if(!this.permitted(request,actor)||this.grant(request,observation,this.now())?.stale_reason!==null)throw Error("external_approval_snapshot_changed");
+  if(!await this.refresh(request)||!this.permitted(request,actor)||this.grant(request,observation,this.now())?.stale_reason!==null)throw Error("external_approval_snapshot_changed");
   const source=this.context(request);
   const exact=this.text(request),card=this.card(request),base={request_id:requestId,operation:"slack.post_thread_reply.v1" as const,workspace_id:this.scope.workspace_id,...snapshot.target,
    workspace_name:observation.workspace_name,channel_name:observation.channel_name,
@@ -156,6 +160,7 @@ export class LocalExternalApprovalService {
   if(stableStringify({instance_id:receipt.instance_id,owner_id:receipt.owner_id,device_id:receipt.device_id,grant_revision:receipt.grant_revision})!==stableStringify(actor))throw Error("external_approval_step_up_invalid");
   const request=this.requestRecord(receipt.request_id);
   const observation=await this.observe(request);
+  if(!await this.refresh(request))throw Error("external_approval_unauthorized");
   const card=this.card(request),now=this.now();
   if(receipt.expires_at>request.row.expires_at||Date.parse(receipt.expires_at)>Date.parse(now.effective_utc)+120000||Date.parse(receipt.expires_at)<=Date.parse(now.effective_utc)
    ||card.row.message_ref!=="web_"+receipt.presentation_digest||this.auth.verifyStepUp(receipt)!==true)throw Error("external_approval_step_up_invalid");
@@ -287,10 +292,12 @@ export class LocalExternalApprovalService {
    if(decision.row.kind!=="approve"){this.settleEvent(event.row.event_id);results.push({request_id:request.row.request_id,state:request.row.state});continue;}
    const snapshot=this.snapshot(request),target={workspace_id:this.scope.workspace_id,...snapshot.target};
    let observation:SlackTargetObservation;try{observation=await this.observe(request);}catch{results.push({request_id:request.row.request_id,state:"unavailable"});continue;}
+   const prior=this.records.readAlias({name:"execution_request",request_id:request.row.request_id});
+   // 未開始writeだけにlive authorityを要求し、開始済みunknownのread-only照合は妨げない。
+   if((prior?.kind!=="execution"||prior.row.state==="claimed")&&!await this.refresh(request)){results.push({request_id:request.row.request_id,state:"unavailable"});continue;}
    const consume=new ApprovalConsumeBroker(this.db,this.providers,this.scope,(_command,r,mark,state)=>{
     const g=this.grant(r,observation,mark,state);return g?{status:"verified",scope:this.scope,request_id:r.row.request_id,decision_id:decision.row.decision_id,event_id:event.row.event_id,consumer_id:"local_external_executor",...g}:denied;
    },v=>this.keys.content(v),v=>this.keys.wrappingVersion(v),v=>this.keys.notificationVersion(v));
-   const prior=this.records.readAlias({name:"execution_request",request_id:request.row.request_id});
    const claimed=prior?.kind==="execution"?{status:"reused" as const,attempt_handle:prior.row.attempt_id}:consume.consume(tx(),{request_handle:request.row.request_id,authority_ref:event.row.event_id,expected_revision:request.row.revision});
    if(claimed.status!=="claimed"&&claimed.status!=="reused"){results.push({request_id:request.row.request_id,state:claimed.status});continue;}
    const execution=this.records.read("execution",claimed.attempt_handle);if(!execution)throw Error("external_approval_execution_missing");
@@ -306,9 +313,10 @@ export class LocalExternalApprovalService {
     const text=this.text(request,"attempt",execution.row.attempt_id),started=broker.start(tx(),command());
     if(started.status==="started"){
      const marker=this.markers.read(execution.row.attempt_id);if(!marker)throw Error("external_approval_marker_missing");
-     try{receipt=await this.slack.send(target,text,marker,observation,()=>{
-      const mark=this.now(),current=this.requestRecord(request.row.request_id),g=this.grant(current,observation,mark);
-      if(!g||g.stale_reason!==null||Date.parse(mark.effective_utc)>=Date.parse(execution.row.execution_expires_at))throw Error("external_approval_authority_changed");
+     try{receipt=await this.slack.send(target,text,marker,observation,async()=>{
+      if(!await this.refresh(this.requestRecord(request.row.request_id)))throw Error("external_approval_authority_changed");
+      return ()=>{const mark=this.now(),current=this.requestRecord(request.row.request_id),g=this.grant(current,observation,mark);
+      if(!g||g.stale_reason!==null||Date.parse(mark.effective_utc)>=Date.parse(execution.row.execution_expires_at))throw Error("external_approval_authority_changed");};
      });}catch{receipt={outcome:"unknown"};}
      broker.resolve(tx(),command());
     }

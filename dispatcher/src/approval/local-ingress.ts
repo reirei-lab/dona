@@ -43,13 +43,23 @@ export class LocalExternalApprovalIngress {
   return true;
  }
  authorizeSource(source:ExternalApprovalSource){const current=this.live.get(source.runtime_request_id);return !!current&&current.until>Date.now()&&stableStringify(current.source)===stableStringify(source)&&this.durable(source);}
+ async refreshSource(source:ExternalApprovalSource):Promise<boolean>{
+  this.live.delete(source.runtime_request_id);
+  try{
+   const saved=this.sql.prepare("SELECT source_json FROM local_external_ingress WHERE runtime_request_id=? AND state='pending'").get(source.runtime_request_id) as {source_json:string}|undefined;
+   if(!saved||saved.source_json!==stableStringify(source))return false;
+   const row=await this.runtime.externalRequest(source.runtime_request_id),agent=await this.runtime.status(source.agent);
+   if(!row||row.state==="expired"||!this.runtimeMatches(source,row,agent)||!this.durable(source))return false;
+   this.live.set(source.runtime_request_id,{source,until:Date.now()+30000});return true;
+  }catch{return false;}
+ }
  private runtimeMatches(source:ExternalApprovalSource,row:ExternalToolRequest,agent:AgentRecord|null):boolean{
   const role=source.source_job_id===null?"main":"worker";
   return !!agent&&agent.name===source.agent&&agent.role===role&&row.role===role
    &&row.attempt_id===source.source_job_id&&row.request_id===source.runtime_request_id
    &&row.agent===source.agent&&row.generation===source.generation&&row.thread_id===source.thread_id&&row.turn_id===source.turn_id
    &&agent.generation===source.generation&&agent.thread_id===source.thread_id
-   &&(role!=="worker"||agent.turn_id===source.turn_id&&(row.operation_key??null)===source.runtime_operation_key);
+   &&(role==="main"?row.source_event_id===source.source_event_id:agent.turn_id===source.turn_id&&(row.operation_key??null)===source.runtime_operation_key);
  }
  private source(row:ExternalToolRequest):ExternalApprovalSource{
   if((row.role==="main"&&(row.attempt_id!==null||row.agent!==this.config.main_agent))
@@ -122,20 +132,7 @@ export class LocalExternalApprovalIngress {
      if(row.role==="main")await this.runtime.resolveExternal(row.agent,row.request_id,{request_id:saved.request_id,state:"pending"});
     }catch{/* exact source/idempotencyで次回照合。外部sendはしない。 */}
    }
-   },async()=>{
-   // 前tickが新規要求でbudgetを使い切るとexecutorから再開する。
-   // その場合も前回のrole観測を送信権限へ流用しない。
-   const sources=[...this.live.values()].map(entry=>entry.source);this.live.clear();
-   for(const source of sources){
-    if(performance.now()>=deadline)break;
-    try{
-     const record=await this.runtime.externalRequest(source.runtime_request_id),agent=await this.runtime.status(source.agent);
-     if(record&&record.state!=="expired"&&this.runtimeMatches(source,record,agent)&&this.durable(source))
-      this.live.set(source.runtime_request_id,{source,until:Date.now()+30000});
-    }catch{/* Runtime照会不能では古いcacheへfallbackしない。 */}
-   }
-   if(performance.now()<deadline)await this.service.executePending(deadline);
-  },async()=>{
+   },async()=>{await this.service.executePending(deadline);},async()=>{
    const ready=this.sql.prepare("SELECT source_json,request_id FROM local_external_ingress WHERE state='pending' AND request_id IS NOT NULL AND runtime_request_id IN (SELECT value FROM json_each(?)) ORDER BY runtime_request_id LIMIT 128").all(JSON.stringify([...new Set([...rows.map(r=>r.runtime_request_id),...pending.map(r=>r.request_id)])])) as {source_json:string;request_id:string}[];
    for(const row of ready){if(performance.now()>=deadline)break;const source=JSON.parse(row.source_json) as ExternalApprovalSource;if(!this.authorizeSource(source))continue;
     try{const status=this.service.sourceStatus(source,row.request_id),state=status.execution?.state??status.state;if(!terminal.has(state))continue;

@@ -12,14 +12,14 @@ const intent={idempotency_key:"one",workspace_id:scope.workspace_id,channel_id:"
 function setup(t:{after(fn:()=>void):void}){
  const f=fixture(t);installApprovalExecutionMarkerSchema(f.db);
  f.transaction.runPrepared("local_marker_admission",()=>({event:{scope:{instance_id:scope.instance_id,tenant_id:scope.workspace_id},actor:{kind:"system",id:"fixture"},action:"approval_execution",operation:"slack.post_thread_reply.v1",resource_id:"fixture_root",outcome:"succeeded",reason:"none",session_ref:null,receipt_id:null,attempt_id:null,policy_revision:1,binding_revision:1,authz_revision:1},resource_commitments:[{scope:{instance_id:scope.instance_id,tenant_id:scope.workspace_id},resource_id:"approval_execution_markers",resource_digest:emptyMetadataRoot({...scope,collection:"approval_execution_markers_v1"})}],mutation:()=>null}));
- const revoked=new Set<string>();let sourceAuthorizer:((source:any)=>boolean)|undefined;let beforeAction=()=>{};
+ const revoked=new Set<string>();let sourceAuthorizer:((source:any)=>boolean)|undefined;let sourceRefresher:((source:any)=>Promise<boolean>)|undefined;let beforeAction=()=>{},beforeObservation=()=>{};
  let allowed=true,verified=true,changed=false,sends=0,reconciles=0,sendResult:ExternalSendResult={outcome:"accepted",receipt_ref:"slack_receipt"};
- const slack:ExternalSlackPort={observe:async (target,requesterId)=>({target,...(requesterId?{requester_id:requesterId,requester_authorized:true}:{}),observed_at:start,bot_user_id:"U123",bot_id:"B123",workspace_name:"Workspace",channel_name:"Channel",revision:{complete:true,items:[{message_ts:target.thread_ts,edited_ts:null,content_hmac_sha256:(changed?"b":"a").repeat(64)}]}}),
- send:async(_target,_text,_marker,_observation,before)=>{beforeAction();before();sends++;return sendResult;},reconcile:async()=>{reconciles++;return {outcome:"accepted",receipt_ref:"slack_receipt"};}};
+ const slack:ExternalSlackPort={observe:async (target,requesterId)=>(beforeObservation(),{target,...(requesterId?{requester_id:requesterId,requester_authorized:true}:{}),observed_at:start,bot_user_id:"U123",bot_id:"B123",workspace_name:"Workspace",channel_name:"Channel",revision:{complete:true,items:[{message_ts:target.thread_ts,edited_ts:null,content_hmac_sha256:(changed?"b":"a").repeat(64)}]}}),
+ send:async(_target,_text,_marker,_observation,before)=>{beforeAction();const assertCurrent=await before();assertCurrent?.();sends++;return sendResult;},reconcile:async()=>{reconciles++;return {outcome:"accepted",receipt_ref:"slack_receipt"};}};
  const keys={content:()=>content,wrapping:()=>wrapping,notification:()=>notification,wrappingVersion:()=>wrapping,notificationVersion:()=>notification,execution:()=>executionKey};
- const auth={authorize:(a:any)=>allowed&&!revoked.has(a.device_id),authorizeSource:(source:any)=>sourceAuthorizer?.(source)===true,verifyStepUp:()=>verified};
+ const auth={authorize:(a:any)=>allowed&&!revoked.has(a.device_id),authorizeSource:(source:any)=>sourceAuthorizer?.(source)===true,refreshSource:async(source:any)=>sourceRefresher?.(source)??false,verifyStepUp:()=>verified};
  const make=()=>new LocalExternalApprovalService(f.db,f.providers,scope,keys,auth,slack);
- return {...f,service:make(),make,revoke:(device:string)=>revoked.add(device),beforeSend:(action:()=>void)=>{beforeAction=action;},setSourceAuthorizer:(fn:(source:any)=>boolean)=>{sourceAuthorizer=fn;},setAllowed:(v:boolean)=>{allowed=v;},setVerified:(v:boolean)=>{verified=v;},setChanged:()=>{changed=true;},setSend:(v:ExternalSendResult)=>{sendResult=v;},counts:()=>({sends,reconciles})};
+ return {...f,service:make(),make,revoke:(device:string)=>revoked.add(device),beforeSend:(action:()=>void)=>{beforeAction=action;},beforeObserve:(action:()=>void)=>{beforeObservation=action;},setSourceAuthorizer:(fn:(source:any)=>boolean,refresh?:(source:any)=>Promise<boolean>)=>{sourceAuthorizer=fn;sourceRefresher=refresh;},setAllowed:(v:boolean)=>{allowed=v;},setVerified:(v:boolean)=>{verified=v;},setChanged:()=>{changed=true;},setSend:(v:ExternalSendResult)=>{sendResult=v;},counts:()=>({sends,reconciles})};
 }
 async function approved(f:ReturnType<typeof setup>){
  const created=await f.service.request(actor,intent);if(created.status==="denied")throw Error("unexpected_denial");
@@ -116,7 +116,7 @@ test("main要求はpending受付で解放しterminalを新しい固定threadイ�
  const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_source",agent:"main",generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"main",attempt_id:null,source_event_id:event.event_id,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
  const results:any[]=[];
  const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:"main",role:"main",generation:"generation",thread_id:"thread",turn_id:"turn"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{results.push(result);row.state="resolved";row.result_json=JSON.stringify(result);row.text="";return {};}};
- const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source));
+ const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source),source=>ingress.refreshSource(source));
  await ingress.tick();assert.equal(results[0]?.state,"pending");assert.equal(f.counts().sends,0);assert.equal(row.state,"resolved");
  const requestId=results[0].request_id,presentation=await f.service.present(actor,requestId);
  await f.service.decide(actor,{...actor,receipt_id:"external_decision",request_id:requestId,decision:"approve",presentation_digest:presentation.presentation_digest,expires_at:"2026-09-19T00:01:00.000Z"});
@@ -142,7 +142,7 @@ test("workerの外部承認checkpointは同じAttempt/callに保持し応答喪�
  const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_worker",operation_key:`attempt:${job.job_id}`,agent:job.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"worker",attempt_id:job.job_id,source_event_id:null,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
  let lost=true;
  const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:job.agent_name,role:"worker",generation:"generation",thread_id:"thread",turn_id:"turn"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{row.state="resolved";row.result_json=JSON.stringify(result);row.text="";if(lost){lost=false;throw Error("response lost");}return {state:"resolved"};}};
- const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source));
+ const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source),source=>ingress.refreshSource(source));
  await ingress.tick();assert.equal(dispatcher.tasks.get(task.task_id)?.wait_reason,"external_approval");assert.equal(row.state,"pending");
  const requestId=(f.db.prepare("SELECT request_id FROM local_external_ingress").get() as {request_id:string}).request_id,presentation=await f.service.present(actor,requestId);
  await f.service.decide(actor,{...actor,receipt_id:"worker_decision",request_id:requestId,decision:"approve",presentation_digest:presentation.presentation_digest,expires_at:"2026-09-19T00:01:00.000Z"});
@@ -187,7 +187,7 @@ test("Runtime再起動で失われた外部callは監査付きneeds_reviewとな
  const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_worker",operation_key:`attempt:${job.job_id}`,agent:job.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"worker",attempt_id:job.job_id,source_event_id:null,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
  let lost=true;
  const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:job.agent_name,role:"worker",generation:"generation",thread_id:"thread",turn_id:"turn"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{row.state="resolved";row.result_json=JSON.stringify(result);row.text="";if(lost){lost=false;throw Error("response lost");}return {state:"resolved"};}};
- const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source));
+ const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source),source=>ingress.refreshSource(source));
  await ingress.tick();assert.equal(dispatcher.tasks.get(task.task_id)?.wait_reason,"external_approval");assert.equal(row.state,"pending");
  const requestId=(f.db.prepare("SELECT request_id FROM local_external_ingress").get() as {request_id:string}).request_id;
  row.state="expired";row.text="";await ingress.tick();
@@ -245,7 +245,7 @@ async function workerApprovalFixture(t:{after(fn:()=>void):void},queuedSteer=fal
  let row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_checkpoint",operation_key:`attempt:${job.job_id}`,agent:job.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"worker",attempt_id:job.job_id,source_event_id:null,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
  let beforeResolve=()=>{};
  const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async(id:string)=>id===row.request_id?{...row}:null,status:async()=>({name:job.agent_name,role:"worker",generation:"generation",thread_id:"thread",turn_id:"turn"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{beforeResolve();row.state="resolved";row.result_json=JSON.stringify(result);row.text="";return {state:"resolved"};}};
- const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source));
+ const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source),source=>ingress.refreshSource(source));
  const requestId=()=> (f.db.prepare("SELECT request_id FROM local_external_ingress WHERE runtime_request_id=?").get(row.request_id) as {request_id:string}).request_id;
  const approve=async()=>{const id=requestId(),p=await f.service.present(actor,id);await f.service.decide(actor,{...actor,receipt_id:"decision_"+row.request_id,request_id:id,decision:"approve",presentation_digest:p.presentation_digest,expires_at:"2026-09-19T00:01:00.000Z"});return id;};
  return {...f,dispatcher,enqueue,event,task,job,ingress,runtime,requestId,approve,row:()=>row,beforeResolve:(fn:()=>void)=>{beforeResolve=fn;},newCall:(operation:string)=>{row={...row,request_id:"ext_after",call_id:"after",operation_slot:"after",operation_key:operation,state:"pending",result_json:null,text:"新しい目的の本文"};}};
@@ -382,13 +382,13 @@ for(const scenario of ["main_with_attempt","worker_without_attempt","worker_as_m
   if(scenario==="live_generation")live.generation="other_generation";
   const results:any[]=[];
   const runtime={externalRequests:async()=>[row],externalRequest:async()=>row,status:async()=>live as any,resolveExternal:async(_name:string,_id:string,result:any)=>{results.push(result);return {};}};
-  const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source));
+  const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source),source=>ingress.refreshSource(source));
   await ingress.tick();assert.equal(results[0]?.state,"source_denied");assert.equal(f.counts().sends,0);
   assert.equal((f.db.prepare("SELECT count(*) n FROM approval_requests").get() as {n:number}).n,0);
  });
 }
 
-for(const role of ["main","worker"] as const)test(`executor開始phase持越しでもmain通常turn変更を維持しlive role=${role}を照合する`,async t=>{
+for(const stage of ["phase","observe","send"] as const)for(const role of ["main","worker"] as const)test(`executor開始phase持越しと${stage}時のlive role=${role}を照合する`,async t=>{
  const {DispatcherDatabase}=await import("../src/database.js");
  const f=setup(t),dispatcher=new DispatcherDatabase(f.filename);t.after(()=>dispatcher.close());
  const event=dispatcher.enqueue({schema_version:1,source:"slack",external_event_id:"role_drift",type:"app_mention",occurred_at:start,subject:{workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts,actor_id:"U123"},payload:{},reply_target:{kind:"slack_thread",workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts}}).row;
@@ -397,10 +397,36 @@ for(const role of ["main","worker"] as const)test(`executor開始phase持越し�
  const live={name:"main",role:"main",generation:"generation",thread_id:"thread",turn_id:"turn"};
  let requestId="",now=100;const clock=t.mock.method(performance,"now",()=>now);t.after(()=>clock.mock.restore());
  const runtime={externalRequests:async()=>row.state==="pending"?[row]:[],externalRequest:async()=>row,status:async()=>live as any,resolveExternal:async(_name:string,_id:string,result:any)=>{requestId=result.request_id;row.state="resolved";now+=6000;return {};}};
- const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source));
+ const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source),source=>ingress.refreshSource(source));
  await ingress.tick();assert.ok(requestId);assert.equal(f.counts().sends,0);
  const presentation=await f.service.present(actor,requestId);
  await f.service.decide(actor,{...actor,receipt_id:"role_decision",request_id:requestId,decision:"approve",presentation_digest:presentation.presentation_digest,expires_at:"2026-09-19T00:01:00.000Z"});
- live.turn_id="next_main_turn";live.role=role;await ingress.tick();assert.equal(f.counts().sends,role==="main"?1:0);
+ live.turn_id="next_main_turn";
+ if(stage==="phase")live.role=role;else if(stage==="observe")f.beforeObserve(()=>{live.role=role;});else f.beforeSend(()=>{live.role=role;});
+ await ingress.tick();assert.equal(f.counts().sends,role==="main"?1:0);
  assert.equal((f.db.prepare("SELECT state FROM local_external_ingress WHERE runtime_request_id=?").get(row.request_id) as {state:string}).state,"terminal");
+});
+
+test("遅いRuntime再照合でもdecision cursorは後続の承認済みsourceへ進む",async t=>{
+ const f=setup(t);f.setSourceAuthorizer(()=>true,async()=>true);
+ for(const name of ["slow","ready"]){
+  const source={kind:"slack" as const,...scope,owner_id:actor.owner_id,requester_id:"U123",source_event_id:"evt_source",source_job_id:null,runtime_request_id:"ext_"+name,agent:"main",generation:"generation",thread_id:"thread",turn_id:"turn",channel_id:intent.channel_id,thread_ts:intent.thread_ts};
+  const created=await f.service.requestFromSource(source,{idempotency_key:name,text:intent.text});if(created.status==="denied")throw Error();
+  const view=await f.service.present(actor,created.request_handle);
+  await f.service.decide(actor,{...actor,receipt_id:"receipt_"+name,request_id:created.request_handle,decision:"approve",presentation_digest:view.presentation_digest,expires_at:"2026-09-19T00:01:00.000Z"});
+ }
+ let now=100;const clock=t.mock.method(performance,"now",()=>now);t.after(()=>clock.mock.restore());
+ const visited:string[]=[];
+ f.setSourceAuthorizer(()=>true,async source=>{visited.push(source.runtime_request_id);if(source.runtime_request_id==="ext_slow"){now+=6000;return false;}return true;});
+ const first=await f.service.executePending();assert.equal(first.truncated,true);assert.deepEqual(visited,["ext_slow"]);assert.equal(f.counts().sends,0);
+ await f.service.executePending();assert.ok(visited.includes("ext_ready"));assert.equal(f.counts().sends,1);
+});
+
+for(const timing of ["async","sync"] as const)test(`Slack providerはcredential取得後の${timing} authority拒否でtransportを呼ばない`,async()=>{
+ let calls=0,checked=false;
+ const provider=new LocalSlackApprovalProvider("T123",async()=>"fixture_token",Buffer.alloc(32,7),(async()=>{calls++;throw Error("unexpected_send");}) as typeof fetch);
+ const marker={marker:{codec_version:1 as const,scope:{instance_id:"instance",workspace_id:"T123"},request_id:"r",consume_id:"c",attempt_id:"a",operation:"slack.post_thread_reply.v1" as const,semantic_hash:"a".repeat(64),execution_fence:2,created_at:start,clock_transaction_id:"tx",key_version:1},mac:"b".repeat(64)};
+ const target={workspace_id:"T123",channel_id:"C123",thread_ts:intent.thread_ts};
+ await provider.send(target,intent.text,marker,{target,observed_at:start,bot_user_id:"U123",bot_id:"B123",workspace_name:"W",channel_name:"C",revision:{complete:true,items:[]}},async()=>{await Promise.resolve();if(timing==="async"){checked=true;throw Error("source_changed");}return ()=>{checked=true;throw Error("source_changed");};});
+ assert.equal(checked,true);assert.equal(calls,0);
 });

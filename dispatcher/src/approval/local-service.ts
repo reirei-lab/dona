@@ -57,6 +57,7 @@ export async function openLocalApprovalService(database:DispatcherDatabase,confi
   const service=new LocalExternalApprovalService(sql,native.providers,nativeConfig.scope,native.keys,{
    authorize:a=>operator.authorize()&&database.operatorAuth.authorize(a,'approvals:external'),
    authorizeSource:s=>operator.authorize()&&ingress?.authorizeSource(s)===true,
+   refreshSource:async s=>operator.authorize()&&await ingress?.refreshSource(s)===true&&operator.authorize(),
    verifyStepUp:r=>database.operatorWebAuthn?.verifyReceipt(r,r,'approvals:external')===true,
   },slack);
   const operations=new LocalApprovalOperations(sql,native.providers,nativeConfig.scope,native.keys,operator,{reconcile:(...args)=>slack.reconcile(...args)});
