@@ -237,6 +237,8 @@ export class TaskRepository {
         if(!resource||predecessor.resource_id!==resource)throw Error("task_followup_issue_mismatch");
         const old=this.dispatcher.getJob(predecessor.current_attempt_id)!;
         if(predecessor.state!=="completed"||predecessor.desired_state!=="running"||predecessor.steer_pending_event_id||old.status!=="completed"||!old.result_json||old.steer_state||old.last_error_code)throw Error("task_followup_requires_completed_result");
+        const result=JSON.parse(old.result_json) as {actions?:Array<Record<string,unknown>>};
+        if(result.actions?.some(action=>action?.ambiguous===true))throw Error("task_external_effect_reconciliation_required");
         const stopped=this.sql.prepare("SELECT 1 FROM job_terminal_worker_stop_proofs WHERE job_id=? UNION ALL SELECT 1 FROM job_terminal_worker_cleanups WHERE job_id=? AND outcome='stopped'").get(old.job_id,old.job_id);
         if(!stopped)throw Error("task_followup_worker_stop_required");
         const group=this.dispatcher.getJobGroup(old.source_event_id);

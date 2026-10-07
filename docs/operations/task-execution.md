@@ -133,7 +133,7 @@ PR提出後の競合解消など、完了済みTaskへ利用者が追加作業�
 Dispatcherはtransaction内で以下を再照合する。
 
 - Issue node ID・依頼者・元thread・Task revision・current Attemptが一致する。
-- 旧Task/AttemptがcompletedでResult受理済み、steerや外部承認・checkpointの未確定操作がない。
+- 旧Task/AttemptがcompletedでResult受理済み、steerや外部承認・checkpointの未確定操作がなく、旧Job Resultのactionsに`ambiguous: true`がない。
 - Runtime hostによるworker停止記録があり、旧完了通知とgroup terminal通知が処理済みで曖昧なwriteがない。
 - Projectがある場合は同じitem/fieldで同期済み、未確定の同期intentがない。
 

@@ -11,7 +11,7 @@ import {buildJobPrompt} from "../src/job-prompt.js";
 import {TaskProjector,type GitHubQuery} from "../src/task-github.js";
 import {eventEnvelope,tempConfig} from "./helpers.js";
 
-async function fixture(project=false){
+async function fixture(project=false,ambiguousResult=false){
   const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath),sql=new Database(config.databasePath);
   const event=db.enqueue(eventEnvelope("initial")).row;
   const projectRequest={owner:"org",number:4,completion_status:"In Progress" as const};
@@ -21,7 +21,7 @@ async function fixture(project=false){
   const job=db.getJob(task.current_attempt_id)!;
   db.beginJobPreparation(job.job_id);db.setJobRuntime(job.job_id,"w","p");db.beginJobDispatch(job.job_id);db.markJobRunning(job.job_id);
   db.sealJobGroup(event.event_id);
-  db.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"PR提出済み",completed_at:new Date().toISOString()},job.result_path);
+  db.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"PR提出済み",actions:ambiguousResult?[{tool:"github.push",ambiguous:true}]:[],completed_at:new Date().toISOString()},job.result_path);
   const notification=db.enqueueJobNotification(job.job_id).row;
   sql.prepare("UPDATE events SET status='completed',result_json=? WHERE event_id=?").run(JSON.stringify({schema_version:1,event_id:notification.event_id,status:"completed",summary:"通知済み",actions:[],completed_at:new Date().toISOString()}),notification.event_id);
   db.markTerminalWorkerStopProof(job.job_id);
@@ -55,8 +55,8 @@ test("明示followupがclaimを原子的に引継ぎ、旧成果と予算履歴�
   }finally{await f.dispose();}
 });
 
-for(const scenario of ["actor","channel","thread","revision","attempt","resource","running","stop","notification","external","project"] as const)test(`followupは${scenario}の不一致・未確定を拒否しclaimを残す`,async()=>{
-  const f=await fixture(scenario==="project");try{
+for(const scenario of ["actor","channel","thread","revision","attempt","resource","running","stop","notification","external","project","result-ambiguous","result-ambiguous-clean-checkpoint"] as const)test(`followupは${scenario}の不一致・未確定を拒否しclaimを残す`,async()=>{
+  const f=await fixture(scenario==="project",scenario.startsWith("result-ambiguous"));try{
     let input=f.input,issue=f.issue;
     if(["actor","channel","thread"].includes(scenario)){
       const envelope=eventEnvelope("unauthorized");
@@ -74,8 +74,13 @@ for(const scenario of ["actor","channel","thread","revision","attempt","resource
       await fs.mkdir(f.job.result_path.substring(0,f.job.result_path.lastIndexOf("/")),{recursive:true});
       await fs.writeFile(f.job.result_path.replace("result.json","checkpoint.json"),JSON.stringify({schema_version:1,task_id:f.task.task_id,attempt_id:f.job.job_id,sequence:1,summary:"応答不明",remaining:[],artifacts:[],unresolved_operations:["push unknown"],waiting:"external_effect_unknown"}));
     }
+    if(scenario==="result-ambiguous-clean-checkpoint"){
+      await fs.mkdir(f.job.result_path.substring(0,f.job.result_path.lastIndexOf("/")),{recursive:true});
+      await fs.writeFile(f.job.result_path.replace("result.json","checkpoint.json"),JSON.stringify({schema_version:1,task_id:f.task.task_id,attempt_id:f.job.job_id,sequence:1,summary:"checkpointでは未確定なし",remaining:[],artifacts:[],unresolved_operations:[],waiting:"none"}));
+    }
     if(scenario==="project")f.sql.prepare("UPDATE tasks SET project_state='unknown' WHERE task_id=?").run(f.task.task_id);
-    assert.throws(()=>f.create(input,issue));
+    if(scenario.startsWith("result-ambiguous"))assert.throws(()=>f.create(input,issue),/task_external_effect_reconciliation_required/);
+    else assert.throws(()=>f.create(input,issue));
     assert.equal(f.db.tasks.get(f.task.task_id)!.resource_id,"github:I_1");assert.equal(f.db.listEventJobs(input.source_event_id).length,0);
   }finally{await f.dispose();}
 });
