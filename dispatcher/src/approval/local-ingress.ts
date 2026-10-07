@@ -55,7 +55,7 @@ export class LocalExternalApprovalIngress {
  }
  private runtimeMatches(source:ExternalApprovalSource,row:ExternalToolRequest,agent:AgentRecord|null):boolean{
   const role=source.source_job_id===null?"main":"worker";
-  return !!agent&&agent.name===source.agent&&agent.role===role&&row.role===role
+  return !!agent&&["idle","working","waiting"].includes(agent.state)&&agent.name===source.agent&&agent.role===role&&row.role===role
    &&row.attempt_id===source.source_job_id&&row.request_id===source.runtime_request_id
    &&row.agent===source.agent&&row.generation===source.generation&&row.thread_id===source.thread_id&&row.turn_id===source.turn_id
    &&agent.generation===source.generation&&agent.thread_id===source.thread_id

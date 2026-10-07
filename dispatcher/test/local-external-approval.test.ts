@@ -115,7 +115,7 @@ test("main要求はpending受付で解放しterminalを新しい固定threadイ�
 
  const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_source",agent:"main",generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"main",attempt_id:null,source_event_id:event.event_id,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
  const results:any[]=[];
- const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:"main",role:"main",generation:"generation",thread_id:"thread",turn_id:"turn"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{results.push(result);row.state="resolved";row.result_json=JSON.stringify(result);row.text="";return {};}};
+ const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:"main",role:"main",state:"working",generation:"generation",thread_id:"thread",turn_id:"turn"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{results.push(result);row.state="resolved";row.result_json=JSON.stringify(result);row.text="";return {};}};
  const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source),source=>ingress.refreshSource(source));
  await ingress.tick();assert.equal(results[0]?.state,"pending");assert.equal(f.counts().sends,0);assert.equal(row.state,"resolved");
  const requestId=results[0].request_id,presentation=await f.service.present(actor,requestId);
@@ -141,7 +141,7 @@ test("workerの外部承認checkpointは同じAttempt/callに保持し応答喪�
  const job=dispatcher.getJob(task.current_attempt_id)!;dispatcher.beginJobPreparation(job.job_id);dispatcher.setJobRuntime(job.job_id,job.agent_name,job.agent_name,JSON.stringify(["generation","thread"]));dispatcher.beginJobDispatch(job.job_id);dispatcher.markJobRunning(job.job_id);
  const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_worker",operation_key:`attempt:${job.job_id}`,agent:job.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"worker",attempt_id:job.job_id,source_event_id:null,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
  let lost=true;
- const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:job.agent_name,role:"worker",generation:"generation",thread_id:"thread",turn_id:"turn"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{row.state="resolved";row.result_json=JSON.stringify(result);row.text="";if(lost){lost=false;throw Error("response lost");}return {state:"resolved"};}};
+ const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:job.agent_name,role:"worker",state:"waiting",generation:"generation",thread_id:"thread",turn_id:"turn"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{row.state="resolved";row.result_json=JSON.stringify(result);row.text="";if(lost){lost=false;throw Error("response lost");}return {state:"resolved"};}};
  const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source),source=>ingress.refreshSource(source));
  await ingress.tick();assert.equal(dispatcher.tasks.get(task.task_id)?.wait_reason,"external_approval");assert.equal(row.state,"pending");
  const requestId=(f.db.prepare("SELECT request_id FROM local_external_ingress").get() as {request_id:string}).request_id,presentation=await f.service.present(actor,requestId);
@@ -186,7 +186,7 @@ test("Runtime再起動で失われた外部callは監査付きneeds_reviewとな
  const job=dispatcher.getJob(task.current_attempt_id)!;dispatcher.beginJobPreparation(job.job_id);dispatcher.setJobRuntime(job.job_id,job.agent_name,job.agent_name,JSON.stringify(["generation","thread"]));dispatcher.beginJobDispatch(job.job_id);dispatcher.markJobRunning(job.job_id);
  const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_worker",operation_key:`attempt:${job.job_id}`,agent:job.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"worker",attempt_id:job.job_id,source_event_id:null,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
  let lost=true;
- const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:job.agent_name,role:"worker",generation:"generation",thread_id:"thread",turn_id:"turn"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{row.state="resolved";row.result_json=JSON.stringify(result);row.text="";if(lost){lost=false;throw Error("response lost");}return {state:"resolved"};}};
+ const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:job.agent_name,role:"worker",state:"waiting",generation:"generation",thread_id:"thread",turn_id:"turn"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{row.state="resolved";row.result_json=JSON.stringify(result);row.text="";if(lost){lost=false;throw Error("response lost");}return {state:"resolved"};}};
  const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source),source=>ingress.refreshSource(source));
  await ingress.tick();assert.equal(dispatcher.tasks.get(task.task_id)?.wait_reason,"external_approval");assert.equal(row.state,"pending");
  const requestId=(f.db.prepare("SELECT request_id FROM local_external_ingress").get() as {request_id:string}).request_id;
@@ -218,7 +218,7 @@ test("遅い新規要求が連続しても巡回phaseはexecutorを永久に飛�
  f.db.prepare("UPDATE events SET status='dispatching' WHERE event_id=?").run(event.event_id);
  const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_source",agent:"main",generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"main",attempt_id:null,source_event_id:event.event_id,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
  const results:any[]=[];
- const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:"main",role:"main",generation:"generation",thread_id:"thread",turn_id:"turn"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{results.push(result);row.state="resolved";row.result_json=JSON.stringify(result);row.text="";return {};}};
+ const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async()=>({...row}),status:async()=>({name:"main",role:"main",state:"working",generation:"generation",thread_id:"thread",turn_id:"turn"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{results.push(result);row.state="resolved";row.result_json=JSON.stringify(result);row.text="";return {};}};
  let now=100,executions=0,requests=0;const clock=t.mock.method(performance,"now",()=>now);
  const service={requestFromSource:async()=>{requests++;now+=6000;throw Error("observe timeout");},executePending:async()=>{executions++;}} as any;
  const ingress=dispatcher.createExternalApprovalIngress(runtime,service,{...scope,owner_id:actor.owner_id,main_agent:"main"});
@@ -244,7 +244,7 @@ async function workerApprovalFixture(t:{after(fn:()=>void):void},queuedSteer=fal
  dispatcher.beginJobPreparation(job.job_id);dispatcher.setJobRuntime(job.job_id,job.agent_name,job.agent_name,JSON.stringify(["generation","thread"]));dispatcher.beginJobDispatch(job.job_id);dispatcher.markJobRunning(job.job_id);
  let row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_checkpoint",operation_key:`attempt:${job.job_id}`,agent:job.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"worker",attempt_id:job.job_id,source_event_id:null,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
  let beforeResolve=()=>{};
- const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async(id:string)=>id===row.request_id?{...row}:null,status:async()=>({name:job.agent_name,role:"worker",generation:"generation",thread_id:"thread",turn_id:"turn"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{beforeResolve();row.state="resolved";row.result_json=JSON.stringify(result);row.text="";return {state:"resolved"};}};
+ const runtime={externalRequests:async()=>row.state==="pending"?[{...row}]:[],externalRequest:async(id:string)=>id===row.request_id?{...row}:null,status:async()=>({name:job.agent_name,role:"worker",state:"waiting",generation:"generation",thread_id:"thread",turn_id:"turn"} as any),resolveExternal:async(_name:string,_id:string,result:any)=>{beforeResolve();row.state="resolved";row.result_json=JSON.stringify(result);row.text="";return {state:"resolved"};}};
  const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source),source=>ingress.refreshSource(source));
  const requestId=()=> (f.db.prepare("SELECT request_id FROM local_external_ingress WHERE runtime_request_id=?").get(row.request_id) as {request_id:string}).request_id;
  const approve=async()=>{const id=requestId(),p=await f.service.present(actor,id);await f.service.decide(actor,{...actor,receipt_id:"decision_"+row.request_id,request_id:id,decision:"approve",presentation_digest:p.presentation_digest,expires_at:"2026-09-19T00:01:00.000Z"});return id;};
@@ -365,14 +365,14 @@ test("unknownのTaskはMacで監査済み受理を確定してから同じ投稿
  const next=f.dispatcher.tasks.replaceStopped(task.task_id,f.filename+"-results")!;assert.ok(next.objective.includes(id));assert.ok(next.objective.includes("manual_verified_receipt"));assert.equal(f.dispatcher.tasks.get(task.task_id)?.attempt_number,2);assert.equal(f.counts().sends,1);
 });
 
-for(const scenario of ["main_with_attempt","worker_without_attempt","worker_as_main","live_worker","other_main","live_name","live_generation"]){
+for(const scenario of ["main_with_attempt","worker_without_attempt","worker_as_main","live_worker","other_main","live_name","live_generation","live_unknown","live_stopped","live_starting","live_interrupted"]){
  test(`typed投稿はruntime/source不一致を拒否する: ${scenario}`,async t=>{
   const {DispatcherDatabase}=await import("../src/database.js");
   const f=setup(t),dispatcher=new DispatcherDatabase(f.filename);t.after(()=>dispatcher.close());
   const event=dispatcher.enqueue({schema_version:1,source:"slack",external_event_id:"policy_source",type:"app_mention",occurred_at:start,subject:{workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts,actor_id:"U123"},payload:{},reply_target:{kind:"slack_thread",workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts}}).row;
   f.db.prepare("UPDATE events SET status='completed' WHERE event_id=?").run(event.event_id);
   const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_policy",agent:"main",generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"main",attempt_id:null,source_event_id:event.event_id,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
-  const live={name:"main",role:"main",generation:"generation",thread_id:"thread",turn_id:"turn"};
+  const live={name:"main",role:"main",state:"working",generation:"generation",thread_id:"thread",turn_id:"turn"};
   if(scenario==="main_with_attempt")row.attempt_id="job_forged";
   if(scenario==="worker_without_attempt")row.role="worker";
   if(scenario==="worker_as_main"){row.role="worker";row.attempt_id="job_forged";}
@@ -380,6 +380,7 @@ for(const scenario of ["main_with_attempt","worker_without_attempt","worker_as_m
   if(scenario==="other_main")row.agent=live.name="other_main";
   if(scenario==="live_name")live.name="other_main";
   if(scenario==="live_generation")live.generation="other_generation";
+  if(scenario.startsWith("live_")&&["unknown","stopped","starting","interrupted"].includes(scenario.slice(5)))live.state=scenario.slice(5);
   const results:any[]=[];
   const runtime={externalRequests:async()=>[row],externalRequest:async()=>row,status:async()=>live as any,resolveExternal:async(_name:string,_id:string,result:any)=>{results.push(result);return {};}};
   const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source),source=>ingress.refreshSource(source));
@@ -388,13 +389,13 @@ for(const scenario of ["main_with_attempt","worker_without_attempt","worker_as_m
  });
 }
 
-for(const stage of ["phase","observe","send"] as const)for(const role of ["main","worker"] as const)test(`executor開始phase持越しと${stage}時のlive role=${role}を照合する`,async t=>{
+for(const stage of ["phase","observe","send"] as const)for(const role of ["main","worker","unknown"] as const)test(`executor開始phase持越しと${stage}時のlive identity=${role}を照合する`,async t=>{
  const {DispatcherDatabase}=await import("../src/database.js");
  const f=setup(t),dispatcher=new DispatcherDatabase(f.filename);t.after(()=>dispatcher.close());
  const event=dispatcher.enqueue({schema_version:1,source:"slack",external_event_id:"role_drift",type:"app_mention",occurred_at:start,subject:{workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts,actor_id:"U123"},payload:{},reply_target:{kind:"slack_thread",workspace_id:scope.workspace_id,channel_id:intent.channel_id,thread_ts:intent.thread_ts}}).row;
  f.db.prepare("UPDATE events SET status='completed' WHERE event_id=?").run(event.event_id);
  const row:import("../src/app-server/external-tools.js").ExternalToolRequest={request_id:"ext_drift",agent:"main",generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"call"',role:"main",attempt_id:null,source_event_id:event.event_id,operation_slot:"reply",text:intent.text,state:"pending",result_json:null,created_at:start};
- const live={name:"main",role:"main",generation:"generation",thread_id:"thread",turn_id:"turn"};
+ const live={name:"main",role:"main",state:"working",generation:"generation",thread_id:"thread",turn_id:"turn"};
  let requestId="",now=100;const clock=t.mock.method(performance,"now",()=>now);t.after(()=>clock.mock.restore());
  const runtime={externalRequests:async()=>row.state==="pending"?[row]:[],externalRequest:async()=>row,status:async()=>live as any,resolveExternal:async(_name:string,_id:string,result:any)=>{requestId=result.request_id;row.state="resolved";now+=6000;return {};}};
  const ingress=dispatcher.createExternalApprovalIngress(runtime,f.service,{...scope,owner_id:actor.owner_id,main_agent:"main"});f.setSourceAuthorizer(source=>ingress.authorizeSource(source),source=>ingress.refreshSource(source));
@@ -402,7 +403,8 @@ for(const stage of ["phase","observe","send"] as const)for(const role of ["main"
  const presentation=await f.service.present(actor,requestId);
  await f.service.decide(actor,{...actor,receipt_id:"role_decision",request_id:requestId,decision:"approve",presentation_digest:presentation.presentation_digest,expires_at:"2026-09-19T00:01:00.000Z"});
  live.turn_id="next_main_turn";
- if(stage==="phase")live.role=role;else if(stage==="observe")f.beforeObserve(()=>{live.role=role;});else f.beforeSend(()=>{live.role=role;});
+ const drift=()=>{if(role==="unknown")live.state="unknown";else live.role=role;};
+ if(stage==="phase")drift();else if(stage==="observe")f.beforeObserve(drift);else f.beforeSend(drift);
  await ingress.tick();assert.equal(f.counts().sends,role==="main"?1:0);
  assert.equal((f.db.prepare("SELECT state FROM local_external_ingress WHERE runtime_request_id=?").get(row.request_id) as {state:string}).state,"terminal");
 });
