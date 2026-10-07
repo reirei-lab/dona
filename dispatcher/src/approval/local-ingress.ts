@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import {stableStringify} from "../validation.js";
 import type {DispatcherDatabase} from "../database.js";
 import type {RuntimeClient} from "../app-server/client.js";
+import type {AgentRecord} from "../app-server/store.js";
 import type {ExternalToolRequest} from "../app-server/external-tools.js";
 import type {LocalExternalApprovalService} from "./local-external-service.js";
 import type {ExternalApprovalSource} from "./local-external-types.js";
@@ -42,7 +43,17 @@ export class LocalExternalApprovalIngress {
   return true;
  }
  authorizeSource(source:ExternalApprovalSource){const current=this.live.get(source.runtime_request_id);return !!current&&current.until>Date.now()&&stableStringify(current.source)===stableStringify(source)&&this.durable(source);}
+ private runtimeMatches(source:ExternalApprovalSource,row:ExternalToolRequest,agent:AgentRecord|null):boolean{
+  const role=source.source_job_id===null?"main":"worker";
+  return !!agent&&agent.name===source.agent&&agent.role===role&&row.role===role
+   &&row.attempt_id===source.source_job_id&&row.request_id===source.runtime_request_id
+   &&row.agent===source.agent&&row.generation===source.generation&&row.thread_id===source.thread_id&&row.turn_id===source.turn_id
+   &&agent.generation===source.generation&&agent.thread_id===source.thread_id
+   &&(role!=="worker"||agent.turn_id===source.turn_id&&(row.operation_key??null)===source.runtime_operation_key);
+ }
  private source(row:ExternalToolRequest):ExternalApprovalSource{
+  if((row.role==="main"&&(row.attempt_id!==null||row.agent!==this.config.main_agent))
+   ||(row.role==="worker"&&(row.attempt_id===null||row.agent===this.config.main_agent)))throw Error("external_approval_source_unavailable");
   const job=row.attempt_id?this.dispatcher.getJob(row.attempt_id):undefined,eventId=row.role==="worker"?job?.source_event_id:row.source_event_id;
   const event=eventId?this.dispatcher.get(eventId):undefined;if(!event||event.source!=="slack"||row.role==="worker"&&!job)throw Error("external_approval_source_unavailable");
   const subject=JSON.parse(event.subject_json),target=event.reply_target_json?JSON.parse(event.reply_target_json):{};
@@ -87,11 +98,11 @@ export class LocalExternalApprovalIngress {
 
    for(const [id,entry] of this.live)if(entry.until<=Date.now())this.live.delete(id);
    const phases:Array<()=>Promise<void>>=[async()=>{
-   for(const row of pending){if(performance.now()>=deadline)break;this.live.delete(row.request_id);try{const source=this.source(row),agent=await this.runtime.status(row.agent);if(!agent||agent.generation!==row.generation||agent.thread_id!==row.thread_id)throw Error("external_approval_source_unavailable");this.live.set(row.request_id,{source,until:Date.now()+30000});}catch{this.pendingCursor=row.request_id;await this.runtime.resolveExternal(row.agent,row.request_id,{request_id:null,state:"source_denied"}).catch(()=>{});}}
+   for(const row of pending){if(performance.now()>=deadline)break;this.live.delete(row.request_id);try{const source=this.source(row),agent=await this.runtime.status(row.agent);if(!this.runtimeMatches(source,row,agent))throw Error("external_approval_source_unavailable");this.live.set(row.request_id,{source,until:Date.now()+30000});}catch{this.pendingCursor=row.request_id;await this.runtime.resolveExternal(row.agent,row.request_id,{request_id:null,state:"source_denied"}).catch(()=>{});}}
    // mainへpending handleを返した後も、元のDona世代とsaved sourceを照合する。
    for(const row of rows){if(performance.now()>=deadline)break;this.rowCursor=row.runtime_request_id;this.live.delete(row.runtime_request_id);const source=JSON.parse(row.source_json) as ExternalApprovalSource;
     if(row.state!=="pending"){if(row.request_id)this.refreshRecovery(source,row.request_id);continue;}
-    const record=await this.runtime.externalRequest(source.runtime_request_id),agent=await this.runtime.status(source.agent);if(!record||record.state==="expired"||record.agent!==source.agent||record.generation!==source.generation||record.thread_id!==source.thread_id||record.turn_id!==source.turn_id||(source.source_job_id&&(record.operation_key??null)!==source.runtime_operation_key)||!agent||agent.generation!==source.generation||agent.thread_id!==source.thread_id||!this.durable(source)){
+    const record=await this.runtime.externalRequest(source.runtime_request_id),agent=await this.runtime.status(source.agent);if(!record||record.state==="expired"||!this.runtimeMatches(source,record,agent)||!this.durable(source)){
      this.live.delete(source.runtime_request_id);
      const lost=row.request_id?this.service.sourceUnavailable(source,row.request_id):null;
      if(row.request_id)this.refreshRecovery(source,row.request_id);
