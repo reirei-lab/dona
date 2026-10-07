@@ -253,6 +253,8 @@ async function workerApprovalFixture(t:{after(fn:()=>void):void},queuedSteer=fal
 }
 
 for(const receipt of ["delayed","conflict","wrong_attempt"] as const)test(`worker回答の${receipt}受領はread-only照合し再回答しない`,async t=>{
+ // 受領の不変条件を検証する。巡回budgetの消費は専用のphaseテストで扱う。
+ t.mock.method(performance,"now",()=>0);
  const f=await workerApprovalFixture(t);await f.ingress.tick();const id=await f.approve();let responses=0;
  f.runtime.resolveExternal=async(_name:string,_id:string,result:any)=>{responses++;Object.assign(f.row(),{state:"answering",result_json:JSON.stringify(result),text:""});throw Error("response lost");};
  await f.ingress.tick();assert.equal(f.counts().sends,1);assert.equal(responses,1);
@@ -267,6 +269,7 @@ for(const receipt of ["delayed","conflict","wrong_attempt"] as const)test(`worke
 });
 
 test("回答前のRuntime照会中にTaskが取消されたら回答writeを開始しない",async t=>{
+ t.mock.method(performance,"now",()=>0);
  const f=await workerApprovalFixture(t);await f.ingress.tick();await f.approve();const control=f.enqueue("cancel_during_read");let responses=0,cancelled=false;
  const read=f.runtime.externalRequest;
  f.runtime.externalRequest=async id=>{const record=await read(id);if(f.counts().sends===1&&!cancelled){const task=f.dispatcher.tasks.get(f.task.task_id)!;f.dispatcher.tasks.control(task.task_id,control.event_id,task.revision,"cancel");cancelled=true;}return record;};
