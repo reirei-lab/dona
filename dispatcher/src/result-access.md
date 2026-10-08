@@ -1,0 +1,13 @@
+# Result限定開示・内部照合の先行契約
+
+Issue #171の部分成果。`ResultAccessContract`はAPI/MCP・status-summary・group completionへ未接続で、既定portはdenyする。現行`taskGrantSchema.operations`の`read`を独立`read_result`と解釈しない。実grant発行・issuer・外部fetchも追加しない。
+
+server adapterはverified current principal、exact Task/Attempt、terminal revision、現在のgrant/policy revision、現在のdestination visibilityを取得し、独立したauthority/disclosureを検証してpermitを構築する。リクエスト内のprincipalや本文claimは証拠ではない。permitはrequest全体に束縛し、privateからpublicはpermitがあってもdenyする。非同期参照検証後にsnapshot/permitを再取得し、同一性を比較してlate Result・revoke・destination変更をdenyする。
+
+既存Result validatorとpublishのcode point順canonical encoderを再利用する。`acceptedResultDigest`はaccepted envelope全体（completed_atを含む）の内部identityであり、publish requestのidempotency digestとは異なるdomain。ingestion receiptのdigestをそのまま代入しない。adapterはdurable accepted envelopeから計算・保存し、受理済みterminal stateと同じrevisionに結び付ける必要がある。
+
+projectionはpermitのfield allowlistからstatus/completed_at/summary/outputのみを構築する。artifactはcanonical HTTPS Github PR参照からrepository/number/head/baseだけを抽出し、permitのexact allowlistとserver検証portの成功が揃ったものだけ返す。raw artifact、error、action、path、download URLは返さない。参照文字列を直接fetchしない。実adapterはGithub APIの固定hostとexact repository/PRのみにアクセスし、redirect・private download・ローカル/network resourceを解決しない契約が必要。
+
+照合receiptはterminal revision、内部canonical digest、検証済みPR identityだけを返し、本文をmodelへ渡さない。invalid/未確定/不一致/取得不能はunknown。receiptは署名済み能力でもwrite/handoff許可でもなく、保存したreceiptをrestart後に再利用する際もcurrent snapshot/authorityの再検証が必要。
+
+残acceptanceは独立read_resultのgrant schema採用判断、server-owned adapterの実認可証拠とdurable accepted Resultへの接続、既存#143 projectionとの統合、API/MCPの入力から出口までのtest、制限付きPR検証adapterの実装。fixtureのrestartはcontract再生成であり、本番process/DB restartの証明ではない。PR #401の未merge成果は依存として取り込まない。
