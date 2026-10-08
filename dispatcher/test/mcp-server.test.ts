@@ -423,3 +423,21 @@ describe("Dona Dispatcher MCP server", () => {
     }
   });
 });
+
+test("delegate_taskのfollowupを改変せずUDSへ渡し、受理された後続identityだけをactionへ返す",async()=>{
+  let received:unknown;
+  const api={async createTask(input:unknown){received=input;return {outcome:"created",task:{task_id:"task_01k00000000000000000000002",current_attempt_id:"job_01k00000000000000000000002"}};}} as unknown as DispatcherJobClient;
+  const server=createDispatcherMcpServer(api,logger);
+  const client=new Client({name:"followup-test",version:"1.0"});
+  const [clientTransport,serverTransport]=InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);await client.connect(clientTransport);
+  try{
+    const input={source_event_id:"evt_01k00000000000000000000001",task_key:"followup",objective:"競合解消",workspace:{kind:"github",repository:"org/repo",base_ref:"existing/pr"},issue_number:23,
+      followup:{task_id:"task_01k00000000000000000000001",revision:4,attempt_id:"job_01k00000000000000000000001"}};
+    const result=await client.callTool({name:"delegate_task",arguments:input});
+    assert.equal(result.isError,undefined);assert.deepEqual((received as any).followup,input.followup);
+    const action=(result.structuredContent as any).action;
+    assert.equal(action.task_id,"task_01k00000000000000000000002");assert.equal(action.source_event_id,input.source_event_id);
+    assert.equal(action.followup,undefined);
+  }finally{await client.close();await server.close();}
+});

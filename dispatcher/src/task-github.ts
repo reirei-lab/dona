@@ -46,11 +46,12 @@ export async function verifyTaskIssue(input:TaskRequest,query:GitHubQuery):Promi
 export class TaskProjector {
   constructor(private readonly database:DispatcherDatabase,private readonly query:GitHubQuery) {}
   async sync(task:TaskRow):Promise<void> {
-    if(!task.project_json||task.project_state==="synced"||task.project_state==="conflict")return;
+    task=this.database.tasks.get(task.task_id)!;
+    if(!task.project_json||task.project_state==="superseded"||task.project_state==="synced"||task.project_state==="conflict")return;
     const binding=JSON.parse(task.project_json);
     const data=await this.query(`query($id:ID!){node(id:$id){... on ProjectV2Item{id project{id} content{... on Issue{id}} task:fieldValueByName(name:"Dona Task ID"){... on ProjectV2ItemFieldTextValue{text}} progress:fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{optionId}}}}}`,{id:binding.item_id});
     const item=data.node;
-    if(item?.project?.id!==binding.project_id||item?.content?.id!==binding.issue_id||(item.task?.text&&item.task.text!==task.task_id)){this.database.tasks.projectState(task,"conflict");return;}
+    if(item?.project?.id!==binding.project_id||item?.content?.id!==binding.issue_id||(item.task?.text&&item.task.text!==task.task_id&&item.task.text!==this.database.tasks.followupPredecessor(task.task_id))){this.database.tasks.projectState(task,"conflict");return;}
     // Completed means accepted Task outcome, not automatically merged/deployed.
     const status=task.progress==="todo"?"Todo":task.state==="completed"?binding.completion_status:"In Progress";
     const expected=binding.options[status];

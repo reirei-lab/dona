@@ -40,8 +40,10 @@ export const taskRequestSchema = z.object({
   continuation_scope: continuationScopeSchema.optional(),
   initial_operation: z.enum(["read_only","submit_pr"]).optional(),
   continuation: continuationSchema.optional(),
+  followup: z.object({task_id:taskIdSchema,revision:z.number().int().positive(),attempt_id:z.string().regex(/^job_[0-9a-hjkmnp-tv-z]{26}$/)}).strict().optional(),
   policy: z.object({max_attempts:z.number().int().min(1).max(10).default(3),retry_delay_ms:z.number().int().min(1000).max(86_400_000).default(60_000)}).strict().default({max_attempts:3,retry_delay_ms:60_000}),
-}).strict().refine(v=>v.issue_number===undefined||v.workspace.kind==="github", "Issue requires a GitHub workspace")
+}).strict().refine(v=>!v.followup||(v.issue_number!==undefined&&!v.continuation&&!v.continuation_scope&&v.task_key!=="legacy-default"),"task_followup_requires_issue_request")
+  .refine(v=>v.issue_number===undefined||v.workspace.kind==="github", "Issue requires a GitHub workspace")
   .refine(v=>v.project===undefined||v.issue_number!==undefined,"Project requires an Issue")
   .refine(v=>v.continuation_scope ? v.initial_operation!==undefined&&v.continuation_scope.operations.includes(v.initial_operation) : v.initial_operation===undefined,"task_continuation_initial_operation_required")
   .refine(v=>(v.continuation?.operation??v.initial_operation)!=="read_only"||v.project?.completion_status!=="Merge Ready","task_continuation_scope_mismatch")
@@ -114,6 +116,12 @@ export class TaskRepository {
         attempt_id TEXT PRIMARY KEY REFERENCES task_attempts(attempt_id),task_id TEXT NOT NULL REFERENCES tasks(task_id),
         successor_id TEXT NOT NULL REFERENCES task_attempts(attempt_id),source_event_id TEXT NOT NULL REFERENCES events(event_id),
         request_sha256 TEXT NOT NULL,request_json TEXT NOT NULL,created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS task_followups(
+        predecessor_task_id TEXT PRIMARY KEY REFERENCES tasks(task_id),
+        successor_task_id TEXT NOT NULL UNIQUE REFERENCES tasks(task_id),
+        resource_id TEXT NOT NULL,predecessor_revision INTEGER NOT NULL,
+        predecessor_attempt_id TEXT NOT NULL REFERENCES task_attempts(attempt_id),
+        source_event_id TEXT NOT NULL REFERENCES events(event_id),created_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS tasks_recovery ON tasks(state,next_check_at);
       CREATE TRIGGER IF NOT EXISTS task_attempt_completion AFTER UPDATE OF status ON jobs
       WHEN NEW.status IN ('completed','failed','cancelled') AND EXISTS(SELECT 1 FROM tasks WHERE current_attempt_id=NEW.job_id)
@@ -155,7 +163,7 @@ export class TaskRepository {
   claimProjection(task:TaskRow,fieldId:string,kind:string,value:string):boolean {
     return this.sql.transaction(()=>{
       const fresh=this.get(task.task_id)!;
-      if(fresh.revision!==task.revision||this.projectIntent(task.task_id))return false;
+      if(fresh.revision!==task.revision||fresh.project_state==="superseded"||this.projectIntent(task.task_id))return false;
       this.sql.prepare("INSERT INTO task_project_intents VALUES(?,?,?,?,?,'attempting',?)").run(task.task_id,task.revision,fieldId,kind,value,new Date().toISOString());
       this.sql.prepare("UPDATE tasks SET project_state='attempting',project_next_check_at=? WHERE task_id=?").run(new Date(Date.now()+30_000).toISOString(),task.task_id);return true;
     }).immediate();
@@ -221,10 +229,44 @@ export class TaskRepository {
       if(parsed.issue_number!==undefined&&(!issue||issue.number!==parsed.issue_number||parsed.workspace.kind!=="github"||issue.repository.toLowerCase()!==parsed.workspace.repository.toLowerCase()))throw new Error("task_issue_identity_unverified");
       if(parsed.project&&!issue?.project)throw new Error("task_project_identity_unverified");
       const resource=issue?`github:${issue.node_id}`:null;
+      let predecessor:TaskRow|undefined;
+      if(parsed.followup) {
+        predecessor=this.assertOwner(parsed.followup.task_id,parsed.source_event_id,true);
+        if(event.source!=="slack"||parsed.source_event_id===predecessor.source_event_id)throw Error("task_followup_requires_new_slack_request");
+        if(predecessor.revision!==parsed.followup.revision||predecessor.current_attempt_id!==parsed.followup.attempt_id)throw Error("task_revision_conflict");
+        if(!resource||predecessor.resource_id!==resource)throw Error("task_followup_issue_mismatch");
+        const old=this.dispatcher.getJob(predecessor.current_attempt_id)!;
+        if(predecessor.state!=="completed"||predecessor.desired_state!=="running"||predecessor.steer_pending_event_id||old.status!=="completed"||!old.result_json||old.steer_state||old.last_error_code)throw Error("task_followup_requires_completed_result");
+        const result=JSON.parse(old.result_json) as {actions?:Array<Record<string,unknown>>};
+        if(result.actions?.some(action=>action?.ambiguous===true))throw Error("task_external_effect_reconciliation_required");
+        const stopped=this.sql.prepare("SELECT 1 FROM job_terminal_worker_stop_proofs WHERE job_id=? UNION ALL SELECT 1 FROM job_terminal_worker_cleanups WHERE job_id=? AND outcome='stopped'").get(old.job_id,old.job_id);
+        if(!stopped)throw Error("task_followup_worker_stop_required");
+        const group=this.dispatcher.getJobGroup(old.source_event_id);
+        if(!old.completion_event_id||(group?.notification_mode==="grouped"&&!group.all_terminal_event_id))throw Error("task_prior_notification_requires_reconciliation");
+        const notifications=[...new Set([old.completion_event_id,group?.attention_event_id,group?.all_terminal_event_id])]
+          .filter((id):id is string=>!!id).map(id=>this.dispatcher.get(id)!);
+        const requestedAt=Date.parse(event.occurred_at),completedAt=Date.parse(old.completed_at??"");
+        if(!Number.isFinite(requestedAt)||!Number.isFinite(completedAt)||requestedAt<=completedAt||
+          notifications.some(notice=>{const notifiedAt=Date.parse(notice.completed_at??notice.updated_at);
+            return event.sequence<=notice.sequence||!Number.isFinite(notifiedAt)||requestedAt<=notifiedAt;}))throw Error("task_followup_requires_new_slack_request");
+        this.dispatcher.assertTaskRetryNotificationsSettled(old.job_id);
+        if(this.externalApprovalRecovery(old.job_id).state!=="ready")throw Error("task_external_effect_reconciliation_required");
+        const snapshot=checkpointSnapshot(old,predecessor.task_id);
+        if(snapshot.checkpoint)this.checkpoint(old,snapshot.checkpoint);
+        const checkpoint=this.attemptCheckpoint(old.job_id);
+        if(checkpoint&&(checkpoint.waiting==="external_effect_unknown"||checkpoint.unresolved_operations.length))throw Error("task_external_effect_reconciliation_required");
+        if(predecessor.project_json) {
+          const oldProject=JSON.parse(predecessor.project_json);
+          if(!issue?.project||["issue_id","item_id","project_id","task_field_id","status_field_id"].some(key=>oldProject[key]!==issue.project![key]))throw Error("task_followup_project_mismatch");
+          if(predecessor.project_state!=="synced"||this.projectIntent(predecessor.task_id))throw Error("task_followup_project_reconciliation_required");
+        }
+      }
       if(resource) {
         const claimed=this.sql.prepare("SELECT task_id FROM tasks WHERE resource_id=?").get(resource) as {task_id:string}|undefined;
-        if(claimed){this.assertOwner(claimed.task_id,parsed.source_event_id);throw new Error("task_resource_already_claimed");}
+        if(claimed&&claimed.task_id!==predecessor?.task_id){this.assertOwner(claimed.task_id,parsed.source_event_id);throw new Error("task_resource_already_claimed");}
       }
+      // Atomic transfer retains terminal history and prevents a concurrent claimant.
+      if(predecessor)this.sql.prepare("UPDATE tasks SET resource_id=NULL,project_state='superseded',revision=revision+1,updated_at=? WHERE task_id=?").run(new Date().toISOString(),predecessor.task_id);
       const request=parseCreateJobRequest({source_event_id:parsed.source_event_id,...(storageKey==="legacy-default"?{}:{job_key:storageKey}),objective:parsed.objective,workspace:parsed.workspace,...(parsed.display?{display:parsed.display}:{})});
       const created=this.dispatcher.createJob(request,workspaceRoot,resultDir);
       if(created.duplicate)throw new Error("task_attempt_identity_conflict");
@@ -232,7 +274,15 @@ export class TaskRepository {
       this.sql.prepare(`INSERT INTO tasks(task_id,source_event_id,task_key,request_sha256,resource_id,current_attempt_id,max_attempts,retry_delay_ms,objective,project_json,created_at,updated_at)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(id,parsed.source_event_id,storageKey,digest,resource,job.job_id,parsed.policy.max_attempts,parsed.policy.retry_delay_ms,request.objective,issue?.project?JSON.stringify(issue.project):null,now,now);
       this.sql.prepare("INSERT INTO task_attempts(attempt_id,task_id,number,created_at) VALUES(?,?,1,?)").run(job.job_id,id,now);
+      if(predecessor)this.sql.prepare("INSERT INTO task_followups VALUES(?,?,?,?,?,?,?)").run(predecessor.task_id,id,resource,predecessor.revision,predecessor.current_attempt_id,parsed.source_event_id,now);
       this.stampAttempt(job,id,1);
+      if(predecessor) {
+        const old=this.dispatcher.getJob(predecessor.current_attempt_id)!;
+        const workspace={...JSON.parse(this.dispatcher.getJob(job.job_id)!.workspace_json),_dona_followup:{
+          predecessor_task_id:predecessor.task_id,predecessor_attempt_id:old.job_id,
+          result_path:old.result_path,workspace_path:old.workspace_path}};
+        this.sql.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(JSON.stringify(workspace),job.job_id);
+      }
       this.continuations.attach(parsed,this.get(id)!);
       this.activateSchema();
       return {outcome:"created" as const,task:this.get(id)!};
@@ -284,10 +334,16 @@ export class TaskRepository {
     const workspace={...JSON.parse(job.workspace_json),_dona_task:{task_id:taskId,attempt_id:job.job_id,attempt_number:number}};
     this.sql.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(JSON.stringify(workspace),job.job_id);
   }
+  followupPredecessor(id:string):string|undefined {
+    return (this.sql.prepare("SELECT predecessor_task_id FROM task_followups WHERE successor_task_id=?").get(id) as {predecessor_task_id:string}|undefined)?.predecessor_task_id;
+  }
   projection(task:TaskRow,includeResult=false):Record<string,unknown> {
     const current=this.dispatcher.getJob(task.current_attempt_id)!;
     const continuation=this.continuations.projection(task.task_id);
-    return {...(continuation?{continuation}:{}),task_id:task.task_id,task_key:this.continuations.logicalKey(task),admission:this.continuations.admission(task.task_id),source_event_id:task.source_event_id,revision:task.revision,progress:task.progress,state:task.state,
+    const incoming=this.sql.prepare("SELECT predecessor_task_id,predecessor_attempt_id FROM task_followups WHERE successor_task_id=?").get(task.task_id) as {predecessor_task_id:string;predecessor_attempt_id:string}|undefined;
+    const outgoing=this.sql.prepare("SELECT successor_task_id FROM task_followups WHERE predecessor_task_id=?").get(task.task_id) as {successor_task_id:string}|undefined;
+    const followup=incoming||outgoing?{...incoming,...outgoing}:undefined;
+    return {...(followup?{followup}:{}),...(continuation?{continuation}:{}),task_id:task.task_id,task_key:this.continuations.logicalKey(task),admission:this.continuations.admission(task.task_id),source_event_id:task.source_event_id,revision:task.revision,progress:task.progress,state:task.state,
       wait_reason:task.wait_reason,next_check_at:task.next_check_at,current_attempt_id:task.current_attempt_id,
       attempt_number:task.attempt_number,max_attempts:task.max_attempts,worker_state:current.status,steer_event_id:current.steer_event_id,steer_state:current.steer_state,
       notification_target:JSON.parse(this.dispatcher.get(task.source_event_id)!.reply_target_json!),
