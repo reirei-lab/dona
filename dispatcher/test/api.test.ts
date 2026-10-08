@@ -536,6 +536,7 @@ describe("DispatcherApi", () => {
     const database = new DispatcherDatabase(config.databasePath);
     let workerRunning = true;
     let jobsRunning = true;
+    let quiesceCalls = 0;
     let finishQuiesce!: () => void;
     const quiesceMayFinish = new Promise<void>((resolve) => {
       finishQuiesce = resolve;
@@ -554,7 +555,7 @@ describe("DispatcherApi", () => {
       config,
       logger,
       updates,
-      { async quiesce() { await quiesceMayFinish; workerRunning = false; jobsRunning = false; } },
+      { async quiesce() { quiesceCalls++; await quiesceMayFinish; workerRunning = false; jobsRunning = false; } },
     );
     await api.start();
     const accepted = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-update-plan"));
@@ -599,11 +600,27 @@ describe("DispatcherApi", () => {
     });
     assert.equal(quiesced.status, 202);
     assert.equal(quiesced.body.drained, false);
+    const quiesceIdentity = {
+      schema_version: 1, protocol: 1,
+      operation_id: "upd_01m1es03xy5cf8d9pm5cwx4srv", target_sha: "2".repeat(40),
+    };
+    assert.equal((await request(config.socketPath, "POST", "/v1/admin/quiesce", quiesceIdentity)).status, 202);
+    assert.equal((await request(config.socketPath, "POST", "/v1/admin/quiesce", {
+      ...quiesceIdentity, target_sha: "3".repeat(40),
+    })).status, 409);
+    assert.equal((await request(config.socketPath, "POST", "/v1/admin/quiesce", {
+      ...quiesceIdentity, operation_id: "upd_01m1es03xy5cf8d9pm5cwx4srw",
+    })).status, 409);
     finishQuiesce();
     await waitFor(() => !workerRunning && !jobsRunning);
     const drained = await request(config.socketPath, "GET", "/v1/admin/drain-status");
     assert.equal(drained.status, 200);
     assert.equal(drained.body.drained, true);
+    assert.equal((await request(config.socketPath, "POST", "/v1/admin/quiesce", quiesceIdentity)).status, 200);
+    assert.equal((await request(config.socketPath, "POST", "/v1/admin/quiesce", {
+      ...quiesceIdentity, target_sha: "3".repeat(40),
+    })).status, 409);
+    assert.equal(quiesceCalls, 1);
     assert.equal((await request(config.socketPath, "GET", "/health/version")).status, 503);
     assert.equal((await request(config.socketPath, "POST", "/v1/self-update/apply", {
       source_event_id: eventId,
