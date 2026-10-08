@@ -4,10 +4,11 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import type { JobRow } from "./types.js";
+export const checkpointArtifactKinds=["commit","base","branch","pull_request","file","design","external_process"] as const;
 export const checkpointSchema=z.object({
   schema_version:z.literal(1),task_id:z.string(),attempt_id:z.string(),sequence:z.number().int().positive(),
   summary:z.string().max(4000),remaining:z.array(z.string().max(2000)).max(32),
-  artifacts:z.array(z.object({kind:z.enum(["commit","branch","pull_request","file","design","external_process"]),reference:z.string().max(2000)}).strict()).max(64),
+  artifacts:z.array(z.object({kind:z.enum(checkpointArtifactKinds),reference:z.string().max(2000)}).strict()).max(64),
   unresolved_operations:z.array(z.string().max(2000)).max(32),
   waiting:z.enum(["none","usage_limit","network","human_input","external_effect_unknown"]).default("none"),
   retry_after:z.string().datetime().optional(),

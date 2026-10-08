@@ -142,3 +142,9 @@ Dispatcherはtransaction内で以下を再照合する。
 新Taskは新しい作業領域を使い、旧領域を変更せず旧Result・commit・PR・外部操作を照合してから追加作業を行う。未commitの旧差分を黙って捨てたり、応答不明の外部writeを再送したりしない。`get_task`の`followup`投影で前後のidentityを確認できる。応答喪失後は同じevent/task_keyを`list_tasks`で照合し、既存後続のResultを採用する。元のcanonical requestを再取得したときだけ同内容の冪等応答を照合でき、異内容・別key・古いrevisionからの再委任は拒否される。
 
 これはコード提出後に有効になる契約であり、旧稼働世代のDBからclaimを手動削除する手順ではない。
+
+## checkpointに保存する成果参照
+
+`artifacts[].kind`は`commit` / `base` / `branch` / `pull_request` / `file` / `design` / `external_process`を使用する。`base`は開始元commitの参照であり、実行権限や完了の証拠ではない。checkpoint全体は再開用の未検証資料で、Task/Attempt identity・sequence・外部操作の未解決状態の検証を省略しない。
+
+旧版では`base`を含むcheckpointが停止更新時にschema不一致となり、`offline_task_resumes`に`held` / `result_conflict`が保存される場合がある。修正版でも保存済み保留を自動解除しない。元の依頼者から継続依頼を受け、現在のTask・Attempt・revisionとcheckpoint、旧workerの停止、既存成果・外部操作を照合してから、通常の`resume_task`経路を使う。schema不一致が残る、identityやsequenceが食い違う、外部操作が未確認の場合は保留を維持する。DBやcheckpointを直接削除して迂回しない。
