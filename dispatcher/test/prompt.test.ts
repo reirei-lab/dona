@@ -62,3 +62,14 @@ test('外部承認通知は現在通知IDと保存宛先への非broadcast投稿
  const prompt=buildEventPrompt('evt_current','/tmp/result.json',{...envelope,source:'dona_approval'});
  for(const instruction of ['保存reply_targetのworkspace/channel/thread','今回の通知event_id','payload.source_event_idで代用しない','reply_broadcast:false','mrkdwn:true','parse:none','schedule専用authorize_job_notificationは呼ばない','同じ本文を再投稿しない'])assert.ok(prompt.includes(instruction));
 });
+
+test("CI完了通知の計画は現在通知IDを使い、適用承認を別のSlack入力で待つ", () => {
+  const prompt = buildEventPrompt("evt-1", "/tmp/result.json", { ...envelope, source: "dona_job", type: "job_completed" });
+  assert.match(prompt, /現在の通知event_idをsource_event_idとしてplan_self_update/);
+  assert.match(prompt, /grouped通知はall_terminalに限ります/);
+  assert.match(prompt, /元Slack event IDを手入力して拒否を迂回せず/);
+  assert.match(prompt, /そのplanへの明示的なSlack承認を待ちます/);
+  for (const source of ["slack", "dona_update", "dona_schedule"] as const) {
+    assert.doesNotMatch(buildEventPrompt("evt-1", "/tmp/result.json", { ...envelope, source }), /現在の通知event_idをsource_event_idとしてplan_self_update/);
+  }
+});

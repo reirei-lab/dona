@@ -425,7 +425,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("plan_self_update", {
     title: "Plan Dona self-update",
-    description: "固定repository/mainからexact target SHA、互換性、plan hashを読み取り専用で計画します。raw ref/URL/path/commandは受け付けません。",
+    description: "固定repository/mainからexact target SHA、互換性、plan hashを読み取り専用で計画します。source_event_idには現在のSlack依頼または成功した完了通知のIDを指定します。完了通知は保存済みreceipt・owner・依頼者を照合して元Slack依頼へ結び付けます。raw ref/URL/path/commandは受け付けません。計画作成は適用の承認を意味しません。",
     inputSchema: { source_event_id: eventId },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async ({ source_event_id }) => {

@@ -1,5 +1,6 @@
 import { continuationControlSchema } from "./task-continuation.js";
 import { resolveVerifiedSlackOwner } from "./verified-owner-origin.js";
+import { resolveCompletedUpdatePlanOrigin } from "./self-update-plan-context.js";
 import { projectCompletionJob } from "./completion-projection.js";
 import { verifySlackPrincipalProof } from "./principal-proof.js";
 import type { AgentContextManager } from "./agent-context.js";
@@ -626,9 +627,17 @@ export class DispatcherApi {
         typeof input.source_event_id !== "string" || !/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(input.source_event_id)) {
         throw new ApiRequestError(400, "invalid_request", "source_event_id is invalid");
       }
-      const event = this.database.get(input.source_event_id);
+      let event = this.database.get(input.source_event_id);
+      if (event?.source === "dona_job") {
+        const token = request.headers["x-dona-agent-token"];
+        const currentEventId = request.headers["x-dona-agent-event-id"];
+        const context = typeof token === "string" && currentEventId === event.event_id
+          ? this.agentContexts?.authorize(token, currentEventId, "plan_self_update") : undefined;
+        event = context?.purpose === "job_completion"
+          ? resolveCompletedUpdatePlanOrigin(this.database, event.event_id) : undefined;
+      }
       if (!event || event.source !== "slack" || !event.reply_target_json) {
-        throw new ApiRequestError(400, "invalid_update_context", "Source event does not have a persisted Slack reply target");
+        throw new ApiRequestError(400, "invalid_update_context", "Update planning requires a persisted Slack request or its verified successful completion notification");
       }
       sendJson(response, 200, await this.updates.plan({
         source_event_id: event.event_id,
@@ -677,7 +686,7 @@ export class DispatcherApi {
     }
     const event = this.database.get(eventId);
     if (!event || event.source !== "slack" || !event.reply_target_json) {
-      throw new ApiRequestError(400, "invalid_update_context", "Source event does not have a persisted Slack reply target");
+      throw new ApiRequestError(400, "invalid_update_context", "Update apply/cancel requires a direct Slack event with a persisted reply target");
     }
     return event;
   }
