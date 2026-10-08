@@ -39,7 +39,7 @@ Task schema4の同世代更新では `DONA_TASK_GENERATION_UPDATE=forward_only .
 
 ## 通常update
 
-1. Donaは`plan_self_update(source_event_id)`を呼びます。
+1. Donaは現在処理中のSlack依頼のIDで`plan_self_update(source_event_id)`を呼びます。agent contextが有効なDispatcherではcredentialと要求IDの一致が必要です。
 2. 利用者はcurrent/target exact SHA、plan hash、policy、CI、互換性、rollback可否を確認します。
 3. 明示承認後だけ、Donaは`apply_self_update(source_event_id, plan_id, plan_hash, approval_id)`を呼びます。
 4. acceptedは「approval受付eventとexact planをDBへcommitした」意味です。その受付Event Resultが`completed`になるまでactivationは始まりません。

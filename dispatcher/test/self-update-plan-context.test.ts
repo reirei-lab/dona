@@ -80,7 +80,11 @@ for (const mode of ["api", "mcp"] as const) test(`${mode}: CI完了通知から�
     await assert.rejects(f.client.cancelSelfUpdate({ source_event_id: f.notification.event_id,
       request_id: "request" }), /direct Slack event/);
     assert.equal(f.calls.length, 1);
+    // 現在の通知credentialで古いSlack IDへ置き換える迂回も拒否する。
+    await assert.rejects(f.client.planSelfUpdate({ source_event_id: f.origin.event_id }), /verified successful completion/);
+    assert.equal(f.calls.length, 1);
     // 直接のSlack依頼は従来どおり計画でき、明示承認の入口は変更しない。
+    await f.current(f.origin.event_id);
     await f.client.planSelfUpdate({ source_event_id: f.origin.event_id });
     await f.client.applySelfUpdate({ source_event_id: f.origin.event_id,
       plan_id: "test-plan", plan_hash: "hash", approval_id: "approval" });

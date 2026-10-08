@@ -31,7 +31,7 @@ export class AgentPrincipalUnavailableError extends Error {
 interface ActiveContext extends AgentExecutionContext { token_sha256: string; }
 
 export const agentPurposeOperations: Record<AgentPurpose, readonly string[]> = {
-  human_command: ["get_job_status_summary", "list_event_jobs", "get_job_status", "list_thread_jobs"],
+  human_command: ["get_job_status_summary", "list_event_jobs", "get_job_status", "list_thread_jobs", "plan_self_update"],
   job_completion: ["list_event_jobs", "get_job_status", "plan_self_update"],
   schedule_work: [],
   update_completion: [],

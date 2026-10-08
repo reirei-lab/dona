@@ -628,11 +628,12 @@ export class DispatcherApi {
         throw new ApiRequestError(400, "invalid_request", "source_event_id is invalid");
       }
       let event = this.database.get(input.source_event_id);
+      const token = request.headers["x-dona-agent-token"];
+      const currentEventId = request.headers["x-dona-agent-event-id"];
+      const context = typeof token === "string" && currentEventId === event?.event_id
+        ? this.agentContexts?.authorize(token, currentEventId, "plan_self_update") : undefined;
+      if (this.agentContexts && !context) event = undefined;
       if (event?.source === "dona_job") {
-        const token = request.headers["x-dona-agent-token"];
-        const currentEventId = request.headers["x-dona-agent-event-id"];
-        const context = typeof token === "string" && currentEventId === event.event_id
-          ? this.agentContexts?.authorize(token, currentEventId, "plan_self_update") : undefined;
         event = context?.purpose === "job_completion"
           ? resolveCompletedUpdatePlanOrigin(this.database, event.event_id) : undefined;
       }
