@@ -162,6 +162,7 @@ export class DispatcherApi {
   private ownsStatusContext=false;
   private shuttingDown = false;
   private quiesceOperationId: string | undefined;
+  private quiesceTargetSha: string | undefined;
   private quiescePromise: Promise<void> | undefined;
   private quiesceComplete = false;
   private quiesceError: string | undefined;
@@ -381,10 +382,12 @@ export class DispatcherApi {
           typeof input.target_sha !== "string" || !/^[0-9a-f]{40}$/.test(input.target_sha)) {
           throw new ApiRequestError(400, "invalid_request", "Quiesce request is invalid");
         }
-        if (this.quiesceOperationId && this.quiesceOperationId !== input.operation_id) {
-          throw new ApiRequestError(409, "already_quiescing", "Dispatcher is quiescing for a different update");
+        if (this.quiesceOperationId && (this.quiesceOperationId !== input.operation_id ||
+          this.quiesceTargetSha !== input.target_sha)) {
+          throw new ApiRequestError(409, "already_quiescing", "Dispatcher is quiescing for a different update or target");
         }
         this.quiesceOperationId = input.operation_id;
+        this.quiesceTargetSha = input.target_sha;
         this.beginShutdown();
         if (!this.quiescePromise) {
           this.quiescePromise = Promise.resolve(this.quiesceController?.quiesce())
