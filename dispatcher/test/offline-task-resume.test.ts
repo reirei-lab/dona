@@ -13,6 +13,7 @@ import Database from 'better-sqlite3';
 import {JobSupervisor} from '../src/job-supervisor.js';
 import type {JobAgentRuntime} from '../src/job-runtime.js';
 import {migrateStoppedRuntime} from '../src/app-server/migration.js';
+import {readCheckpoint} from '../src/task-checkpoint.js';
 import {buildJobPrompt} from '../src/job-prompt.js';
 import {eventEnvelope,tempConfig} from './helpers.js';
 
@@ -311,5 +312,43 @@ for(const modern of [false,true])test(`Runtime DBにagentがない旧Taskは既�
    f.db.markJobNeedsReview(f.job.job_id,'agent_not_running','legacy stopped');due(f);const s=new JobSupervisor(f.db,adapter,f.config,{debug(){},info(){},warn(){},error(){}},()=>{});await s.reconcileTasks();
    const task=f.db.tasks.get(f.task.task_id)!;assert.notEqual(task.current_attempt_id,f.job.job_id);assert.equal(JSON.parse(f.db.getJob(task.current_attempt_id)!.workspace_json)._dona_resume,undefined);
   }
+ }finally{await f.close();}
+});
+
+for(const held of [false,true])test(`base commitのcheckpointで停止更新を継続できる 既存保留=${held}`,async()=>{
+ const f=await fixture();try{
+  const checkpoint={schema_version:1 as const,task_id:f.task.task_id,attempt_id:f.job.job_id,sequence:3,summary:'reviewとCI待ち',remaining:['reviewとCI確認','Result公開'],artifacts:[{kind:'pull_request',reference:'https://github.com/reirei-lab/dona/pull/398'},{kind:'commit',reference:'head-sha'},{kind:'base',reference:'base-sha'}],unresolved_operations:[],waiting:'none'};
+  await fs.mkdir(path.dirname(f.job.result_path),{recursive:true});await fs.writeFile(path.join(path.dirname(f.job.result_path),'checkpoint.json'),JSON.stringify(checkpoint));
+  if(held){
+   // 旧版がschema不一致を保存した状態を再現する。実DBへの直接補正ではない。
+   const sql=new Database(f.config.databasePath);sql.prepare('INSERT INTO offline_task_resumes(attempt_id,task_id,run_id,source_json,state,reason) VALUES(?,?,?,?,?,?)').run(f.job.job_id,f.task.task_id,'update-1',JSON.stringify({name:f.job.agent_name,generation:'original-generation',thread_id:'saved-thread',attempt_id:f.job.job_id}),'held','result_conflict');sql.close();
+  }
+  assert.equal((await readCheckpoint(f.job,f.task.task_id))!.artifacts[2]!.kind,'base');
+  f.migrate();
+  if(held){
+   assert.equal(f.db.tasks.get(f.task.task_id)!.wait_reason,'result_conflict');
+   const current=f.db.tasks.get(f.task.task_id)!;
+   f.db.tasks.control(current.task_id,f.event.event_id,current.revision,'resume');
+   due(f);await supervisor(f).reconcileTasks();
+  }
+  const current=f.db.tasks.get(f.task.task_id)!;assert.notEqual(current.current_attempt_id,f.job.job_id);
+  const prompt=buildJobPrompt(f.job);assert.match(prompt,/kindはcommit\/base\/branch\/pull_request\/file\/design\/external_process/);
+  assert.equal(current.attempt_number,2);assert.equal(current.max_attempts,3);
+  assert.equal(f.db.tasks.attemptCheckpoint(f.job.job_id)!.artifacts[2]!.kind,'base');
+  assert.equal(f.db.tasks.offlineResumes.saved(f.job.job_id)!.state,'resumed');
+  assert.equal(f.db.tasks.attempts(current.task_id)[0]!.outcome,'interrupted');
+ }finally{await f.close();}
+});
+
+for(const invalid of ['kind','task','attempt','sequence','external'] as const)test(`base参照の許可は${invalid}の停止境界を緩めない`,async()=>{
+ const f=await fixture();try{
+  const checkpoint={schema_version:1 as const,task_id:f.task.task_id,attempt_id:f.job.job_id,sequence:3,summary:'review待ち',remaining:[],artifacts:[{kind:invalid==='kind'?'unsupported':'base',reference:'base-sha'}],unresolved_operations:invalid==='external'?['push結果未確認']:[],waiting:'none'};
+  if(invalid==='task')checkpoint.task_id='other-task';
+  if(invalid==='attempt')checkpoint.attempt_id='other-attempt';
+  if(invalid==='sequence')f.db.tasks.checkpoint(f.job,{...checkpoint,sequence:4,artifacts:[{kind:'base',reference:'base-sha'}],waiting:'none'});
+  await fs.mkdir(path.dirname(f.job.result_path),{recursive:true});await fs.writeFile(path.join(path.dirname(f.job.result_path),'checkpoint.json'),JSON.stringify(checkpoint));
+  f.migrate();const current=f.db.tasks.get(f.task.task_id)!;
+  assert.equal(current.current_attempt_id,f.job.job_id);assert.equal(current.attempt_number,1);
+  assert.equal(current.wait_reason,invalid==='external'?'external_effect_unknown':'result_conflict');
  }finally{await f.close();}
 });
