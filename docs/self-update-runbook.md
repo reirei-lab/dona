@@ -39,12 +39,16 @@ Task schema4の同世代更新では `DONA_TASK_GENERATION_UPDATE=forward_only .
 
 ## 通常update
 
-1. Donaは`plan_self_update(source_event_id)`を呼びます。
+1. Donaは現在処理中のSlack依頼のIDで`plan_self_update(source_event_id)`を呼びます。agent contextが有効なDispatcherではcredentialと要求IDの一致が必要です。
 2. 利用者はcurrent/target exact SHA、plan hash、policy、CI、互換性、rollback可否を確認します。
 3. 明示承認後だけ、Donaは`apply_self_update(source_event_id, plan_id, plan_hash, approval_id)`を呼びます。
 4. acceptedは「approval受付eventとexact planをDBへcommitした」意味です。その受付Event Resultが`completed`になるまでactivationは始まりません。
 5. updaterは新規Slack ingressとDispatcher dequeueを止め、処理中の1件と`dona-main`のidleを待ってからCodexを終了します。owner-onlyの`config/dispatcher.env`と`config/slack.env`をMCPへ接続し、target releaseから同じpaneへ新しい`dona-main`を起動した後、Dispatcher、Slack Adapterの順に再開します。
 6. `get_self_update_status`で`runtime_state`、`runtime_operations`、`notification_state`、outbox、`main_agent`のcwd/sessionを確認します。terminal通知はmain agentを経由せず、専用workerから元Slack threadへ戻ります。`notification_state: reported`になるまで次のupdateは開始されません。
+
+CI待ちのため監視Taskへ委任した場合、元の更新依頼を確認できれば、その成功した完了通知から`plan_self_update`を呼べます。`source_event_id`は現在の通知IDを指定します。Dispatcherは現在のagent credential、保存済み通知receipt、immutable owner・宛先、認証済み元Slack依頼者を照合し、Updaterには元Slack依頼のIDと固定宛先を渡します。Taskの現行Attemptの受理済み完了だけを対象とし、grouped通知はsealed groupの`all_terminal`に限ります。途中経過、失敗・取消、古いAttempt、失効した依頼者bindingや不明な通知では計画しません。元依頼IDを手入力して拒否を迂回しないでください。
+
+完了通知から作れるのは計画だけです。CI成功やTask完了を更新適用の承認とせず、利用者へexact planを示し、その後の明示的なSlack承認イベントで`apply_self_update`を呼びます。内部通知は`apply_self_update`・`cancel_self_update`の入力に使えません。
 
 ### 稼働中のbackground worker
 
