@@ -234,3 +234,14 @@ for(const reason of ["failure","timeout"] as const)test(`channel明示denyでは
     await assert.rejects(f.client.listTasks(id),/task_owner_mismatch/);
   }finally{await f.close();}
 });
+
+test("受信payloadの外部共有フラグはAPI照会なしにdurable denyとする",async()=>{
+ let reads=0;
+ const f=await fixture(async()=>{reads++;throw Error("channel unavailable");},"T_TEST",{},async()=>{reads++;throw Error("user unavailable");},{is_ext_shared_channel:true});
+ try {
+  const id=await f.dispatch();assert.equal(reads,0);
+  assert.equal(JSON.parse(f.db.get(id)!.trace_json!).principal_origin_denied,true);
+  assert.equal(f.db.getVerifiedPrincipalBinding(id),undefined);
+  await assert.rejects(f.client.listTasks(id),/task_owner_mismatch/);
+ }finally{await f.close();}
+});

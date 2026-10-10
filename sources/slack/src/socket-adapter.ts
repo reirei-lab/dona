@@ -347,7 +347,7 @@ export class SlackSocketAdapter {
           reply_target:{...normalized.envelope.reply_target,workspace_id:socket!.authenticatedTeamId},
           trace:{...normalized.envelope.trace,slack_source_workspace_id:sourceWorkspace}};
       }
-      const [visibility,verifiedActor]=externalWorkspace?["denied",false] as const:await Promise.all([
+      const [visibility,verifiedActor]=externalWorkspace || body.is_ext_shared_channel===true?["denied",false] as const:await Promise.all([
         this.originVisibility(socket,String(normalized.envelope.subject.channel_id)),
         socket?.authenticatedTeamId && socket.verifyActor
           ? this.boundedRead(signal=>socket.verifyActor!(String(normalized.envelope.subject.actor_id),signal),600)
