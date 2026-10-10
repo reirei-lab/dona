@@ -20,20 +20,32 @@ export async function socketOriginVisibility(client: Pick<SlackApiClient, "getCh
 export function createSocketActorVerifier(client: Pick<SlackApiClient, "getUser">, workspaceId: string, now = () => performance.now()) {
   const cache = new Map<string, { value: boolean; expiresAt: number }>();
   const pending = new Map<string, Promise<boolean | undefined>>();
+  const starts: number[] = [];
+  let blockedUntil = 0;
   return async (actorId: string): Promise<boolean | undefined> => {
     const cached = cache.get(actorId);
     if (cached && cached.expiresAt > now()) return cached.value;
     cache.delete(actorId);
     const existing = pending.get(actorId);
     if (existing) return existing;
-    // 同時照会にも上限を設け、未完了Promiseでメモリを無制限に占有しない。
-    if (pending.size >= 1000) return undefined;
+    // 異なるactorや再配送を合算し、workspace全体で60回/rolling minuteに制限する。
+    const current = now();
+    while (starts.length && starts[0]! <= current - 60_000) starts.shift();
+    if (current < blockedUntil || starts.length >= 60) return undefined;
+    starts.push(current);
     const controller = new AbortController();
     let timer: NodeJS.Timeout | undefined;
     const read = Promise.race([
       verifySocketActor(client, workspaceId, actorId, controller.signal),
       new Promise<undefined>(resolve => { timer = setTimeout(() => { controller.abort(); resolve(undefined); }, 450); }),
-    ]).catch(() => undefined).then(value => {
+     ]).catch(error => {
+      if (error && typeof error === "object" && error.errorCode === "rate_limited") {
+        const seconds = typeof error.retryAfterSeconds === "number" && Number.isFinite(error.retryAfterSeconds) && error.retryAfterSeconds > 0
+          ? error.retryAfterSeconds : 60;
+        blockedUntil = Math.max(blockedUntil, now() + seconds * 1000);
+      }
+      return undefined;
+    }).then(value => {
       // 一時失敗は確定否認と区別し、再配送の本人確認を妨げない。
       if (value === undefined) return undefined;
       if (cache.size >= 1000) cache.delete(cache.keys().next().value!);

@@ -37,3 +37,21 @@ test("users.infoのEnterprise所属とsuspendedを変換から本人確認まで
  assert.equal(await verifySocketActor(client,"T_OUTSIDE","U_TEST"),false);
  suspended=true;assert.equal(await verifySocketActor(client,"T_TEST","U_TEST"),false);
 });
+
+test("異なる200人とその再配送でもworkspaceのrolling minute上限を超えない",async()=>{
+ let time=0,calls=0;
+ const verify=createSocketActorVerifier({getUser:async id=>{calls++;return {...human,id};}},"T_TEST",()=>time);
+ const actors=Array.from({length:200},(_,i)=>"U_"+i);
+ const first=await Promise.all(actors.map(id=>verify(id)));
+ assert.equal(first.filter(x=>x===true).length,60);assert.equal(calls,60);
+ await Promise.all(actors.map(id=>verify(id)));assert.equal(calls,60);
+ time=59_999;assert.equal(await verify("U_199"),undefined);assert.equal(calls,60);
+ time=60_000;assert.equal(await verify("U_199"),true);assert.equal(calls,61);
+});
+test("SlackのRetry-Afterをworkspaceで共有し、再配送からの再照会も待機させる",async()=>{
+ let time=0,calls=0;
+ const verify=createSocketActorVerifier({getUser:async id=>{calls++;if(calls===1)throw {errorCode:"rate_limited",retryAfterSeconds:120};return {...human,id};}},"T_TEST",()=>time);
+ assert.equal(await verify("U_TEST"),undefined);
+ time=119_999;assert.equal(await verify("U_OTHER"),undefined);assert.equal(calls,1);
+ time=120_000;assert.equal(await verify("U_OTHER"),true);assert.equal(calls,2);
+});

@@ -160,6 +160,7 @@ for (const changes of [{ isShared: true }, { isArchived: true }, { id: "C_OTHER"
       const eventId = await f.dispatch();
       assert.equal(f.db.getVerifiedPrincipalBinding(eventId), undefined);
       assert.equal(JSON.parse(f.db.get(eventId)!.trace_json!).status_origin_visibility, undefined);
+      assert.equal(JSON.parse(f.db.get(eventId)!.trace_json!).principal_origin_denied, true);
       await assert.rejects(f.client.listTasks(eventId), /task_owner_mismatch/);
     } finally { await f.close(); }
   });

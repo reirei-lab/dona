@@ -150,3 +150,17 @@ for(const state of ["dispatching","waiting_agent","completed"] as const)test(`�
   assert.equal(db.getVerifiedPrincipalBinding(row.event_id),undefined);
  }finally{db.close();}
 });
+
+for(const firstDenied of [true,false])test(`channelの明示denyは後続配送の情報欠落でも失わない(first=${firstDenied})`,async()=>{
+ const {root,config}=await tempConfig();roots.push(root);const db=new DispatcherDatabase(config.databasePath);
+ try {
+  const first={...eventEnvelope("Ev-denied-"+firstDenied),trace:{ingress_attempt:1,...(firstDenied?{principal_origin_denied:true}:{})}};
+  const row=db.enqueue(first).row;
+  if(!firstDenied)db.enqueue({...first,trace:{ingress_attempt:1,principal_origin_denied:true}});
+  const retry={...first,trace:{ingress_attempt:1,socket_envelope_id:"retry"}};
+  assert.throws(()=>db.enqueue(retry,new Date(),verified(retry)),PrincipalBindingConflictError);
+  db.enqueue(retry);
+  assert.equal(JSON.parse(db.get(row.event_id)!.trace_json!).principal_origin_denied,true);
+  assert.equal(db.getVerifiedPrincipalBinding(row.event_id),undefined);
+ }finally{db.close();}
+});

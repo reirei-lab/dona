@@ -345,7 +345,9 @@ export class SlackSocketAdapter {
       ]);
       // 一時失敗を未署名でdispatchしない。永続化もACKもせずSlackの再配送に委ねる。
       if(verifiedActor===undefined && visibility!=="denied")throw new Error("slack_actor_verification_unavailable");
-      const value=visibility && visibility!=="denied"?{...normalized.envelope,trace:{...normalized.envelope.trace,status_origin_visibility:visibility}}:normalized.envelope;
+      const value=visibility==="denied"
+        ? {...normalized.envelope,trace:{...normalized.envelope.trace,principal_origin_denied:true}}
+        : visibility?{...normalized.envelope,trace:{...normalized.envelope.trace,status_origin_visibility:visibility}}:normalized.envelope;
       // 所属とhuman状態を確認した本人だけを署名する。channelの明示denyも保持する。
       const signedWorkspace=verifiedActor===true && visibility!=="denied"?socket?.authenticatedTeamId:undefined;
       response = await this.dispatcher.postEvent(value,signedWorkspace);
