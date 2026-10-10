@@ -1239,6 +1239,7 @@ export class DispatcherDatabase {
           // 未署名の初回配送と同じ内容であることを確認した上で、初めての証拠と
           // その署名対象traceを同一transactionに保存する。既存証拠・失効は更新しない。
           if(!readVerifiedPrincipalBinding(this.db,existing.event_id)) {
+            if(existing.status!=="queued" || existing.attempt_count!==0)throw new PrincipalBindingConflictError();
             this.db.prepare("UPDATE events SET trace_json=? WHERE event_id=?").run(traceJson,existing.event_id);
             existing.trace_json=traceJson;
           }

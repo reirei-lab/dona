@@ -207,3 +207,15 @@ test("本人照会がchannelの200ms期限を超えても、所属確認後にTa
     assert.deepEqual((await f.client.listTasks(id)).tasks,[]);
   } finally { await f.close(); }
 });
+
+for(const reason of ["failure","timeout"] as const)test(`channel明示denyでは本人照会${reason}でも未署名で保存しACKする`,async()=>{
+ const f=await fixture(async()=>"denied","T_TEST",{},async()=>{
+  if(reason==="failure")throw Error("users.info failed");
+  return new Promise(()=>{});
+ });
+ try {
+  const id=await f.dispatch();assert.equal(f.acked(),true);
+  assert.equal(f.db.getVerifiedPrincipalBinding(id),undefined);
+  await assert.rejects(f.client.listTasks(id),/task_owner_mismatch/);
+ }finally{await f.close();}
+});

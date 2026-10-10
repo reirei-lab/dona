@@ -136,3 +136,17 @@ test("未署名配送への新しいproofは署名済みtraceと共に保存し�
   assert.equal(db.list().length,1);
  }finally{db.close();}
 });
+
+for(const state of ["dispatching","waiting_agent","completed"] as const)test(`未署名eventの${state}後には本人確認を後付けしない`,async()=>{
+ const {root,config}=await tempConfig();roots.push(root);const db=new DispatcherDatabase(config.databasePath);
+ try {
+  const first=eventEnvelope("Ev-late-"+state),row=db.enqueue(first).row;
+  db.beginDispatch(row.event_id,root+"/result.json");
+  if(state!=="dispatching")db.markWaiting(row.event_id);
+  if(state==="completed")db.saveCompleted(row.event_id,{schema_version:1,event_id:row.event_id,status:"completed",summary:"処理済み",actions:[],memory_candidates:[],completed_at:new Date().toISOString()},root+"/result.json");
+  const before=db.get(row.event_id),retry={...first,trace:{ingress_attempt:1,socket_envelope_id:"retry"}};
+  assert.throws(()=>db.enqueue(retry,new Date(),verified(retry)),PrincipalBindingConflictError);
+  assert.deepEqual(db.get(row.event_id),before);
+  assert.equal(db.getVerifiedPrincipalBinding(row.event_id),undefined);
+ }finally{db.close();}
+});
