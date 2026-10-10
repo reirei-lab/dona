@@ -4,6 +4,7 @@ import type { SlackAdapterConfig } from "./adapter-config.js";
 import type { DispatcherClient, DispatcherResponse } from "./dispatcher-client.js";
 import type { SlackLogger } from "./logger.js";
 import { normalizeSlackEvent } from "./normalize.js";
+import type { SocketOriginVisibility } from "./socket-principal.js";
 
 export type ConnectionState =
   | "connecting"
@@ -31,7 +32,8 @@ export interface SocketClientLike {
 export interface WorkspaceSocket {
   workspace: string;
   authenticatedTeamId?:string;
-  statusOriginVisibility?:(channelId:string,signal?:AbortSignal)=>Promise<string|undefined>;
+  statusOriginVisibility?:(channelId:string,signal?:AbortSignal)=>Promise<SocketOriginVisibility|undefined>;
+  verifyActor?:(actorId:string,signal?:AbortSignal)=>Promise<boolean>;
   client: SocketClientLike;
 }
 
@@ -334,10 +336,17 @@ export class SlackSocketAdapter {
     const dispatchStarted = Date.now();
     try {
       const socket=this.sockets.find(socket=>socket.workspace===workspace);
-      const visibility=await this.originVisibility(socket,String(normalized.envelope.subject.channel_id));
-      const value=visibility?{...normalized.envelope,trace:{...normalized.envelope.trace,status_origin_visibility:visibility}}:normalized.envelope;
-      // Socket Modeで確認済みのworkspaceによる本人確認は、追加のchannel照会から独立させる。
-      response = await this.dispatcher.postEvent(value,socket?.authenticatedTeamId);
+      if(socket?.authenticatedTeamId && normalized.envelope.subject.workspace_id!==socket.authenticatedTeamId)throw new Error("slack_workspace_mismatch");
+      const [visibility,verifiedActor]=await Promise.all([
+        this.originVisibility(socket,String(normalized.envelope.subject.channel_id)),
+        socket?.authenticatedTeamId && socket.verifyActor
+          ? this.boundedRead(signal=>socket.verifyActor!(String(normalized.envelope.subject.actor_id),signal),2000)
+          : Promise.resolve(false),
+      ]);
+      const value=visibility && visibility!=="denied"?{...normalized.envelope,trace:{...normalized.envelope.trace,status_origin_visibility:visibility}}:normalized.envelope;
+      // 所属とhuman状態を確認した本人だけを署名する。channelの明示denyも保持する。
+      const signedWorkspace=verifiedActor===true && visibility!=="denied"?socket?.authenticatedTeamId:undefined;
+      response = await this.dispatcher.postEvent(value,signedWorkspace);
     } catch (error) {
       this.logger.error("Dispatcher connection failed; Socket Mode envelope was not acknowledged", {
         workspace,
@@ -393,14 +402,18 @@ export class SlackSocketAdapter {
     }
   }
 
-  private async originVisibility(socket:WorkspaceSocket|undefined,channelId:string):Promise<string|undefined> {
+  private async originVisibility(socket:WorkspaceSocket|undefined,channelId:string):Promise<SocketOriginVisibility|undefined> {
     if(!socket?.statusOriginVisibility)return undefined;
     // 追加のreadでdurable ingress/ACKを滞留させない。期限外はvisibilityを付与せず保存する。
+    return this.boundedRead(signal=>socket.statusOriginVisibility!(channelId,signal),200);
+  }
+
+  private async boundedRead<T>(read:(signal:AbortSignal)=>Promise<T>,timeoutMs:number):Promise<T|undefined> {
     const controller=new AbortController();
-    const lookup=this.trackExternal(Promise.resolve().then(()=>socket.statusOriginVisibility!(channelId,controller.signal)));
+    const lookup=this.trackExternal(Promise.resolve().then(()=>read(controller.signal)));
     let timer:NodeJS.Timeout|undefined;
     try {
-      return await Promise.race([lookup.catch(()=>undefined),new Promise<undefined>(resolve=>{timer=setTimeout(()=>{controller.abort();resolve(undefined);},200);})]);
+      return await Promise.race([lookup.catch(()=>undefined),new Promise<undefined>(resolve=>{timer=setTimeout(()=>{controller.abort();resolve(undefined);},timeoutMs);})]);
     } finally {if(timer)clearTimeout(timer);}
   }
 

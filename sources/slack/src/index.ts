@@ -15,6 +15,7 @@ import { SlackUpdateNotificationReporter } from "./update-notification.js";
 import { SlackJobProgressReporter } from "./job-progress.js";
 import { SlackWorkspaceRegistry } from "./workspace-registry.js";
 import { SlackReminderConnector } from "./reminder-connector.js";
+import { socketOriginVisibility, verifySocketActor } from "./socket-principal.js";
 
 async function main(): Promise<void> {
   const config = loadAdapterConfig();
@@ -44,13 +45,8 @@ async function main(): Promise<void> {
   const registry = await SlackWorkspaceRegistry.load(config.workspaces, keychain, logger);
   for(const socket of sockets) {
     const connection=registry.get(socket.workspace);socket.authenticatedTeamId=connection.teamId;
-    socket.statusOriginVisibility=async (id,signal)=>{
-      try {
-        const channel=await connection.client.getChannel(id,signal);
-        if(channel.id!==id||channel.isShared||channel.isArchived||(!channel.isIm&&channel.visibilityKnown!==true))return undefined;
-        return channel.isIm?"im":channel.isMpim?"mpim":channel.isPrivate?"private_channel":"public_channel";
-      } catch {return undefined;}
-    };
+    socket.statusOriginVisibility=(id,signal)=>socketOriginVisibility(connection.client,id,signal);
+    socket.verifyActor=(id,signal)=>verifySocketActor(connection.client,connection.teamId,id,signal);
   }
   const updateNotifications = new SlackUpdateNotificationReporter(registry);
   const adapter = new SlackSocketAdapter(sockets, dispatcher, config, logger);

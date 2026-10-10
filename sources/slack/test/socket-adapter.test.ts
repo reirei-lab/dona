@@ -300,12 +300,12 @@ describe("SlackSocketAdapter", () => {
 });
 
 for(const outcome of ["timeout","failure","success"] as const)test(`origin visibility ${outcome}はdurable ingressとACKを阻害しない`,async()=>{
- const client=new FakeSocketClient();let release:(v:string)=>void=()=>{},acked=false,readSignal:AbortSignal|undefined;const calls:Array<{value:unknown;team:unknown}>=[];
- const visibility=outcome==="timeout"?new Promise<string>(r=>{release=r;}):outcome==="failure"?Promise.reject(Error("visibility unavailable")):Promise.resolve("public_channel");
+ const client=new FakeSocketClient();let release:(v:"public_channel"|"private_channel")=>void=()=>{},acked=false,readSignal:AbortSignal|undefined;const calls:Array<{value:unknown;team:unknown}>=[];
+ const visibility=outcome==="timeout"?new Promise<"public_channel"|"private_channel">(r=>{release=r;}):outcome==="failure"?Promise.reject(Error("visibility unavailable")):Promise.resolve("public_channel" as const);
  // rejection handlerはeventを処理するときに付くため、ここでのunhandled rejectionを避ける。
  void visibility.catch(()=>{});
  const dispatcher={async postEvent(value:unknown,team?:string){calls.push({value,team});return {statusCode:202,body:"{}"};},healthReady:async()=>true};
- const adapter=new SlackSocketAdapter([{workspace:"company",client,authenticatedTeamId:"T01234567",statusOriginVisibility:(_value,signal)=>{readSignal=signal;return visibility;}}],dispatcher,config,logger);
+ const adapter=new SlackSocketAdapter([{workspace:"company",client,authenticatedTeamId:"T01234567",verifyActor:async()=>true,statusOriginVisibility:(_value,signal)=>{readSignal=signal;return visibility;}}],dispatcher,config,logger);
  await adapter.start();try {
   client.emit("slack_event",socketEnvelope(`visibility-${outcome}`,async()=>{acked=true;}));
   await waitFor(()=>acked,1000);assert.equal(calls.length,1);

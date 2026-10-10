@@ -3,7 +3,11 @@ import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { test } from "node:test";
-import { SlackSocketAdapter, type WorkspaceSocket } from "../../sources/slack/src/socket-adapter.js";
+// Slack componentの実装をblack-boxで読み、Dispatcherの型検査へSocket SDK依存を持ち込まない。
+// Slack実装自身の型検査はsources/slackの検証で行う。
+const { SlackSocketAdapter } = await import(new URL("../../sources/slack/src/socket-adapter.ts", import.meta.url).href);
+const { verifySocketActor, socketOriginVisibility } = await import(new URL("../../sources/slack/src/socket-principal.ts", import.meta.url).href);
+type Visibility = (channelId: string, signal?: AbortSignal) => Promise<"public_channel" | "private_channel" | "im" | "mpim" | "denied" | undefined>;
 import { DispatcherClient as SlackDispatcherClient } from "../../sources/slack/src/dispatcher-client.js";
 import type { SlackAdapterConfig } from "../../sources/slack/src/adapter-config.js";
 import { DispatcherDatabase } from "../src/database.js";
@@ -24,7 +28,7 @@ class Socket extends EventEmitter {
   async disconnect() {}
 }
 
-async function fixture(visibility: WorkspaceSocket["statusOriginVisibility"], team: string | null = "T_TEST") {
+async function fixture(visibility: Visibility | undefined, team: string | null = "T_TEST", userOverrides: Record<string, unknown> = {}, userLookup?: (signal?: AbortSignal) => Promise<unknown>) {
   const { root, config } = await tempConfig();
   await fs.mkdir(path.dirname(config.updateInternalTokenPath), { recursive: true });
   await fs.writeFile(config.updateInternalTokenPath, "ingress-test-key-00000000000000000000", { mode: 0o600 });
@@ -52,7 +56,10 @@ async function fixture(visibility: WorkspaceSocket["statusOriginVisibility"], te
   };
   let acked = false, rejected = false;
   const adapter = new SlackSocketAdapter([{ workspace: "test", client: socket, ...(team ? { authenticatedTeamId: team } : {}),
-    ...(visibility ? { statusOriginVisibility: visibility } : {}) }],
+    ...(visibility ? { statusOriginVisibility: visibility } : {}),
+    verifyActor: (actorId: string, signal?: AbortSignal) => verifySocketActor({ getUser: async () => userLookup ? userLookup(signal) : ({
+      id: "U_TEST", teamId: "T_TEST", stateKnown: true, isDeleted: false, isBot: false, isAppUser: false, ...userOverrides,
+    }) }, "T_TEST", actorId, signal) }],
     new SlackDispatcherClient({ socketPath: config.socketPath, connectTimeoutMs: 500, timeoutMs: 2000, internalTokenPath: config.updateInternalTokenPath }),
     adapterConfig, { ...logger, error() { rejected = true; } });
   await adapter.start();
@@ -63,19 +70,19 @@ async function fixture(visibility: WorkspaceSocket["statusOriginVisibility"], te
   } });
   return { db, config, root, contexts, client: new DispatcherApiClient(config.socketPath),
     acked: () => acked, rejected: () => rejected,
-    async dispatch() { await waitFor(() => acked); worker.start(); await waitFor(() => !!prompt); return /^event_id: (.+)$/m.exec(prompt)![1]!; },
+    async dispatch() { await waitFor(() => acked, 5000); worker.start(); await waitFor(() => !!prompt); return /^event_id: (.+)$/m.exec(prompt)![1]!; },
     async close() { release(); await worker.stop(); await adapter.stop(); await api.stop(); db.close(); await fs.rm(root, { recursive: true, force: true }); },
   };
 }
 
 for (const outcome of ["success", "failure", "timeout", "unavailable"] as const) {
   test(`Slack channel情報の${outcome}でも受信から既存Task照合・新規委任・制御まで通る`, async () => {
-    let release: (value: string) => void = () => {}, signal: AbortSignal | undefined;
-    const visibility: NonNullable<WorkspaceSocket["statusOriginVisibility"]> = async (_channel, currentSignal) => {
+    let release: (value: "public_channel" | "private_channel") => void = () => {}, signal: AbortSignal | undefined;
+    const visibility: Visibility = async (_channel, currentSignal) => {
       signal = currentSignal;
       if (outcome === "failure") throw Error("channel unavailable");
       if (outcome === "unavailable") return undefined;
-      if (outcome === "timeout") return new Promise<string>(resolve => { release = resolve; });
+      if (outcome === "timeout") return new Promise<"public_channel" | "private_channel">(resolve => { release = resolve; });
       return "public_channel";
     };
     const f = await fixture(visibility);
@@ -128,5 +135,61 @@ test("認証済みworkspaceがない受信では本文のuserからTask権限を
     await assert.rejects(f.client.createTask({ source_event_id: eventId, task_key: "unsigned", objective: "調査",
       workspace: { kind: "scratch" } }), /task_owner_mismatch/);
     assert.equal(f.db.listEventJobs(eventId).length, 0);
+  } finally { await f.close(); }
+});
+
+for (const [reason, changes] of Object.entries({ external: { teamId: "T_OTHER" }, bot: { isBot: true }, app: { isAppUser: true },
+  deleted: { isDeleted: true }, unknown: { stateKnown: false }, mismatched: { id: "U_OTHER" }, agentforce: { isAgentforceBot: true } })) {
+  test(`channel照会不能でも${reason}のactorにはTask権限を発行しない`, async () => {
+    const f = await fixture(async () => undefined, "T_TEST", changes);
+    try {
+      const eventId = await f.dispatch();
+      assert.equal(f.db.getVerifiedPrincipalBinding(eventId), undefined);
+      await assert.rejects(f.client.listTasks(eventId), /task_owner_mismatch/);
+    } finally { await f.close(); }
+  });
+}
+
+for (const changes of [{ isShared: true }, { isArchived: true }, { id: "C_OTHER" }]) {
+  test(`channelの明示deny ${JSON.stringify(changes)}では本人が一致しても署名しない`, async () => {
+    const f = await fixture((channelId, signal) => socketOriginVisibility({ getChannel: async () => ({
+      id: "C_TEST", isShared: false, isArchived: false, isPrivate: false, isMember: true, visibilityKnown: true, ...changes,
+    }) }, channelId, signal));
+    try {
+      const eventId = await f.dispatch();
+      assert.equal(f.db.getVerifiedPrincipalBinding(eventId), undefined);
+      assert.equal(JSON.parse(f.db.get(eventId)!.trace_json!).status_origin_visibility, undefined);
+      await assert.rejects(f.client.listTasks(eventId), /task_owner_mismatch/);
+    } finally { await f.close(); }
+  });
+}
+
+for (const outcome of ["failure", "timeout"] as const) {
+  test(`本人の照会${outcome}は署名せずにACKし、Task操作を拒否する`, async () => {
+    let signal: AbortSignal | undefined, release: () => void = () => {};
+    const f = await fixture(async () => "public_channel", "T_TEST", {}, async currentSignal => {
+      signal = currentSignal;
+      if (outcome === "failure") throw Error("users.info unavailable");
+      return new Promise(resolve => { release = () => resolve({ id: "U_TEST", teamId: "T_TEST", stateKnown: true, isDeleted: false, isBot: false, isAppUser: false }); });
+    });
+    try {
+      const eventId = await f.dispatch();
+      if (outcome === "timeout") assert.equal(signal?.aborted, true);
+      release(); await new Promise(resolve => setImmediate(resolve));
+      assert.equal(f.db.getVerifiedPrincipalBinding(eventId), undefined);
+      await assert.rejects(f.client.listTasks(eventId), /task_owner_mismatch/);
+    } finally { release(); await f.close(); }
+  });
+}
+
+test("本人照会がchannelの200ms期限を超えても、所属確認後にTask権限を発行する", async () => {
+  const f = await fixture(async () => undefined, "T_TEST", {}, async () => {
+    await new Promise(resolve => setTimeout(resolve, 250));
+    return { id: "U_TEST", teamId: "T_TEST", stateKnown: true, isDeleted: false, isBot: false, isAppUser: false };
+  });
+  try {
+    const eventId = await f.dispatch();
+    assert.equal(f.db.getVerifiedPrincipalBinding(eventId)?.principal_id, "U_TEST");
+    assert.deepEqual((await f.client.listTasks(eventId)).tasks, []);
   } finally { await f.close(); }
 });
