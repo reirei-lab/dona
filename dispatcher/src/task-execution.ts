@@ -1,3 +1,4 @@
+import {resolveVerifiedSlackOwner} from "./verified-owner-origin.js";
 import {OfflineTaskResumes} from "./offline-task-resume.js";
 import { TaskContinuations, continuationScopeSchema, continuationSchema } from "./task-continuation.js";
 import {readEventJobBinding} from "./job-routing.js";
@@ -184,9 +185,9 @@ export class TaskRepository {
   forAttempt(id:string):TaskRow|undefined {return this.sql.prepare("SELECT t.* FROM tasks t JOIN task_attempts a USING(task_id) WHERE a.attempt_id=?").get(id) as TaskRow|undefined;}
   assertOwner(id:string,eventId:string,sameThread=false):TaskRow {
     const task=this.get(id);if(!task)throw new Error("task_owner_mismatch");
-    try{this.dispatcher.assertJobSourceMatchesThread(task.current_attempt_id,eventId);}catch{throw new Error("task_owner_mismatch");}
     const event=this.dispatcher.get(eventId);
     if(event?.source==="web"&&this.dispatcher.hasLocalDashboardJobOwner(task.current_attempt_id)) {
+      try{this.dispatcher.assertJobSourceMatchesThread(task.current_attempt_id,eventId);}catch{throw new Error("task_owner_mismatch");}
       const binding=readEventJobBinding(this.sql,eventId);
       if(binding?.owner.kind!=="local_dashboard")throw new Error("task_owner_mismatch");
       return task;
@@ -195,16 +196,29 @@ export class TaskRepository {
     if(event.source==="dona_job"&&JSON.parse(event.subject_json).source_event_id!==task.source_event_id&&!this.continuations.canRead(id,eventId))throw new Error("task_owner_mismatch");
     const original=this.dispatcher.get(task.source_event_id)!;
     const target=original.reply_target_json?JSON.parse(original.reply_target_json):{},current=event.reply_target_json?JSON.parse(event.reply_target_json):{};
-    if(["workspace_id","channel_id"].some(key=>typeof target[key]!=="string"||target[key]!==current[key]))throw new Error("task_owner_mismatch");
-    if(sameThread&&target.thread_ts!==current.thread_ts)throw new Error("task_owner_mismatch");
+    if(typeof target.workspace_id!=="string"||target.workspace_id!==current.workspace_id)throw new Error("task_owner_mismatch");
+    if(target.channel_id!==current.channel_id) {
+      // 別channelへの操作・Result開示は、署名検証済みの同じ依頼者だけに許可する。
+      const owner=resolveVerifiedSlackOwner(this.dispatcher,task.source_event_id),requester=resolveVerifiedSlackOwner(this.dispatcher,eventId);
+      if(!owner||!requester||owner.principal.tenant_id!==requester.principal.tenant_id||
+        owner.principal.workspace_id!==requester.principal.workspace_id||owner.principal.principal_id!==requester.principal.principal_id)
+        throw new Error("task_owner_mismatch");
+    } else {
+      try{this.dispatcher.assertJobSourceMatchesThread(task.current_attempt_id,eventId);}catch{throw new Error("task_owner_mismatch");}
+    }
+    if(sameThread&&(target.channel_id!==current.channel_id||target.thread_ts!==current.thread_ts))throw new Error("task_owner_mismatch");
     const actor=JSON.parse(original.subject_json).actor_id;
     if(typeof actor!=="string"||JSON.parse(event.subject_json).actor_id!==actor)throw new Error("task_owner_mismatch");
     return task;
   }
   findIssue(eventId:string,issue:VerifiedTaskIssue):TaskRow {
     const row=this.sql.prepare("SELECT task_id FROM tasks WHERE resource_id=?").get(`github:${issue.node_id}`) as {task_id:string}|undefined;
-    // Absence and another owner's claim have the same public response.
-    if(!row)throw new Error("task_owner_mismatch");
+    if(!row) {
+      const event=this.dispatcher.get(eventId),binding=readEventJobBinding(this.sql,eventId);
+      if(!event||event.source!=="slack"||binding?.owner.kind!=="slack_thread"||
+        typeof JSON.parse(event.subject_json).actor_id!=="string")throw new Error("task_owner_mismatch");
+      throw new Error("task_not_found");
+    }
     return this.assertOwner(row.task_id,eventId);
   }
   lookupRequest(input:TaskRequest):TaskRow|undefined {
