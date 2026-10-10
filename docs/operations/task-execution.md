@@ -20,7 +20,7 @@
 4. `cancel_task`は自動再開を禁止する。起動済みworkerでは停止確認が終わるまで取消完了にしない。
 5. `retry_exhausted`では、追加実行の明示依頼を得てから`retry_task`へ新しい総`max_attempts`を渡す。使用済みAttempt数は維持する。
 
-Taskの読み取り・通常制御は元のworkspace/channelと依頼者へ束縛する。明示Task IDまたはIssue照会で対象を確定した場合は別threadからも利用できる。実行承認と通知先は元threadへ束縛する。
+Taskの読み取り・通常制御は同じworkspaceの検証済み依頼者へ束縛する。明示Task IDまたはIssue照会で対象を確定した場合は別channel・別threadからも利用でき、取得した結果をその依頼場所へ公開できる。実行承認も要求通知後の検証済み依頼者の返信とcurrent Attempt・質問identityを照合して受理する。自動通知先は元threadを維持する。
 
 同じeventによる同じcontrolの再照合は既存状態を返し、異内容はconflictにする。古いrevisionを自動上書きしない。
 
