@@ -1238,10 +1238,11 @@ export class DispatcherDatabase {
         if(principal && mismatch)throw new PrincipalBindingConflictError();
         const existingTrace=existing.trace_json?JSON.parse(existing.trace_json):{};
         if(principal && existingTrace.principal_origin_denied===true)throw new PrincipalBindingConflictError();
-        if(!mismatch && envelope.trace?.principal_origin_denied===true && !readVerifiedPrincipalBinding(this.db,existing.event_id)) {
+        if(!mismatch && envelope.trace?.principal_origin_denied===true) {
           const deniedTrace=stableStringify({...existingTrace,principal_origin_denied:true});
           this.db.prepare("UPDATE events SET trace_json=? WHERE event_id=?").run(deniedTrace,existing.event_id);
           existing.trace_json=deniedTrace;
+          this.db.prepare("UPDATE verified_principal_bindings SET revoked_at=COALESCE(revoked_at,?) WHERE event_id=?").run(timestamp,existing.event_id);
         }
         if(principal) {
           // 未署名の初回配送と同じ内容であることを確認した上で、初めての証拠と

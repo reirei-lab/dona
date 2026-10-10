@@ -326,3 +326,15 @@ test("遅い本人照会でもDispatcherのcommitを待ち、通常のACK予算�
   await waitFor(()=>acked,2900);assert.equal(signal?.aborted,false);assert.ok(Date.now()-started<2900);
  }finally{await adapter.stop();}
 });
+
+test("同一Appの別Socketへ届いてもpayloadのinstallationのclientで本人確認する",async()=>{
+ const first=new FakeSocketClient(),second=new FakeSocketClient();let firstReads=0,secondReads=0,acked=false;
+ const adapter=new SlackSocketAdapter([
+  {workspace:"company",client:first,authenticatedTeamId:"T01234567",verifyActor:async()=>{firstReads++;return true;}},
+  {workspace:"other",client:second,authenticatedTeamId:"T_OTHER",verifyActor:async()=>{secondReads++;return true;}},
+ ],{postEvent:async(value,team)=>{assert.equal(team,"T01234567");assert.equal((value as any).subject.workspace_id,"T01234567");return {statusCode:202,body:"{}"};},healthReady:async()=>true},config,logger);
+ await adapter.start();try {
+  second.emit("slack_event",socketEnvelope("cross-socket",async()=>{acked=true;},{...eventBody(),authorizations:[{team_id:"T01234567",user_id:"U_BOT"}]}));
+  await waitFor(()=>acked);assert.equal(firstReads,1);assert.equal(secondReads,0);
+ }finally{await adapter.stop();}
+});

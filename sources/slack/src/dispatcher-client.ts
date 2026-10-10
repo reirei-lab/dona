@@ -20,7 +20,11 @@ export class DispatcherClient {
   async postEvent(envelope: unknown, authenticatedWorkspaceId?:string): Promise<DispatcherResponse> {
     const value=envelope as Record<string,unknown>;
     let headers:Record<string,string>={};
-    if(authenticatedWorkspaceId && this.options.internalTokenPath) {
+    const denied=(value.trace as Record<string,unknown>|undefined)?.principal_origin_denied===true;
+    if(denied && !this.options.internalTokenPath)throw new Error("slack_origin_denial_token_missing");
+    if(denied && this.options.internalTokenPath) {
+      headers["x-dona-update-token"]=(await fs.readFile(this.options.internalTokenPath,"utf8")).trim();
+    } else if(authenticatedWorkspaceId && this.options.internalTokenPath) {
       const key=(await fs.readFile(this.options.internalTokenPath,"utf8")).trim();
       const trace={...(value.trace as Record<string,unknown>??{}),ingress_attempt:1};
       envelope={...value,trace};

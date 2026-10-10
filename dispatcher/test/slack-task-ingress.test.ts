@@ -221,9 +221,9 @@ for(const reason of ["failure","timeout"] as const)test(`channel明示denyでは
  }finally{await f.close();}
 });
 
- test("Slack Connectの外部送信元は受信installationへ束縛し、署名せず保存・ACKする",async()=>{
+ for(const installation of [{authorizations:[{team_id:"T_TEST",user_id:"U_BOT",is_bot:true}]},{context_team_id:"T_TEST",authorizations:[]}])test(`Slack Connectの外部送信元を受信installationへ束縛する ${JSON.stringify(installation)}`,async()=>{
   const f=await fixture(undefined,"T_TEST",{},async()=>{throw Error("本人照会は不要");},
-    {team_id:"T_EXTERNAL",authorizations:[{team_id:"T_TEST",user_id:"U_BOT",is_bot:true}]});
+    {team_id:"T_EXTERNAL",...installation});
   try {
     const id=await f.dispatch(),row=f.db.get(id)!;
     assert.equal(JSON.parse(row.subject_json).workspace_id,"T_TEST");
@@ -243,5 +243,29 @@ test("受信payloadの外部共有フラグはAPI照会なしにdurable denyと�
   assert.equal(JSON.parse(f.db.get(id)!.trace_json!).principal_origin_denied,true);
   assert.equal(f.db.getVerifiedPrincipalBinding(id),undefined);
   await assert.rejects(f.client.listTasks(id),/task_owner_mismatch/);
+ }finally{await f.close();}
+});
+
+test("後発の認証済みdenyは実行中のTask権限も失効させ、未認証denyでは失効させない",async()=>{
+ let visibility: "public_channel"|"denied"="public_channel";
+ const f=await fixture(async()=>visibility);
+ try {
+  const id=await f.dispatch();assert.deepEqual((await f.client.listTasks(id)).tasks,[]);
+  const row=f.db.get(id)!;
+  const envelope={schema_version:1,source:"slack",external_event_id:row.external_event_id,type:row.event_type,occurred_at:row.occurred_at,
+    subject:JSON.parse(row.subject_json),payload:JSON.parse(row.payload_json),reply_target:JSON.parse(row.reply_target_json!),trace:{principal_origin_denied:true}};
+  // tokenなしの内部HTTP callerがfalse denyを送り、実行中の権限を取り消せないこと。
+  const http=await import("node:http");
+  const status=await new Promise<number>((resolve,reject)=>{
+    const request=http.request({socketPath:f.config.socketPath,path:"/v1/events",method:"POST",headers:{"content-type":"application/json"}},response=>{response.resume();response.on("end",()=>resolve(response.statusCode!));});
+    request.on("error",reject);request.end(JSON.stringify(envelope));
+  });
+  assert.equal(status,403);assert.deepEqual((await f.client.listTasks(id)).tasks,[]);
+  visibility="denied";f.deliver("deny-redelivery");
+  await waitFor(()=>f.db.getVerifiedPrincipalBinding(id)===undefined);
+  assert.equal(JSON.parse(f.db.get(id)!.trace_json!).principal_origin_denied,true);
+  await assert.rejects(f.client.listTasks(id),/task_owner_mismatch/);
+  visibility="public_channel";f.deliver("after-deny");await waitFor(f.rejected);
+  assert.equal(f.db.getVerifiedPrincipalBinding(id),undefined);
  }finally{await f.close();}
 });

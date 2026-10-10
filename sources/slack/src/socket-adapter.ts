@@ -335,10 +335,11 @@ export class SlackSocketAdapter {
     let response: DispatcherResponse;
     const dispatchStarted = Date.now();
     try {
-      const socket=this.sockets.find(socket=>socket.workspace===workspace);
+      const socket=this.routeSocket(body,workspace);
+      if(socket)workspace=socket.workspace;
       const externalWorkspace=!!socket?.authenticatedTeamId && normalized.envelope.subject.workspace_id!==socket.authenticatedTeamId;
       if(externalWorkspace) {
-        const authorized=Array.isArray(body.authorizations) && body.authorizations.some(value=>value && typeof value==="object" && value.team_id===socket!.authenticatedTeamId);
+        const authorized=body.context_team_id===socket!.authenticatedTeamId || Array.isArray(body.authorizations) && body.authorizations.some(value=>value && typeof value==="object" && value.team_id===socket!.authenticatedTeamId);
         if(!authorized)throw new Error("slack_workspace_mismatch");
         // Slack Connectの送信元workspaceと、応答に使う受信installationを区別する。
         const sourceWorkspace=normalized.envelope.subject.workspace_id;
@@ -414,6 +415,22 @@ export class SlackSocketAdapter {
         duration_to_ack_ms: Date.now() - started,
       });
     }
+  }
+
+  private routeSocket(body:Record<string,unknown>,receivedWorkspace:string):WorkspaceSocket|undefined {
+    const configured=this.sockets.filter(socket=>socket.authenticatedTeamId);
+    if(configured.length===0)return this.sockets.find(socket=>socket.workspace===receivedWorkspace);
+    const teams=Array.isArray(body.authorizations)?body.authorizations.flatMap(value=>
+      value && typeof value==="object" && typeof value.team_id==="string"?[value.team_id]:[]):[];
+    let candidates=teams.length?configured.filter(socket=>teams.includes(socket.authenticatedTeamId!))
+      :configured.filter(socket=>socket.authenticatedTeamId===(typeof body.context_team_id==="string"?body.context_team_id:body.team_id));
+    if(candidates.length>1) {
+      const preferred=candidates.find(socket=>socket.authenticatedTeamId===body.context_team_id)
+        ?? candidates.find(socket=>socket.authenticatedTeamId===body.team_id);
+      if(preferred)candidates=[preferred];
+    }
+    if(candidates.length!==1)throw new Error("slack_workspace_mismatch");
+    return candidates[0];
   }
 
   private async originVisibility(socket:WorkspaceSocket|undefined,channelId:string):Promise<SocketOriginVisibility|undefined> {
