@@ -3212,7 +3212,9 @@ export class DispatcherDatabase {
 
   appendQueuedJobInstruction(jobId: string, sourceEventId: string, instruction: string): { row: JobRow; duplicate: boolean } {
     return this.db.transaction(() => {
-      this.assertJobSourceMatchesThread(jobId, sourceEventId);
+      const task=this.tasks.forAttempt(jobId);
+      if(task)this.tasks.assertOwner(task.task_id,sourceEventId);
+      else this.assertJobSourceMatchesThread(jobId, sourceEventId);
       this.assertJobSteerAllowed(jobId);
       if (this.getRequired(sourceEventId).source !== "slack") throw new Error("Job control requires a Slack source event");
       const row = this.getJobRequired(jobId);
@@ -3236,7 +3238,9 @@ export class DispatcherDatabase {
   }
 
   beginJobSteer(jobId: string, sourceEventId: string): { row: JobRow; duplicate: boolean } {
-    this.assertJobSourceMatchesThread(jobId, sourceEventId);
+    const task=this.tasks.forAttempt(jobId);
+    if(task)this.tasks.assertOwner(task.task_id,sourceEventId);
+    else this.assertJobSourceMatchesThread(jobId, sourceEventId);
     this.assertJobSteerAllowed(jobId);
     if (this.getRequired(sourceEventId).source !== "slack") throw new Error("Job control requires a Slack source event");
     const row = this.getJobRequired(jobId);

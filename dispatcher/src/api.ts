@@ -740,48 +740,66 @@ export class DispatcherApi {
 
   private async handleTasks(request:IncomingMessage,response:ServerResponse,url:URL):Promise<void> {
     if(this.shuttingDown&&request.method!=="GET")throw new ApiRequestError(503,"shutting_down","Dispatcher is shutting down");
+    const body=request.method==="POST"?await this.readJson(request):undefined;
+    const sourceEvent=request.method==="POST"?(body as Record<string,unknown>|undefined)?.source_event_id:url.searchParams.get("source_event_id");
+    const operation=request.method==="GET"?"task_read":url.pathname==="/v1/tasks"?"task_delegate":"task_control";
+    const authorize=()=>{
+      if(!this.agentContexts)return;
+      const token=request.headers["x-dona-agent-token"],event=request.headers["x-dona-agent-event-id"];
+      const context=typeof token==="string"&&typeof event==="string"?this.agentContexts.authorize(token,event,operation):undefined;
+      if(!context||sourceEvent!==context.event_id)throw new ApiRequestError(403,"task_owner_mismatch","task_owner_mismatch");
+    };
+    authorize();
+    const sendTaskJson=(status:number,value:unknown)=>{
+      if(request.method==="GET")authorize();
+      sendJson(response,status,value);
+    };
     try {
       if(request.method==="POST"&&url.pathname==="/v1/tasks") {
-        const input=taskRequestSchema.parse(await this.readJson(request));
+        const input=taskRequestSchema.parse(body);
         const existing=this.database.tasks.lookupRequest(input);
         if(!existing)this.database.tasks.continuations.validate(input);
         const issue=existing?undefined:await verifyTaskIssue(input,githubQuery(this.config.ghPath));
+        authorize();
         const result=existing?{outcome:"reused" as const,task:existing}:this.database.tasks.create(input,this.config.jobsWorkspaceRoot,this.config.jobResultsDir,issue);
-        this.jobs.wake();sendJson(response,result.outcome==="created"?202:200,{schema_version:1,outcome:result.outcome,task:this.database.tasks.projection(result.task)});return;
+        this.jobs.wake();sendTaskJson(result.outcome==="created"?202:200,{schema_version:1,outcome:result.outcome,task:this.database.tasks.projection(result.task)});return;
       }
       const source=url.searchParams.get("source_event_id")??"";
       if(request.method==="GET"&&url.pathname==="/v1/tasks") {
-        sendJson(response,200,{schema_version:1,tasks:this.database.tasks.list(source).map(task=>this.database.tasks.projection(task)),limit:100});return;
+        sendTaskJson(200,{schema_version:1,tasks:this.database.tasks.list(source).map(task=>this.database.tasks.projection(task)),limit:100});return;
       }
       if(request.method==="GET"&&url.pathname==="/v1/tasks/issue") {
         const input=taskRequestSchema.parse({source_event_id:source,task_key:"lookup",objective:"Issue lookup",
           workspace:{kind:"github",repository:url.searchParams.get("repository")},issue_number:Number(url.searchParams.get("issue_number"))});
         const issue=await verifyTaskIssue(input,githubQuery(this.config.ghPath));
         if(!issue)throw new Error("task_issue_identity_unverified");
-        sendJson(response,200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.findIssue(source,issue),true)});return;
+        authorize();
+        try{sendTaskJson(200,{schema_version:1,status:"found",task:this.database.tasks.projection(this.database.tasks.findIssue(source,issue),true)});}
+        catch(error){if(error instanceof Error&&error.message==="task_not_found")sendTaskJson(200,{schema_version:1,status:"not_found",task:null});else throw error;}
+        return;
       }
       const match=/^\/v1\/tasks\/([^/]+)(?:\/(pause|resume|cancel|steer|retry|questions|answer|approve|recovery|reconcile|continuation))?$/.exec(url.pathname);
       if(!match)throw new Error("task_route_not_found");
       const id=taskIdSchema.parse(match[1]),action=match[2];
-      if(request.method==="GET"&&action==="recovery"){if(!this.jobs.inspectTaskRecovery)throw Error("task_recovery_unavailable");sendJson(response,200,await this.jobs.inspectTaskRecovery(id,source));return;}
-      if(request.method==="GET"&&action==="questions"){if(!this.jobs.taskQuestions)throw Error("task_questions_unavailable");sendJson(response,200,await this.jobs.taskQuestions(id,source));return;}
-      if(request.method==="GET"&&!action){sendJson(response,200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.assertOwner(id,source),true)});return;}
+      if(request.method==="GET"&&action==="recovery"){if(!this.jobs.inspectTaskRecovery)throw Error("task_recovery_unavailable");sendTaskJson(200,await this.jobs.inspectTaskRecovery(id,source));return;}
+      if(request.method==="GET"&&action==="questions"){if(!this.jobs.taskQuestions)throw Error("task_questions_unavailable");sendTaskJson(200,await this.jobs.taskQuestions(id,source));return;}
+      if(request.method==="GET"&&!action){sendTaskJson(200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.assertOwner(id,source),true)});return;}
       if(request.method==="POST"&&action==="continuation") {
-        const input=continuationControlSchema.parse(await this.readJson(request));
-        sendJson(response,200,{schema_version:1,continuation:this.database.tasks.continuations.control(id,input)});return;
+        const input=continuationControlSchema.parse(body);
+        sendTaskJson(200,{schema_version:1,continuation:this.database.tasks.continuations.control(id,input)});return;
       }
       if(request.method==="POST"&&action&&action!=="questions") {
-        const input=await this.readJson(request) as Record<string,unknown>;
+        const input=body as Record<string,unknown>;
         if(typeof input.source_event_id!=="string"||!Number.isSafeInteger(input.revision))throw new Error("task_control_invalid");
-        if(action==="reconcile"){if(!this.jobs.reconcileTaskResult)throw Error("task_recovery_unavailable");sendJson(response,200,await this.jobs.reconcileTaskResult(id,input));return;}
+        if(action==="reconcile"){if(!this.jobs.reconcileTaskResult)throw Error("task_recovery_unavailable");sendTaskJson(200,await this.jobs.reconcileTaskResult(id,input));return;}
         if(action==="approve") {
           if(!this.jobs.approveTaskRequest||typeof input.question_id!=="string"||typeof input.accepted!=="boolean")throw Error("task_approval_invalid");
-          sendJson(response,200,await this.jobs.approveTaskRequest(id,input.source_event_id,input.revision as number,input.question_id,input.accepted));this.jobs.wake();return;
+          sendTaskJson(200,await this.jobs.approveTaskRequest(id,input.source_event_id,input.revision as number,input.question_id,input.accepted));this.jobs.wake();return;
         }
         if(action==="answer") {
           if(!this.jobs.answerTaskQuestion)throw Error("task_questions_unavailable");
           if(typeof input.question_id!=="string"||!input.answers||typeof input.answers!=="object"||Array.isArray(input.answers))throw Error("task_answer_invalid");
-          sendJson(response,200,await this.jobs.answerTaskQuestion(id,input.source_event_id,input.revision as number,input.question_id,input.answers as Record<string,{answers:string[]}>));this.jobs.wake();return;
+          sendTaskJson(200,await this.jobs.answerTaskQuestion(id,input.source_event_id,input.revision as number,input.question_id,input.answers as Record<string,{answers:string[]}>));this.jobs.wake();return;
         }
         if(action==="retry") {
           if(input.attempt_id!==undefined) {
@@ -797,7 +815,7 @@ export class DispatcherApi {
           }
           this.database.tasks.finishSteer(id,input.source_event_id);
         } else this.database.tasks.control(id,input.source_event_id,input.revision as number,action as "pause"|"resume"|"cancel");
-        this.jobs.wake();sendJson(response,200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.assertOwner(id,input.source_event_id))});return;
+        this.jobs.wake();sendTaskJson(200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.assertOwner(id,input.source_event_id))});return;
       }
       throw new Error("task_route_not_found");
     } catch(error) {

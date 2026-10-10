@@ -104,7 +104,7 @@ test("再試行上限では新Attemptを作らず、人間待ちを通知でき�
   }finally{await f.dispose();}
 });
 
-test("別actor・別channel・古いrevisionではTaskを操作できない",async()=>{
+test("別actor・古いrevisionではTaskを操作できない",async()=>{
   const f=await fixture();try{
     const e=eventEnvelope("other");e.subject.actor_id="U_OTHER";const other=f.db.enqueue(e).row;
     assert.throws(()=>f.db.tasks.assertOwner(f.task.task_id,other.event_id),/owner_mismatch/);
@@ -464,9 +464,9 @@ test("承認は通知後に取り込んだ所有者の返信だけを許可し�
   for(const event of [f.event,before])await assert.rejects(supervisor.approveTaskRequest(f.task.task_id,event.event_id,revision,request.question_id,true),/requires_user_reply/);
   const elsewhere=eventEnvelope("approval-other-thread");elsewhere.subject.thread_ts="1700000000.000099";elsewhere.reply_target!.thread_ts=elsewhere.subject.thread_ts;
   const cross=f.db.enqueue(elsewhere).row;
-  await assert.rejects(supervisor.approveTaskRequest(f.task.task_id,cross.event_id,revision,request.question_id,true),/owner_mismatch/);assert.equal(sent,0);
+  await supervisor.approveTaskRequest(f.task.task_id,cross.event_id,revision,request.question_id,true);assert.equal(sent,1);
   const after=f.db.enqueue({...eventEnvelope("after-approval"),occurred_at:"1999-01-01T00:00:00.000Z"}).row;
-  await supervisor.approveTaskRequest(f.task.task_id,after.event_id,revision,request.question_id,true);assert.equal(sent,1);
+  await supervisor.approveTaskRequest(f.task.task_id,after.event_id,revision,request.question_id,true);assert.equal(sent,2);
  }finally{await f.dispose();}
 });
 
@@ -493,13 +493,13 @@ test("明示Issueを同じ依頼者の別threadから照会しTaskを継続、�
   assert.deepEqual(f.db.tasks.projection(paused).notification_target,JSON.parse(f.event.reply_target_json!));
   assert.throws(()=>f.db.tasks.assertOwner(task.task_id,event.event_id,true),/owner_mismatch/);
   assert.equal(f.db.listEventJobs(event.event_id).length,0);
-  for(const key of ["actor_id","channel_id","workspace_id"] as const){
+  for(const key of ["actor_id","workspace_id"] as const){
    const foreign=eventEnvelope(`foreign-${key}`);foreign.subject[key]="other";if(key!=="actor_id")foreign.reply_target![key]="other";
    const denied=f.db.enqueue(foreign).row;
    assert.throws(()=>f.db.tasks.findIssue(denied.event_id,issue),/owner_mismatch/);
    assert.throws(()=>f.db.tasks.control(task.task_id,denied.event_id,paused.revision,"resume"),/owner_mismatch/);
   }
-  assert.throws(()=>f.db.tasks.findIssue(event.event_id,{...issue,node_id:"missing"}),/owner_mismatch/);
+  assert.throws(()=>f.db.tasks.findIssue(event.event_id,{...issue,node_id:"missing"}),/task_not_found/);
  }finally{await f.dispose();}
 });
 
