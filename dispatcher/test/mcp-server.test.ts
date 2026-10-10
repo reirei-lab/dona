@@ -90,6 +90,11 @@ describe("Dona Dispatcher MCP server", () => {
       assert.notEqual(found.isError,true);
       assert.deepEqual(calls.pop(),{method:"findIssueTask",args:["evt_01K00000000000000000000000","org/repo",24]});
       const listed = await client.listTools();
+      const approval=listed.tools.find(tool=>tool.name==="respond_task_approval")!.description!;
+      assert.match(approval,/同じworkspaceの検証済み依頼者/);
+      assert.match(approval,/別channel・別threadでも受理/);
+      assert.match(approval,/current Attempt・質問identity/);
+      assert.match(approval,/要求通知後/);
       assert.equal(listed.tools.find(tool=>tool.name==="authorize_job_notification")?.annotations?.idempotentHint,false);
       assert.deepEqual(listed.tools.map(({ name }) => name), [
         "delegate_task", "control_task_continuation", "get_task", "inspect_task_recovery", "reconcile_task_result", "find_issue_task", "list_tasks", "get_task_questions", "answer_task_question", "respond_task_approval", "pause_task", "resume_task", "cancel_task", "steer_task", "retry_task",
