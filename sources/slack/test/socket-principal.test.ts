@@ -15,20 +15,19 @@ test("同一workspace/actorの同時受信と連続受信を共有し、期限�
  assert.equal(await createSocketActorVerifier(client,"T_OTHER",()=>time)("U_TEST"),false);
  assert.equal(await verify("U_OTHER"),false);
 });
-test("期限後の照会失敗で古い許可を再利用せず、短い否認期限後は回復できる",async()=>{
+test("期限後の照会失敗で古い許可を再利用せず、再配送ですぐ回復できる",async()=>{
  let time=0,fail=false,calls=0;
  const verify=createSocketActorVerifier({getUser:async()=>{calls++;if(fail)throw Error("rate_limited");return human;}},"T_TEST",()=>time);
  assert.equal(await verify("U_TEST"),true);time=30_000;fail=true;
- assert.equal(await verify("U_TEST"),false);fail=false;time=34_999;
- assert.equal(await verify("U_TEST"),false);assert.equal(calls,2);
- time=35_000;assert.equal(await verify("U_TEST"),true);assert.equal(calls,3);
+ assert.equal(await verify("U_TEST"),undefined);fail=false;
+ assert.equal(await verify("U_TEST"),true);assert.equal(calls,3);
 });
 test("本人照会の期限で共有処理を解放し、遅れた成功をcacheへ入れない",async()=>{
  let signal:AbortSignal|undefined,release!:(value:typeof human)=>void;
  const verify=createSocketActorVerifier({getUser:async(_id,current)=>{signal=current;return new Promise(resolve=>{release=resolve;});}},"T_TEST");
- assert.equal(await verify("U_TEST"),false);assert.equal(signal?.aborted,true);
+ assert.equal(await verify("U_TEST"),undefined);assert.equal(signal?.aborted,true);
  release(human);await new Promise(resolve=>setImmediate(resolve));
- assert.equal(await verify("U_TEST"),false);
+ assert.equal(await verify("U_TEST"),undefined);
 });
 test("users.infoのEnterprise所属とsuspendedを変換から本人確認まで評価する",async t=>{
  let suspended=false;

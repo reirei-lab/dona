@@ -33,7 +33,7 @@ export interface WorkspaceSocket {
   workspace: string;
   authenticatedTeamId?:string;
   statusOriginVisibility?:(channelId:string,signal?:AbortSignal)=>Promise<SocketOriginVisibility|undefined>;
-  verifyActor?:(actorId:string,signal?:AbortSignal)=>Promise<boolean>;
+  verifyActor?:(actorId:string,signal?:AbortSignal)=>Promise<boolean|undefined>;
   client: SocketClientLike;
 }
 
@@ -343,6 +343,8 @@ export class SlackSocketAdapter {
           ? this.boundedRead(signal=>socket.verifyActor!(String(normalized.envelope.subject.actor_id),signal),600)
           : Promise.resolve(false),
       ]);
+      // 一時失敗を未署名でdispatchしない。永続化もACKもせずSlackの再配送に委ねる。
+      if(verifiedActor===undefined)throw new Error("slack_actor_verification_unavailable");
       const value=visibility && visibility!=="denied"?{...normalized.envelope,trace:{...normalized.envelope.trace,status_origin_visibility:visibility}}:normalized.envelope;
       // 所属とhuman状態を確認した本人だけを署名する。channelの明示denyも保持する。
       const signedWorkspace=verifiedActor===true && visibility!=="denied"?socket?.authenticatedTeamId:undefined;

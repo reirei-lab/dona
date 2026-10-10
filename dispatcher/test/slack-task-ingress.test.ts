@@ -6,7 +6,7 @@ import { test } from "node:test";
 // Slack componentの実装をblack-boxで読み、Dispatcherの型検査へSocket SDK依存を持ち込まない。
 // Slack実装自身の型検査はsources/slackの検証で行う。
 const { SlackSocketAdapter } = await import(new URL("../../sources/slack/src/socket-adapter.ts", import.meta.url).href);
-const { verifySocketActor, socketOriginVisibility } = await import(new URL("../../sources/slack/src/socket-principal.ts", import.meta.url).href);
+const { createSocketActorVerifier, socketOriginVisibility } = await import(new URL("../../sources/slack/src/socket-principal.ts", import.meta.url).href);
 type Visibility = (channelId: string, signal?: AbortSignal) => Promise<"public_channel" | "private_channel" | "im" | "mpim" | "denied" | undefined>;
 import { DispatcherClient as SlackDispatcherClient } from "../../sources/slack/src/dispatcher-client.js";
 import type { SlackAdapterConfig } from "../../sources/slack/src/adapter-config.js";
@@ -57,18 +57,19 @@ async function fixture(visibility: Visibility | undefined, team: string | null =
   let acked = false, rejected = false;
   const adapter = new SlackSocketAdapter([{ workspace: "test", client: socket, ...(team ? { authenticatedTeamId: team } : {}),
     ...(visibility ? { statusOriginVisibility: visibility } : {}),
-    verifyActor: (actorId: string, signal?: AbortSignal) => verifySocketActor({ getUser: async () => userLookup ? userLookup(signal) : ({
+    verifyActor: createSocketActorVerifier({ getUser: async (_actorId: string, signal?: AbortSignal) => userLookup ? userLookup(signal) : ({
       id: "U_TEST", teamId: "T_TEST", stateKnown: true, isDeleted: false, isBot: false, isAppUser: false, ...userOverrides,
-    }) }, "T_TEST", actorId, signal) }],
+    }) }, "T_TEST") }],
     new SlackDispatcherClient({ socketPath: config.socketPath, connectTimeoutMs: 500, timeoutMs: 2000, internalTokenPath: config.updateInternalTokenPath }),
     adapterConfig, { ...logger, error() { rejected = true; } });
   await adapter.start();
   // 本番と同じapp_mentionを受信し、署名・HTTP ingress・永続化・workerのcontext発行を通す。
-  socket.emit("slack_event", { type: "events_api", envelope_id: "envelope-task-ingress", ack: async () => { acked = true; }, body: {
+  const deliver = (envelopeId="envelope-task-ingress") => socket.emit("slack_event", { type: "events_api", envelope_id: envelopeId, ack: async () => { acked = true; }, body: {
     type: "event_callback", team_id: "T_TEST", event_id: "EvIngressTask", authorizations: [{ user_id: "U_BOT" }],
     event: { type: "app_mention", user: "U_TEST", channel: "C_TEST", ts: "1791615423.357439", event_ts: "1791615423.357439", text: "Issueを再開してください" },
   } });
-  return { db, config, root, contexts, client: new DispatcherApiClient(config.socketPath),
+  deliver();
+  return { db, config, root, contexts, deliver, client: new DispatcherApiClient(config.socketPath),
     acked: () => acked, rejected: () => rejected,
     async dispatch() { await waitFor(() => acked, 5000); worker.start(); await waitFor(() => !!prompt); return /^event_id: (.+)$/m.exec(prompt)![1]!; },
     async close() { release(); await worker.stop(); await adapter.stop(); await api.stop(); db.close(); await fs.rm(root, { recursive: true, force: true }); },
@@ -165,19 +166,25 @@ for (const changes of [{ isShared: true }, { isArchived: true }, { id: "C_OTHER"
 }
 
 for (const outcome of ["failure", "timeout"] as const) {
-  test(`本人の照会${outcome}は署名せずにACKし、Task操作を拒否する`, async () => {
-    let signal: AbortSignal | undefined, release: () => void = () => {};
+  test(`本人の照会${outcome}は永続化とACKをせず、再配送でTask操作まで回復する`, async () => {
+    let signal: AbortSignal | undefined, release: () => void = () => {}, recovered=false;
+    const human={ id: "U_TEST", teamId: "T_TEST", stateKnown: true, isDeleted: false, isBot: false, isAppUser: false };
     const f = await fixture(async () => "public_channel", "T_TEST", {}, async currentSignal => {
       signal = currentSignal;
+      if(recovered)return human;
       if (outcome === "failure") throw Error("users.info unavailable");
       return new Promise(resolve => { release = () => resolve({ id: "U_TEST", teamId: "T_TEST", stateKnown: true, isDeleted: false, isBot: false, isAppUser: false }); });
     });
     try {
-      const eventId = await f.dispatch();
+      await waitFor(f.rejected);
+      assert.equal(f.acked(),false);
+      assert.equal(f.db.getByExternalId("slack","EvIngressTask"),undefined);
       if (outcome === "timeout") assert.equal(signal?.aborted, true);
       release(); await new Promise(resolve => setImmediate(resolve));
-      assert.equal(f.db.getVerifiedPrincipalBinding(eventId), undefined);
-      await assert.rejects(f.client.listTasks(eventId), /task_owner_mismatch/);
+      recovered=true;f.deliver("redelivery-envelope");
+      const eventId=await f.dispatch();
+      assert.equal(f.db.getVerifiedPrincipalBinding(eventId)?.principal_id,"U_TEST");
+      assert.deepEqual((await f.client.listTasks(eventId)).tasks,[]);
     } finally { release(); await f.close(); }
   });
 }

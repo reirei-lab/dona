@@ -19,23 +19,25 @@ export async function socketOriginVisibility(client: Pick<SlackApiClient, "getCh
 /** workspace接続ごとに短期共有する。期限後の失敗で古い許可を延長しない。 */
 export function createSocketActorVerifier(client: Pick<SlackApiClient, "getUser">, workspaceId: string, now = () => performance.now()) {
   const cache = new Map<string, { value: boolean; expiresAt: number }>();
-  const pending = new Map<string, Promise<boolean>>();
-  return async (actorId: string): Promise<boolean> => {
+  const pending = new Map<string, Promise<boolean | undefined>>();
+  return async (actorId: string): Promise<boolean | undefined> => {
     const cached = cache.get(actorId);
     if (cached && cached.expiresAt > now()) return cached.value;
     cache.delete(actorId);
     const existing = pending.get(actorId);
     if (existing) return existing;
     // 同時照会にも上限を設け、未完了Promiseでメモリを無制限に占有しない。
-    if (pending.size >= 1000) return false;
+    if (pending.size >= 1000) return undefined;
     const controller = new AbortController();
     let timer: NodeJS.Timeout | undefined;
     const read = Promise.race([
       verifySocketActor(client, workspaceId, actorId, controller.signal),
-      new Promise<boolean>(resolve => { timer = setTimeout(() => { controller.abort(); resolve(false); }, 450); }),
-    ]).catch(() => false).then(value => {
+      new Promise<undefined>(resolve => { timer = setTimeout(() => { controller.abort(); resolve(undefined); }, 450); }),
+    ]).catch(() => undefined).then(value => {
+      // 一時失敗は確定否認と区別し、再配送の本人確認を妨げない。
+      if (value === undefined) return undefined;
       if (cache.size >= 1000) cache.delete(cache.keys().next().value!);
-      // 許可は最長30秒、否認・照会失敗は5秒。期限後は必ず再検証する。
+      // 許可は最長30秒、確定否認は5秒。期限後は必ず再検証する。
       cache.set(actorId, { value, expiresAt: now() + (value ? 30_000 : 5_000) });
       return value;
     }).finally(() => { clearTimeout(timer); pending.delete(actorId); });
