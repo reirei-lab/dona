@@ -29,11 +29,13 @@ test("本人照会の期限で共有処理を解放し、遅れた成功をcache
  release(human);await new Promise(resolve=>setImmediate(resolve));
  assert.equal(await verify("U_TEST"),undefined);
 });
-test("users.infoのEnterprise所属とsuspendedを変換から本人確認まで評価する",async t=>{
- let suspended=false;
+test("users.infoのEnterprise所属と任意のsuspendedの省略・false・trueを評価する",async t=>{
+ let suspended:boolean|undefined;
  t.mock.method(globalThis,"fetch",async()=>new Response(JSON.stringify({ok:true,user:{id:"U_TEST",team_id:"T_HOME",enterprise_user:{teams:["T_TEST"]},suspended,is_bot:false,is_app_user:false,deleted:false}}),{headers:{"content-type":"application/json"}}));
  const client=new SlackWebApiClient("fixture-token",{debug(){},info(){},warn(){},error(){}});
+ assert.equal((await client.getUser("U_TEST")).isSuspended,undefined);
  assert.equal(await verifySocketActor(client,"T_TEST","U_TEST"),true);
+ suspended=false;assert.equal(await verifySocketActor(client,"T_TEST","U_TEST"),true);
  assert.equal(await verifySocketActor(client,"T_OUTSIDE","U_TEST"),false);
  suspended=true;assert.equal(await verifySocketActor(client,"T_TEST","U_TEST"),false);
 });
