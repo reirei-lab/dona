@@ -336,7 +336,8 @@ export class SlackSocketAdapter {
       const socket=this.sockets.find(socket=>socket.workspace===workspace);
       const visibility=await this.originVisibility(socket,String(normalized.envelope.subject.channel_id));
       const value=visibility?{...normalized.envelope,trace:{...normalized.envelope.trace,status_origin_visibility:visibility}}:normalized.envelope;
-      response = await this.dispatcher.postEvent(value,visibility?socket?.authenticatedTeamId:undefined);
+      // Socket Modeで確認済みのworkspaceによる本人確認は、追加のchannel照会から独立させる。
+      response = await this.dispatcher.postEvent(value,socket?.authenticatedTeamId);
     } catch (error) {
       this.logger.error("Dispatcher connection failed; Socket Mode envelope was not acknowledged", {
         workspace,
@@ -394,7 +395,7 @@ export class SlackSocketAdapter {
 
   private async originVisibility(socket:WorkspaceSocket|undefined,channelId:string):Promise<string|undefined> {
     if(!socket?.statusOriginVisibility)return undefined;
-    // 追加のreadでdurable ingress/ACKを滞留させない。期限外は未署名で保存しstatusだけdenyする。
+    // 追加のreadでdurable ingress/ACKを滞留させない。期限外はvisibilityを付与せず保存する。
     const controller=new AbortController();
     const lookup=this.trackExternal(Promise.resolve().then(()=>socket.statusOriginVisibility!(channelId,controller.signal)));
     let timer:NodeJS.Timeout|undefined;

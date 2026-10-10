@@ -312,7 +312,7 @@ for(const outcome of ["timeout","failure","success"] as const)test(`origin visib
   const value=calls[0]!.value as {trace?:{status_origin_visibility?:string}};
   assert.equal(value.trace?.status_origin_visibility,outcome==="success"?"public_channel":undefined);
   if(outcome==="timeout")assert.equal(readSignal?.aborted,true);
-  assert.equal(calls[0]!.team,outcome==="success"?"T01234567":undefined);
+  assert.equal(calls[0]!.team,"T01234567");
   release("private_channel");await new Promise(r=>setTimeout(r,10));assert.equal(calls.length,1);
  }finally{release("public_channel");await adapter.stop();}
 });
