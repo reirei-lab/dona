@@ -103,8 +103,13 @@ test("principal proof: 改竄・期限切れ・replay・未署名ownerは許可�
   assert.throws(()=>verifySlackPrincipalProof({...proofEnvelope,subject:{...env.subject,channel_id:"C_OTHER"}},signed.proof,signed.signature,"key"));
   assert.throws(()=>verifySlackPrincipalProof(proofEnvelope,signed.proof,signed.signature,"key",new Date(Date.now()+121000)));
   const proof=verifySlackPrincipalProof(proofEnvelope,signed.proof,signed.signature,"key");
-  f.db.enqueue(proofEnvelope,new Date(),proof);
   assert.throws(()=>f.db.enqueue(proofEnvelope,new Date(),proof),/principal binding conflicts/);
+  const queuedEnvelope={...eventEnvelope("queued-proof"),trace:{ingress_attempt:1}};
+  f.db.enqueue(queuedEnvelope);
+  const queuedSigned=signSlackPrincipalProof(queuedEnvelope,1,"T_TEST","key");assert.ok(queuedSigned.proof);
+  const queuedProof=verifySlackPrincipalProof(queuedEnvelope,queuedSigned.proof,queuedSigned.signature,"key");
+  f.db.enqueue(queuedEnvelope,new Date(),queuedProof);
+  assert.throws(()=>f.db.enqueue(queuedEnvelope,new Date(),queuedProof),/principal binding conflicts/);
   await f.current(await f.event("good"));await fs.writeFile(path.join(path.dirname(f.config.socketPath),"status-context.json"),JSON.stringify({event_id:row.event_id,token:"forged"}));
   assert.deepEqual(await f.query("api"),statusNotAvailable);
  }finally{await f.close();}

@@ -541,6 +541,10 @@ export class DispatcherApi {
       }
       const input = await this.readJson(request);
       const envelope = parseEventEnvelope(input);
+      // 未署名本文だけで既存principalを失効させない。denyは内部adapterの認証を必須にする。
+      if(envelope.source==="slack" && envelope.trace?.principal_origin_denied===true && !(await this.authorizedUpdateRequest(request))) {
+        throw new ApiRequestError(403,"slack_origin_denial_unauthorized","Slack origin denial requires adapter authentication");
+      }
       let result;
       try {
         let principal;

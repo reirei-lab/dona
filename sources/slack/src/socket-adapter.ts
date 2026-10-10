@@ -4,6 +4,7 @@ import type { SlackAdapterConfig } from "./adapter-config.js";
 import type { DispatcherClient, DispatcherResponse } from "./dispatcher-client.js";
 import type { SlackLogger } from "./logger.js";
 import { normalizeSlackEvent } from "./normalize.js";
+import type { SocketOriginVisibility } from "./socket-principal.js";
 
 export type ConnectionState =
   | "connecting"
@@ -31,7 +32,8 @@ export interface SocketClientLike {
 export interface WorkspaceSocket {
   workspace: string;
   authenticatedTeamId?:string;
-  statusOriginVisibility?:(channelId:string,signal?:AbortSignal)=>Promise<string|undefined>;
+  statusOriginVisibility?:(channelId:string,signal?:AbortSignal)=>Promise<SocketOriginVisibility|undefined>;
+  verifyActor?:(actorId:string,signal?:AbortSignal)=>Promise<boolean|undefined>;
   client: SocketClientLike;
 }
 
@@ -333,10 +335,33 @@ export class SlackSocketAdapter {
     let response: DispatcherResponse;
     const dispatchStarted = Date.now();
     try {
-      const socket=this.sockets.find(socket=>socket.workspace===workspace);
-      const visibility=await this.originVisibility(socket,String(normalized.envelope.subject.channel_id));
-      const value=visibility?{...normalized.envelope,trace:{...normalized.envelope.trace,status_origin_visibility:visibility}}:normalized.envelope;
-      response = await this.dispatcher.postEvent(value,visibility?socket?.authenticatedTeamId:undefined);
+      const socket=this.routeSocket(body,workspace);
+      if(socket)workspace=socket.workspace;
+      const externalWorkspace=!!socket?.authenticatedTeamId && normalized.envelope.subject.workspace_id!==socket.authenticatedTeamId;
+      if(externalWorkspace) {
+        const authorized=body.context_team_id===socket!.authenticatedTeamId || Array.isArray(body.authorizations) && body.authorizations.some(value=>value && typeof value==="object" && value.team_id===socket!.authenticatedTeamId);
+        if(!authorized)throw new Error("slack_workspace_mismatch");
+        // Slack Connectの送信元workspaceと、応答に使う受信installationを区別する。
+        const sourceWorkspace=normalized.envelope.subject.workspace_id;
+        normalized.envelope={...normalized.envelope,
+          subject:{...normalized.envelope.subject,workspace_id:socket!.authenticatedTeamId},
+          reply_target:{...normalized.envelope.reply_target,workspace_id:socket!.authenticatedTeamId},
+          trace:{...normalized.envelope.trace,slack_source_workspace_id:sourceWorkspace}};
+      }
+      const [visibility,verifiedActor]=externalWorkspace || body.is_ext_shared_channel===true?["denied",false] as const:await Promise.all([
+        this.originVisibility(socket,String(normalized.envelope.subject.channel_id)),
+        socket?.authenticatedTeamId && socket.verifyActor
+          ? this.boundedRead(signal=>socket.verifyActor!(String(normalized.envelope.subject.actor_id),signal),600)
+          : Promise.resolve(false),
+      ]);
+      // 一時失敗を未署名でdispatchしない。永続化もACKもせずSlackの再配送に委ねる。
+      if(verifiedActor===undefined && visibility!=="denied")throw new Error("slack_actor_verification_unavailable");
+      const value=visibility==="denied"
+        ? {...normalized.envelope,trace:{...normalized.envelope.trace,principal_origin_denied:true}}
+        : visibility?{...normalized.envelope,trace:{...normalized.envelope.trace,status_origin_visibility:visibility}}:normalized.envelope;
+      // 所属とhuman状態を確認した本人だけを署名する。channelの明示denyも保持する。
+      const signedWorkspace=verifiedActor===true && visibility!=="denied"?socket?.authenticatedTeamId:undefined;
+      response = await this.dispatcher.postEvent(value,signedWorkspace);
     } catch (error) {
       this.logger.error("Dispatcher connection failed; Socket Mode envelope was not acknowledged", {
         workspace,
@@ -392,14 +417,34 @@ export class SlackSocketAdapter {
     }
   }
 
-  private async originVisibility(socket:WorkspaceSocket|undefined,channelId:string):Promise<string|undefined> {
+  private routeSocket(body:Record<string,unknown>,receivedWorkspace:string):WorkspaceSocket|undefined {
+    const configured=this.sockets.filter(socket=>socket.authenticatedTeamId);
+    if(configured.length===0)return this.sockets.find(socket=>socket.workspace===receivedWorkspace);
+    const teams=Array.isArray(body.authorizations)?body.authorizations.flatMap(value=>
+      value && typeof value==="object" && typeof value.team_id==="string"?[value.team_id]:[]):[];
+    let candidates=teams.length?configured.filter(socket=>teams.includes(socket.authenticatedTeamId!))
+      :configured.filter(socket=>socket.authenticatedTeamId===(typeof body.context_team_id==="string"?body.context_team_id:body.team_id));
+    if(candidates.length>1) {
+      const preferred=candidates.find(socket=>socket.authenticatedTeamId===body.context_team_id)
+        ?? candidates.find(socket=>socket.authenticatedTeamId===body.team_id);
+      if(preferred)candidates=[preferred];
+    }
+    if(candidates.length!==1)throw new Error("slack_workspace_mismatch");
+    return candidates[0];
+  }
+
+  private async originVisibility(socket:WorkspaceSocket|undefined,channelId:string):Promise<SocketOriginVisibility|undefined> {
     if(!socket?.statusOriginVisibility)return undefined;
-    // 追加のreadでdurable ingress/ACKを滞留させない。期限外は未署名で保存しstatusだけdenyする。
+    // 追加のreadでdurable ingress/ACKを滞留させない。期限外はvisibilityを付与せず保存する。
+    return this.boundedRead(signal=>socket.statusOriginVisibility!(channelId,signal),200);
+  }
+
+  private async boundedRead<T>(read:(signal:AbortSignal)=>Promise<T>,timeoutMs:number):Promise<T|undefined> {
     const controller=new AbortController();
-    const lookup=this.trackExternal(Promise.resolve().then(()=>socket.statusOriginVisibility!(channelId,controller.signal)));
+    const lookup=this.trackExternal(Promise.resolve().then(()=>read(controller.signal)));
     let timer:NodeJS.Timeout|undefined;
     try {
-      return await Promise.race([lookup.catch(()=>undefined),new Promise<undefined>(resolve=>{timer=setTimeout(()=>{controller.abort();resolve(undefined);},200);})]);
+      return await Promise.race([lookup.catch(()=>undefined),new Promise<undefined>(resolve=>{timer=setTimeout(()=>{controller.abort();resolve(undefined);},timeoutMs);})]);
     } finally {if(timer)clearTimeout(timer);}
   }
 

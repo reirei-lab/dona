@@ -300,19 +300,41 @@ describe("SlackSocketAdapter", () => {
 });
 
 for(const outcome of ["timeout","failure","success"] as const)test(`origin visibility ${outcome}はdurable ingressとACKを阻害しない`,async()=>{
- const client=new FakeSocketClient();let release:(v:string)=>void=()=>{},acked=false,readSignal:AbortSignal|undefined;const calls:Array<{value:unknown;team:unknown}>=[];
- const visibility=outcome==="timeout"?new Promise<string>(r=>{release=r;}):outcome==="failure"?Promise.reject(Error("visibility unavailable")):Promise.resolve("public_channel");
+ const client=new FakeSocketClient();let release:(v:"public_channel"|"private_channel")=>void=()=>{},acked=false,readSignal:AbortSignal|undefined;const calls:Array<{value:unknown;team:unknown}>=[];
+ const visibility=outcome==="timeout"?new Promise<"public_channel"|"private_channel">(r=>{release=r;}):outcome==="failure"?Promise.reject(Error("visibility unavailable")):Promise.resolve("public_channel" as const);
  // rejection handlerはeventを処理するときに付くため、ここでのunhandled rejectionを避ける。
  void visibility.catch(()=>{});
  const dispatcher={async postEvent(value:unknown,team?:string){calls.push({value,team});return {statusCode:202,body:"{}"};},healthReady:async()=>true};
- const adapter=new SlackSocketAdapter([{workspace:"company",client,authenticatedTeamId:"T01234567",statusOriginVisibility:(_value,signal)=>{readSignal=signal;return visibility;}}],dispatcher,config,logger);
+ const adapter=new SlackSocketAdapter([{workspace:"company",client,authenticatedTeamId:"T01234567",verifyActor:async()=>true,statusOriginVisibility:(_value,signal)=>{readSignal=signal;return visibility;}}],dispatcher,config,logger);
  await adapter.start();try {
   client.emit("slack_event",socketEnvelope(`visibility-${outcome}`,async()=>{acked=true;}));
   await waitFor(()=>acked,1000);assert.equal(calls.length,1);
   const value=calls[0]!.value as {trace?:{status_origin_visibility?:string}};
   assert.equal(value.trace?.status_origin_visibility,outcome==="success"?"public_channel":undefined);
   if(outcome==="timeout")assert.equal(readSignal?.aborted,true);
-  assert.equal(calls[0]!.team,outcome==="success"?"T01234567":undefined);
+  assert.equal(calls[0]!.team,"T01234567");
   release("private_channel");await new Promise(r=>setTimeout(r,10));assert.equal(calls.length,1);
  }finally{release("public_channel");await adapter.stop();}
+});
+
+test("遅い本人照会でもDispatcherのcommitを待ち、通常のACK予算内で応答する",async()=>{
+ const client=new FakeSocketClient();let acked=false,committed=false,signal:AbortSignal|undefined;
+ const adapter=new SlackSocketAdapter([{workspace:"company",client,authenticatedTeamId:"T01234567",verifyActor:async(_id,current)=>{signal=current;await new Promise(resolve=>setTimeout(resolve,500));return true;}}],
+ {postEvent:async(_value,team)=>{assert.equal(team,"T01234567");await new Promise(resolve=>setTimeout(resolve,1200));committed=true;return {statusCode:202,body:"{}"};},healthReady:async()=>true},config,logger);
+ await adapter.start();try {
+  const started=Date.now();client.emit("slack_event",socketEnvelope("actor-budget",async()=>{assert.equal(committed,true);acked=true;}));
+  await waitFor(()=>acked,2900);assert.equal(signal?.aborted,false);assert.ok(Date.now()-started<2900);
+ }finally{await adapter.stop();}
+});
+
+test("同一Appの別Socketへ届いてもpayloadのinstallationのclientで本人確認する",async()=>{
+ const first=new FakeSocketClient(),second=new FakeSocketClient();let firstReads=0,secondReads=0,acked=false;
+ const adapter=new SlackSocketAdapter([
+  {workspace:"company",client:first,authenticatedTeamId:"T01234567",verifyActor:async()=>{firstReads++;return true;}},
+  {workspace:"other",client:second,authenticatedTeamId:"T_OTHER",verifyActor:async()=>{secondReads++;return true;}},
+ ],{postEvent:async(value,team)=>{assert.equal(team,"T01234567");assert.equal((value as any).subject.workspace_id,"T01234567");return {statusCode:202,body:"{}"};},healthReady:async()=>true},config,logger);
+ await adapter.start();try {
+  second.emit("slack_event",socketEnvelope("cross-socket",async()=>{acked=true;},{...eventBody(),authorizations:[{team_id:"T01234567",user_id:"U_BOT"}]}));
+  await waitFor(()=>acked);assert.equal(firstReads,1);assert.equal(secondReads,0);
+ }finally{await adapter.stop();}
 });
