@@ -28,7 +28,7 @@ class Socket extends EventEmitter {
   async disconnect() {}
 }
 
-async function fixture(visibility: Visibility | undefined, team: string | null = "T_TEST", userOverrides: Record<string, unknown> = {}, userLookup?: (signal?: AbortSignal) => Promise<unknown>) {
+async function fixture(visibility: Visibility | undefined, team: string | null = "T_TEST", userOverrides: Record<string, unknown> = {}, userLookup?: (signal?: AbortSignal) => Promise<unknown>, envelopeOverrides: Record<string,unknown> = {}) {
   const { root, config } = await tempConfig();
   await fs.mkdir(path.dirname(config.updateInternalTokenPath), { recursive: true });
   await fs.writeFile(config.updateInternalTokenPath, "ingress-test-key-00000000000000000000", { mode: 0o600 });
@@ -66,7 +66,7 @@ async function fixture(visibility: Visibility | undefined, team: string | null =
   // 本番と同じapp_mentionを受信し、署名・HTTP ingress・永続化・workerのcontext発行を通す。
   const deliver = (envelopeId="envelope-task-ingress") => socket.emit("slack_event", { type: "events_api", envelope_id: envelopeId, ack: async () => { acked = true; }, body: {
     type: "event_callback", team_id: "T_TEST", event_id: "EvIngressTask", authorizations: [{ user_id: "U_BOT" }],
-    event: { type: "app_mention", user: "U_TEST", channel: "C_TEST", ts: "1791615423.357439", event_ts: "1791615423.357439", text: "Issueを再開してください" },
+    event: { type: "app_mention", user: "U_TEST", channel: "C_TEST", ts: "1791615423.357439", event_ts: "1791615423.357439", text: "Issueを再開してください" }, ...envelopeOverrides,
   } });
   deliver();
   return { db, config, root, contexts, deliver, client: new DispatcherApiClient(config.socketPath),
@@ -219,4 +219,18 @@ for(const reason of ["failure","timeout"] as const)test(`channel明示denyでは
   assert.equal(f.db.getVerifiedPrincipalBinding(id),undefined);
   await assert.rejects(f.client.listTasks(id),/task_owner_mismatch/);
  }finally{await f.close();}
+});
+
+ test("Slack Connectの外部送信元は受信installationへ束縛し、署名せず保存・ACKする",async()=>{
+  const f=await fixture(undefined,"T_TEST",{},async()=>{throw Error("本人照会は不要");},
+    {team_id:"T_EXTERNAL",authorizations:[{team_id:"T_TEST",user_id:"U_BOT",is_bot:true}]});
+  try {
+    const id=await f.dispatch(),row=f.db.get(id)!;
+    assert.equal(JSON.parse(row.subject_json).workspace_id,"T_TEST");
+    assert.equal(JSON.parse(row.reply_target_json!).workspace_id,"T_TEST");
+    assert.equal(JSON.parse(row.trace_json!).slack_source_workspace_id,"T_EXTERNAL");
+    assert.equal(JSON.parse(row.trace_json!).principal_origin_denied,true);
+    assert.equal(f.db.getVerifiedPrincipalBinding(id),undefined);
+    await assert.rejects(f.client.listTasks(id),/task_owner_mismatch/);
+  }finally{await f.close();}
 });

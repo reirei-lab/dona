@@ -336,8 +336,18 @@ export class SlackSocketAdapter {
     const dispatchStarted = Date.now();
     try {
       const socket=this.sockets.find(socket=>socket.workspace===workspace);
-      if(socket?.authenticatedTeamId && normalized.envelope.subject.workspace_id!==socket.authenticatedTeamId)throw new Error("slack_workspace_mismatch");
-      const [visibility,verifiedActor]=await Promise.all([
+      const externalWorkspace=!!socket?.authenticatedTeamId && normalized.envelope.subject.workspace_id!==socket.authenticatedTeamId;
+      if(externalWorkspace) {
+        const authorized=Array.isArray(body.authorizations) && body.authorizations.some(value=>value && typeof value==="object" && value.team_id===socket!.authenticatedTeamId);
+        if(!authorized)throw new Error("slack_workspace_mismatch");
+        // Slack Connectの送信元workspaceと、応答に使う受信installationを区別する。
+        const sourceWorkspace=normalized.envelope.subject.workspace_id;
+        normalized.envelope={...normalized.envelope,
+          subject:{...normalized.envelope.subject,workspace_id:socket!.authenticatedTeamId},
+          reply_target:{...normalized.envelope.reply_target,workspace_id:socket!.authenticatedTeamId},
+          trace:{...normalized.envelope.trace,slack_source_workspace_id:sourceWorkspace}};
+      }
+      const [visibility,verifiedActor]=externalWorkspace?["denied",false] as const:await Promise.all([
         this.originVisibility(socket,String(normalized.envelope.subject.channel_id)),
         socket?.authenticatedTeamId && socket.verifyActor
           ? this.boundedRead(signal=>socket.verifyActor!(String(normalized.envelope.subject.actor_id),signal),600)
