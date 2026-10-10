@@ -53,6 +53,20 @@ test("同じ検証済み依頼者は別channelでTaskを照会・操作し、Res
  }finally{await f.close();}
 });
 
+test("検証済み完了通知から既存Issue Taskを読み取る経路を保持する",async()=>{
+ const f=await fixture();try{
+  const job=f.db.getJob(f.task.current_attempt_id)!;
+  f.db.beginJobPreparation(job.job_id,new Date(job.available_at));f.db.setJobRuntime(job.job_id,"w","p");f.db.beginJobDispatch(job.job_id);f.db.markJobRunning(job.job_id);f.db.sealJobGroup(f.origin.event_id);
+  f.db.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",actions:[],completed_at:new Date().toISOString()},job.result_path);
+  const notice=f.db.enqueueJobNotification(job.job_id).row;await f.current(notice.event_id);
+  const found=await f.client.findIssueTask(notice.event_id,"org/repo",1);
+  assert.equal(found.status,"found");assert.equal((found.task as any).result.summary,"完了");
+  // 完了通知を新しい人間のIssue着手依頼に読み替えない。
+  await assert.rejects(f.client.findIssueTask(notice.event_id,"org/repo",2),/task_owner_mismatch/);
+  await assert.rejects(f.client.controlTask(f.task.task_id,"pause",{source_event_id:notice.event_id,revision:f.db.tasks.get(f.task.task_id)!.revision}),/task_owner_mismatch/);
+ }finally{await f.close();}
+});
+
 test("Taskなしは明示し、照会後に他依頼者がclaimしたIssueへ重複作成しない",async()=>{
  const f=await fixture();try{
   const e=f.event("lookup","C_OTHER");await f.current(e.event_id);

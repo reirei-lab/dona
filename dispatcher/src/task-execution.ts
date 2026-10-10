@@ -213,10 +213,12 @@ export class TaskRepository {
   }
   findIssue(eventId:string,issue:VerifiedTaskIssue):TaskRow {
     const row=this.sql.prepare("SELECT task_id FROM tasks WHERE resource_id=?").get(`github:${issue.node_id}`) as {task_id:string}|undefined;
-    const event=this.dispatcher.get(eventId),binding=readEventJobBinding(this.sql,eventId);
-    if(!event||event.source!=="slack"||binding?.owner.kind!=="slack_thread"||
-      typeof JSON.parse(event.subject_json).actor_id!=="string")throw new Error("task_owner_mismatch");
-    if(!row)throw new Error("task_not_found");
+    if(!row) {
+      const event=this.dispatcher.get(eventId),binding=readEventJobBinding(this.sql,eventId);
+      if(!event||event.source!=="slack"||binding?.owner.kind!=="slack_thread"||
+        typeof JSON.parse(event.subject_json).actor_id!=="string")throw new Error("task_owner_mismatch");
+      throw new Error("task_not_found");
+    }
     return this.assertOwner(row.task_id,eventId);
   }
   lookupRequest(input:TaskRequest):TaskRow|undefined {
