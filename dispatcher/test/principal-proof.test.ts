@@ -114,3 +114,25 @@ describe("verified principal binding", () => {
     database.close();
   });
 });
+
+test("未署名配送への新しいproofは署名済みtraceと共に保存し、再配送でも有効性を維持する",async()=>{
+ const {root,config}=await tempConfig();roots.push(root);
+ const db=new DispatcherDatabase(config.databasePath);
+ try {
+  const first={...eventEnvelope("Ev-trace-rebind"),trace:{socket_envelope_id:"first"}};
+  const row=db.enqueue(first).row;
+  const retry={...first,trace:{socket_envelope_id:"retry",ingress_attempt:1,status_origin_visibility:"public_channel"}};
+  const proof=verified(retry);
+  const rebound=db.enqueue(retry,new Date(),proof);
+  assert.equal(rebound.row.event_id,row.event_id);assert.equal(rebound.duplicate,true);
+  assert.equal(db.getVerifiedPrincipalBinding(row.event_id)?.principal_id,"U_TEST");
+  assert.equal(JSON.parse(rebound.row.trace_json!).socket_envelope_id,"retry");
+  const again={...retry,trace:{...retry.trace,socket_envelope_id:"third"}};
+  db.enqueue(again,new Date(),verified(again,{nonce:"third-delivery-nonce"}));
+  assert.equal(JSON.parse(db.get(row.event_id)!.trace_json!).socket_envelope_id,"retry");
+  assert.equal(db.getVerifiedPrincipalBinding(row.event_id)?.proof_sha256,proof.proof_sha256);
+  const conflict={...retry,payload:{...retry.payload,text:"different"}};
+  assert.throws(()=>db.enqueue(conflict,new Date(),verified(conflict,{nonce:"conflicting-delivery"})),PrincipalBindingConflictError);
+  assert.equal(db.list().length,1);
+ }finally{db.close();}
+});

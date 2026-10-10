@@ -1235,7 +1235,15 @@ export class DispatcherDatabase {
         const binding=legacySlackBinding(existing);
         if(binding) insertEventJobBinding(this.db,existing.event_id,binding);
         if(principal && mismatch)throw new PrincipalBindingConflictError();
-        if(principal) persistVerifiedPrincipalBinding(this.db,existing.event_id,principal,timestamp);
+        if(principal) {
+          // 未署名の初回配送と同じ内容であることを確認した上で、初めての証拠と
+          // その署名対象traceを同一transactionに保存する。既存証拠・失効は更新しない。
+          if(!readVerifiedPrincipalBinding(this.db,existing.event_id)) {
+            this.db.prepare("UPDATE events SET trace_json=? WHERE event_id=?").run(traceJson,existing.event_id);
+            existing.trace_json=traceJson;
+          }
+          persistVerifiedPrincipalBinding(this.db,existing.event_id,principal,timestamp);
+        }
         return { row: existing, duplicate: true, payloadMismatch: mismatch };
       }
 

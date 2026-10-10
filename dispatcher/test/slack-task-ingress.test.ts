@@ -139,7 +139,7 @@ test("認証済みworkspaceがない受信では本文のuserからTask権限を
 });
 
 for (const [reason, changes] of Object.entries({ external: { teamId: "T_OTHER" }, bot: { isBot: true }, app: { isAppUser: true },
-  deleted: { isDeleted: true }, unknown: { stateKnown: false }, mismatched: { id: "U_OTHER" }, agentforce: { isAgentforceBot: true } })) {
+  suspended: { isSuspended: true }, deleted: { isDeleted: true }, unknown: { stateKnown: false }, mismatched: { id: "U_OTHER" }, agentforce: { isAgentforceBot: true } })) {
   test(`channel照会不能でも${reason}のactorにはTask権限を発行しない`, async () => {
     const f = await fixture(async () => undefined, "T_TEST", changes);
     try {
@@ -191,5 +191,12 @@ test("本人照会がchannelの200ms期限を超えても、所属確認後にTa
     const eventId = await f.dispatch();
     assert.equal(f.db.getVerifiedPrincipalBinding(eventId)?.principal_id, "U_TEST");
     assert.deepEqual((await f.client.listTasks(eventId)).tasks, []);
+  } finally { await f.close(); }
+});
+
+ test("Enterpriseの対象workspace所属を確認した利用者はTask照合できる", async () => {
+  const f = await fixture(async () => undefined, "T_TEST", {teamId:"T_HOME", enterpriseTeamIds:["T_TEST"]});
+  try { const id=await f.dispatch(); assert.equal(f.db.getVerifiedPrincipalBinding(id)?.principal_id,"U_TEST");
+    assert.deepEqual((await f.client.listTasks(id)).tasks,[]);
   } finally { await f.close(); }
 });

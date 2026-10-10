@@ -340,7 +340,7 @@ export class SlackSocketAdapter {
       const [visibility,verifiedActor]=await Promise.all([
         this.originVisibility(socket,String(normalized.envelope.subject.channel_id)),
         socket?.authenticatedTeamId && socket.verifyActor
-          ? this.boundedRead(signal=>socket.verifyActor!(String(normalized.envelope.subject.actor_id),signal),2000)
+          ? this.boundedRead(signal=>socket.verifyActor!(String(normalized.envelope.subject.actor_id),signal),600)
           : Promise.resolve(false),
       ]);
       const value=visibility && visibility!=="denied"?{...normalized.envelope,trace:{...normalized.envelope.trace,status_origin_visibility:visibility}}:normalized.envelope;

@@ -316,3 +316,13 @@ for(const outcome of ["timeout","failure","success"] as const)test(`origin visib
   release("private_channel");await new Promise(r=>setTimeout(r,10));assert.equal(calls.length,1);
  }finally{release("public_channel");await adapter.stop();}
 });
+
+test("本人照会の期限後もDispatcherのcommitを待ち、通常のACK予算内で応答する",async()=>{
+ const client=new FakeSocketClient();let acked=false,committed=false,signal:AbortSignal|undefined;
+ const adapter=new SlackSocketAdapter([{workspace:"company",client,authenticatedTeamId:"T01234567",verifyActor:async(_id,current)=>{signal=current;return new Promise(()=>{});}}],
+ {postEvent:async(_value,team)=>{assert.equal(team,undefined);await new Promise(resolve=>setTimeout(resolve,1200));committed=true;return {statusCode:202,body:"{}"};},healthReady:async()=>true},config,logger);
+ await adapter.start();try {
+  const started=Date.now();client.emit("slack_event",socketEnvelope("actor-budget",async()=>{assert.equal(committed,true);acked=true;}));
+  await waitFor(()=>acked,2900);assert.equal(signal?.aborted,true);assert.ok(Date.now()-started<2900);
+ }finally{await adapter.stop();}
+});

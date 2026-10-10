@@ -490,6 +490,8 @@ export interface SlackUser {
   stateKnown?:boolean;
   isAgentforceBot?:boolean;
   teamId?:string;
+  enterpriseTeamIds?:string[];
+  isSuspended?:boolean;
   id: string;
   username?: string;
   displayName?: string;
@@ -626,6 +628,8 @@ function channelFromResponse(channel: {
 
 function userFromResponse(user: {
   team_id?:string;
+  enterprise_user?: { teams?: string[] };
+  suspended?: boolean;
   is_agentforce_bot?:boolean;
   id?: string;
   name?: string;
@@ -645,6 +649,8 @@ function userFromResponse(user: {
       : {}),
     ...(user.profile?.title ? { title: user.profile.title } : {}),
     ...(user.tz ? { timezone: user.tz } : {}),
+    isSuspended:user.suspended===true,
+    ...(user.enterprise_user?.teams ? {enterpriseTeamIds:user.enterprise_user.teams.filter(team=>typeof team === "string")} : {}),
     isAgentforceBot:user.is_agentforce_bot===true,
     stateKnown:typeof user.is_bot==="boolean"&&typeof user.is_app_user==="boolean"&&typeof user.deleted==="boolean",
     ...(user.team_id?{teamId:user.team_id}:{}),
