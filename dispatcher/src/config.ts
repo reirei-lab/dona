@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 export interface DispatcherConfig {
+  slackRuntimeIngressEnabled?: boolean;
   localApprovalConfigPath?: string;
   socketPath: string;
   databasePath: string;
@@ -106,6 +107,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
     throw new Error("DONA_JOB_PROMPT_RECONCILE_POLL_MS must be at most DONA_JOB_PROMPT_RECONCILE_MS");
   }
   return {
+    slackRuntimeIngressEnabled: env.DONA_SLACK_RUNTIME_INGRESS_ENABLED === "true",
     ...(env.DONA_LOCAL_APPROVAL_CONFIG ? {localApprovalConfigPath: expandHome(env.DONA_LOCAL_APPROVAL_CONFIG)} : {}),
     socketPath: expandHome(env.DONA_SOCKET_PATH ?? path.join(base, "run", "dispatcher.sock")),
     databasePath: expandHome(env.DONA_DATABASE_PATH ?? path.join(base, "dona.sqlite3")),

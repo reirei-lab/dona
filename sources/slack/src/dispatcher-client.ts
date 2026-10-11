@@ -1,6 +1,8 @@
 import { signSlackPrincipalProof } from "./principal-proof.js";
 import http from "node:http";
 import fs from "node:fs/promises";
+import { constants } from "node:fs";
+import type { RuntimeCommandRequest } from "./runtime-command.js";
 
 export interface DispatcherResponse {
   statusCode: number;
@@ -16,6 +18,23 @@ export interface DispatcherClientOptions {
 
 export class DispatcherClient {
   constructor(private readonly options: DispatcherClientOptions) {}
+
+  async postRuntimeCommand(input: RuntimeCommandRequest, signal: AbortSignal) {
+    if (!this.options.internalTokenPath) throw Error("runtime_command_unavailable");
+    const file = await fs.open(this.options.internalTokenPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    let token: string;
+    try {
+      const info = await file.stat();
+      if (!info.isFile() || info.nlink !== 1 || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0 || info.size > 4096)
+        throw Error("runtime_command_unavailable");
+      token = (await file.readFile("utf8")).trim();
+      if (token.length < 32 || Buffer.byteLength(token) > 4096) throw Error("runtime_command_unavailable");
+    } finally { await file.close(); }
+    signal.throwIfAborted();
+    const response = await this.request("POST", "/v1/internal/slack-runtime-commands", Buffer.from(JSON.stringify(input)), token, {}, signal);
+    if (response.statusCode !== 200) throw Error("runtime_command_unavailable");
+    return JSON.parse(response.body) as { request_id: string; state: "pending"; received_at: string };
+  }
 
   async postEvent(envelope: unknown, authenticatedWorkspaceId?:string): Promise<DispatcherResponse> {
     const value=envelope as Record<string,unknown>;
@@ -51,7 +70,7 @@ export class DispatcherClient {
     }
   }
 
-  private request(method: "GET" | "POST", path: string, body?: Buffer, internalToken?: string,extraHeaders:Record<string,string>={}): Promise<DispatcherResponse> {
+  private request(method: "GET" | "POST", path: string, body?: Buffer, internalToken?: string,extraHeaders:Record<string,string>={}, signal?: AbortSignal): Promise<DispatcherResponse> {
     return new Promise((resolve, reject) => {
       let settled = false;
       let connectTimer: NodeJS.Timeout | undefined;
@@ -70,6 +89,7 @@ export class DispatcherClient {
           socketPath: this.options.socketPath,
           method,
           path,
+          ...(signal ? { signal } : {}),
           headers: {
             ...extraHeaders,
             ...(body ? {

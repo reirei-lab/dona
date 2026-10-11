@@ -7,7 +7,19 @@
 | Slack Adapter | `dist/index.js` | Socket ModeイベントをDispatcherへ渡し、typed internal update通知をSlackへ届ける |
 | Dona Slack MCP | `dist/mcp/index.js` | CodexがSlackの読み取り・書き込みを任意に実行するstdio MCP |
 
-AdapterはSlack Socket ModeのWebSocketからイベントを受信し、共通Event Envelopeへ正規化してDona Dispatcherへ転送します。また、認証済みの内部UDS endpointでセルフアップデートの固定terminal通知を受け、該当threadへの投稿とAgent Session状態変更を行います。Macへの公開port、Request URL、Signing Secretは不要です。MCPはAdapterとは別プロセスで、Herdr/Codexから必要時に起動されます。
+AdapterはSlack Socket ModeのWebSocketからイベントを受信し、共通Event Envelopeへ正規化してDona Dispatcherへ転送します。また、認証済みの内部UDS endpointでセルフアップデートの固定terminal通知を受け、該当threadへの投稿とAgent Session状態変更を行います。通常のmessage経路にはMacへの公開port、Request URL、Signing Secretは不要です。MCPはAdapterとは別プロセスで、Herdr/Codexから必要時に起動されます。
+
+## Slash Command受付（開発中・既定off）
+
+Issue #261のHTTP受付経路は[採用済みADR 0002](../../docs/adr/0002-slash-runtime-control.md)を実装します。Issue旧本文のSocket Mode方式やUnicode正規化とは異なり、署名付きHTTPのraw bodyを先に検証し、ASCII完全一致grammarを使います。Socket Modeのslash payloadを通常eventへ変換しません。
+
+Adapterの`SLACK_RUNTIME_INGRESS_CONFIG`に、同じMac user所有・mode 600・非symlinkのJSON fileを指定した場合だけ、既存private health socketの`POST /slack/commands`を追加します。設定は毎要求で再読し、本人照会後の変更も拒否します。JSONのversionは1、workspacesの各要素は`alias`、`team_id`、`app_id`、`enterprise_id`（未使用はnull）、`signing_secret`、`actor_ids`（明示operator allowlist）を持ち、未知fieldを拒否します。Signing Secretはrepositoryやログへ保存しません。
+
+raw bodyは8 KiB、署名timestampは現在時刻から前後5分、decode後の命令はASCII 256 byteまでです。重複form field、不正percent escape/UTF-8、二重decodeを必要とする命令、余分な引数、未知command、別installationを拒否します。現在のworkspace所属、非bot本人状態、channelの共有・archive・membership・本人DMをSlack APIで確認します。全処理は2.5秒で打ち切り、durable receiptを確認できた場合だけ受付ACKを返します。`response_url`や旧verification tokenは取得先にも永続fieldにも使いません。[Slackの署名検証仕様](https://docs.slack.dev/authentication/verifying-requests-from-slack/)、[3秒ACK仕様](https://docs.slack.dev/interactivity/implementing-slash-commands/)を参照してください。
+
+Dispatcherでは`DONA_SLACK_RUNTIME_INGRESS_ENABLED=true`の場合だけ、internal token付き`POST /v1/internal/slack-runtime-commands`でtyped requestを受け付けます。SQLiteの同じrequest ID/同じ内容は同じreceiptへ収束し、異内容はconflictです。receiptのread-only照合は同じinternal認証で`GET /v1/internal/slack-runtime-commands/<request_id>`を使います。raw bodyや秘密URLを保存せず、inboxは1024件を上限に拒否し、履歴を自動削除しません。受付commitはFULL同期で行い、再起動してもreceiptを維持します。
+
+この受付は操作を実行せず、通常event queueやLLMへdispatchしません。ACKは`pending`だけを表します。本人DM rootの予約・外部投稿receipt、stable control planeへの接続、plan/approval/operationの状態遷移と最終通知、実Slackの隔離live検証は残作業です。両flagは開発用であり、これらのgateが揃うまで実workspaceへ公開しません。将来の公開ではTLS proxyをこのexact routeだけへ固定し、health/admin/internal routesを公開しないでください。Slack App設定と本番enablementはこの変更では実施しません。
 
 通常の`message`はDona宛とは限らないため、正規化時にSlackの`channel_type`（`channel` / `group` / `im` / `mpim`）を許可リストで検証し、存在する場合は`subject.channel_type`として渡します。Donaはこの値、イベント種別、本文、スレッド文脈から対応要否を判断します。
 

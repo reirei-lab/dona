@@ -257,6 +257,35 @@ export class DispatcherApi {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
+      if (url.pathname === "/v1/internal/slack-runtime-commands" || /^\/v1\/internal\/slack-runtime-commands\/[a-f0-9]{64}$/.test(url.pathname)) {
+        if (!this.config.slackRuntimeIngressEnabled || this.shuttingDown)
+          throw new ApiRequestError(503, "runtime_command_unavailable", "Runtime command ingress is disabled or quiescing");
+        if (!await this.authorizedUpdateRequest(request)) throw new ApiRequestError(403, "forbidden", "Internal authentication failed");
+        if (url.search) throw new ApiRequestError(400, "invalid_request", "Unexpected query");
+        if (request.method === "GET" && url.pathname !== "/v1/internal/slack-runtime-commands") {
+          sendJson(response, 200, { receipt: this.database.runtimeCommandReceipt(url.pathname.split("/").at(-1)!) });
+          return;
+        }
+        if (request.method === "POST" && url.pathname === "/v1/internal/slack-runtime-commands") {
+          try {
+            const input = await this.readJson(request);
+            if (!this.config.slackRuntimeIngressEnabled || this.shuttingDown)
+              throw new ApiRequestError(503, "runtime_command_unavailable", "Runtime command ingress is disabled or quiescing");
+            sendJson(response, 200, this.database.acceptRuntimeCommand(input));
+          }
+          catch (error) {
+            if (error instanceof Error && error.message === "runtime_command_conflict")
+              throw new ApiRequestError(409, "runtime_command_conflict", "Request identity conflicts");
+            if (error instanceof Error && error.message === "runtime_command_capacity")
+              throw new ApiRequestError(503, "runtime_command_capacity", "Inbox capacity reached");
+            if (error instanceof Error && error.name === "ZodError")
+              throw new ApiRequestError(400, "invalid_request", "Invalid typed command");
+            throw error;
+          }
+          return;
+        }
+        throw new ApiRequestError(405, "invalid_request", "Unsupported method");
+      }
       if(url.pathname.startsWith("/v1/dashboard/")) {
         if(this.shuttingDown)throw new ApiRequestError(503,"shutting_down","Dispatcher is shutting down");
         if(request.method!=="POST"||url.search)throw new ApiRequestError(400,"invalid_request","Invalid dashboard request");

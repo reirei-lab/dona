@@ -16,6 +16,7 @@ import {
 import type { SlackReminderConnector } from "./reminder-connector.js";
 import { parseJobProgressRequest, type SlackJobProgressReporter } from "./job-progress.js";
 import { SlackApiError } from "./slack-api.js";
+import type { RuntimeCommandHttpIngress } from "./runtime-command-ingress.js";
 
 function send(response: ServerResponse, statusCode: number, body: unknown): void {
   const encoded = Buffer.from(JSON.stringify(body));
@@ -66,6 +67,8 @@ export interface AdapterHealthState {
 }
 
 export class SlackHealthServer {
+  private runtimeCommands: RuntimeCommandHttpIngress | undefined;
+  setRuntimeCommandIngress(ingress: RuntimeCommandHttpIngress): void { this.runtimeCommands = ingress; }
   private server: http.Server | undefined;
   private quiesceOperationId: string | undefined;
   private readonly progressOperations = new Set<Promise<unknown>>();
@@ -128,6 +131,11 @@ export class SlackHealthServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const method = request.method ?? "";
     const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+    if (pathname === "/slack/commands" && this.runtimeCommands) {
+      const operation = this.runtimeCommands.handle(request, response);
+      await (this.adapter.trackExternal ? this.adapter.trackExternal(operation) : operation);
+      return;
+    }
     if (method === "POST" && (pathname === "/v1/internal/slack-reminders/preflight" || pathname === "/v1/internal/slack-reminders")) {
       const operation = this.handleReminder(request, response, pathname.endsWith("/preflight"));
       if (this.adapter.trackOperation) await this.adapter.trackOperation(operation);

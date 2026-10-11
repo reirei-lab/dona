@@ -15,6 +15,7 @@ import { SlackUpdateNotificationReporter } from "./update-notification.js";
 import { SlackJobProgressReporter } from "./job-progress.js";
 import { SlackWorkspaceRegistry } from "./workspace-registry.js";
 import { SlackReminderConnector } from "./reminder-connector.js";
+import { authorizeRuntimeCommand, readRuntimeIngressConfig, RuntimeCommandHttpIngress } from "./runtime-command-ingress.js";
 
 async function main(): Promise<void> {
   const config = loadAdapterConfig();
@@ -67,6 +68,16 @@ async function main(): Promise<void> {
     config.appSchemaWrite,
     config.appSchemaReadMax,
   );
+  const runtimeConfigPath = process.env.SLACK_RUNTIME_INGRESS_CONFIG;
+  if (runtimeConfigPath) {
+    await readRuntimeIngressConfig(runtimeConfigPath);
+    health.setRuntimeCommandIngress(new RuntimeCommandHttpIngress({
+      configured: () => readRuntimeIngressConfig(runtimeConfigPath),
+      stopping: () => adapter.isStopping(),
+      authorize: (request, signal) => authorizeRuntimeCommand(registry, request, signal),
+      persist: (request, signal) => dispatcher.postRuntimeCommand(request, signal),
+    }));
+  }
   await health.start();
   try {
     await adapter.start();
