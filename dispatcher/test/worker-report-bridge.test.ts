@@ -1,3 +1,4 @@
+import {runService} from "../src/service.js";
 import type {JobRow} from "../src/types.js";
 import {envelopeFromRow,buildEventPrompt} from "../src/prompt.js";
 import {existsSync} from "node:fs";
@@ -366,6 +367,8 @@ test("既存messageが未処理なら無効化を拒否し、再起動後にdrai
   db.beginJobPreparation(job.job_id);db.setJobRuntime(job.job_id,"w","p","runtime");db.beginJobDispatch(job.job_id);db.markJobRunning(job.job_id);
   db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"condition",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"検証を追加してください"}});
   assert.throws(()=>db.assertWorkerMessagingMode(false),/disable_requires_drain/);db.assertWorkerMessagingMode(true);
+  await assert.rejects(runService({...config,workerMessagingEnabled:false}),/disable_requires_drain/);
+  assert.equal(existsSync(config.socketPath),false);assert.equal(db.tasks.get(task.task_id)?.current_attempt_id,job.job_id);
   db.close();db=new DispatcherDatabase(config.databasePath);assert.throws(()=>db.assertWorkerMessagingMode(false),/disable_requires_drain/);
   await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();db.assertWorkerMessagingMode(false);
   const question=db.workerMessages.appendWorkerReport(job.job_id,"runtime",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"question",occurred_at:new Date().toISOString(),payload:{kind:"question",question:"続行できますか？"}});
