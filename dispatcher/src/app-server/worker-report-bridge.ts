@@ -12,7 +12,10 @@ export class AppServerWorkerReportBridge {
   for(const request of await this.runtime.workerReports()) {
    try {
    const job=this.database.getJob(request.attempt_id),task=this.database.tasks.forAttempt(request.attempt_id);
-   if(!job||!task||task.current_attempt_id!==job.job_id||task.desired_state!=="running"||job.agent_name!==request.agent||!["running","blocked"].includes(job.status))continue;
+   if(!job||!task||task.current_attempt_id!==job.job_id||task.desired_state!=="running"||job.agent_name!==request.agent||["cancelling","completed","failed","cancelled","needs_review","retryable_failed"].includes(job.status)){
+    if(request.state==="pending")await this.runtime.resolveWorkerReport(request.agent,request.request_id,{state:"denied",diagnostic:"attempt_unavailable"});continue;
+   }
+   if(!["running","blocked"].includes(job.status))continue;
    const agent=await this.runtime.status(request.agent);
    if(!agent||agent.role!=="worker"||agent.generation!==request.generation||agent.thread_id!==request.thread_id||(agent.turn_id!==null&&agent.turn_id!==request.turn_id)||!["working","waiting"].includes(agent.state))continue;
    const identity=JSON.stringify([request.generation,request.thread_id]);
@@ -24,13 +27,14 @@ export class AppServerWorkerReportBridge {
      producer_sequence:request.request_sequence,idempotency_key:request.report_key,occurred_at:request.created_at,payload:input.payload,
      ...(input.correlation_message_id?{correlation_message_id:input.correlation_message_id}:{}),...(input.conversation_revision!==undefined?{conversation_revision:input.conversation_revision}:{})};
    let result;
-   try{result=this.database.acceptTaskWorkerReport(job.job_id,identity,report);}
+   try{result=request.state==="pending"?this.database.acceptTaskWorkerReport(job.job_id,identity,report):this.database.workerMessages.reconcileRuntimeReport(job.job_id,identity,report);if(!result)continue;}
    catch(error){
     if(!(error instanceof WorkerMessageError))throw error;
     const diagnostic=error.code==="worker_report_payload_denied"?"payload_rejected":error.code==="worker_report_attempt_not_current"?"attempt_unavailable":"report_rejected";
     await this.runtime.resolveWorkerReport(request.agent,request.request_id,{state:"denied",diagnostic});continue;
    }
-   await this.runtime.resolveWorkerReport(request.agent,request.request_id,{message_id:result.message.message_id,receipt_id:result.receipt_id,outcome:result.outcome});accepted++;
+   const receipt={message_id:result.message.message_id,receipt_id:result.receipt_id,outcome:result.outcome};
+   if(request.state==="pending")await this.runtime.resolveWorkerReport(request.agent,request.request_id,receipt);else await this.runtime.reconcileWorkerReport(request.agent,request.request_id,receipt);accepted++;
    }catch(error){this.onError(error);}
   }
   return accepted;

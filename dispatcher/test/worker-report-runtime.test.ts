@@ -37,7 +37,7 @@ test("worker reportを現在のruntime identityへ固定し同key/異内容を�
 import {AppServerManager} from "../src/app-server/manager.js";
 import {AppServerRpc} from "../src/app-server/rpc.js";
 async function until(check:()=>boolean){for(let i=0;i<100;i++){if(check())return;await new Promise(resolve=>setTimeout(resolve,20));}assert.fail("RPC state did not settle");}
-for(const completeBeforeReply of [false,true])test(`実RPCでworker reportを受理しreceiptを一度だけ返す（turn先行完了=${completeBeforeReply}）`,async()=>{
+for(const completeBeforeReply of [false,true])for(const outage of [false,true])test(`実RPCでworker reportを受理しreceiptを一度だけ返す（turn先行完了=${completeBeforeReply}, broker停止=${outage}）`,async()=>{
  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-worker-report-rpc-")),script=path.join(root,"fake.mjs");
  await fs.writeFile(script,`import readline from 'node:readline';import fs from 'node:fs';
 const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
@@ -55,6 +55,10 @@ if(r.id==='rpc-report'&&r.result){fs.appendFileSync('responses.jsonl',JSON.strin
   const report=manager.workerReports.pending()[0]!;assert.equal(report.generation,agent.generation);assert.equal(report.thread_id,agent.thread_id);assert.equal(manager.status(agent.name)?.state,"waiting");
   const result={message_id:"msg_01h00000000000000000000000",receipt_id:"rcpt_01h00000000000000000000000",outcome:"created"};
   assert.throws(()=>manager.resolveWorkerReport("other-worker",report.request_id,result),/not_current/);
+  if(outage){manager.workerReports.availability(false);await manager.recover();await until(()=>manager.workerReports.get(report.request_id)?.state==="resolved"&&manager.status(agent!.name)?.state==="idle");
+   assert.deepEqual(JSON.parse(manager.workerReports.get(report.request_id)!.result_json!),{state:"unknown",diagnostic:"receipt_unavailable"});
+   assert.equal((await fs.readFile(path.join(root,"responses.jsonl"),"utf8")).trim().split("\n").length,1);return;
+  }
   manager.resolveWorkerReport(agent.name,report.request_id,result);await until(()=>manager.workerReports.get(report.request_id)?.state==="resolved"&&manager.status(agent!.name)?.state==="idle");
   manager.resolveWorkerReport(agent.name,report.request_id,result);
   const responses=(await fs.readFile(path.join(root,"responses.jsonl"),"utf8")).trim().split("\n");assert.equal(responses.length,1);assert.deepEqual(JSON.parse(JSON.parse(responses[0]!).contentItems[0].text),result);

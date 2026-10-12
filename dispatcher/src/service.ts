@@ -175,8 +175,10 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       apiLogger.info("Graceful shutdown started", { signal });
       try {
         stopWebJobProjectionMaintenance?.();
-        await external?.stop();
         api.beginShutdown();
+        messages?.stop();instructions?.beginShutdown();
+        await reportBridge?.stop();await instructions?.stop();
+        await external?.stop();
         await api.stop();
         await scheduler.stop();
         await reminderPublisher.stop();

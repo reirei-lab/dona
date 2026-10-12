@@ -8,7 +8,7 @@ Issue #273のApp Server向け接続。mainに未採用のIssue #272のledger実�
 
 workerは`dona_worker_report`へ`report_key`とcheckpoint/question/risk/decision_requestのpayloadを渡す。Job、Task、宛先、runtime identity、sequenceを指定できない。Runtimeが現在のstreamからAttempt/generation/thread/turnと受付順を固定し、Dispatcherはcurrent Attempt、desired state、live session bindingを再照合してledgerへ保存する。payloadはstrict schema・UTF-8上限・既知credential/URL/command/path patternで検査する。自由記述の意味的な安全性を完全に保証する検査ではないため、親は報告を未信頼の資料として扱う。
 
-Runtime queueは未応答64件、Attemptごとの報告256件を上限とする。Dispatcher heartbeatが30秒失効すると新しい報告を受けない。ledgerのproducer sequenceは受理時に自動付与し、Runtimeの受付順と分ける。確定拒否には安全なdiagnostic classを返し、拒否した報告が後続の連番を破綻させない。保存結果が不明な場合は拒否や未実行を推測せず、canonical receiptを再照合する。1件の観測・応答障害で他workerの報告を止めない。応答確認済み/失効済みのpayloadは30日後に消去し、内容hashとkey/receiptは照合のため残す。Reportは通常のatomic Resultやcheckpointを代替しない。
+Runtime queueは未応答64件、Attemptごとの報告256件を上限とする。Dispatcher heartbeatが30秒失効すると新しい報告を受けない。受付済みの未応答RPCはhostの1秒tickで`unknown/receipt_unavailable`として解放し、workerのatomic Result公開を妨げない。受理不明を未実行と断定せず、broker復帰後は既存ledgerのcanonical receiptだけを照合してstatusを更新し、新しい報告writeやRPC二重応答を行わない。ledgerのproducer sequenceは受理時に自動付与し、Runtimeの受付順と分ける。確定拒否には安全なdiagnostic classを返し、拒否した報告が後続の連番を破綻させない。保存結果が不明な場合は拒否や未実行を推測せず、canonical receiptを再照合する。1件の観測・応答障害で他workerの報告を止めない。応答確認済み/失効済みのpayloadは30日後に消去し、内容hashとkey/receiptは照合のため残す。Reportは通常のatomic Resultやcheckpointを代替しない。
 
 ## 受理と照合
 
@@ -22,7 +22,7 @@ workerの`dona_worker_report_status`は自分のAttempt/generation/threadのkey�
 
 `instruct_task(task_id, revision, message)`はanswer/add_condition/change_priorityのstrict schemaを受ける。通常の指示には元threadのSlack eventが必要。内部のworker報告eventからは、そのeventが示すquestion/decision_requestへのanswerだけを許す。answerは元message IDと次のconversation revisionへ束縛する。内部eventは永続delivery、immutable owner、署名検証済み元Slack principalを辿り、Taskの新規委任権限を取得しない。
 
-質問待ちではTaskを`human_input`に保ち、新Attemptを自動起動しない。指示はworkerが起動するまでledgerに待機する。bridgeは同じcurrent Attempt/runtimeへ型付き入力を配送し、App Serverの既存operation journalを使用する。応答喪失後は同じoperationのreceiptをread-only照合し、`sending`/`unknown`を再送しない。workerへの受理が確定した後だけdelivery receiptを保存する。親への投入前、またはnot-sentと確定した報告eventがdead-letterになった場合だけ、同じmessageのdeliveryをbackoff付きで再配信する。prompt受理不明や親の外部操作結果不明では再配信しない。取消・停止・terminal stateが優先される。
+質問待ちではTaskを`human_input`に保ち、新Attemptを自動起動しない。correlated answerのdelivery receiptと同じtransactionでJobをrunning、Taskをactiveへ戻す。signal終了では新規受付を止め、publisher/bridgeの進行中RPCをdrainしてからDBを閉じる。指示はworkerが起動するまでledgerに待機する。bridgeは同じcurrent Attempt/runtimeへ型付き入力を配送し、App Serverの既存operation journalを使用する。応答喪失後は同じoperationのreceiptをread-only照合し、`sending`/`unknown`を再送しない。workerへの受理が確定した後だけdelivery receiptを保存する。親への投入前、またはnot-sentと確定した報告eventがdead-letterになった場合だけ、同じmessageのdeliveryをbackoff付きで再配信する。prompt受理不明や親の外部操作結果不明では再配信しない。取消・停止・terminal stateが優先される。
 
 ## 状態ごとの扱い
 
@@ -36,6 +36,8 @@ workerの`dona_worker_report_status`は自分のAttempt/generation/threadのkey�
 Taskのpause/cancelとruntime bindingはreceipt照会後にも再確認する。terminal/cancellingの未処理報告eventは取り出し前にsupersededとしてsettleし、処理中の親からの報告readはphase/desired stateを返して本文を開示しない。App Serverのdynamic tool spec/responseは、ローカルCLIの`app-server generate-json-schema`でもfield契約を照合した。
 
 workerの起動環境から`DONA_*`、`SLACK_*`、`HERDR_*`とSlack tokenの既知prefixを除外する。モデル/GitHub等の元作業用認証はこのフィルターで変更しない。既存のMCP inventory経路によるDona Slack/Dispatcher serverの無効化を保持する。
+
+local dashboard Taskも既存のcreate receiptとimmutable ownerから報告eventを作る。親の`worker_report_local` contextはそのTaskのreport read/answer専用で、汎用operator権限、Task新規委任、Slackの宛先・principalを作らない。silence eventは同じownerと現行cadence generationを検証し、新しいreportが来た後の古いsilence contextを再利用しない。
 
 ## 検証と未検証境界
 

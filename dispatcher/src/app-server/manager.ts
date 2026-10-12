@@ -353,6 +353,11 @@ export class AppServerManager {
     if(!this.workerReports.waiting(name)&&!this.external.waiting(name)&&!this.store.questions(name).length)this.store.change(name,agent.generation,{state:agent.turn_id?"working":"idle"});
     return {request_id:id,state:resolved.state};
   }
+  reconcileWorkerReport(name:string,id:string,result:unknown){
+    const row=this.workerReports.get(id),agent=this.store.agent(name);
+    if(!row||row.agent!==name||!agent||agent.generation!==row.generation||agent.thread_id!==row.thread_id)throw Error("runtime_worker_report_not_current");
+    const updated=this.workerReports.reconcileReceipt(id,result);return {request_id:id,state:updated.state};
+  }
   async answer(name:string,id:string,answers:Record<string,{answers:string[]}>):Promise<QuestionRecord> {
     return this.serialized(name,async()=>{
       const q=this.store.question(id),row=this.status(name),rpc=this.connections.get(name),answerHash=hash(answers);
@@ -421,6 +426,10 @@ export class AppServerManager {
   }
   /** workerは停止intentだけ再開する。mainのみ、停止証明の後に新threadで再生成する。 */
   async recover():Promise<void> {
+    // Brokerのlease喪失を未実行と断定せず、worker RPCだけをboundedに解放する。
+    for(const request of this.workerReports.unavailablePending()){
+      try{this.resolveWorkerReport(request.agent,request.request_id,{state:"unknown",diagnostic:"receipt_unavailable"});}catch{}
+    }
     this.store.expireObservations();
     for(const candidate of this.store.agents()) {
       if((this.recoveryAfter.get(candidate.name)??0)>Date.now())continue;

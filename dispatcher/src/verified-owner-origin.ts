@@ -20,7 +20,7 @@ export function resolveVerifiedSlackOwner(database:DispatcherDatabase,eventId:st
       const subject=JSON.parse(event.subject_json),payload=JSON.parse(event.payload_json),job=database.getJob(payload.job_id);
       if(!job||subject.job_id!==job.job_id||subject.source_event_id!==job.source_event_id||job.source_event_id===eventId)return;
       const group=database.getJobGroup(job.source_event_id);
-      if(event.source==="dona_message") {if(!database.workerMessages.ownsReportEvent(job.job_id,eventId)||database.tasks.forAttempt(job.job_id)?.current_attempt_id!==job.job_id)return;}
+      if(event.source==="dona_message") {if(!database.workerMessages.ownsMessageEvent(job.job_id,eventId)||database.tasks.forAttempt(job.job_id)?.current_attempt_id!==job.job_id)return;}
       else if(job.completion_event_id!==eventId&&group?.attention_event_id!==eventId&&group?.all_terminal_event_id!==eventId)return;
       const parentBinding=database.getEventJobBinding(job.source_event_id);
       if(!parentBinding||stableStringify(parentBinding)!==stableStringify(binding))return;

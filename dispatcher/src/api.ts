@@ -742,7 +742,7 @@ export class DispatcherApi {
     if(this.shuttingDown&&request.method!=="GET")throw new ApiRequestError(503,"shutting_down","Dispatcher is shutting down");
     const body=request.method==="POST"?await this.readJson(request):undefined;
     const sourceEvent=request.method==="POST"?(body as Record<string,unknown>|undefined)?.source_event_id:url.searchParams.get("source_event_id");
-    const operation=url.pathname.endsWith("/instruction")?"task_instruction":request.method==="GET"?"task_read":url.pathname==="/v1/tasks"?"task_delegate":"task_control";
+    const operation=url.pathname.endsWith("/reports")?"worker_message_read":url.pathname.endsWith("/instruction")?"worker_message_answer":request.method==="GET"?"task_read":url.pathname==="/v1/tasks"?"task_delegate":"task_control";
     const authorize=()=>{
       if(!this.agentContexts)return;
       const token=request.headers["x-dona-agent-token"],event=request.headers["x-dona-agent-event-id"];

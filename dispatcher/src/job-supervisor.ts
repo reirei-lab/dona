@@ -1114,7 +1114,7 @@ export class JobSupervisor {
       })
       .finally(async () => {
         const finalJob=this.database.getJob(row.job_id),finalStatus=finalJob?.status;
-        const questionPending=finalStatus==="blocked"&&finalJob?.last_error_code==="runtime_question_pending";
+        const questionPending=finalStatus==="blocked"&&["runtime_question_pending","worker_message_question_pending"].includes(finalJob?.last_error_code??"");
         if(this.progress&&finalStatus==="needs_review")this.trackCancelledWorkerCleanup(row);
         else if (!questionPending&&(!this.progress || (finalStatus!==undefined&&["blocked","completed","failed","cancelled"].includes(finalStatus)))) await fs.rm(path.dirname(jobProgressPath(row)), { recursive:true, force:true }).catch(() => {
           this.logger.warn("Disabled job progress terminal cleanup failed", { job_id:row.job_id, error_code:"job_progress_disabled_terminal_cleanup_failed" });

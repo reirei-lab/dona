@@ -186,13 +186,14 @@ export class TaskRepository {
   assertOwner(id:string,eventId:string,sameThread=false):TaskRow {
     const task=this.get(id);if(!task)throw new Error("task_owner_mismatch");
     const event=this.dispatcher.get(eventId);
-    if(event?.source==="web"&&this.dispatcher.hasLocalDashboardJobOwner(task.current_attempt_id)) {
+    if((event?.source==="web"||(event?.source==="dona_message"&&this.dispatcher.localDashboard.messagePrincipal(eventId)))&&this.dispatcher.hasLocalDashboardJobOwner(task.current_attempt_id)) {
+      if(event.source==="dona_message"&&!this.dispatcher.workerMessages.ownsMessageEvent(task.current_attempt_id,eventId))throw new Error("task_owner_mismatch");
       try{this.dispatcher.assertJobSourceMatchesThread(task.current_attempt_id,eventId);}catch{throw new Error("task_owner_mismatch");}
       const binding=readEventJobBinding(this.sql,eventId);
       if(binding?.owner.kind!=="local_dashboard")throw new Error("task_owner_mismatch");
       return task;
     }
-    if(event?.source==="dona_message"&&!this.dispatcher.workerMessages.ownsReportEvent(task.current_attempt_id,eventId))throw new Error("task_owner_mismatch");
+    if(event?.source==="dona_message"&&!this.dispatcher.workerMessages.ownsMessageEvent(task.current_attempt_id,eventId))throw new Error("task_owner_mismatch");
     if(!event||!["slack","dona_job","dona_message"].includes(event.source))throw new Error("task_owner_mismatch");
     if(["dona_job","dona_message"].includes(event.source)&&JSON.parse(event.subject_json).source_event_id!==task.source_event_id&&!this.continuations.canRead(id,eventId))throw new Error("task_owner_mismatch");
     const original=this.dispatcher.get(task.source_event_id)!;

@@ -57,7 +57,8 @@ export async function serveRuntime(config:HostConfig):Promise<http.Server> {
           if(p.after!==undefined&&typeof p.after!=="string")throw Error("runtime_worker_handoff_cursor_invalid");
           result=manager.workerHandoffInventory(p.after as string|undefined);break;
         case "workerReportAvailability":if(typeof p.enabled!=="boolean")throw Error("runtime_worker_report_availability_invalid");result=manager.workerReports.availability(p.enabled);break;
-        case "workerReports":result=manager.workerReports.pending();break;
+        case "workerReports":result=manager.workerReports.recoverable();break;
+        case "reconcileWorkerReport":if(typeof p.id!=="string")throw Error("runtime_worker_report_id_invalid");result=manager.reconcileWorkerReport(name,p.id,p.result);break;
         case "resolveWorkerReport":if(typeof p.id!=="string")throw Error("runtime_worker_report_id_invalid");result=manager.resolveWorkerReport(name,p.id,p.result);break;
         case "externalAvailability":if(typeof p.enabled!=="boolean")throw Error("runtime_external_availability_invalid");result=manager.external.availability(p.enabled);break;
         case "externalRequests":result=manager.externalRequests();break;

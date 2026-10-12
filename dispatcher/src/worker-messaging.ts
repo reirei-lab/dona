@@ -267,8 +267,7 @@ export class WorkerMessageRepository {
     const rows=this.db.prepare(`SELECT m.message_id,m.job_id,m.kind,m.payload_json,m.correlation_message_id,m.conversation_revision
       FROM worker_messages m JOIN worker_message_deliveries d USING(message_id) JOIN jobs j USING(job_id)
       WHERE j.source_event_id=? AND j.status IN ('queued','retryable_failed') AND m.direction='dona_to_worker'
-        AND d.consumer='worker' AND d.state IN ('pending','leased')
-        AND NOT EXISTS (SELECT 1 FROM job_steer_receipts r WHERE r.job_id=m.job_id AND r.operation_id=m.message_id)`)
+        AND d.consumer='worker' AND d.state IN ('pending','leased')`)
       .all(sourceEventId) as Array<{message_id:string;job_id:string;kind:WorkerMessageKind;payload_json:string;
         correlation_message_id:string|null;conversation_revision:number|null}>;
     return rows.map(row=>({job_id:row.job_id,addition:`\n\n[DONA_FOLLOW_UP]\n${typedInstructionText(row.message_id,row.kind,
@@ -326,6 +325,10 @@ export class WorkerMessageRepository {
     }).immediate();
   }
 
+  reconcileRuntimeReport(jobId:string,runtimeIdentity:string,raw:unknown){
+    const input=parseWorkerReport(raw),prior=this.db.prepare("SELECT producer_sequence FROM worker_messages WHERE job_id=? AND producer='worker' AND idempotency_key=?").get(jobId,input.idempotency_key) as {producer_sequence:number}|undefined;
+    if(!prior)return undefined;return this.reconcileWorkerReport(jobId,runtimeIdentity,{...input,producer_sequence:prior.producer_sequence});
+  }
   reconcileWorkerReport(jobId:string,runtimeIdentity:string,raw:unknown) {
     const input=parseWorkerReport(raw);
     this.assertWorkerReconciliationRuntime(jobId,runtimeIdentity,input.idempotency_key);
@@ -360,6 +363,17 @@ export class WorkerMessageRepository {
     if(!job)throw Error("job_not_found");this.assertAuthorized(job,sourceEventId);
     return (this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND direction='worker_to_dona' ORDER BY producer_sequence DESC LIMIT 20").all(jobId) as WorkerMessageRow[]).map(row=>({...this.project(row),payload:JSON.parse(row.payload_json)}));
   }
+  ownsMessageEvent(jobId:string,eventId:string):boolean {
+    if(this.ownsReportEvent(jobId,eventId))return true;
+    return !!this.db.prepare(`SELECT 1 FROM events e JOIN jobs j ON j.job_id=? JOIN worker_message_cadence c USING(job_id)
+      WHERE e.event_id=? AND e.source='dona_message' AND e.event_type='worker_message_silence'
+      AND e.external_event_id='worker-message-silence:'||j.job_id||':'||c.generation
+      AND json_extract(e.payload_json,'$.job_id')=j.job_id AND json_extract(e.payload_json,'$.source_event_id')=j.source_event_id
+      AND json_extract(e.payload_json,'$.generation')=c.generation AND json_extract(e.subject_json,'$.job_id')=j.job_id
+      AND json_extract(e.subject_json,'$.source_event_id')=j.source_event_id
+      AND j.status IN ('running','blocked') AND NOT(j.status='blocked' AND j.last_error_code='worker_message_question_pending')`).get(jobId,eventId);
+  }
+
   ownsReportEvent(jobId:string,eventId:string):boolean {
     return !!this.db.prepare(`SELECT 1 FROM worker_message_deliveries d JOIN worker_messages m USING(message_id) JOIN events e ON e.event_id=d.event_id
       WHERE m.job_id=? AND e.event_id=? AND e.source='dona_message' AND e.event_type='worker_message_report'
@@ -690,6 +704,10 @@ export class WorkerMessageRepository {
       if(row.consumer==="worker"&&message.kind==="answer") {
         this.db.prepare(`UPDATE jobs SET status='running',last_error_code=NULL,last_error_message=NULL,updated_at=? WHERE job_id=? AND status='blocked' AND last_error_code='worker_message_question_pending'
           AND EXISTS(SELECT 1 FROM tasks WHERE current_attempt_id=jobs.job_id AND desired_state='running')`).run(now,jobId);
+        this.db.prepare(`UPDATE tasks SET state='active',wait_reason=NULL,next_check_at=NULL,revision=revision+1,
+          project_state=CASE WHEN project_state IN ('attempting','unknown') THEN project_state ELSE 'pending' END,updated_at=?
+          WHERE current_attempt_id=? AND desired_state='running' AND state='waiting' AND wait_reason='human_input'
+          AND EXISTS(SELECT 1 FROM jobs WHERE job_id=? AND status='running' AND last_error_code IS NULL)`).run(now,jobId,jobId);
       }
       return { delivery: this.db.prepare("SELECT * FROM worker_message_deliveries WHERE delivery_id=?").get(deliveryId), receipt_id: receiptId, outcome: "delivered" as const };
     }).immediate();
@@ -737,7 +755,10 @@ export class WorkerMessageRepository {
         FROM worker_message_deliveries d JOIN worker_messages m USING(message_id) JOIN jobs j USING(job_id)
         WHERE d.consumer='dona-main' AND d.state='pending' AND d.available_at<=?
           AND j.status NOT IN ('completed','failed','cancelled','needs_review')
-          AND m.workspace_id IS NOT NULL AND m.channel_id IS NOT NULL AND m.thread_ts IS NOT NULL
+          AND ((m.workspace_id IS NOT NULL AND m.channel_id IS NOT NULL AND m.thread_ts IS NOT NULL) OR EXISTS(
+            SELECT 1 FROM event_job_bindings b JOIN tasks t ON t.current_attempt_id=m.job_id JOIN local_dashboard_command_receipts r ON r.task_id=t.task_id
+            WHERE b.event_id=m.source_event_id AND json_extract(b.owner_json,'$.kind')='local_dashboard' AND json_extract(b.destination_json,'$.kind')='none'
+              AND r.operation='create' AND r.event_id=m.source_event_id AND r.instance_id=json_extract(b.owner_json,'$.instance_id') AND r.owner_id=json_extract(b.owner_json,'$.owner_id')))
         ORDER BY d.available_at,d.created_at,m.job_id,m.producer_sequence,d.delivery_id LIMIT ?`).all(now, limit) as Array<{
           delivery_id:string;message_id:string;job_id:string;source_event_id:string;workspace_id:string|null;channel_id:string|null;thread_ts:string|null;
           kind:WorkerMessageKind;payload_json:string;occurred_at:string;status:JobRow["status"];
@@ -750,7 +771,9 @@ export class WorkerMessageRepository {
             .run(now,row.job_id,row.message_id);
           continue;
         }
-        if (!row.workspace_id || !row.channel_id || !row.thread_ts) continue;
+        const ownerBinding=readEventJobBinding(this.db,row.source_event_id);
+        const local=ownerBinding?.owner.kind==="local_dashboard"&&ownerBinding.destination.kind==="none";
+        if ((!row.workspace_id || !row.channel_id || !row.thread_ts)&&!local) continue;
         const report=JSON.parse(row.payload_json) as {severity?:unknown};
         const urgent=row.kind==="question"||row.kind==="decision_request"||(row.kind==="risk"&&report.severity==="high");
         if(!urgent&&row.workspace_id){
@@ -775,7 +798,7 @@ export class WorkerMessageRepository {
         const original=this.db.prepare("SELECT subject_json FROM events WHERE event_id=?").get(row.source_event_id) as {subject_json:string};
         const subject=stableStringify({job_id:row.job_id,message_id:row.message_id,source_event_id:row.source_event_id,actor_id:JSON.parse(original.subject_json).actor_id});
         const task=this.db.prepare("SELECT task_id FROM tasks WHERE current_attempt_id=?").get(row.job_id) as {task_id:string}|undefined;
-        const payload=stableStringify({schema_version:1,message_id:row.message_id,job_id:row.job_id,task_id:task?.task_id,source_event_id:row.source_event_id,kind:row.kind});
+        const payload=stableStringify({schema_version:1,message_id:row.message_id,job_id:row.job_id,task_id:task?.task_id,source_event_id:row.source_event_id,owner_kind:ownerBinding?.owner.kind,kind:row.kind});
         const replyTarget=row.workspace_id&&row.channel_id&&row.thread_ts?stableStringify({kind:"slack_thread",workspace_id:row.workspace_id,channel_id:row.channel_id,thread_ts:row.thread_ts}):null;
         this.db.prepare(`INSERT OR IGNORE INTO events(event_id,schema_version,source,external_event_id,event_type,occurred_at,subject_json,payload_json,reply_target_json,trace_json,status,available_at,created_at,updated_at)
           VALUES(?,1,'dona_message',?,'worker_message_report',?,?,?,?,?,'queued',?,?,?)`).run(eventId,externalId,row.occurred_at,subject,payload,replyTarget,
@@ -812,7 +835,7 @@ export class WorkerMessageRepository {
         const replyTarget=row.workspace_id&&row.channel_id&&row.thread_ts?stableStringify({kind:"slack_thread",workspace_id:row.workspace_id,channel_id:row.channel_id,thread_ts:row.thread_ts}):null;
         this.db.prepare(`INSERT OR IGNORE INTO events(event_id,schema_version,source,external_event_id,event_type,occurred_at,subject_json,payload_json,reply_target_json,trace_json,status,available_at,created_at,updated_at)
           VALUES(?,1,'dona_message',?,'worker_message_silence',?,?,?,?,?,'queued',?,?,?)`).run(eventId,externalId,now,
-          stableStringify({job_id:row.job_id}),stableStringify({schema_version:1,job_id:row.job_id,source_event_id:row.source_event_id,generation:row.generation}),replyTarget,
+          stableStringify({job_id:row.job_id,source_event_id:row.source_event_id,actor_id:(this.db.prepare("SELECT actor_id FROM jobs WHERE job_id=?").get(row.job_id) as {actor_id:string}).actor_id}),stableStringify({schema_version:1,job_id:row.job_id,source_event_id:row.source_event_id,generation:row.generation}),replyTarget,
           stableStringify({job_id:row.job_id,generation:row.generation}),now,now,now);
         const expectedPayload=stableStringify({schema_version:1,job_id:row.job_id,source_event_id:row.source_event_id,generation:row.generation});
         const event=this.db.prepare("SELECT event_id,event_type,payload_json FROM events WHERE source='dona_message' AND external_event_id=?")

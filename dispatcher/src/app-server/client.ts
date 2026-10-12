@@ -26,6 +26,7 @@ export class RuntimeClient {
   workerInstruction(name:string,messageId:string,text:string,scope:{attempt_id:string;generation:string;thread_id:string}):Promise<{turnId:string}>{return this.call("workerInstruction",{name,key:`worker-message:${messageId}`,text,scope});}
   workerReportAvailability(enabled:boolean):Promise<{enabled:boolean;ttl_ms:number}>{return this.call("workerReportAvailability",{enabled});}
   workerReports():Promise<RuntimeWorkerReport[]>{return this.call("workerReports");}
+  reconcileWorkerReport(name:string,id:string,result:unknown):Promise<unknown>{return this.call("reconcileWorkerReport",{name,id,result});}
   resolveWorkerReport(name:string,id:string,result:unknown):Promise<unknown>{return this.call("resolveWorkerReport",{name,id,result});}
   externalAvailability(enabled:boolean):Promise<{enabled:boolean;ttl_ms:number}>{return this.call("externalAvailability",{enabled});}
   externalRequest(id:string):Promise<ExternalToolRequest|null>{return this.call("externalRequest",{id});}

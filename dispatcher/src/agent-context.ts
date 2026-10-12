@@ -6,7 +6,7 @@ import path from "node:path";
 import type { DispatcherDatabase } from "./database.js";
 import type { EventRow } from "./types.js";
 
-export type AgentPurpose = "human_command" | "job_completion" | "schedule_work" | "update_completion" | "worker_report";
+export type AgentPurpose = "human_command" | "job_completion" | "schedule_work" | "update_completion" | "worker_report" | "worker_report_local";
 
 export interface AgentExecutionContext {
   event_id: string;
@@ -14,7 +14,7 @@ export interface AgentExecutionContext {
   purpose: AgentPurpose;
   tenant_id: string;
   workspace_id: string;
-  principal_kind: "human";
+  principal_kind: "human" | "local_dashboard_task";
   principal_id: string;
   expires_at: string;
   policy_revision: 1;
@@ -31,16 +31,18 @@ export class AgentPrincipalUnavailableError extends Error {
 interface ActiveContext extends AgentExecutionContext { token_sha256: string; }
 
 export const agentPurposeOperations: Record<AgentPurpose, readonly string[]> = {
-  human_command: ["get_job_status_summary", "list_event_jobs", "get_job_status", "list_thread_jobs", "plan_self_update", "task_read", "task_delegate", "task_control", "task_instruction"],
+  human_command: ["get_job_status_summary", "list_event_jobs", "get_job_status", "list_thread_jobs", "plan_self_update", "task_read", "task_delegate", "task_control", "task_instruction", "worker_message_read", "worker_message_answer"],
   job_completion: ["list_event_jobs", "get_job_status", "plan_self_update", "task_read", "task_delegate"],
-  worker_report: ["task_read", "task_instruction"],
+  worker_report: ["task_read", "task_instruction", "worker_message_read", "worker_message_answer"],
+  worker_report_local: ["worker_message_read", "worker_message_answer"],
   schedule_work: [],
   update_completion: [],
 };
 
-function purpose(row: EventRow): AgentPurpose {
+function purpose(row: EventRow,database?:DispatcherDatabase): AgentPurpose {
+  if(database?.localDashboard.messagePrincipal(row.event_id))return "worker_report_local";
   if (row.source === "slack") return "human_command";
-  if (row.source === "dona_message" && row.event_type === "worker_message_report") return "worker_report";
+  if (row.source === "dona_message" && ["worker_message_report","worker_message_silence"].includes(row.event_type)) return "worker_report";
   if (row.source === "dona_job") return "job_completion";
   if (row.source === "dona_schedule") return "schedule_work";
   if (row.source === "dona_update") return "update_completion";
@@ -48,7 +50,7 @@ function purpose(row: EventRow): AgentPurpose {
 }
 
 function verifiedPrincipal(database: DispatcherDatabase, row: EventRow) {
-  return resolveVerifiedSlackOwner(database,row.event_id)?.principal;
+  return resolveVerifiedSlackOwner(database,row.event_id)?.principal??database.localDashboard.messagePrincipal(row.event_id);
 }
 
 export class AgentContextManager {
@@ -73,10 +75,10 @@ export class AgentContextManager {
     const context: AgentExecutionContext = {
       event_id: row.event_id,
       attempt: row.attempt_count,
-      purpose: purpose(row),
+      purpose: purpose(row,this.database),
       tenant_id: principal.tenant_id,
       workspace_id: principal.workspace_id,
-      principal_kind: "human",
+      principal_kind: principal.principal_kind,
       principal_id: principal.principal_id,
       expires_at: new Date(Date.now() + this.lifetimeMs).toISOString(),
       policy_revision: 1,
@@ -117,7 +119,7 @@ export class AgentContextManager {
     const expected = Buffer.from(active.token_sha256, "hex");
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return undefined;
     const current = this.database.get(active.event_id);
-    if (!current || purpose(current)!==active.purpose || current.attempt_count !== active.attempt || !["dispatching", "waiting_agent", "blocked"].includes(current.status)) return undefined;
+    if (!current || purpose(current,this.database)!==active.purpose || current.attempt_count !== active.attempt || !["dispatching", "waiting_agent", "blocked"].includes(current.status)) return undefined;
     const principal = verifiedPrincipal(this.database, current);
     if (!principal || principal.revoked_at !== null ||
       principal.tenant_id !== active.tenant_id || principal.workspace_id !== active.workspace_id ||

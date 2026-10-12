@@ -62,6 +62,17 @@ export class LocalDashboardCommands {
     const subject=JSON.parse(event.subject_json);
     return row?.source_event_id===job.source_event_id&&row.owner_json===stableStringify(binding.owner)&&subject.instance_id===binding.owner.instance_id&&subject.owner_id===binding.owner.owner_id;
   }
+  /** 親serviceのreport read/answer専用。operatorの汎用権限ではなく、受理済みTask一件へ束縛する。 */
+  messagePrincipal(eventId:string){
+    const event=this.dispatcher.get(eventId);if(event?.source!=="dona_message")return;
+    const payload=JSON.parse(event.payload_json),job=this.dispatcher.getJob(payload.job_id);
+    if(!job||!this.isLocalJob(job.job_id)||!this.dispatcher.workerMessages.ownsMessageEvent(job.job_id,eventId))return;
+    const task=this.dispatcher.tasks.forAttempt(job.job_id),binding=readEventJobBinding(this.sql,eventId),original=readEventJobBinding(this.sql,job.source_event_id);
+    if(!task||task.current_attempt_id!==job.job_id||!binding||binding.owner.kind!=="local_dashboard"||stableStringify(binding)!==stableStringify(original)||event.reply_target_json!==null)return;
+    const receipt=this.sql.prepare("SELECT 1 FROM local_dashboard_command_receipts WHERE operation='create' AND task_id=? AND event_id=? AND instance_id=? AND owner_id=?").get(task.task_id,job.source_event_id,binding.owner.instance_id,binding.owner.owner_id);
+    if(!receipt)return;
+    return {tenant_id:`local-task:${binding.owner.instance_id}`,workspace_id:`local-task:${task.task_id}`,principal_kind:"local_dashboard_task" as const,principal_id:binding.owner.owner_id,revoked_at:null};
+  }
   matchesRecordedReply(eventId:string,jobId:string,questionId:string,kind:"question"|"approval",response:unknown):boolean {
     const event=this.dispatcher.get(eventId);
     if(event?.source!=="web"||event.event_type!=="worker_question_reply")return false;
