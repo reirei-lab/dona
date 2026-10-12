@@ -62,6 +62,17 @@ export class LocalDashboardCommands {
     const subject=JSON.parse(event.subject_json);
     return row?.source_event_id===job.source_event_id&&row.owner_json===stableStringify(binding.owner)&&subject.instance_id===binding.owner.instance_id&&subject.owner_id===binding.owner.owner_id;
   }
+  /** 親serviceのreport read/answer専用。operatorの汎用権限ではなく、受理済みTask一件へ束縛する。 */
+  messagePrincipal(eventId:string){
+    const event=this.dispatcher.get(eventId);if(event?.source!=="dona_message")return;
+    const payload=JSON.parse(event.payload_json),job=this.dispatcher.getJob(payload.job_id);
+    if(!job||!this.isLocalJob(job.job_id)||!this.dispatcher.workerMessages.ownsMessageEvent(job.job_id,eventId))return;
+    const task=this.dispatcher.tasks.forAttempt(job.job_id),binding=readEventJobBinding(this.sql,eventId),original=readEventJobBinding(this.sql,job.source_event_id);
+    if(!task||task.current_attempt_id!==job.job_id||!binding||binding.owner.kind!=="local_dashboard"||stableStringify(binding)!==stableStringify(original)||event.reply_target_json!==null)return;
+    const receipt=this.sql.prepare("SELECT 1 FROM local_dashboard_command_receipts WHERE operation='create' AND task_id=? AND event_id=? AND instance_id=? AND owner_id=?").get(task.task_id,job.source_event_id,binding.owner.instance_id,binding.owner.owner_id);
+    if(!receipt)return;
+    return {tenant_id:`local-task:${binding.owner.instance_id}`,workspace_id:`local-task:${task.task_id}`,principal_kind:"local_dashboard_task" as const,principal_id:binding.owner.owner_id,revoked_at:null};
+  }
   matchesRecordedReply(eventId:string,jobId:string,questionId:string,kind:"question"|"approval",response:unknown):boolean {
     const event=this.dispatcher.get(eventId);
     if(event?.source!=="web"||event.event_type!=="worker_question_reply")return false;
@@ -107,6 +118,16 @@ export class LocalDashboardCommands {
       return {outcome:"created" as const,receipt,task,row:this.dispatcher.getJob(row.job_id)!};
     }).immediate();
   }
+  typedQuestion(authority:LocalDashboardAuthority,taskId:string){
+    const {task,row}=this.task(authority,taskId);
+    if(task.desired_state!=="running"||!["running","blocked"].includes(row.status))return [];
+    const pending=this.dispatcher.workerMessages.pendingQuestion(row.job_id);
+    if(!pending||pending.ambiguous)return [];
+    const payload=pending.payload as {question:string;options?:string[]};
+    return [{question_id:pending.message_id,kind:"question",state:"pending",typed:true,request:{questions:[{id:"answer",question:payload.question,isSecret:false,
+      ...(payload.options?{options:payload.options.map(label=>({label}))}:{})}]}}];
+  }
+
   reply(authority:LocalDashboardAuthority,input:LocalDashboardQuestionReply) {
     const key=this.key(authority,input.request_id);
     if(!Number.isSafeInteger(input.revision)||input.revision<1)throw Error("local_dashboard_command_invalid");
@@ -121,6 +142,22 @@ export class LocalDashboardCommands {
       if(input.kind==="approval"&&this.nativeApprovalTask(authority,input.task_id).row.job_id!==input.attempt_id)throw Error("task_approval_not_current");
       const task=this.dispatcher.tasks.get(input.task_id);
       if(!task||task.current_attempt_id!==input.attempt_id||task.revision!==input.revision||task.desired_state!=="running"||task.stop_state!=="none"||!["active","waiting"].includes(task.state))throw Error("task_question_not_current");
+      if(input.kind==="question"&&/^msg_[0-9a-hjkmnp-tv-z]{26}$/.test(input.question_id)){
+        const pending=this.dispatcher.workerMessages.pendingQuestion(input.attempt_id);
+        if(!pending||pending.ambiguous||pending.message_id!==input.question_id)throw Error("task_question_not_current");
+        const text=z.strictObject({answer:z.strictObject({answers:z.tuple([z.string().trim().min(1).max(4000)])})}).parse(input.answers).answer.answers[0];
+        const event=this.dispatcher.enqueue({schema_version:1,source:"web",type:"local_typed_question_reply",external_event_id:`local-typed-reply:${key}`,occurred_at:new Date().toISOString(),
+          subject:{instance_id:authority.instance_id,owner_id:authority.owner_id,job_id:input.attempt_id,source_event_id:task.source_event_id},
+          payload:{task_id:task.task_id,attempt_id:input.attempt_id,revision:input.revision,message_id:pending.message_id},reply_target:null});
+        if(event.duplicate||event.payloadMismatch)throw Error("local_dashboard_command_conflict");
+        insertEventJobBinding(this.sql,event.row.event_id,{owner:{kind:"local_dashboard",instance_id:authority.instance_id,owner_id:authority.owner_id},destination:{kind:"none"}});
+        const receipt=this.record(authority,input.request_id,operation,canonical,task.task_id,input.attempt_id,event.row.event_id);
+        const next=this.dispatcher.workerMessages.instructionReceipts(input.attempt_id,task.source_event_id).next_producer_sequence;
+        this.dispatcher.workerMessages.appendInstruction(input.attempt_id,{schema_version:1,source_event_id:event.row.event_id,producer_sequence:next,idempotency_key:`local-answer-${key}`,occurred_at:new Date().toISOString(),
+          correlation_message_id:pending.message_id,conversation_revision:pending.next_conversation_revision,payload:{operation:"answer",text}});
+        this.sql.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=? WHERE event_id=?").run(new Date().toISOString(),new Date().toISOString(),event.row.event_id);
+        return {outcome:"created" as const,receipt,task,row:this.dispatcher.getJob(input.attempt_id)!};
+      }
       const notification=this.sql.prepare(`SELECT event_id FROM events WHERE source IN ('web','dona_job') AND event_type='worker_question'
         AND external_event_id=? AND json_extract(subject_json,'$.job_id')=? AND json_extract(payload_json,'$.task_id')=?
         AND json_extract(payload_json,'$.request_kind')=?`).get(`question:${input.question_id}`,input.attempt_id,input.task_id,input.kind) as {event_id:string}|undefined;

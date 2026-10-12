@@ -742,7 +742,7 @@ export class DispatcherApi {
     if(this.shuttingDown&&request.method!=="GET")throw new ApiRequestError(503,"shutting_down","Dispatcher is shutting down");
     const body=request.method==="POST"?await this.readJson(request):undefined;
     const sourceEvent=request.method==="POST"?(body as Record<string,unknown>|undefined)?.source_event_id:url.searchParams.get("source_event_id");
-    const operation=request.method==="GET"?"task_read":url.pathname==="/v1/tasks"?"task_delegate":"task_control";
+    const operation=url.pathname.endsWith("/reports")?"worker_message_read":url.pathname.endsWith("/instruction")?"worker_message_answer":request.method==="GET"?"task_read":url.pathname==="/v1/tasks"?"task_delegate":"task_control";
     const authorize=()=>{
       if(!this.agentContexts)return;
       const token=request.headers["x-dona-agent-token"],event=request.headers["x-dona-agent-event-id"];
@@ -778,9 +778,20 @@ export class DispatcherApi {
         catch(error){if(error instanceof Error&&error.message==="task_not_found")sendTaskJson(200,{schema_version:1,status:"not_found",task:null});else throw error;}
         return;
       }
-      const match=/^\/v1\/tasks\/([^/]+)(?:\/(pause|resume|cancel|steer|retry|questions|answer|approve|recovery|reconcile|continuation))?$/.exec(url.pathname);
+      const match=/^\/v1\/tasks\/([^/]+)(?:\/(pause|resume|cancel|steer|retry|questions|answer|approve|recovery|reconcile|continuation|reports|instruction))?$/.exec(url.pathname);
       if(!match)throw new Error("task_route_not_found");
       const id=taskIdSchema.parse(match[1]),action=match[2];
+      if(action==="reports"||action==="instruction") {
+        if(!this.config.workerMessagingEnabled)throw Error("worker_messaging_disabled");
+        if(request.method==="GET"&&action==="reports"){sendTaskJson(200,this.database.taskReports(id,source));return;}
+        if(request.method==="POST"&&action==="instruction") {
+          const input=body as Record<string,unknown>;
+          if(!Number.isSafeInteger(input.revision)||typeof input.revision!=="number"||input.revision<1)throw Error("worker_instruction_revision_invalid");
+          if(!input.message||typeof input.message!=="object"||(input.message as Record<string,unknown>).source_event_id!==input.source_event_id)throw Error("worker_instruction_source_mismatch");
+          authorize();sendTaskJson(202,this.database.instructTask(id,input.revision,input.message));this.jobs.wake();return;
+        }
+        throw Error("worker_message_route_invalid");
+      }
       if(request.method==="GET"&&action==="recovery"){if(!this.jobs.inspectTaskRecovery)throw Error("task_recovery_unavailable");sendTaskJson(200,await this.jobs.inspectTaskRecovery(id,source));return;}
       if(request.method==="GET"&&action==="questions"){if(!this.jobs.taskQuestions)throw Error("task_questions_unavailable");sendTaskJson(200,await this.jobs.taskQuestions(id,source));return;}
       if(request.method==="GET"&&!action){sendTaskJson(200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.assertOwner(id,source),true)});return;}

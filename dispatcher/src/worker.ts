@@ -233,7 +233,7 @@ export class DispatcherWorker {
   private async prepareStatusContext(row:EventRow):Promise<void> {
     if(!this.agentContexts)return;
     // 未署名eventの既存処理は保持し、status権限だけをdefault denyにする。
-    if(row.source!=="dona_job"&&(row.source!=="slack"||!this.database.getVerifiedPrincipalBinding(row.event_id))) { await this.agentContexts.revoke(); return; }
+    if(row.source!=="dona_job"&&row.source!=="dona_message"&&(row.source!=="slack"||!this.database.getVerifiedPrincipalBinding(row.event_id))) { await this.agentContexts.revoke(); return; }
     try { await this.agentContexts.ensure(row); } catch { await this.agentContexts.revoke(); }
   }
 

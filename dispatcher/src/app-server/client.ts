@@ -1,3 +1,4 @@
+import type {RuntimeWorkerReport} from "./worker-reports.js";
 import type {ExternalToolRequest} from "./external-tools.js";
 import type {ConversationIdentity,ConversationSnapshot} from "./observation.js";
 import http from "node:http";
@@ -21,6 +22,14 @@ export class RuntimeClient {
       request.setTimeout(this.timeoutMs,()=>request.destroy(Error("runtime_response_unknown")));request.on("error",reject);request.end(body);
     });
   }
+  workerInstructionReceipt(name:string,messageId:string,text:string,scope:{attempt_id:string;generation:string;thread_id:string}):Promise<{state:"not_found"|"unknown"|"accepted";turnId?:string}>{return this.call("workerInstructionReceipt",{name,key:`worker-message:${messageId}`,text,scope});}
+  reconcileWorkerInstructionResult(name:string,messageId:string,text:string,scope:{attempt_id:string;generation:string;thread_id:string},evidence:{message_id:string;result_sha256:string}):Promise<{state:"not_found"|"unknown"|"accepted";turnId?:string}>{return this.call("reconcileWorkerInstructionResult",{name,key:`worker-message:${messageId}`,text,scope,evidence});}
+  workerInstruction(name:string,messageId:string,text:string,scope:{attempt_id:string;generation:string;thread_id:string}):Promise<{turnId:string}>{return this.call("workerInstruction",{name,key:`worker-message:${messageId}`,text,scope});}
+  workerReportAvailability(enabled:boolean):Promise<{enabled:boolean;ttl_ms:number}>{return this.call("workerReportAvailability",{enabled});}
+  workerReportDrainState():Promise<{protocol:1;recoverable_count:number}>{return this.call("workerReportDrainState");}
+  workerReports():Promise<RuntimeWorkerReport[]>{return this.call("workerReports");}
+  reconcileWorkerReport(name:string,id:string,result:unknown):Promise<unknown>{return this.call("reconcileWorkerReport",{name,id,result});}
+  resolveWorkerReport(name:string,id:string,result:unknown):Promise<unknown>{return this.call("resolveWorkerReport",{name,id,result});}
   externalAvailability(enabled:boolean):Promise<{enabled:boolean;ttl_ms:number}>{return this.call("externalAvailability",{enabled});}
   externalRequest(id:string):Promise<ExternalToolRequest|null>{return this.call("externalRequest",{id});}
   externalRequests():Promise<ExternalToolRequest[]>{return this.call("externalRequests");}
@@ -36,4 +45,13 @@ export class RuntimeClient {
   questions(name:string,includeResolved=false):Promise<QuestionRecord[]>{return this.call("questions",{name,includeResolved});}
   answer(name:string,id:string,answers:Record<string,{answers:string[]}>):Promise<QuestionRecord>{return this.call("answer",{name,id,answers});}
   stop(name:string,generation:string):Promise<AgentRecord>{return this.call("stop",{name,generation});}
+}
+
+/** Runtimeの受付を閉じてから、未受理・応答待ち・受理不明の残件を確認する。 */
+export async function disableWorkerReportsAfterDrain(runtime:Pick<RuntimeClient,"workerReportAvailability"|"workerReportDrainState">):Promise<void>{
+ let closed;try{closed=await runtime.workerReportAvailability(false);}catch{throw Error("worker_report_disable_unavailable");}
+ if(!closed||closed.enabled!==false||closed.ttl_ms!==0)throw Error("worker_report_disable_unavailable");
+ let inventory;try{inventory=await runtime.workerReportDrainState();}catch{throw Error("worker_report_disable_unavailable");}
+ if(!inventory||inventory.protocol!==1||!Number.isSafeInteger(inventory.recoverable_count)||inventory.recoverable_count<0)throw Error("worker_report_disable_unavailable");
+ if(inventory.recoverable_count!==0)throw Error("worker_messaging_disable_requires_runtime_drain");
 }

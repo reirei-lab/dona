@@ -1,3 +1,4 @@
+import { WorkerInstructionBridge } from "../src/worker-messaging.js";
 import { once } from "node:events";
 import Database from "better-sqlite3";
 import assert from "node:assert/strict";
@@ -86,14 +87,32 @@ test("worker停止中の取消が後継起動より優先される",async()=>{
   }finally{await f.dispose();}
 });
 
-test("pauseは停止を待ち、resume後もTaskと予算を保持する",async()=>{
+for(const deliveryState of ["pending","leased","delivered"] as const)test(`pauseは停止を待ち、resume後もTask・予算・追加指示を保持する（${deliveryState}）`,async()=>{
   const f=await fixture();try{
-    f.start();const event=f.db.enqueue(eventEnvelope("pause")).row;
+    f.start();const follow=f.db.enqueue(eventEnvelope("typed-condition")).row;
+    const instruction=f.db.workerMessages.appendInstruction(f.task.current_attempt_id,{schema_version:1,source_event_id:follow.event_id,producer_sequence:1,idempotency_key:"condition",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"既存の要件を保って検証結果を残してください"}});
+    if(deliveryState!=="pending"){
+      const claimed=f.db.workerMessages.claimNextWorkerInstruction("test-owner",300000)!;
+      if(deliveryState==="delivered")f.db.workerMessages.acknowledge(f.task.current_attempt_id,follow.event_id,claimed.delivery.delivery_id,"test-owner",claimed.lease_token,claimed.delivery.fence);
+    }
+    const event=f.db.enqueue(eventEnvelope("pause")).row;
     f.db.tasks.control(f.task.task_id,event.event_id,f.db.tasks.get(f.task.task_id)!.revision,"pause");await f.supervisor().reconcileTasks();
     const paused=f.db.tasks.get(f.task.task_id)!;assert.equal(paused.state,"paused");assert.equal(paused.stop_state,"stopped");assert.equal(paused.attempt_number,1);
+    assert.equal(f.db.workerMessages.claimNextWorkerInstruction("test-owner",300000),undefined);
     const resume=f.db.enqueue(eventEnvelope("resume")).row;
     f.db.tasks.control(paused.task_id,resume.event_id,paused.revision,"resume");await f.supervisor().reconcileTasks();
-    assert.equal(f.db.tasks.get(paused.task_id)!.attempt_number,2);assert.equal(f.sends(),1);
+    const next=f.db.tasks.get(paused.task_id)!;
+    assert.equal(next.attempt_number,2);assert.equal(f.sends(),1);
+    assert.match(f.db.getJob(next.current_attempt_id)!.objective,/既存の要件を保って検証結果を残してください/);
+    assert.ok(f.db.getJob(next.current_attempt_id)!.objective.includes(instruction.message.message_id));
+    assert.ok(f.db.getJob(next.current_attempt_id)!.objective.includes(`"attempt_count":${deliveryState==="pending"?0:1}`));
+    const receipt=f.db.workerMessages.reconcile(f.task.current_attempt_id,follow.event_id,"dona-main","condition") as {delivery:{state:string}};
+    assert.equal(receipt.delivery.state,deliveryState==="delivered"?"delivered":"superseded");
+    f.start(next.current_attempt_id);f.setStopped(false);f.interrupt(next.current_attempt_id);await f.supervisor().reconcileTasks();
+    const third=f.db.tasks.get(next.task_id)!;assert.equal(third.attempt_number,3);
+    assert.match(f.db.getJob(third.current_attempt_id)!.objective,/既存の要件を保って検証結果を残してください/);
+    assert.ok(f.db.getJob(third.current_attempt_id)!.objective.includes(instruction.message.message_id));
+
   }finally{await f.dispose();}
 });
 
@@ -786,5 +805,31 @@ test("外部承認待ちはRuntime停止を再照合し停止確認後だけ次A
   f.setObserved({state:"waiting"});await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)?.wait_reason,"external_approval");assert.equal(f.sends(),0);
   f.setObserved({state:"unknown"});f.due();await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)?.attempt_number,1);assert.equal(f.sends(),0);
   f.setObserved({state:"inactive"});f.due();await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)?.attempt_number,2);assert.equal(f.sends(),1);
+ }finally{await f.dispose();}
+});
+
+for(const latestMissing of [false,true])for(const boundary of ["claim", "replace"] as const)test(`指示別Resultが${boundary}直前に届いた場合はAttemptを交代しない（最新未公開=${latestMissing}）`,async()=>{
+ const f=await fixture();try{
+  f.start();const job=f.db.getJob(f.task.current_attempt_id)!;
+  const instruction=f.db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:f.event.event_id,producer_sequence:1,idempotency_key:"result-fence",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"検証結果を含める"}});
+  await new WorkerInstructionBridge(f.db.workerMessages,{async steer(){return {};}}).runOnce();
+  if(latestMissing){
+   f.db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:f.event.event_id,producer_sequence:2,idempotency_key:"result-fence-next",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"追加の確認を含める"}});
+   await new WorkerInstructionBridge(f.db.workerMessages,{async steer(){return {};}}).runOnce();
+  }
+  f.interrupt();const task=f.db.tasks.get(f.task.task_id)!;
+  const evidence:WorkerObservation={state:"stopped",reason:"verified",observed_at:new Date().toISOString(),process_ids:[],process_groups:[]};
+  if(boundary==="replace"){
+   const claimed=f.db.tasks.claimStop(task,evidence);f.db.tasks.stopped(claimed,evidence);
+  }
+  const resultPath=f.db.workerMessages.instructionResultPath(job.job_id,instruction.message.message_id);
+  await fs.mkdir(path.dirname(resultPath),{recursive:true});
+  await fs.writeFile(resultPath,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString(),worker_instruction_message_ids:[instruction.message.message_id]}));
+  await assert.rejects(fs.stat(job.result_path),{code:"ENOENT"});
+  if(boundary==="claim")assert.throws(()=>f.db.tasks.claimStop(task,evidence),/task_reconciliation_required/);
+  else assert.throws(()=>f.db.tasks.replaceStopped(task.task_id,f.config.jobResultsDir),/task_result_requires_reconciliation/);
+  assert.equal(f.db.tasks.get(task.task_id)!.current_attempt_id,job.job_id);
+  assert.equal(f.db.tasks.get(task.task_id)!.attempt_number,1);
+  assert.equal(JSON.parse(await fs.readFile(resultPath,"utf8")).status,"completed");
  }finally{await f.dispose();}
 });

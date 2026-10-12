@@ -186,14 +186,16 @@ export class TaskRepository {
   assertOwner(id:string,eventId:string,sameThread=false):TaskRow {
     const task=this.get(id);if(!task)throw new Error("task_owner_mismatch");
     const event=this.dispatcher.get(eventId);
-    if(event?.source==="web"&&this.dispatcher.hasLocalDashboardJobOwner(task.current_attempt_id)) {
+    if((event?.source==="web"||(event?.source==="dona_message"&&this.dispatcher.localDashboard.messagePrincipal(eventId)))&&this.dispatcher.hasLocalDashboardJobOwner(task.current_attempt_id)) {
+      if(event.source==="dona_message"&&!this.dispatcher.workerMessages.ownsMessageEvent(task.current_attempt_id,eventId))throw new Error("task_owner_mismatch");
       try{this.dispatcher.assertJobSourceMatchesThread(task.current_attempt_id,eventId);}catch{throw new Error("task_owner_mismatch");}
       const binding=readEventJobBinding(this.sql,eventId);
       if(binding?.owner.kind!=="local_dashboard")throw new Error("task_owner_mismatch");
       return task;
     }
-    if(!event||!["slack","dona_job"].includes(event.source))throw new Error("task_owner_mismatch");
-    if(event.source==="dona_job"&&JSON.parse(event.subject_json).source_event_id!==task.source_event_id&&!this.continuations.canRead(id,eventId))throw new Error("task_owner_mismatch");
+    if(event?.source==="dona_message"&&!this.dispatcher.workerMessages.ownsMessageEvent(task.current_attempt_id,eventId))throw new Error("task_owner_mismatch");
+    if(!event||!["slack","dona_job","dona_message"].includes(event.source))throw new Error("task_owner_mismatch");
+    if(["dona_job","dona_message"].includes(event.source)&&JSON.parse(event.subject_json).source_event_id!==task.source_event_id&&!this.continuations.canRead(id,eventId))throw new Error("task_owner_mismatch");
     const original=this.dispatcher.get(task.source_event_id)!;
     const target=original.reply_target_json?JSON.parse(original.reply_target_json):{},current=event.reply_target_json?JSON.parse(event.reply_target_json):{};
     if(typeof target.workspace_id!=="string"||target.workspace_id!==current.workspace_id)throw new Error("task_owner_mismatch");
@@ -384,7 +386,7 @@ export class TaskRepository {
       if(task.revision!==revision)throw new Error("task_revision_conflict");
       if(["completed","failed","cancelled"].includes(task.state))throw new Error("task_terminal");
       if(action==="resume"&&!["paused","waiting"].includes(task.state))throw new Error("task_resume_requires_waiting_or_paused");
-      if(action==="pause"&&this.dispatcher.getJob(task.current_attempt_id)?.status==="blocked"&&this.dispatcher.getJob(task.current_attempt_id)?.last_error_code!=="runtime_question_pending")throw new Error("task_human_input_pending");
+      if(action==="pause"&&this.dispatcher.getJob(task.current_attempt_id)?.status==="blocked"&&!["runtime_question_pending","worker_message_question_pending"].includes(this.dispatcher.getJob(task.current_attempt_id)?.last_error_code??""))throw new Error("task_human_input_pending");
       const state=action==="pause"?"paused":action==="resume"?"waiting":"waiting";
       const reason=action==="cancel"?"cancel_requested":action==="pause"?"pause_requested":"resume_requested";
       this.sql.prepare("UPDATE tasks SET state=?,desired_state=?,wait_reason=?,next_check_at=?,revision=revision+1,updated_at=? WHERE task_id=?")
@@ -415,6 +417,7 @@ export class TaskRepository {
       if(task.revision!==revision||(!answer&&task.state!=="active")||task.desired_state!=="running"||task.stop_state!=="none")throw new Error("task_control_conflict");
       const objective=task.objective+"\n\n利用者の追加指示（既存の承認境界を維持）:\n"+instruction;
       if([...objective].length>100_000)throw new Error("task_objective_limit");
+      this.dispatcher.assertTaskSteerReservationBudget(task.current_attempt_id,objective);
       this.sql.prepare("UPDATE tasks SET objective=?,revision=revision+1,state='waiting',wait_reason='steer_acceptance_unknown',steer_pending_event_id=? WHERE task_id=?").run(objective,eventId,id);
       const checkpoint=this.sql.prepare("SELECT json_extract(checkpoint_json,'$.sequence') AS sequence FROM task_attempts WHERE attempt_id=?").get(task.current_attempt_id) as {sequence:number|null};
       this.sql.prepare("INSERT INTO task_controls(task_id,source_event_id,request_sha256,checkpoint_sequence) VALUES(?,?,?,?)").run(id,eventId,digest,checkpoint.sequence);return true;
@@ -503,11 +506,11 @@ export class TaskRepository {
     return this.sql.prepare(`SELECT t.* FROM tasks t JOIN jobs j ON j.job_id=t.current_attempt_id
       WHERE t.state IN ('active','waiting','paused') AND NOT (t.state='paused' AND t.wait_reason='paused') AND (t.next_check_at IS NULL OR t.next_check_at<=?)
       AND NOT (t.desired_state='running' AND COALESCE(t.wait_reason,'')='runtime_profile_unavailable')
-      AND (j.status IN ('needs_review','blocked') OR t.desired_state<>'running' OR t.wait_reason IN ('cancel_requested','pause_requested','resume_requested','worker_stop_pending','steer_acceptance_unknown'))
+      AND (j.status IN ('needs_review','blocked') OR t.desired_state<>'running' OR t.wait_reason IN ('cancel_requested','pause_requested','resume_requested','worker_stop_pending','steer_acceptance_unknown','worker_instruction_delivery_pending','worker_instruction_result_pending'))
       ORDER BY COALESCE(t.next_check_at,t.created_at),t.task_id LIMIT 8`).all(at.toISOString()) as TaskRow[];
   }
   mayNotify(job:JobRow):boolean {
-    if(job.last_error_code==="runtime_question_pending")return false;
+    if(["runtime_question_pending","worker_message_question_pending"].includes(job.last_error_code??""))return false;
     const task=this.forAttempt(job.job_id);if(!task)return true;
     if(task.current_attempt_id!==job.job_id)return false;
     if(["completed","failed","cancelled"].includes(task.state))return true;
@@ -518,7 +521,9 @@ export class TaskRepository {
   reconnect(task:TaskRow):void {
     this.sql.transaction(()=>{
       const fresh=this.get(task.task_id)!;if(fresh.revision!==task.revision||fresh.current_attempt_id!==task.current_attempt_id||fresh.desired_state!=="running"||! ["none","not_sent"].includes(fresh.stop_state))return;
+      const prior=this.dispatcher.getJob(task.current_attempt_id);
       this.sql.prepare("UPDATE jobs SET status='running',last_error_code=NULL,last_error_message=NULL WHERE job_id=? AND status IN ('needs_review','blocked')").run(task.current_attempt_id);
+      if(prior&&['runtime_question_pending','runtime_external_approval_pending'].includes(prior.last_error_code??'')&&this.sql.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_message_cadence'").get())this.dispatcher.workerMessages.resetSilenceAfterInput(task.current_attempt_id);
       this.sql.prepare("UPDATE tasks SET state='active',wait_reason=NULL,next_check_at=NULL,stop_state='none',stop_evidence_json=NULL,observation_failures=0 WHERE task_id=?").run(task.task_id);
     }).immediate();
   }
@@ -528,7 +533,7 @@ export class TaskRepository {
       if(fresh.stop_state!=="none")return fresh;
       if((evidence.state!=="stopped"&&(!evidence.process_ids.length||!evidence.process_groups.length))||!(fresh.desired_state!=="running"?["working","waiting","inactive","stopped","unreachable"]:["inactive","stopped","unreachable"]).includes(evidence.state))throw new Error("task_stop_evidence_missing");
       const job=this.dispatcher.getJob(task.current_attempt_id)!;
-      if(job.result_json||fs.existsSync(job.result_path)||job.steer_state==="dispatching")throw new Error("task_reconciliation_required");
+      if(job.result_json||fs.existsSync(this.dispatcher.jobResultReadPath(job.job_id))||job.steer_state==="dispatching")throw new Error("task_reconciliation_required");
       this.sql.prepare("UPDATE jobs SET status='needs_review',last_error_code='task_stop_pending' WHERE job_id=?").run(job.job_id);
       this.sql.prepare("UPDATE tasks SET stop_state='not_sent',stop_evidence_json=?,wait_reason='worker_stop_pending' WHERE task_id=?")
         .run(JSON.stringify(evidence),task.task_id);
@@ -638,7 +643,7 @@ export class TaskRepository {
       const task=this.get(taskId)!;
       if(task.stop_state!=="stopped"||["completed","failed","cancelled"].includes(task.state))throw new Error("task_stop_required");
       const old=this.dispatcher.getJob(task.current_attempt_id)!;
-      if(old.result_json||(recoveryDigest?!this.recoveryResultMatches(old,recoveryDigest):fs.existsSync(old.result_path)))throw new Error("task_result_requires_reconciliation");
+      if(old.result_json||(recoveryDigest?!this.recoveryResultMatches(old,recoveryDigest):fs.existsSync(this.dispatcher.jobResultReadPath(old.job_id))))throw new Error("task_result_requires_reconciliation");
       if(task.desired_state==="paused"){this.sql.prepare("UPDATE tasks SET wait_reason='paused',next_check_at=NULL WHERE task_id=?").run(taskId);return;}
       if(task.desired_state==="cancelled") {
         this.dispatcher.beginJobCancellation(old.job_id,old.source_event_id);
@@ -649,7 +654,8 @@ export class TaskRepository {
       if(task.attempt_number>=task.max_attempts){this.wait(task,"retry_exhausted",86_400_000);return;}
       this.dispatcher.beginJobCancellation(old.job_id,old.source_event_id);
       const id=`job_${ulid().toLowerCase()}`,number=task.attempt_number+1,now=new Date().toISOString();
-      const objective=task.objective+(external.accepted.length?"\n\nDispatcher検証済み外部投稿（既に実行済み。同じ投稿を再送しない）:\n"+JSON.stringify(external.accepted):"");
+      const typedContext=this.sql.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()?this.dispatcher.workerMessages.stoppedInstructionContext(old.job_id):"";
+      const objective=task.objective+typedContext+(external.accepted.length?"\n\nDispatcher検証済み外部投稿（既に実行済み。同じ投稿を再送しない）:\n"+JSON.stringify(external.accepted):"");
       if([...objective].length>100_000)throw Error("task_objective_limit");
       const workspace={...JSON.parse(old.workspace_json),_dona_task:{task_id:taskId,attempt_id:id,attempt_number:number},_dona_handoff:{predecessor_job_id:old.job_id,workspace_job_id:workspaceJobId(old)}};
       const resumeFrom=this.offlineResumes.source(old.job_id);

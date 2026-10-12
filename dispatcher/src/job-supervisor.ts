@@ -318,9 +318,28 @@ export class JobSupervisor {
     if(task.wait_reason==="steer_acceptance_unknown"&&job.steer_state==="accepted"&&job.steer_event_id&&task.steer_pending_event_id===job.steer_event_id) {
       this.database.tasks.finishSteer(task.task_id,job.steer_event_id);return;
     }
+    const typedOverlap=this.config.workerMessagingEnabled&&job.last_error_code==="runtime_external_approval_pending"&&this.database.workerMessages.hasUnansweredQuestion(job.job_id);
+    if(task.desired_state==="running"&&task.stop_state==="none"&&((job.last_error_code==="runtime_question_pending"&&this.runtime.questions)||typedOverlap)){
+      if(job.last_error_code==="runtime_external_approval_pending"){
+        const recovery=this.database.tasks.externalApprovalRecovery(job.job_id);
+        if(recovery.state!=="ready"){this.database.tasks.wait(task,recovery.state==="unknown"?"external_effect_unknown":"external_approval",30000);return;}
+      }
+      const native=this.runtime.questions?await this.runtime.questions(job.agent_name):[];
+      if(native.length){this.database.tasks.wait(task,"human_input");return;}
+      const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
+      if(observed.ok&&["working","idle","done"].includes(observed.agentStatus??"")){
+        this.database.tasks.reconnect(task);
+        if(this.config.workerMessagingEnabled&&this.database.workerMessages.hasUnansweredQuestion(job.job_id)){
+          this.database.markJobBlocked(job.job_id,"Worker typed question remains unanswered",["running"],"worker_message_question_pending");
+          this.database.tasks.wait(this.database.tasks.get(task.task_id)!,"human_input");
+        }
+        this.wake();return;
+      }
+    }
     // A result is evidence belonging to this attempt, never to its successor.
     try {
-      const result=await readJobResultEnvelope(job.result_path,job.job_id);
+      const resultPath=this.instructionResultPath(job);
+      const result=await readJobResultEnvelope(resultPath,job.job_id);
       if(result.status==="failed"&&job.last_error_code==="steer_acceptance_unknown") {
         const prior=this.database.tasks.resultRecovery(job.job_id);
         if(prior&&task.wait_reason==="retry_exhausted")return;
@@ -337,8 +356,8 @@ export class JobSupervisor {
           return;
         }
       }
-      try { this.database.saveJobResult(job.job_id,result,job.result_path); }
-      catch { this.database.tasks.wait(task,"result_reconciliation_required"); }
+      try { this.database.saveJobResult(job.job_id,result,resultPath); }
+      catch(error) { if(!this.holdInstructionResult(job,error))this.database.tasks.wait(task,"result_reconciliation_required"); }
       return;
     } catch(error) {
       if(!(error instanceof JobResultNotFoundError)) {this.database.tasks.wait(task,"result_conflict");return;}
@@ -350,6 +369,8 @@ export class JobSupervisor {
     if(capacityDelay>0){this.database.tasks.wait(task,"capacity_wait",Math.min(capacityDelay,86_400_000));return;}
     // 外部tool待機が未確定steerのreceipt待ちを上書きしてはいけない。
     if(task.desired_state==="running"&&(task.steer_pending_event_id||task.wait_reason==="steer_acceptance_unknown"||job.steer_state==="dispatching")) {this.database.tasks.wait(task,"steer_acceptance_unknown",60_000);return;}
+    if(job.last_error_code==="worker_instruction_acceptance_unknown"&&task.desired_state==="running"){this.database.tasks.wait(task,"external_effect_unknown",30000);return;}
+    if(this.config.workerMessagingEnabled&&task.desired_state==="running"&&this.database.workerMessages.hasUnansweredQuestion(job.job_id)){this.database.tasks.wait(task,"human_input");return;}
     const externalRecovery=this.database.tasks.externalApprovalRecovery(job.job_id);
     if(task.desired_state==="running"&&externalRecovery.state!=="ready") {this.database.tasks.wait(task,externalRecovery.state==="unknown"?"external_effect_unknown":"external_approval",30_000);return;}
     if(job.last_error_code==="runtime_external_approval_pending"&&task.desired_state==="running"&&task.stop_state==="none"){
@@ -948,8 +969,9 @@ export class JobSupervisor {
     const stopped=this.database.getJob(jobId);
     if(stopped?.last_error_code!=="invalid_result_agent_stopped") return;
     try {
-      const result=await readJobResultEnvelope(stopped.result_path,stopped.job_id);
-      this.database.saveJobResult(stopped.job_id,result,stopped.result_path);
+      const resultPath=this.instructionResultPath(stopped);
+      const result=await readJobResultEnvelope(resultPath,stopped.job_id);
+      this.database.saveJobResult(stopped.job_id,result,resultPath);
     } catch {
       // The invalid/missing Result remains fenced for operator review after the worker is stopped.
     }
@@ -1113,7 +1135,7 @@ export class JobSupervisor {
       })
       .finally(async () => {
         const finalJob=this.database.getJob(row.job_id),finalStatus=finalJob?.status;
-        const questionPending=finalStatus==="blocked"&&finalJob?.last_error_code==="runtime_question_pending";
+        const questionPending=finalStatus==="blocked"&&["runtime_question_pending","worker_message_question_pending"].includes(finalJob?.last_error_code??"");
         if(this.progress&&finalStatus==="needs_review")this.trackCancelledWorkerCleanup(row);
         else if (!questionPending&&(!this.progress || (finalStatus!==undefined&&["blocked","completed","failed","cancelled"].includes(finalStatus)))) await fs.rm(path.dirname(jobProgressPath(row)), { recursive:true, force:true }).catch(() => {
           this.logger.warn("Disabled job progress terminal cleanup failed", { job_id:row.job_id, error_code:"job_progress_disabled_terminal_cleanup_failed" });
@@ -1359,13 +1381,26 @@ export class JobSupervisor {
     );
   }
 
+  private instructionResultPath(job:JobRow):string {
+    return this.config.workerMessagingEnabled?this.database.jobResultReadPath(job.job_id):job.result_path;
+  }
+
+  private holdInstructionResult(job:JobRow,error:unknown):boolean {
+    if(!(error instanceof Error)||!["worker_instruction_delivery_pending","worker_instruction_result_stale","worker_message_question_pending"].includes(error.message))return false;
+    const task=this.database.tasks.forAttempt(job.job_id);
+    if(task)this.database.tasks.wait(task,error.message==="worker_message_question_pending"?"human_input":error.message==="worker_instruction_delivery_pending"?"worker_instruction_delivery_pending":"worker_instruction_result_pending",1000);
+    return true;
+  }
+
   private async tryCompleteAfterUnknownAcceptance(row: JobRow): Promise<boolean> {
     try {
-      const result = await this.readResult(row.result_path, row.job_id);
+      const resultPath=this.instructionResultPath(row);
+      const result = await this.readResult(resultPath, row.job_id);
       this.database.markJobRunning(row.job_id);
-      this.database.saveJobResult(row.job_id, result, row.result_path);
+      this.database.saveJobResult(row.job_id, result, resultPath);
       return true;
     } catch (error) {
+      if(this.holdInstructionResult(row,error))return false;
       if (error instanceof JobResultNotFoundError) return false;
       this.database.markJobNeedsReview(row.job_id, "invalid_result", error instanceof Error ? error.message : String(error));
       return true;
@@ -1442,10 +1477,12 @@ export class JobSupervisor {
   private async tryComplete(row: JobRow, terminalAgentState: boolean): Promise<boolean> {
     let completed: JobRow;
     try {
-      const result = await this.readResult(row.result_path, row.job_id);
-      this.database.saveJobResult(row.job_id, result, row.result_path);
+      const resultPath=this.instructionResultPath(row);
+      const result = await this.readResult(resultPath, row.job_id);
+      this.database.saveJobResult(row.job_id, result, resultPath);
       completed = this.database.getJob(row.job_id)!;
     } catch (error) {
+      if(this.holdInstructionResult(row,error))return false;
       if (error instanceof JobResultNotFoundError && !terminalAgentState) return false;
       if (this.database.getJob(row.job_id)?.status === "cancelled") return true;
       this.database.markJobNeedsReview(

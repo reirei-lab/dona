@@ -370,7 +370,7 @@ async function loadQuestions(taskId,target) {
         if(typeof question.id!=='string'||typeof question.question!=='string')continue;
         const group=node('fieldset');group.append(node('legend',question.header||'確認'),node('p',question.question));let field;
         if(Array.isArray(question.options)&&question.options.length){field=node('select');field.required=true;const empty=node('option','回答を選択してください');empty.value='';field.append(empty);for(const option of question.options){const item=node('option',option.label+(option.description?' — '+option.description:''));item.value=option.label;field.append(item);}}
-        else {field=node('textarea');field.required=true;field.maxLength=10000;}
+        else {field=node('textarea');field.required=true;field.maxLength=q.typed?4000:10000;}
         field.setAttribute('aria-label',question.question);group.append(field);form.append(group);fields.push({id:question.id,field});
       }
       if(!fields.length)continue;const button=node('button','回答をDonaに送る');button.type='submit';button.disabled=!!pending;form.append(button);

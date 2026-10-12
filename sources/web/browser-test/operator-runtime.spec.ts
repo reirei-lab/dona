@@ -5,15 +5,18 @@ import https from 'node:https';
 import net from 'node:net';
 import {operatorRuntimeFixture} from '../../../dispatcher/test/operator-runtime-fixture.js';
 import {observerDashboardPage} from '../src/observer-dashboard.js';
-async function freePort(){const s=net.createServer();await new Promise<void>(r=>s.listen(0,'127.0.0.1',r));const port=(s.address() as net.AddressInfo).port;await new Promise<void>(r=>s.close(()=>r()));return port;}
 test('browser依頼から実Dispatcher・Unix App Server subprocessの進捗・最終Resultまで到達する',async({browser})=>{
  // 1秒周期のRuntime復旧がinitialize待ちを観測する条件を作る。起動成功後に停止されてはいけない。
- test.setTimeout(60000);const port=await freePort(),origin=`https://localhost:${port}`,f=await operatorRuntimeFixture(origin,observerDashboardPage(),{initializeDelayMs:1100}),context=await browser.newContext({ignoreHTTPSErrors:true});let submits=0;const slow:http.IncomingMessage[]=[];
+ test.setTimeout(60000);let fixture:Awaited<ReturnType<typeof operatorRuntimeFixture>>|undefined,contextToClose:Awaited<ReturnType<typeof browser.newContext>>|undefined;let submits=0;const slow:http.IncomingMessage[]=[];
  const proxy=https.createServer({cert:await fs.readFile(new URL('../../../test-fixtures/tls/loopback-fixture-cert.pem',import.meta.url)),key:await fs.readFile(new URL('../../../test-fixtures/tls/loopback-fixture-key.pem',import.meta.url))},(incoming,outgoing)=>{
+  if(!fixture){outgoing.writeHead(503);outgoing.end();return;}
   if(incoming.method==='POST'&&incoming.url==='/api/tasks')submits++;
-  const upstream=http.request({hostname:'127.0.0.1',port:f.port,path:incoming.url,method:incoming.method,headers:incoming.headers},response=>{outgoing.writeHead(response.statusCode!,response.headers);response.pipe(outgoing);});upstream.on('error',()=>outgoing.destroy());incoming.pipe(upstream);
- });await new Promise<void>(r=>proxy.listen(port,'127.0.0.1',r));
+  const upstream=http.request({hostname:'127.0.0.1',port:fixture.port,path:incoming.url,method:incoming.method,headers:incoming.headers},response=>{outgoing.writeHead(response.statusCode!,response.headers);response.pipe(outgoing);});upstream.on('error',()=>outgoing.destroy());incoming.pipe(upstream);
+ });
  try{
+  // proxyのsocketを先に保持し、upstream fixtureが同じ空きportを再取得するraceをなくす。
+  await new Promise<void>((resolve,reject)=>{proxy.once('error',reject);proxy.listen(0,'127.0.0.1',resolve);});
+  const port=(proxy.address() as net.AddressInfo).port,origin=`https://localhost:${port}`,f=fixture=await operatorRuntimeFixture(origin,observerDashboardPage(),{initializeDelayMs:1100}),context=contextToClose=await browser.newContext({ignoreHTTPSErrors:true});
   const page=await context.newPage(),errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));await page.goto(origin);
   await page.getByLabel('接続コード').fill(await f.pairCode());await page.getByRole('button',{name:'この端末を接続する',exact:true}).click();
   await page.getByLabel('Donaへの依頼').fill('隔離プロトコルを実行して成果を返す');await page.getByRole('button',{name:'依頼する',exact:true}).click();await expect(page.locator('#command-status')).toContainText('依頼を受け付けました');
@@ -33,7 +36,7 @@ test('browser依頼から実Dispatcher・Unix App Server subprocessの進捗・�
   expect(submits).toBe(1);expect(f.db.tasks.attempts(task.task_id)).toHaveLength(1);expect(f.db.getJob(task.current_attempt_id)?.status).toBe('completed');
   const calls=await f.calls();expect(calls.filter(c=>c.method==='thread/start')).toHaveLength(2);expect(calls.filter(c=>c.method==='turn/start'&&c.pid===agent.pid)).toHaveLength(1);expect(calls.some(c=>c.method==='thread/read')).toBe(true);expect(calls.some(c=>c.method==='thread/turns/list')).toBe(true);expect(errors).toEqual([]);
  }catch(error){
-  try{console.error('operator runtime diagnostics:',JSON.stringify(await f.diagnostics()));}catch(diagnosticError){console.error('operator runtime diagnostics unavailable:',diagnosticError);}
+  try{console.error('operator runtime diagnostics:',JSON.stringify(await fixture?.diagnostics()));}catch(diagnosticError){console.error('operator runtime diagnostics unavailable:',diagnosticError);}
   throw error;
- }finally{for(const response of slow)response.destroy();await context.close();proxy.closeAllConnections();await new Promise<void>(r=>proxy.close(()=>r()));await f.close();}
+ }finally{for(const response of slow)response.destroy();await contextToClose?.close();proxy.closeAllConnections();if(proxy.listening)await new Promise<void>(r=>proxy.close(()=>r()));await fixture?.close();}
 });

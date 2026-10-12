@@ -1,3 +1,5 @@
+import {reportContainsPrivateValues} from "./worker-report-privacy.js";
+import {migrateWorkerMessaging,WorkerMessageRepository,parseDonaInstruction,parseWorkerReport,WorkerMessageError} from "./worker-messaging.js";
 import { envelopeFromRow } from "./prompt.js";
 import { migrateVerifiedPrincipalBindings, persistVerifiedPrincipalBinding, readVerifiedPrincipalBinding, readVerifiedPrincipalProofConsumption, PrincipalBindingConflictError } from "./principal-binding.js";
 import type { VerifiedSlackPrincipalProof } from "./principal-proof.js";
@@ -1051,6 +1053,64 @@ function pendingHandoffSql(source: string): string {
 }
 
 export class DispatcherDatabase {
+  private workerMessageStore:WorkerMessageRepository|undefined;
+  get workerMessages():WorkerMessageRepository {
+    if(!this.workerMessageStore){
+      migrateWorkerMessaging(this.db);
+      const repository=new WorkerMessageRepository(this.db,this.jobAdmissionLimits.jobObjectiveTotalMaxBytes);
+      // An enclosing acceptance transaction can roll schema creation back on rejection.
+      if(!this.db.inTransaction)this.workerMessageStore=repository;
+      return repository;
+    }
+    return this.workerMessageStore;
+  }
+
+  assertWorkerMessagingMode(enabled:boolean):void {
+    if(enabled||!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get())return;
+    const outstanding=this.db.prepare(`SELECT 1 FROM worker_message_deliveries d JOIN worker_messages m USING(message_id) JOIN jobs j USING(job_id)
+      LEFT JOIN events e ON e.event_id=d.event_id
+      WHERE d.state IN ('pending','leased') OR
+        (d.consumer='worker' AND d.state='delivered' AND j.status NOT IN ('completed','failed','cancelled')) OR
+        (d.consumer='dona-main' AND e.status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review')) OR
+        (j.status NOT IN ('completed','failed','cancelled') AND m.direction='worker_to_dona' AND m.kind IN ('question','decision_request')
+          AND NOT EXISTS (SELECT 1 FROM worker_messages a JOIN worker_message_deliveries ad ON ad.message_id=a.message_id
+            WHERE a.correlation_message_id=m.message_id AND a.kind='answer' AND ad.consumer='worker' AND ad.state='delivered')) LIMIT 1`).get();
+    const silence=this.db.prepare(`SELECT 1 FROM events WHERE source='dona_message' AND event_type='worker_message_silence'
+      AND status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review') LIMIT 1`).get();
+    if(outstanding||silence)throw Error("worker_messaging_disable_requires_drain");
+  }
+
+  acceptTaskWorkerReport(attemptId:string,identity:string,raw:unknown){
+    const input=parseWorkerReport(raw);
+    return this.db.transaction(()=>{
+      const task=this.tasks.forAttempt(attemptId),job=this.getJob(attemptId);
+      if(!job||!task||task.current_attempt_id!==attemptId||task.desired_state!=="running"||!["running","blocked"].includes(job.status)||input.source_event_id!==job.source_event_id)throw new WorkerMessageError("worker_report_attempt_not_current","current Attempt does not accept reports");
+      if(reportContainsPrivateValues(input.payload,job.objective,[job.workspace_path,job.result_path]))throw new WorkerMessageError("worker_report_payload_denied","report payload is denied");
+      return this.workerMessages.acceptRuntimeReport(attemptId,identity,input);
+    }).immediate();
+  }
+
+  markWorkerInstructionUnknown(jobId:string,messageId:string){
+    this.db.transaction(()=>{
+      const task=this.tasks.forAttempt(jobId),job=this.getJob(jobId);
+      if(!task||task.current_attempt_id!==jobId||task.desired_state!=="running"||!job||!["running","blocked"].includes(job.status))return;
+      if(job.status==="blocked"&&!["worker_message_question_pending","worker_instruction_acceptance_unknown"].includes(job.last_error_code??""))return;
+      if(job.last_error_code==="worker_instruction_acceptance_unknown"&&job.last_error_message===messageId)return;
+      this.db.prepare("UPDATE jobs SET status='blocked',last_error_code='worker_instruction_acceptance_unknown',last_error_message=?,updated_at=? WHERE job_id=?").run(messageId,new Date().toISOString(),jobId);
+      this.tasks.wait(task,"external_effect_unknown",30000);
+    }).immediate();
+  }
+  taskReports(id:string,eventId:string){const task=this.tasks.assertOwner(id,eventId,true),job=this.getJob(task.current_attempt_id)!;return {schema_version:1,task_id:id,attempt_id:task.current_attempt_id,revision:task.revision,phase:job.status,wait_reason:task.wait_reason,diagnostic:job.last_error_code,desired_state:task.desired_state,event_report:task.desired_state==="running"&&["running","blocked"].includes(job.status)?this.workerMessages.eventReport(task.current_attempt_id,eventId):undefined,pending_question:task.desired_state==="running"&&["running","blocked"].includes(job.status)?this.workerMessages.pendingQuestion(task.current_attempt_id):undefined,reports:task.desired_state==="running"&&["running","blocked"].includes(job.status)?this.workerMessages.reports(task.current_attempt_id,eventId):[],...this.workerMessages.silenceEventState(task.current_attempt_id,eventId),...this.workerMessages.instructionReceipts(task.current_attempt_id,eventId),limit:20};}
+  instructTask(id:string,revision:number,raw:unknown){
+    const input=parseDonaInstruction(raw);
+    return this.db.transaction(()=>{
+      const task=this.tasks.assertOwner(id,input.source_event_id,true);
+      if(task.revision!==revision||task.desired_state!=="running")throw Error("worker_instruction_task_changed");
+      const result=this.workerMessages.appendInstruction(task.current_attempt_id,input);
+      return {schema_version:1,task_id:id,attempt_id:task.current_attempt_id,message:this.workerMessages.project(result.message),receipt_id:result.receipt_id,outcome:result.outcome};
+    }).immediate();
+  }
+
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
   readonly tasks: TaskRepository;
@@ -1540,9 +1600,10 @@ export class DispatcherDatabase {
         if(group?.notification_mode==="legacy"&&jobKey!==legacyJobKey) throw new JobCreationError("job_group_closed","Legacy job group does not accept additional keys");
         const admitted=this.db.prepare("SELECT COALESCE(t.objective,j.objective) AS objective,j.workspace_json FROM jobs j LEFT JOIN task_attempts a ON a.attempt_id=j.job_id LEFT JOIN tasks t ON t.task_id=a.task_id WHERE j.source_event_id=? AND (a.number IS NULL OR a.number=1)").all(sourceEvent.event_id) as Array<{objective:string;workspace_json:string}>;
         if(admitted.length>=this.jobAdmissionLimits.jobsPerEventMax) throw new JobCreationError("job_group_limit_exceeded","Job group jobs-per-event limit exceeded",{resource:"jobs_per_event",current:admitted.length,attempted:admitted.length+1,maximum:this.jobAdmissionLimits.jobsPerEventMax});
-        const currentBytes=admitted.reduce((sum,row)=>sum+(jobCreationObjectiveBytesFromWorkspace(JSON.parse(row.workspace_json))??Buffer.byteLength(row.objective,"utf8")),0);
+        const reserved=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()?this.workerMessages.reservedQueuedInstructionBytes(sourceEvent.event_id):0;
+        const currentBytes=reserved+admitted.reduce((sum,row)=>sum+(jobCreationObjectiveBytesFromWorkspace(JSON.parse(row.workspace_json))??Buffer.byteLength(row.objective,"utf8")),0);
         if(currentBytes+objectiveUtf8Bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Job group objective UTF-8 byte limit exceeded",{resource:"objective_utf8_bytes_per_event",current:currentBytes,attempted:currentBytes+objectiveUtf8Bytes,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
-        const effectiveBytes=admitted.reduce((sum,row)=>sum+Buffer.byteLength(row.objective,"utf8"),0);
+        const effectiveBytes=reserved+admitted.reduce((sum,row)=>sum+Buffer.byteLength(row.objective,"utf8"),0);
         if(effectiveBytes+objectiveUtf8Bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Effective job group objective limit exceeded",{resource:"objective_utf8_bytes_per_event",current:effectiveBytes,attempted:effectiveBytes+objectiveUtf8Bytes,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
         if(!group) this.db.prepare("INSERT INTO job_groups(source_event_id,sealed_at,notification_mode,attention_event_id,all_terminal_event_id,created_at,updated_at) VALUES(?,NULL,?,NULL,NULL,?,?)").run(sourceEvent.event_id,jobKey===legacyJobKey?"legacy":"grouped",at.toISOString(),at.toISOString());
       }
@@ -1715,6 +1776,7 @@ export class DispatcherDatabase {
   cancelLocalDashboardTask(authority:LocalDashboardAuthority,input:LocalDashboardCancel) {
     return this.localDashboard.cancel(authority,input);
   }
+  getLocalDashboardTypedQuestion(authority:LocalDashboardAuthority,taskId:string){return this.localDashboard.typedQuestion(authority,taskId);}
   enqueueLocalDashboardQuestionReply(authority:LocalDashboardAuthority,input:LocalDashboardQuestionReply) {
     return this.localDashboard.reply(authority,input);
   }
@@ -2469,8 +2531,24 @@ export class DispatcherDatabase {
     throw new Error("maintenance_fence_receipt_required");
   }
 
-  private lateResultFile(job: JobRow): {result:JobResultEnvelope;sha256:string} {
-    const fd=fs.openSync(job.result_path,fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);
+  jobResultReadPath(jobId:string):string {
+    const job=this.getJobRequired(jobId);
+    return this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()?this.workerMessages.resultPathForRead(jobId):job.result_path;
+  }
+
+  workerInstructionResultEvidence(jobId:string,messageId:string,identity:string):{message_id:string;result_sha256:string}|undefined {
+    const task=this.tasks.forAttempt(jobId),job=this.getJob(jobId);
+    if(!job||!task||task.current_attempt_id!==jobId||task.desired_state!=="running"||this.getJobLiveSessionIdentity(jobId)?.herdr_agent_session_id!==identity)return;
+    this.workerMessages.bindInstructionRuntime(jobId,messageId,identity);
+    try{
+      const file=this.lateResultFile(job,this.workerMessages.instructionResultPath(jobId,messageId));
+      if(!file.result.worker_instruction_message_ids?.includes(messageId)||Date.parse(file.result.completed_at)>Date.now())return;
+      return {message_id:messageId,result_sha256:file.sha256};
+    }catch{return;}
+  }
+
+  private lateResultFile(job: JobRow,resultPath=this.jobResultReadPath(job.job_id)): {result:JobResultEnvelope;sha256:string} {
+    const fd=fs.openSync(resultPath,fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);
     try {
       const stat=fs.fstatSync(fd);
       if(!stat.isFile()||stat.size>jobResultEnvelopeMaxBytes) throw new Error("late_result_file_invalid");
@@ -2513,7 +2591,7 @@ export class DispatcherDatabase {
 
   private operatorResultFile(job:JobRow):{kind:"valid"|"invalid"|"missing";sha256:string|null;result?:JobResultEnvelope} {
     let fd:number;
-    try {fd=fs.openSync(job.result_path,fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);}
+    try {fd=fs.openSync(this.jobResultReadPath(job.job_id),fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);}
     catch(error) {
       if((error as NodeJS.ErrnoException).code==="ENOENT") return {kind:"missing",sha256:null};
       throw new Error("operator_result_file_unreadable");
@@ -2600,7 +2678,7 @@ export class DispatcherDatabase {
       if(file.kind!==input.expectedResultClass||file.sha256!==input.expectedResultSha256)
         throw new Error("operator_result_drift");
       if(file.kind==="valid") {
-        this.saveJobResultInternal(job.job_id,file.result!,job.result_path,at,()=>{},true);
+        this.saveJobResultInternal(job.job_id,file.result!,this.jobResultReadPath(job.job_id),at,()=>{},true);
       } else {
         for(const id of new Set([job.completion_event_id,group.attention_event_id])) {
           if(!id) continue;
@@ -2705,7 +2783,7 @@ export class DispatcherDatabase {
       const file=this.lateResultFile(job);
       if(file.sha256!==expectedDigest) throw new Error("late_result_digest_drift");
       this.assertMaintenanceFenceReceipt();
-      this.saveJobResultInternal(jobId,file.result,job.result_path,at,()=>{},true);
+      this.saveJobResultInternal(jobId,file.result,this.jobResultReadPath(jobId),at,()=>{},true);
       if(this.lateResultFile(job).sha256!==expectedDigest) throw new Error("late_result_digest_drift");
       this.markTerminalWorkerStopProof(jobId);
       this.enqueueJobNotification(jobId,at);
@@ -3152,6 +3230,14 @@ export class DispatcherDatabase {
       this.assertJobCompletionBinding(job);
       if (result.job_id !== jobId) throw new Error("job_result_identity_mismatch");
       if (job.result_json === stableStringify(result) && job.status === result.status) return;
+      if(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()) {
+        if(this.workerMessages.hasUnansweredQuestion(jobId))throw Error("worker_message_question_pending");
+        if(this.workerMessages.hasPendingInstructions(jobId))throw Error("worker_instruction_delivery_pending");
+        const delivered=this.db.prepare(`SELECT m.message_id FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
+          WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.consumer='worker' AND d.state='delivered'`).all(jobId) as Array<{message_id:string}>;
+        const acknowledged=result.worker_instruction_message_ids??[];
+        if(!Array.isArray(acknowledged)||acknowledged.length!==delivered.length||new Set(acknowledged).size!==acknowledged.length||delivered.some(row=>!acknowledged.includes(row.message_id)))throw Error("worker_instruction_result_stale");
+      }
       const binding = readEventJobBinding(this.db,job.source_event_id);
       if (binding?.owner.kind === "schedule") {
         const serialized=stableStringify(result);
@@ -3164,7 +3250,7 @@ export class DispatcherDatabase {
       }
       const status: JobStatus = result.status === "completed" ? "completed" : "failed";
       const completedAt = new Date(result.completed_at);
-      if(binding?.owner.kind==="schedule"&&completedAt.getTime()>at.getTime()) throw new Error("completed_at_is_in_the_future");
+      if(completedAt.getTime()>at.getTime()) throw new Error("completed_at_is_in_the_future");
       const acceptedDeadline=job.prompt_accepted_at??job.dispatch_started_at;
       if(binding?.owner.kind==="schedule"&&acceptedDeadline&&at.getTime()>Date.parse(acceptedDeadline)+3_600_000)
         throw new Error("scheduled_work_result_deadline_exceeded");
@@ -3210,6 +3296,15 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
+  assertTaskSteerReservationBudget(jobId:string,objective:string):void {
+    const job=this.getJobRequired(jobId);
+    if(!["queued","retryable_failed"].includes(job.status)||!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get())return;
+    if([...objective].length+this.workerMessages.reservedQueuedInstructionCharacters(jobId)>jobObjectiveCharacterMax)throw Error("task_objective_limit");
+    const total=this.db.prepare(`SELECT COALESCE(t.objective,j.objective) AS objective FROM jobs j LEFT JOIN tasks t ON t.current_attempt_id=j.job_id WHERE j.source_event_id=? AND j.job_id!=?`).all(job.source_event_id,jobId) as Array<{objective:string}>;
+    const bytes=total.reduce((sum,row)=>sum+Buffer.byteLength(row.objective),0)+Buffer.byteLength(objective)+this.workerMessages.reservedQueuedInstructionBytes(job.source_event_id);
+    if(bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes)throw Error("task_objective_limit");
+  }
+
   appendQueuedJobInstruction(jobId: string, sourceEventId: string, instruction: string): { row: JobRow; duplicate: boolean } {
     return this.db.transaction(() => {
       const task=this.tasks.forAttempt(jobId);
@@ -3223,10 +3318,12 @@ export class DispatcherDatabase {
       if (!["queued", "retryable_failed"].includes(row.status)) throw new Error(`Job ${jobId} is not waiting to start`);
       const addition = `\n\n[DONA_FOLLOW_UP]\n${instruction}\n[/DONA_FOLLOW_UP]`;
       const objective = row.objective + addition;
-      if ([...objective].length > jobObjectiveCharacterMax) throw new Error("Effective job objective character limit exceeded");
+      const reserved=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()?this.workerMessages.reservedQueuedInstructionCharacters(jobId):0;
+      if ([...objective].length+reserved > jobObjectiveCharacterMax) throw new Error("Effective job objective character limit exceeded");
       const siblings = this.db.prepare("SELECT objective FROM jobs WHERE source_event_id=?").all(row.source_event_id) as Array<{objective:string}>;
       const current = siblings.reduce((sum,job)=>sum+Buffer.byteLength(job.objective,"utf8"),0);
-      const attempted = current + Buffer.byteLength(addition,"utf8");
+      const queuedBytes=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()?this.workerMessages.reservedQueuedInstructionBytes(row.source_event_id):0;
+      const attempted = current + queuedBytes + Buffer.byteLength(addition,"utf8");
       const maximum = this.jobAdmissionLimits.jobObjectiveTotalMaxBytes;
       if (attempted > maximum) throw new JobCreationError("job_group_limit_exceeded","Effective job group objective limit exceeded",{resource:"objective_utf8_bytes_per_event",current,attempted,maximum});
       this.db.prepare(`UPDATE jobs SET objective=?,steer_event_id=?,steer_state='accepted',updated_at=? WHERE job_id=?`)
@@ -3652,6 +3749,11 @@ export class DispatcherDatabase {
 
   nextAvailable(at = new Date()): EventRow | undefined {
     this.suppressUnauthorizedScheduledNotifications(at);
+    this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='worker_report_superseded',last_error_message=NULL
+      WHERE source='dona_message' AND event_type IN ('worker_message_report','worker_message_silence') AND status IN ('queued','retryable_failed') AND EXISTS(
+        SELECT 1 FROM jobs j JOIN tasks t ON t.task_id=(SELECT task_id FROM task_attempts WHERE attempt_id=j.job_id)
+        WHERE j.job_id=json_extract(events.payload_json,'$.job_id') AND
+          (j.status IN ('completed','failed','cancelled','cancelling') OR t.current_attempt_id<>j.job_id OR t.desired_state='cancelled'))`).run(at.toISOString(),at.toISOString());
     const head = this.db
       .prepare(`
         SELECT * FROM events
@@ -3857,6 +3959,7 @@ export class DispatcherDatabase {
         `)
         .run(status, attemptCount, availableAt, code, message, at.toISOString(), eventId);
       if(status==="dead_letter") {
+        if(row.source==="dona_message"&&row.event_type==="worker_message_report")this.workerMessages.rearmUndispatchedReport(eventId,retryAt(Math.max(1,row.attempt_count),at),at);
         this.sealJobGroupIfPresent(eventId, at.toISOString());
         this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
         this.setNotificationState(eventId,"failed",at);
@@ -3878,6 +3981,7 @@ export class DispatcherDatabase {
         `)
         .run(status, availableAt, code, message, at.toISOString(), eventId);
       if(status==="dead_letter") {
+        if(row.source==="dona_message"&&row.event_type==="worker_message_report")this.workerMessages.rearmUndispatchedReport(eventId,retryAt(Math.max(1,row.attempt_count),at),at);
         this.sealJobGroupIfPresent(eventId, at.toISOString());
         this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
         this.setNotificationState(eventId,"failed",at);

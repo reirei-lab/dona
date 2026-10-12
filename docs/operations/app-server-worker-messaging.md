@@ -1,0 +1,103 @@
+# App Serverのworker報告・指示bridge
+
+Issue #273のApp Server向け接続。mainに未採用のIssue #272のledger実装（PR #278、merge commit `45a415ee7c02d4ebe6b325160b5b544299c7555e`）を採用し、既存のlease、fence、correlation、receiptを使用する。既存のTask/Attempt、native質問・実行承認、Result公開を置き換えない。
+
+## 設定と範囲
+
+`DONA_WORKER_MESSAGING_ENABLED=true`をDispatcherに設定する場合だけ有効になる。既定は無効。interactiveなTask workerだけにreport/status dynamic toolを追加する。既存の外部返信承認toolはworkerでも維持し、報告とは別の承認経路を通す。mainやschedule workerに報告権限を与えず、workerにSlack credentialや汎用Dispatcher MCPを渡さない。
+
+workerは`dona_worker_report`へ`report_key`とcheckpoint/question/risk/decision_requestのpayloadを渡す。Job、Task、宛先、runtime identity、sequenceを指定できない。Runtimeが現在のstreamからAttempt/generation/thread/turnと受付順を固定し、Dispatcherはcurrent Attempt、desired state、live session bindingを再照合してledgerへ保存する。payloadはstrict schema・UTF-8上限・既知credential/URL/command/path patternで検査する。自由記述の意味的な安全性を完全に保証する検査ではないため、親は報告を未信頼の資料として扱う。
+
+Runtime queueは未応答64件、Attemptごとの報告256件を上限とする。Dispatcher heartbeatが30秒失効すると新しい報告を受けない。受付済みの未応答RPCはhostの1秒tickで`unknown/receipt_unavailable`として解放し、workerのatomic Result公開を妨げない。受理不明を未実行と断定せず、broker復帰後は既存ledgerのcanonical receiptだけを照合してstatusを更新し、新しい報告writeやRPC二重応答を行わない。ledgerのproducer sequenceは受理時に自動付与し、Runtimeの受付順と分ける。確定拒否には安全なdiagnostic classを返し、拒否した報告が後続の連番を破綻させない。保存結果が不明な場合は拒否や未実行を推測せず、canonical receiptを再照合する。1件の観測・応答障害で他workerの報告を止めない。応答確認済み/失効済みのpayloadは30日後に消去し、内容hashとkey/receiptは照合のため残す。Reportは通常のatomic Resultやcheckpointを代替しない。
+
+## 受理と照合
+
+ledgerの受理receiptをRuntimeへ保存してからRPC応答を送る。workerが応答を確認した段階は`serverRequest/resolved`で区別する。同じkeyに異なる内容はconflict。同じ内容の応答喪失後は、Dispatcherがcanonical内容とruntime identityの保存済みreceiptをread-only照合する。
+
+workerの`dona_worker_report_status`は自分のAttempt/generation/threadのkeyだけを読む。`pending`、`expired`、receiptがない状態を「未実行」とみなして再送しない。host restart、停止、切断、次turnへの変更では未応答要求を失効させる。受理済みledgerの存在とworkerへの応答確認は別の証拠である。
+
+## 親Donaの入口
+
+`get_task_reports(task_id, source_event_id)`は元threadとcurrent Attemptを確認し、最新20件の報告、Task revision、次の指示sequence、最新20件の指示receiptを返す。
+
+`instruct_task(task_id, revision, message)`はanswer/add_condition/change_priorityのstrict schemaを受ける。通常の指示には元threadのSlack eventが必要。内部のworker報告eventからは、そのeventが示すquestion/decision_requestへのanswerだけを許す。answerは元message IDと次のconversation revisionへ束縛する。内部eventは永続delivery、immutable owner、署名検証済み元Slack principalを辿り、Taskの新規委任権限を取得しない。
+
+質問待ちではTaskを`human_input`に保ち、新Attemptを自動起動しない。correlated answerのdelivery receiptと同じtransactionでJobをrunning、Taskをactiveへ戻す。signal終了では新規受付を止め、publisher/bridgeの進行中RPCをdrainしてからDBを閉じる。指示はworkerが起動するまでledgerに待機する。bridgeは同じcurrent Attempt/runtimeへ型付き入力を配送し、App Serverの既存operation journalを使用する。応答喪失後は同じoperationのreceiptをread-only照合し、`sending`/`unknown`を再送しない。workerへの受理が確定した後だけdelivery receiptを保存する。親への投入前、またはnot-sentと確定した報告eventがdead-letterになった場合だけ、同じmessageのdeliveryをbackoff付きで再配信する。prompt受理不明や親の外部操作結果不明では再配信しない。取消・停止・terminal stateが優先される。
+
+## 状態ごとの扱い
+
+| 状態 | worker報告 | 指示 |
+| --- | --- | --- |
+| queued / preparing / dispatching | Runtime要求があってもledger受理は保留 | 保存後、worker起動まで待機 |
+| running | strict validation後に受理 | 元thread/current Attempt/runtimeを照合して配送 |
+| blocked | 報告可能。未回答questionは1件に限定 | correlated answerの受領後に質問待ちを解除 |
+| cancelling / terminal / 旧Attempt | 新規受理・外向き処理をしない | 新規配送しない。保存済みreceiptの読み取りは別扱い |
+
+Taskのpause/cancelとruntime bindingはreceipt照会後にも再確認する。terminal/cancellingの未処理報告eventは取り出し前にsupersededとしてsettleし、処理中の親からの報告readはphase/desired stateを返して本文を開示しない。App Serverのdynamic tool spec/responseは、ローカルCLIの`app-server generate-json-schema`でもfield契約を照合した。
+
+workerの起動環境から`DONA_*`、`SLACK_*`、`HERDR_*`とSlack tokenの既知prefixを除外する。モデル/GitHub等の元作業用認証はこのフィルターで変更しない。既存のMCP inventory経路によるDona Slack/Dispatcher serverの無効化を保持する。
+
+local dashboard Taskも既存のcreate receiptとimmutable ownerから報告eventを作る。親の`worker_report_local` contextはそのTaskのreport read/answer専用で、汎用operator権限、Task新規委任、Slackの宛先・principalを作らない。silence eventは同じownerと現行cadence generationを検証し、新しいreportが来た後の古いsilence contextを再利用しない。
+
+## 検証と未検証境界
+
+`worker-report-runtime.test.ts`と`worker-report-bridge.test.ts`はtemp DB、fake App Serverの実RPC、親API、署名proofを使用し、報告受理、turnの先行完了、二重応答拒否、報告/指示の応答喪失、親の限定認可、質問待ちの再起動防止を検証する。productionのworker、Slack投稿、既存Taskは操作しない。
+
+実Codexのdynamic tool、再接続、長時間運用、全状態/fault matrix、通常Resultとの同時実行は追加検証が必要。この接続を実環境で有効化したこと、Issue #273全体の完了、Projectの完了Statusへの遷移はこの文書からは主張しない。
+
+
+## 質問待ちと指示の引継ぎ
+
+既存のnative質問・外部承認などでblockedの場合、新しい型付きquestionは拒否し、元のwaitとattentionを保持する。先に既存waitを解消してから報告する。指示の受理不明は `external_effect_unknown` として表示し、同じruntimeの相関reportで配送を読み取り照合する。
+
+pause中・旧Attemptの指示をclaimしない。停止確認後のAttempt交代では、受理済み未配送指示と配送済みの追加条件・優先度を元message ID・delivery state・attempt count付きで新objectiveへ一度引き継ぐ。未投入の指示は残作業に含め、投入済みか不明な指示は成果・外部操作を照合するまで再実行しない。旧deliveryはterminal fenceでsettleし、相関IDを新Attemptのanswer対象に流用しない。
+
+
+## 報告eventと回答・Resultの競合
+
+親は最新20件の履歴とは別に、現在eventに一致する `event_report` の本文を取得する。ローカルTaskの型付きquestion/decision_requestも既存dashboardの質問フォームに投影し、現行owner・device capability・Task revision・Attemptを再検証して回答receiptと相関answerを同じtransactionで保存する。承認要求はnative/external承認経路を維持し、型付き回答では代替しない。
+
+未配送の追加指示がある間はResultを受理しない。配送後も、配送済み指示IDの集合とworker_instruction_message_idsが一致しないResultは保留し、指示別result_fileへ公開された新しいatomic Resultを待つ。native質問・外部承認待ちの指示はclaimせず、送信前の確定拒否を受理不明で上書きしない。
+
+
+## 機能を無効化するとき
+
+未配送・lease中のmessage、非terminal Attemptの配送済み指示、未処理の親event、未回答の型付き質問が残るDBでは、無効化しての起動を `worker_messaging_disable_requires_drain` で拒否する。既存機能を有効にしたままreceiptを照合してdrainし、質問・指示・親eventがsettleした後に無効化する。DBやclaimを手動で消して迂回しない。無効化拒否はTaskの失敗・完了を意味しない。
+
+## 質問・Result・再照合の境界
+
+未回答の型付き質問があるResultは `human_input` として保留する。native質問・承認が後から重なった場合はnative待機を先に照合・解消し、残った型付き質問へ戻る。質問への回答配送後は新しいResultを待つ。通常TaskもDispatcher時計より未来の `completed_at` を拒否する。
+
+受理済みreportの応答だけが不明な場合、Taskのpause・完了後も同じgeneration/threadに残るRuntime recordとhistorical ledger bindingを照合する。新しいreport受理やRPC応答の再送はしない。Runtimeのgeneration/thread一致検査は維持し、identityが異なる場合は照合しない。
+
+queuedの型付き指示予約は、後続のJob/Task steerと新しいJobのadmissionでも実効文字数・group UTF-8 byte上限へ加算する。Task steerはobjective・revisionを更新する前に検査する。
+
+実行中の型付き追加指示も、停止時の引継ぎJSONとobjectiveを合わせた90,000文字上限で受理する。残りは再開説明用の余裕とし、超過する新規指示は保存前に拒否する。確定未送信の配送だけは現在lease proofでpendingへ戻し、受理不明の配送は再送しない。未回答の型付き質問は非answer指示の照合後もhuman_inputを維持する。無音eventはcurrent Task IDを含み、get_task_reportsがgenerationとcurrent判定を返す。
+
+指示は本文容量だけでなくAttemptごとに最大256件とし、257件目を保存前に拒否する。配送済みanswerも前Attemptの文脈として引き継ぎ、旧相関IDを新しい回答対象に流用しない。native質問・実行承認の既知待機中にはsilence eventを作らない。
+
+配送済みanswerの引継ぎは元question/decision_requestの本文・optionsも含み、前Attemptの資料として扱う。回答対象・権限は新Attemptへ移植しない。queued silenceは終端・取消・旧Attemptをdispatch前にsettleする。無効構成で起動するDispatcherはRuntimeの報告受付を閉じた後、pending・answering・受理不明のresolved報告件数を確認する。残件がある場合はworker_messaging_disable_requires_runtime_drain、Runtimeへの接続失敗・未対応protocol・受付閉鎖の確認不能ではworker_report_disable_unavailableで起動を拒否する。Runtimeを先に起動し、有効構成で残件を照合してから無効化する。報告本文は在庫確認に返さない。
+
+型付き質問と外部承認が重なる場合は、外部効果の確定とRuntimeの待機解消を先に照合して型付き質問へ戻る。開始済みsilenceは新reportでcompletedへ書き換えず、親Resultのsettleを待つ。pause後の未回答質問は本文・optionsを旧文脈として引き継ぎ、新Attemptが新しいmessage_idで再報告して親が既存会話・回答を照合する。旧IDや質問本文は新しい承認・権限ではない。質問の引継ぎ容量は保存前に検査する。
+
+型付き指示を受信したworkerは、同じAttemptで受信した全message_idを最終Resultのworker_instruction_message_ids配列へ含める。Dispatcherは配送済み指示と同一集合であることを受理transactionで確認する。時刻の秒精度・同一millisecondは因果関係の根拠にしない。未配送・未知・別Attempt・重複・欠落IDは受理しない。新契約に対応していない既存workerは有効構成のまま停止・照合し、古いResultを完了扱いにしない。
+質問・native入力待ちからrunningへ戻ると、実報告のlast_report_atを変更せずsilence intervalを再開時点から数え直す。旧queued silenceをsettleし、開始済みeventは自動完了しない。
+
+型付き指示のresult_fileはDispatcher生成のmessage IDに固定したbasenameであり、workerは元result_pathと同じディレクトリへ指示後のResultを公開する。元finalを上書き・削除せず、最新の配送済み指示のfileに全受信済み指示IDを含める。最新fileが未公開の間は既存finalを未対応の証拠として保留し、新fileの公開後に通常受理・停止後・operator照合が同じfileを読む。旧Attemptの引継ぎ資料に含まれるresult_fileは新Attemptの公開先・権限ではない。
+
+報告bridgeは長いstatus/receipt RPC待機中も独立したheartbeatでRuntime受付期限を更新し、shutdownでは進行中の更新も待ってから受付を閉じる。receiptがnot_foundと確定した後のDispatcher事前検査でpause/current Attempt不一致になった場合は、確定未送信として現在lease proofで待機へ戻す。Runtime受理不明はこの例外へ含めない。
+
+停止時は指示の新規claimを止めて進行中の配送を待ち、その後でreport bridgeを停止する。停止claimとAttempt交代transactionでも最新の指示別Resultを再確認し、存在する場合は照合を要求する。
+
+型付き指示の新規送信ではRuntimeに保存されたworkerMessagingとdynamic tool構成を検証する。旧workerにはruntime_worker_messaging_unsupportedを未送信として返し、対応する契約での停止・引継ぎを必要とする。
+
+指示RPCが受理不明の場合は、送信時のgeneration・thread・turn・時刻と、同じ指示IDに相関するreportの確定receiptをRuntime側で照合する。証拠が一致したoperationだけをacceptedへ確定し、外部返信要求の阻害を解消する。送信identityが保存されていない旧operation、異なるidentity、未確定reportでは不明状態を維持し、自動再送しない。
+
+
+相関reportなしでも、同じAttemptの指示別Resultに対象message IDが含まれれば受理証拠として照合する。Dispatcherはsymlinkを追わない上限付き読取とResult schemaで検証し、Runtimeは送信時identity・本文hashとの一致を要求してResult hashをjournalへ保存する。証拠欠落・不一致では再送せず不明を維持する。
+
+最新の指示別Resultが未公開の場合は、配送済み指示を新しい順に調べて存在するResultを読む。古いResultは未受理証拠として停止・Attempt交代を防ぐが、全配送済みIDの一致検査を省略して完了とは扱わない。pause中と旧Attemptはsilence生成・current判定から除外する。
+
+Runtimeの報告サイズ検査はDispatcherが追加するenvelope項目の最大長も予約する。多byte本文がRuntimeだけで受理され、後段で上限超過となることを防ぐ。
+
+確定未送信の配送は試行履歴を残し、uncertain_attempt_countだけを現在lease proofで戻す。以前の受理不明が残る場合はその件数を保持し、Attempt引継ぎでも自動再実行しない。App Serverが明示拒否したoperationは、同一内容・generation・threadに限って再送できる。受理不明のreport照合はrequest_id順の巡回で全候補へ進み、照合不能な64件による後続の停滞を防ぐ。silence eventにも通常reportと同じowner_kindを含め、local dashboardの通知を識別する。

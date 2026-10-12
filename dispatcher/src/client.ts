@@ -22,6 +22,8 @@ export class DispatcherApiClient {
 
   createTask(input:unknown):Promise<Record<string,unknown>> {return this.request("POST","/v1/tasks",input);}
   inspectTaskRecovery(id:string,eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/${encodeURIComponent(id)}/recovery?${new URLSearchParams({source_event_id:eventId})}`);}
+  getTaskReports(id:string,eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/${encodeURIComponent(id)}/reports?${new URLSearchParams({source_event_id:eventId})}`);}
+  instructTask(id:string,revision:number,message:unknown):Promise<Record<string,unknown>> {return this.request("POST",`/v1/tasks/${encodeURIComponent(id)}/instruction`,{source_event_id:(message as Record<string,unknown>).source_event_id,revision,message});}
   getTaskQuestions(id:string,eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/${encodeURIComponent(id)}/questions?${new URLSearchParams({source_event_id:eventId})}`);}
   getTask(id:string,eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/${encodeURIComponent(id)}?${new URLSearchParams({source_event_id:eventId})}`);}
   findIssueTask(eventId:string,repository:string,issueNumber:number):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/issue?${new URLSearchParams({source_event_id:eventId,repository,issue_number:String(issueNumber)})}`);}

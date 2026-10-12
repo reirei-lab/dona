@@ -1,6 +1,8 @@
+import {AppServerWorkerReportBridge,AppServerWorkerInstructionController} from "./app-server/worker-report-bridge.js";
+import {WorkerMessagePublisher,WorkerInstructionBridge} from "./worker-messaging.js";
 import path from "node:path";
 import { AgentContextManager } from "./agent-context.js";
-import {RuntimeClient} from "./app-server/client.js";
+import {RuntimeClient,disableWorkerReportsAfterDrain} from "./app-server/client.js";
 import {openLocalApprovalService} from "./approval/local-service.js";
 import { assertTaskGenerationFile } from "./task-execution.js";
 import type { DispatcherConfig } from "./config.js";
@@ -32,7 +34,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     jobsPerEventMax: config.jobsPerEventMax,
     jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,
   });
-  database.tasks.assertFreshExecutionModel();
+  try{database.tasks.assertFreshExecutionModel();database.assertWorkerMessagingMode(config.workerMessagingEnabled===true);}
+  catch(error){database.close();throw error;}
   const updateNotificationDatabase = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
   let jobProgressStore: JobProgressStore | undefined;
   try {
@@ -68,6 +71,9 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     jobProgress,
   );
   if (!jobProgressStore) await jobSupervisor.disableProgress();
+  const messages=config.workerMessagingEnabled?new WorkerMessagePublisher(database.workerMessages,()=>worker.wake()):undefined;
+  const reportBridge=config.workerMessagingEnabled?new AppServerWorkerReportBridge(database,new RuntimeClient(runtimeSocket(config),5000),()=>apiLogger.warn("Worker report bridge failed",{error_code:"worker_report_bridge_failed"})):undefined;
+  const instructions=config.workerMessagingEnabled?new WorkerInstructionBridge(database.workerMessages,new AppServerWorkerInstructionController(database,new RuntimeClient(runtimeSocket(config),5000)),1000,()=>apiLogger.warn("Worker instruction bridge failed",{error_code:"worker_instruction_bridge_failed"}),()=>jobSupervisor.wake()):undefined;
   const updateNotificationWorker = new UpdateNotificationWorker(
     database,
     updateNotificationDatabase,
@@ -84,6 +90,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     new UpdaterClient(config.updaterSocketPath, config.jobCommandTimeoutMs),
     {
       async quiesce() {
+        await instructions?.stop();await reportBridge?.stop();messages?.stop();
         await external?.stop();
         await scheduler.stop();
         await reminderPublisher.stop();
@@ -134,8 +141,11 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       api.disableJobProgress();
       }
     }
+    if(!reportBridge)await disableWorkerReportsAfterDrain(new RuntimeClient(runtimeSocket(config),5000));
     if(external)await external.start();
     else await new RuntimeClient(runtimeSocket(config),5000).externalAvailability(false).catch(()=>{});
+
+    messages?.start();reportBridge?.start();instructions?.start();
     worker.start();
     scheduler.start();
     reminderPublisher.start();
@@ -146,6 +156,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     }));
   } catch (error) {
     stopWebJobProjectionMaintenance?.();
+    await instructions?.stop();await reportBridge?.stop();messages?.stop();
     if (updateNotificationWorker.isRunning()) await updateNotificationWorker.stop();
     if (jobSupervisor.isRunning()) await jobSupervisor.stop();
     if (scheduler.isRunning()) await scheduler.stop();
@@ -167,8 +178,10 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       apiLogger.info("Graceful shutdown started", { signal });
       try {
         stopWebJobProjectionMaintenance?.();
-        await external?.stop();
         api.beginShutdown();
+        messages?.stop();instructions?.beginShutdown();
+        await instructions?.stop();await reportBridge?.stop();
+        await external?.stop();
         await api.stop();
         await scheduler.stop();
         await reminderPublisher.stop();
