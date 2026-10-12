@@ -225,6 +225,8 @@ for(const local of [false,true])test(`report/silenceの親contextをownerと現�
   assert.equal(db.workerMessages.publishDueSilenceEvents(100,new Date(Date.now()+1000000)),1);
   const silence=(sql.prepare("SELECT event_id FROM events WHERE source='dona_message' AND event_type='worker_message_silence' AND json_extract(payload_json,'$.job_id')=?").get(job) as {event_id:string}).event_id;
   assert.equal(envelopeFromRow(db.get(silence)!).type,"worker_message_silence");
+  assert.equal(envelopeFromRow(db.get(silence)!).payload.owner_kind,local?"local_dashboard":"slack_thread");
+  if(local)assert.equal(db.get(silence)?.reply_target_json,null);
   const issued=await contexts.issue(db.beginDispatch(silence,path.join(root,"silence-result.json")));assert.equal(issued.purpose,local?"worker_report_local":"worker_report");
   assert.equal((envelopeFromRow(db.get(silence)!).payload as {task_id:string}).task_id,task.task_id);
   db.markWaiting(silence);
@@ -637,5 +639,23 @@ for(const pausedBeforePublish of [false,true])test(`pause中のTaskをsilence対
     assert.equal(db.workerMessages.silenceEventState(t.current_attempt_id,event.event_id)?.worker_message_silence.current,false);
    }finally{sql.close();}
   }
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+
+for(const priorUnknown of [false,true])test(`確定未送信を引継ぎで区別し以前の受理不明を保つ（priorUnknown=${priorUnknown}）`,async()=>{
+ const {root,config}=await tempConfig();let db=new DispatcherDatabase(config.databasePath);try{
+  const source=db.enqueue(eventEnvelope("unsent-handoff")).row,t=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"unsent",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,j=db.getJob(t.current_attempt_id)!;
+  db.beginJobPreparation(j.job_id);db.setJobRuntime(j.job_id,"w","p","identity");db.beginJobDispatch(j.job_id);db.markJobRunning(j.job_id);
+  db.workerMessages.appendInstruction(j.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"condition",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"根拠を確認してください"}});
+  if(priorUnknown){
+   await assert.rejects(new WorkerInstructionBridge(db.workerMessages,{async steer(){throw Object.assign(Error("unknown"),{acceptance:"unknown"});}}).runOnce());
+   const Sqlite=(await import("better-sqlite3")).default,sql=new Sqlite(config.databasePath);sql.prepare("UPDATE worker_message_deliveries SET lease_expires_at='2000-01-01T00:00:00.000Z' WHERE consumer='worker'").run();sql.close();
+  }
+  await assert.rejects(new WorkerInstructionBridge(db.workerMessages,{async steer(){throw Object.assign(Error("unsupported"),{acceptance:"not_sent"});}}).runOnce());
+  db.close();db=new DispatcherDatabase(config.databasePath);
+  const context=db.workerMessages.stoppedInstructionContext(j.job_id);
+  assert.ok(context.includes(`"uncertain_attempt_count":${priorUnknown?1:0}`));
+  assert.ok(context.includes(`"attempt_count":${priorUnknown?2:1}`));assert.ok(context.includes("根拠を確認してください"));
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });

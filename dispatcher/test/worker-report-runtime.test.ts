@@ -161,3 +161,38 @@ test("Runtime受付でDispatcher envelope分を予約し、多byte報告を後�
  const value=JSON.parse(accepted.payload_json);
  assert.doesNotThrow(()=>parseWorkerReport({schema_version:1,source_event_id:"evt_01h00000000000000000000000",producer_sequence:accepted.request_sequence,idempotency_key:accepted.report_key,occurred_at:accepted.created_at,payload:value.payload}));
 });
+
+
+test("照合不能な64件が残っても全reportのreceipt照合を巡回する",async t=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-report-fairness-")),store=new RuntimeStore(path.join(root,"runtime.db"));
+ t.after(async()=>{store.close();await fs.rm(root,{recursive:true,force:true});});
+ const queue=new WorkerReportQueue(store),agent={name:"worker-name",generation:"generation-secret",thread_id:"thread-id",turn_id:"turn-id",role:"worker",cwd:root,release:root,config_json:JSON.stringify({attemptId:attempt,workerMessaging:true,threadConfig:{}})} as AgentRecord;
+ queue.availability(true);const ids=new Set<string>();
+ for(let i=0;i<130;i++){
+  const id=`call-${i}`,row=queue.accept(agent,{id,method:"item/tool/call",params:{tool:workerReportTool.name,threadId:agent.thread_id,turnId:agent.turn_id,callId:id,arguments:{report_key:`report-${i}`,payload:{kind:"checkpoint",summary:"確認しました"}}}});
+  queue.resolve(row.request_id,{state:"unknown",diagnostic:"receipt_unavailable"});queue.resolved(agent.name,agent.generation,id);ids.add(row.request_id);
+ }
+ const seen=new Set<string>();
+ for(let i=0;i<3;i++){const batch=queue.recoverable();assert.equal(batch.length,64);for(const row of batch)seen.add(row.request_id);}
+ assert.deepEqual(seen,ids);
+ const recovered=queue.recoverable()[0]!;
+ queue.reconcileReceipt(recovered.request_id,{message_id:"msg_01h00000000000000000000000",receipt_id:"rcpt_01h00000000000000000000000",outcome:"created"});
+ for(let i=0;i<3;i++)assert.ok(queue.recoverable().every(row=>row.request_id!==recovered.request_id));
+ assert.equal(queue.drainState().recoverable_count,129);
+});
+
+
+for(const steer of [false,true])test(`明示拒否した指示を同一operationで再送する（steer=${steer}）`,async t=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-instruction-rejected-")),script=path.join(root,"fake.mjs");
+ await fs.writeFile(script,`import readline from 'node:readline';let rejected=false;const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);if(r.method==='initialize')send({id:r.id,result:{}});if(r.method==='thread/start')send({id:r.id,result:{thread:{id:'thread-retry'}}});if(r.method==='turn/start'||r.method==='turn/steer'){if(r.params.input[0].text==='追加条件'&&!rejected){rejected=true;send({id:r.id,error:{code:-32602,message:'rejected'}});}else send({id:r.id,result:r.method==='turn/steer'?{turnId:'turn-retry'}:{turn:{id:'turn-retry'}}});}});`);
+ const store=new RuntimeStore(path.join(root,"runtime.db")),manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));
+ const agent=await manager.start({name:"retry-worker",attemptId:attempt,role:"worker",cwd:root,release:root,args:[],workerMessaging:true,threadConfig:{}});
+ t.after(async()=>{await manager.stop(agent.name,agent.generation);store.close();await fs.rm(root,{recursive:true,force:true});});
+ if(steer)await manager.prompt(agent.name,"initial","開始");
+ const scope={attempt_id:attempt,generation:agent.generation,thread_id:agent.thread_id!},key="worker-message:retry";
+ await assert.rejects(manager.prompt(agent.name,key,"追加条件",scope),{acceptance:"rejected"});
+ assert.deepEqual(manager.workerInstructionReceipt(agent.name,key,"追加条件",scope),{state:"not_found"});
+ assert.throws(()=>manager.workerInstructionReceipt(agent.name,key,"別条件",scope),/conflict/);
+ assert.deepEqual(await manager.prompt(agent.name,key,"追加条件",scope),{turnId:"turn-retry"});
+ assert.deepEqual(manager.workerInstructionReceipt(agent.name,key,"追加条件",scope),{state:"accepted",turnId:"turn-retry"});
+});
