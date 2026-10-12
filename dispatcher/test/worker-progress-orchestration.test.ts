@@ -286,6 +286,11 @@ for(const kind of ['question','decision_request','risk'] as const)test(`steer終
   assert.equal(f.db.workerMessages.publishDueProgressDecisions(32,new Date(now.getTime()+62000)),1);
   const follow=(sql.prepare('SELECT followup_event_id FROM worker_progress_applications WHERE decision_key=?').get(c.decision_id) as {followup_event_id:string}).followup_event_id;
   const fresh=f.db.prepareTaskProgressDecision(t.task_id,follow)!;assert.equal(fresh.decision.target?.message_id,m.message.message_id);assert.equal(fresh.decision.action,kind==='risk'?'report_to_user':'ask_user');
+  if(kind!=='risk'){
+   const answer={schema_version:1,source_event_id:follow,producer_sequence:1,idempotency_key:'aggregate-answer',occurred_at:new Date().toISOString(),correlation_message_id:m.message.message_id,conversation_revision:1,payload:{operation:'answer',text:'既存の範囲で続行してください'}};
+   assert.throws(()=>f.db.workerMessages.appendInstruction(f.tasks[1]!.current_attempt_id,answer),{code:"worker_message_instruction_source_invalid"});
+   assert.equal(f.db.workerMessages.appendInstruction(t.current_attempt_id,answer).outcome,'created');
+  }
  }finally{sql.close();await f.dispose();}
 });
 
@@ -332,6 +337,9 @@ for(const stage of ["preflight","prompt"] as const)test(`集約eventの${stage}�
   f.reopen();assert.equal(f.db.workerMessages.publishDueProgressDecisions(32,new Date(now.getTime()+120000)),1);
   const next=read().followup_event_id!;assert.notEqual(next,first);assert.equal(f.db.get(first)?.status,"dead_letter");
   assert.equal(JSON.parse(f.db.get(next)!.payload_json).message_id,m.message.message_id);
+  assert.equal(f.db.workerMessages.ownsProgressAggregateEvent(t.current_attempt_id,next),true);
+  assert.ok(f.db.workerMessages.progressDecisionCandidate(t.current_attempt_id,next,new Date(now.getTime()+120000)));
+  assert.equal(f.db.workerMessages.ownsProgressAggregateEvent(t.current_attempt_id,first),false);
   assert.equal(f.db.workerMessages.publishDueProgressDecisions(32,new Date(now.getTime()+121000)),0);
  }finally{await f.dispose();}
 });
@@ -361,4 +369,19 @@ for(const outcome of ["suspended","unchanged","failure"] as const)test(`質問�
   worker.start();await waitFor(()=>f.db.get(event)?.status===(outcome==="suspended"?"completed":"needs_review"));await worker.stop();assert.equal(calls,1);
   assert.equal(f.db.taskReports(t.task_id,event).progress_decision_candidate!.application_receipt.state,outcome==="suspended"?"presentation_delivered":"presentation_ready");
  }finally{await worker?.stop();await f.dispose();}
+});
+
+
+test("ETAなしのcheckpointを挟んでも同じAttemptの最後のETAを比較する",async()=>{
+ const f=await fixture();try{
+  const t=f.tasks[0]!,now=new Date();
+  for(const [index,summary] of ["見込み 30 分","検証を継続しています","見込み 60 分"].entries()){
+   const at=new Date(now.getTime()+index*61000);
+   const m=f.db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:f.source.event_id,producer_sequence:index+1,idempotency_key:`eta-${index}`,occurred_at:at.toISOString(),payload:{kind:"checkpoint",summary}},at);
+   f.db.workerMessages.publishPendingReports(100,at);const event=f.eventFor(m.message.message_id);
+   const candidate=f.db.workerMessages.progressDecisionCandidate(t.current_attempt_id,event,at)!;
+   if(index===2){assert.equal(candidate.decision.signals.eta_changed,true);assert.equal(candidate.decision.action,"report_to_user");}
+   else f.db.workerMessages.applyProgressDecision(t.current_attempt_id,event,candidate.decision_id,at);
+  }
+ }finally{await f.dispose();}
 });

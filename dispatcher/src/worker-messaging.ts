@@ -451,6 +451,10 @@ export class WorkerMessageRepository {
       const key=sha256(stableStringify({root,snapshot}));
       const prior=this.db.prepare("SELECT p.decision_json,p.decided_at FROM worker_progress_decisions p JOIN worker_progress_applications a USING(decision_key) WHERE p.job_id=? ORDER BY p.decided_at DESC,p.decision_key DESC LIMIT 1").get(jobId) as {decision_json:string;decided_at:string}|undefined;
       const previous=prior?JSON.parse(prior.decision_json) as ProgressDecision:undefined;
+      const lastEta=this.db.prepare(`SELECT json_extract(p.decision_json,'$.observed.eta_minutes') eta_minutes
+        FROM worker_progress_decisions p JOIN worker_progress_applications a USING(decision_key)
+        WHERE p.job_id=? AND json_type(p.decision_json,'$.observed.eta_minutes')='integer'
+        ORDER BY p.decided_at DESC,p.decision_key DESC LIMIT 1`).get(jobId) as {eta_minutes:number}|undefined;
       const presentation=this.db.prepare(`SELECT a.applied_at,p.decision_json FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key) JOIN jobs j ON j.job_id=p.job_id
         WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready' ORDER BY a.applied_at DESC,a.decision_key DESC LIMIT 1`).get(job.source_event_id) as {applied_at:string;decision_json:string}|undefined;
       const reserved=presentation?JSON.parse(presentation.decision_json) as ProgressDecision:undefined;
@@ -462,7 +466,7 @@ export class WorkerMessageRepository {
         .all(job.source_event_id,...currentHighIds) as Array<{message_id:string}>).map(r=>r.message_id):[];
       const delivered=this.db.prepare(`SELECT MAX(json_extract(a.result_json,'$.provider_receipt.posted_at')) posted_at FROM worker_progress_applications a
         JOIN worker_progress_decisions p USING(decision_key) JOIN jobs j ON j.job_id=p.job_id WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_delivered'`).get(job.source_event_id) as {posted_at:string|null};
-      const decision=evaluateProgress({event_id:eventId,...identity,context_complete:rows.length<=32,now:at.toISOString(),members,reserved_high_risk_ids:reservedHighIds,presentation_pending:!!presentation,...(delivered.posted_at?{last_user_report_at:delivered.posted_at}:{}),...(presentation?{last_presentation_fingerprint:reserved?.observed?.group_fingerprint}:{}),...(report?{report:project(report)}:{}),
+      const decision=evaluateProgress({event_id:eventId,...identity,context_complete:rows.length<=32,...(lastEta?{last_eta_minutes:lastEta.eta_minutes}:{}),now:at.toISOString(),members,reserved_high_risk_ids:reservedHighIds,presentation_pending:!!presentation,...(delivered.posted_at?{last_user_report_at:delivered.posted_at}:{}),...(presentation?{last_presentation_fingerprint:reserved?.observed?.group_fingerprint}:{}),...(report?{report:project(report)}:{}),
         ...(!report&&cadence?.last_report_at?{silence_since:cadence.last_report_at}:{}),
         ...(pending?{pending_instruction:{message_id:pending.message_id,state:pending.attempt_count>0?"unknown":"pending"}}:{}),
         ...(previous&&prior?{previous:{fingerprint:previous.fingerprint??"",action:previous.action,decided_at:prior.decided_at,...previous.observed,...(previous.target?.message_id?{message_id:previous.target.message_id}:{})}}:{})});
@@ -648,7 +652,7 @@ export class WorkerMessageRepository {
     return !!this.db.prepare(`SELECT 1 FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key)
       JOIN events e ON e.event_id=a.followup_event_id JOIN jobs j ON j.job_id=p.job_id JOIN worker_messages m ON m.message_id=json_extract(e.payload_json,'$.message_id')
       WHERE p.job_id=? AND e.event_id=? AND e.source='dona_message' AND e.event_type='worker_message_aggregate'
-        AND e.external_event_id='progress-aggregate:'||a.decision_key AND m.job_id=p.job_id AND m.direction='worker_to_dona'
+        AND e.external_event_id='progress-aggregate:'||a.decision_key||CASE WHEN a.followup_generation>0 THEN ':'||a.followup_generation ELSE '' END AND m.job_id=p.job_id AND m.direction='worker_to_dona'
         AND json_extract(e.subject_json,'$.job_id')=p.job_id AND json_extract(e.subject_json,'$.source_event_id')=j.source_event_id
         AND json_extract(e.payload_json,'$.job_id')=p.job_id AND json_extract(e.payload_json,'$.source_event_id')=j.source_event_id`).get(jobId,eventId);
   }
@@ -677,7 +681,7 @@ export class WorkerMessageRepository {
     const localAnswer=event?.source==="web"&&input.payload.operation==="answer"&&!!this.db.prepare(`SELECT 1 FROM events e JOIN local_dashboard_command_receipts r ON r.event_id=e.event_id
       WHERE e.event_id=? AND e.event_type='local_typed_question_reply' AND r.operation='question_reply' AND r.attempt_id=?
       AND json_extract(e.payload_json,'$.message_id')=?`).get(input.source_event_id,jobId,input.correlation_message_id);
-    if(event?.source!=="slack"&&!localAnswer&&!(event?.source==="dona_message"&&input.payload.operation==="answer"&&this.ownsReportEvent(jobId,input.source_event_id)&&input.correlation_message_id===(JSON.parse((this.db.prepare("SELECT subject_json FROM events WHERE event_id=?").get(input.source_event_id) as {subject_json:string}).subject_json).message_id)))throw new WorkerMessageError("worker_message_instruction_source_invalid","worker instructions require a Slack source event");
+    if(event?.source!=="slack"&&!localAnswer&&!(event?.source==="dona_message"&&input.payload.operation==="answer"&&(this.ownsReportEvent(jobId,input.source_event_id)||this.ownsProgressAggregateEvent(jobId,input.source_event_id))&&input.correlation_message_id===(JSON.parse((this.db.prepare("SELECT subject_json FROM events WHERE event_id=?").get(input.source_event_id) as {subject_json:string}).subject_json).message_id)))throw new WorkerMessageError("worker_message_instruction_source_invalid","worker instructions require a Slack source event");
     return this.append(jobId, "dona_to_worker", input, at);
   }
 

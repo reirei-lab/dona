@@ -12,7 +12,7 @@ const projection=z.strictObject({message_id:z.string().min(1).max(80),payload:z.
 const member=z.strictObject({job_id:z.string().min(1).max(80),phase,report:projection.optional()});
 /** Only the server's owner-checked, transaction-consistent ledger projection may supply this context. */
 export const progressContextSchema=z.strictObject({event_id:z.string().min(1).max(80),job_id:z.string().min(1).max(80),
- control_pending:z.boolean().default(false),last_risk_severity:z.enum(["low","medium","high"]).optional(),reserved_high_risk_ids:z.array(z.string().max(80)).max(64).default([]),presentation_pending:z.boolean().default(false),report_current:z.boolean().default(true),current:z.boolean(),desired_state:z.enum(["running","paused","cancelled"]),phase,now:instant,
+ control_pending:z.boolean().default(false),last_eta_minutes:z.number().int().nonnegative().optional(),last_risk_severity:z.enum(["low","medium","high"]).optional(),reserved_high_risk_ids:z.array(z.string().max(80)).max(64).default([]),presentation_pending:z.boolean().default(false),report_current:z.boolean().default(true),current:z.boolean(),desired_state:z.enum(["running","paused","cancelled"]),phase,now:instant,
  report:projection.optional(),silence_since:instant.optional(),members:z.array(member).min(1).max(32),
  group_attention:z.boolean(),group_terminal:z.boolean(),context_complete:z.boolean(),
  previous:z.strictObject({high_risk_message_ids:z.array(z.string().max(80)).max(64).optional(),fingerprint:z.string(),group_fingerprint:z.string().optional(),severity:z.enum(["low","medium","high"]).optional(),eta_minutes:z.number().int().nonnegative().optional(),
@@ -78,7 +78,8 @@ export function evaluateProgress(raw:unknown):ProgressDecision {
  const etaMatch=normalized(reportText(c.report)).match(/(?:残り|あと|見込み)\s*([0-9]{1,5})\s*分/u),eta=etaMatch?Number(etaMatch[1]):undefined;
  const highRiskIds=[...new Set([...(payload.kind==="risk"&&payload.severity==="high"?[c.report.message_id]:[]),...c.members.flatMap(m=>m.report?.payload.kind==="risk"&&m.report.payload.severity==="high"?[m.report.message_id]:[])])];
  result.observed={high_risk_message_ids:highRiskIds,group_fingerprint:groupFingerprint,...(payload.kind==="risk"?{severity:payload.severity}:{}),...(eta!==undefined?{eta_minutes:eta}:{})};
- result.signals.eta_changed=eta!==undefined&&c.previous?.eta_minutes!==undefined&&Math.abs(eta-c.previous.eta_minutes)>=Math.max(5,c.previous.eta_minutes*0.25);
+ const previousEta=c.last_eta_minutes??c.previous?.eta_minutes;
+ result.signals.eta_changed=eta!==undefined&&previousEta!==undefined&&Math.abs(eta-previousEta)>=Math.max(5,previousEta*0.25);
  result.signals.risk_escalation=(payload.kind==="risk"&&payload.severity!=="high"&&rank[payload.severity]>rank[c.last_risk_severity??c.previous?.severity??"low"])
   ||highRiskIds.some(id=>!c.reserved_high_risk_ids.includes(id));
  if(payload.kind==="question"||payload.kind==="decision_request"){
