@@ -299,7 +299,7 @@ test('期限timer検索が履歴全体ではなくpartial indexを使用する',
 
 for(const severity of ['medium','high'] as const)test(`risk→checkpoint→同じmediumのpipelineで基準を保つ（${severity}）`,async()=>{
  const f=await fixture();try{
-  const t=f.tasks[0]!,now=new Date(),first=f.db.workerMessages.appendWorkerReport(t.current_attempt_id,'runtime',{schema_version:1,source_event_id:f.source.event_id,producer_sequence:1,idempotency_key:'first-risk',occurred_at:now.toISOString(),payload:{kind:'risk',severity,summary:'確認事項があります'}},now);f.report(1,'並行検証が進みました',now);f.db.workerMessages.publishPendingReports();
+  const t=f.tasks[0]!,now=new Date(),first=f.db.workerMessages.appendWorkerReport(t.current_attempt_id,'runtime',{schema_version:1,source_event_id:f.source.event_id,producer_sequence:1,idempotency_key:'first-risk',occurred_at:now.toISOString(),payload:{kind:'risk',severity,summary:'確認事項があります'}},now);f.db.workerMessages.publishPendingReports();f.report(1,'並行検証が進みました',now);
   const e=f.eventFor(first.message.message_id),c=f.db.prepareTaskProgressDecision(t.task_id,e)!;f.db.applyTaskProgressDecision(t.task_id,e,c.decision_id);
   const cp=f.db.workerMessages.appendWorkerReport(t.current_attempt_id,'runtime',{schema_version:1,source_event_id:f.source.event_id,producer_sequence:2,idempotency_key:'checkpoint',occurred_at:now.toISOString(),payload:{kind:'checkpoint',summary:'検証が進みました'}},now);f.db.workerMessages.publishPendingReports(100,new Date(now.getTime()+121000));f.db.workerMessages.publishPendingReports(100,new Date(now.getTime()+182000));
   const ec=f.eventFor(cp.message.message_id),cc=f.db.prepareTaskProgressDecision(t.task_id,ec)!;f.db.applyTaskProgressDecision(t.task_id,ec,cc.decision_id);
@@ -311,10 +311,54 @@ for(const severity of ['medium','high'] as const)test(`risk→checkpoint→同�
 test('checkpointに含まれる新しいsibling high riskを同じgroup fingerprintでも提示する',async()=>{
  const f=await fixture();try{
   const now=new Date(),t=f.tasks[0]!,a=f.report(0,'検証が進みました',now),riskInput={schema_version:1,source_event_id:f.source.event_id,producer_sequence:1,idempotency_key:'risk-one',occurred_at:now.toISOString(),payload:{kind:'risk' as const,severity:'high' as const,summary:'重要な確認です'}};
-  f.db.workerMessages.appendWorkerReport(f.tasks[1]!.current_attempt_id,'runtime',riskInput,now);f.db.workerMessages.publishPendingReports();
+  f.db.workerMessages.publishPendingReports();f.db.workerMessages.appendWorkerReport(f.tasks[1]!.current_attempt_id,'runtime',riskInput,now);
   const ea=f.eventFor(a.message.message_id),ca=f.db.prepareTaskProgressDecision(t.task_id,ea)!;assert.equal(f.db.applyTaskProgressDecision(t.task_id,ea,ca.decision_id).state,'presentation_ready');
   const newer=f.db.workerMessages.appendWorkerReport(f.tasks[1]!.current_attempt_id,'runtime',{...riskInput,producer_sequence:2,idempotency_key:'risk-two',payload:{...riskInput.payload,summary:'重要な確認です '}},now),cp=f.db.workerMessages.appendWorkerReport(t.current_attempt_id,'runtime',{schema_version:1,source_event_id:f.source.event_id,producer_sequence:2,idempotency_key:'checkpoint-two',occurred_at:now.toISOString(),payload:{kind:'checkpoint',summary:'検証が進みました '}},now);f.db.workerMessages.publishPendingReports(100,new Date(now.getTime()+301000));f.db.workerMessages.publishPendingReports(100,new Date(now.getTime()+362000));
   const ec=f.eventFor(cp.message.message_id),cc=f.db.prepareTaskProgressDecision(t.task_id,ec)!;assert.equal(cc.decision.observed?.group_fingerprint,ca.decision.observed?.group_fingerprint);assert.equal(cc.decision.signals.risk_escalation,true);assert.ok(cc.decision.observed?.high_risk_message_ids?.includes(newer.message.message_id));
   assert.equal(f.db.applyTaskProgressDecision(t.task_id,ec,cc.decision_id).state,'presentation_ready');
  }finally{await f.dispose();}
+});
+
+for(const stage of ["preflight","prompt"] as const)test(`集約eventの${stage}確定失敗を再起動後に新eventで再評価する`,async()=>{
+ const f=await fixture();try{
+  const now=new Date(),m=f.report(0,"確認が進みました",now);f.db.workerMessages.publishPendingReports();const event=f.eventFor(m.message.message_id),t=f.tasks[0]!;
+  const c=f.db.workerMessages.progressDecisionCandidate(t.current_attempt_id,event,now)!;f.db.applyTaskProgressDecision(t.task_id,event,c.decision_id);
+  f.db.workerMessages.publishDueProgressDecisions(32,new Date(now.getTime()+31000));
+  const read=()=>{const sql=new Database(f.config.databasePath);try{return sql.prepare("SELECT followup_event_id,next_check_at FROM worker_progress_applications WHERE decision_key=?").get(c.decision_id) as {followup_event_id:string|null;next_check_at:string|null};}finally{sql.close();}};
+  const first=read().followup_event_id!;
+  if(stage==="preflight")f.db.recordPreDispatchFailure(first,"unavailable","確定未送信",1,new Date(now.getTime()+32000));
+  else{f.db.beginDispatch(first,path.join(f.root,"aggregate-failed.json"));f.db.recordSafePromptFailure(first,"not_sent","確定未送信",1,new Date(now.getTime()+32000));}
+  assert.equal(f.db.get(first)?.status,"dead_letter");assert.equal(read().followup_event_id,null);assert.ok(read().next_check_at);
+  f.reopen();assert.equal(f.db.workerMessages.publishDueProgressDecisions(32,new Date(now.getTime()+120000)),1);
+  const next=read().followup_event_id!;assert.notEqual(next,first);assert.equal(f.db.get(first)?.status,"dead_letter");
+  assert.equal(JSON.parse(f.db.get(next)!.payload_json).message_id,m.message.message_id);
+  assert.equal(f.db.workerMessages.publishDueProgressDecisions(32,new Date(now.getTime()+121000)),0);
+ }finally{await f.dispose();}
+});
+
+test("最大長decision_requestの質問と全選択肢を欠落なく描画する",async()=>{
+ const f=await fixture();try{
+  const t=f.tasks[0]!,question="Q".repeat(4000),options=Array.from({length:8},(_,i)=>String(i+1).repeat(1000));
+  const m=f.db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:f.source.event_id,producer_sequence:1,idempotency_key:"maximum-question",occurred_at:new Date().toISOString(),payload:{kind:"decision_request",question,options}});
+  f.db.workerMessages.publishPendingReports();const event=f.eventFor(m.message.message_id),candidate=f.db.prepareTaskProgressDecision(t.task_id,event)!;
+  assert.equal(candidate.decision.action,"ask_user");
+  const applied=f.db.applyTaskProgressDecision(t.task_id,event,candidate.decision_id),artifact=applied.artifact as {rendered_body:string};
+  assert.equal(artifact.rendered_body,[question,...options.map(option=>`- ${option}`)].join("\n"));assert.equal(artifact.rendered_body.length,12024);
+ }finally{await f.dispose();}
+});
+
+for(const outcome of ["suspended","unchanged","failure"] as const)test(`質問投稿とsession suspendedを一体で確定する（${outcome}）`,async()=>{
+ const f=await fixture();let worker:DispatcherWorker|undefined;try{
+  f.config.workerMessagingEnabled=true;const t=f.tasks[0]!;
+  const message=f.db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:f.source.event_id,producer_sequence:1,idempotency_key:"ask-session",occurred_at:new Date().toISOString(),payload:{kind:"question",question:"続行できますか？"}});f.db.workerMessages.publishPendingReports();
+  const event=f.eventFor(message.message.message_id),candidate=f.db.prepareTaskProgressDecision(t.task_id,event)!;
+  const applied=f.db.applyTaskProgressDecision(t.task_id,event,candidate.decision_id),artifact=applied.artifact as {desired_session_status:string;destination:{workspace_id:string;channel_id:string;thread_ts:string}};
+  assert.equal(artifact.desired_session_status,"suspended");
+  const resultPath=path.join(f.root,"question-result.json"),ts=(Date.now()/1000).toFixed(6);f.db.beginDispatch(event,resultPath);f.db.markWaiting(event);
+  await fs.writeFile(resultPath,JSON.stringify({schema_version:1,event_id:event,status:"completed",summary:"質問しました",completed_at:new Date().toISOString(),actions:[{tool:"dona_slack.post_message",event_id:event,...artifact.destination,message_ts:ts,reply_broadcast:false,mrkdwn:true,parse:"none"}]}));
+  let calls=0;const never=async()=>{throw Error("再投入・read-only verifyは使用しない");};
+  worker=new DispatcherWorker(f.db,{get:never,prompt:never,wait:never},f.config,{debug(){},info(){},warn(){},error(){}},{verify:never,async settle(request){calls++;worker!.quiesceAfterCurrent();assert.equal(request.desired_session_status,"suspended");if(outcome==="failure")throw Error("job_delivery_session_not_settled");return {event_id:event,workspace_id:request.workspace_id,channel_id:request.channel_id,thread_ts:request.thread_ts,message_ts:ts,body_sha256:request.body_sha256,posted_at:new Date(Number(ts)*1000).toISOString(),reply_broadcast:false,identity_block_verified:true,session_status:outcome==="suspended"?"suspended":null};}});
+  worker.start();await waitFor(()=>f.db.get(event)?.status===(outcome==="suspended"?"completed":"needs_review"));await worker.stop();assert.equal(calls,1);
+  assert.equal(f.db.taskReports(t.task_id,event).progress_decision_candidate!.application_receipt.state,outcome==="suspended"?"presentation_delivered":"presentation_ready");
+ }finally{await worker?.stop();await f.dispose();}
 });

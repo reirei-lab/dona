@@ -317,7 +317,7 @@ export class DispatcherWorker {
         const progress=this.database.workerMessages.presentationVerificationRequest(row.event_id,result);
         if(progress){
           if(!this.notificationVerifier)throw Error("progress_presentation_verifier_unavailable");
-          const confirmed=await this.notificationVerifier.verify(progress);
+          const confirmed=progress.desired_session_status===null?await this.notificationVerifier.verify(progress):await this.notificationVerifier.settle(progress);
           this.database.workerMessages.confirmPresentation(row.event_id,progress,confirmed);
         }
       }

@@ -260,6 +260,7 @@ export function migrateWorkerMessaging(db: Database.Database): void {
   const trigger=db.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?").get(workerMessageTerminalTrigger.name) as {sql:string}|undefined;
   if(trigger&&trigger.sql!==workerMessageTerminalTrigger.sql)throw new WorkerMessageError("worker_message_schema_invalid","terminal fence was modified");
   if(!trigger)db.exec(workerMessageTerminalTrigger.sql);
+  if(!(db.pragma("table_info(worker_progress_applications)") as {name:string}[]).some(c=>c.name==="followup_generation"))db.exec("ALTER TABLE worker_progress_applications ADD COLUMN followup_generation INTEGER NOT NULL DEFAULT 0");
   const runtimeIdentityColumns=new Set((db.pragma("table_info(worker_message_runtime_identities)") as Array<{name:string}>).map(row=>row.name));
   if(runtimeIdentityColumns.has("job_id"))db.exec(`
     CREATE TABLE worker_message_runtime_identities_v2 (
@@ -313,6 +314,12 @@ export class WorkerMessageRepository {
   reservedQueuedInstructionBytes(sourceEventId:string):number {
     return this.queuedInstructionReservations(sourceEventId)
       .reduce((sum,row)=>sum+Buffer.byteLength(row.addition,"utf8"),0);
+  }
+
+  rearmUndispatchedAggregate(eventId:string,availableAt:string):boolean {
+    return this.db.prepare(`UPDATE worker_progress_applications SET followup_event_id=NULL,next_check_at=?,followup_generation=followup_generation+1
+      WHERE followup_event_id=? AND EXISTS (SELECT 1 FROM events e WHERE e.event_id=? AND e.source='dona_message' AND e.event_type='worker_message_aggregate' AND e.status='dead_letter')`)
+      .run(availableAt,eventId,eventId).changes>0;
   }
 
   rearmUndispatchedReport(eventId:string,availableAt:string,at=new Date()):boolean {
@@ -521,9 +528,9 @@ export class WorkerMessageRepository {
         const body=this.renderPresentation(candidate.decision);
         result.artifact={version:1,decision_id:decisionId,action:candidate.decision.action,
           source_event_id:job.source_event_id,destination:binding.destination,
-          operation_slot:decisionId,reply_broadcast:false,safe_projection:candidate.decision.safe_projection,rendered_body:body,rendered_body_sha256:sha256(body)};}
+          operation_slot:decisionId,reply_broadcast:false,desired_session_status:candidate.decision.action==="ask_user"?"suspended":null,safe_projection:candidate.decision.safe_projection,rendered_body:body,rendered_body_sha256:sha256(body)};}
       }
-      this.db.prepare("INSERT INTO worker_progress_applications VALUES(?,?,?,?,NULL,?)").run(decisionId,eventId,stableStringify(result),nextCheck,at.toISOString());
+      this.db.prepare("INSERT INTO worker_progress_applications(decision_key,event_id,result_json,next_check_at,followup_event_id,applied_at) VALUES(?,?,?,?,NULL,?)").run(decisionId,eventId,stableStringify(result),nextCheck,at.toISOString());
       return result;
     }).immediate();
   }
@@ -533,7 +540,8 @@ export class WorkerMessageRepository {
     const lines=[p.question??p.summary??"進捗を確認しました",...(p.options??[]).map(option=>`- ${option}`),
       ...(decision.action==='report_to_user'?(p.members??[]).map((m,i)=>`並行作業 ${i+1}: ${Array.from(m.summary??m.phase).slice(0,100).join("")}`):[])];
     const body=Buffer.from(lines.join("\n"),"utf8").toString("utf8").replace(/<!(?:channel|here|everyone)(?:\|[^>]+)?>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+(?:\|[^>]+)?>/gi,mention=>`&lt;${mention.slice(1)}`);
-    if(body.length>12000)throw Error("progress_presentation_body_limit");return body;
+    // question 4,000 + options 8×1,000。mention無効化の展開（最大2倍）と8行の接頭辞を含める。
+    if(body.length>24_024)throw Error("progress_presentation_body_limit");return body;
   }
 
   presentationVerificationRequest(eventId:string,result:ResultEnvelope):JobNotificationVerificationRequest|undefined {
@@ -543,11 +551,11 @@ export class WorkerMessageRepository {
     if(rows.length===1&&!posts.length&&JSON.parse(rows[0]!.result_json).artifact?.destination?.kind==='none')return undefined;
     if(!posts.length)throw Error("progress_presentation_action_missing");
     if(rows.length!==1||posts.length!==1)throw Error("progress_presentation_ambiguous");
-    const artifact=JSON.parse(rows[0]!.result_json).artifact as {destination:{kind:string;workspace_id?:string;channel_id?:string;thread_ts?:string};rendered_body?:string;rendered_body_sha256?:string};
+    const artifact=JSON.parse(rows[0]!.result_json).artifact as {action:string;destination:{kind:string;workspace_id?:string;channel_id?:string;thread_ts?:string};rendered_body?:string;rendered_body_sha256?:string};
     const target=artifact.destination,post=posts[0]!;
     if(target.kind!=='slack_thread'||typeof artifact.rendered_body_sha256!=='string'||!/^[a-f0-9]{64}$/.test(artifact.rendered_body_sha256))throw Error("progress_presentation_body_unbound");
     if(post.event_id!==eventId||post.workspace_id!==target.workspace_id||post.channel_id!==target.channel_id||post.thread_ts!==target.thread_ts||post.reply_broadcast!==false||post.parse!=='none'||post.mrkdwn!==true||typeof post.message_ts!=='string'||!/^\d{1,20}\.\d{6}$/.test(post.message_ts))throw Error("progress_presentation_action_mismatch");
-    return {schema_version:1,event_id:eventId,workspace_id:target.workspace_id!,channel_id:target.channel_id!,thread_ts:target.thread_ts!,message_ts:post.message_ts,body_sha256:artifact.rendered_body_sha256!,desired_session_status:null};
+    return {schema_version:1,event_id:eventId,workspace_id:target.workspace_id!,channel_id:target.channel_id!,thread_ts:target.thread_ts!,message_ts:post.message_ts,body_sha256:artifact.rendered_body_sha256!,desired_session_status:artifact.action==="ask_user"?"suspended":null};
   }
 
   confirmPresentation(eventId:string,request:JobNotificationVerificationRequest,evidence:JobNotificationEvidence):void {
@@ -555,7 +563,7 @@ export class WorkerMessageRepository {
       const rows=this.db.prepare("SELECT decision_key,result_json FROM worker_progress_applications WHERE event_id=? AND json_extract(result_json,'$.state') IN ('presentation_ready','presentation_delivered','local_artifact_ready') LIMIT 2").all(eventId) as Array<{decision_key:string;result_json:string}>;
       if(rows.length!==1)throw Error("progress_presentation_not_found");
       const row=rows[0]!,result=JSON.parse(row.result_json),artifact=result.artifact;
-      if(request.event_id!==eventId||evidence.event_id!==eventId||evidence.workspace_id!==artifact.destination.workspace_id||evidence.channel_id!==artifact.destination.channel_id||evidence.thread_ts!==artifact.destination.thread_ts||evidence.message_ts!==request.message_ts||evidence.body_sha256!==artifact.rendered_body_sha256||request.body_sha256!==evidence.body_sha256||evidence.reply_broadcast!==false||evidence.identity_block_verified!==true||evidence.session_status!==null||!Number.isFinite(Date.parse(evidence.posted_at)))throw Error("progress_presentation_receipt_mismatch");
+      if(request.event_id!==eventId||evidence.event_id!==eventId||evidence.workspace_id!==artifact.destination.workspace_id||evidence.channel_id!==artifact.destination.channel_id||evidence.thread_ts!==artifact.destination.thread_ts||evidence.message_ts!==request.message_ts||evidence.body_sha256!==artifact.rendered_body_sha256||request.body_sha256!==evidence.body_sha256||evidence.reply_broadcast!==false||evidence.identity_block_verified!==true||request.desired_session_status!==(artifact.action==="ask_user"?"suspended":null)||evidence.session_status!==(artifact.action==="ask_user"?"suspended":null)||!Number.isFinite(Date.parse(evidence.posted_at)))throw Error("progress_presentation_receipt_mismatch");
       if(result.state==='presentation_delivered'){
         if(stableStringify(result.provider_receipt)!==stableStringify(evidence))throw Error("progress_presentation_receipt_conflict");return;
       }
@@ -567,8 +575,8 @@ export class WorkerMessageRepository {
   publishDueProgressDecisions(limit=32,at=new Date()):number {
     if(!Number.isSafeInteger(limit)||limit<1||limit>100)throw Error("progress_publish_limit_invalid");
     return this.db.transaction(()=>{
-      const due=this.db.prepare(`SELECT a.decision_key,p.job_id,p.decision_json FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key)
-        WHERE a.next_check_at<=? AND a.followup_event_id IS NULL ORDER BY a.next_check_at,a.decision_key LIMIT ?`).all(at.toISOString(),limit) as Array<{decision_key:string;job_id:string;decision_json:string}>;
+      const due=this.db.prepare(`SELECT a.decision_key,a.followup_generation,p.job_id,p.decision_json FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key)
+        WHERE a.next_check_at<=? AND a.followup_event_id IS NULL ORDER BY a.next_check_at,a.decision_key LIMIT ?`).all(at.toISOString(),limit) as Array<{decision_key:string;followup_generation:number;job_id:string;decision_json:string}>;
       let count=0;
       for(const row of due){
         const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(row.job_id) as JobRow;
@@ -590,7 +598,7 @@ export class WorkerMessageRepository {
         }
         const original=this.db.prepare("SELECT subject_json FROM events WHERE event_id=?").get(job.source_event_id) as {subject_json:string};
         const binding=readEventJobBinding(this.db,job.source_event_id);if(!binding)throw Error("progress_owner_unverified");
-        const eventId=`evt_${ulid(at.getTime())}`,externalId=`progress-aggregate:${row.decision_key}`;
+        const eventId=`evt_${ulid(at.getTime())}`,externalId=`progress-aggregate:${row.decision_key}${row.followup_generation?`:${row.followup_generation}`:""}`;
         const subject=stableStringify({job_id:row.job_id,message_id:message.message_id,source_event_id:job.source_event_id,actor_id:JSON.parse(original.subject_json).actor_id});
         const payload=stableStringify({schema_version:1,job_id:row.job_id,task_id:task.task_id,message_id:message.message_id,source_event_id:job.source_event_id,owner_kind:binding.owner.kind,decision_id:row.decision_key});
         const reply=job.workspace_id&&job.channel_id&&job.thread_ts?stableStringify({kind:"slack_thread",workspace_id:job.workspace_id,channel_id:job.channel_id,thread_ts:job.thread_ts}):null;

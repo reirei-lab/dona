@@ -3973,6 +3973,7 @@ export class DispatcherDatabase {
         .run(status, attemptCount, availableAt, code, message, at.toISOString(), eventId);
       if(status==="dead_letter") {
         if(row.source==="dona_message"&&row.event_type==="worker_message_report")this.workerMessages.rearmUndispatchedReport(eventId,retryAt(Math.max(1,row.attempt_count),at),at);
+        if(row.source==="dona_message"&&row.event_type==="worker_message_aggregate")this.workerMessages.rearmUndispatchedAggregate(eventId,retryAt(Math.max(1,row.attempt_count),at));
         this.sealJobGroupIfPresent(eventId, at.toISOString());
         this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
         this.setNotificationState(eventId,"failed",at);
@@ -3995,6 +3996,7 @@ export class DispatcherDatabase {
         .run(status, availableAt, code, message, at.toISOString(), eventId);
       if(status==="dead_letter") {
         if(row.source==="dona_message"&&row.event_type==="worker_message_report")this.workerMessages.rearmUndispatchedReport(eventId,retryAt(Math.max(1,row.attempt_count),at),at);
+        if(row.source==="dona_message"&&row.event_type==="worker_message_aggregate")this.workerMessages.rearmUndispatchedAggregate(eventId,retryAt(Math.max(1,row.attempt_count),at));
         this.sealJobGroupIfPresent(eventId, at.toISOString());
         this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
         this.setNotificationState(eventId,"failed",at);
