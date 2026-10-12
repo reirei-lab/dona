@@ -3,7 +3,7 @@ import {test} from "node:test";
 import {evaluateProgress,progressActions,type ProgressContext} from "../src/worker-progress-policy.js";
 const now="2026-10-12T08:00:00.000Z";
 const report={message_id:"message-one",payload:{kind:"checkpoint" as const,summary:"検証が進みました"},occurred_at:now,accepted_at:now};
-function context(patch:Partial<ProgressContext>={}):ProgressContext{return {event_id:"event-one",job_id:"job-one",reserved_high_risk_ids:[],presentation_pending:false,report_current:true,current:true,desired_state:"running",phase:"running",now,report,
+function context(patch:Partial<ProgressContext>={}):ProgressContext{return {event_id:"event-one",job_id:"job-one",control_pending:false,reserved_high_risk_ids:[],presentation_pending:false,report_current:true,current:true,desired_state:"running",phase:"running",now,report,
  members:[{job_id:"job-one",phase:"running",report}],group_attention:false,group_terminal:false,context_complete:true,silence_threshold_ms:900000,minimum_report_interval_ms:60000,...patch};}
 const first=evaluateProgress(context());
 const previous={fingerprint:first.fingerprint!,action:first.action,decided_at:"2026-10-12T07:55:00.000Z"};
@@ -90,4 +90,13 @@ for(const kind of ['question','decision_request','risk'] as const)test(`安全�
  const d=evaluateProgress(context({report:unsafe,members:[{job_id:'job-one',phase:'running',report:unsafe}]}));
  assert.equal(d.action,kind==='risk'?'report_to_user':'ask_user');assert.equal(d.target?.message_id,unsafe.message_id);assert.ok(d.safe_projection);assert.ok(!JSON.stringify(d).includes('src/a.ts'));assert.ok(!JSON.stringify(d).includes('curl private'));
  assert.equal(evaluateProgress(context({report:unsafe,report_current:false})).action,'ack_internal');
+});
+
+for(const last of ['medium','high'] as const)test(`checkpointの後も最後のrisk severityと比較する（${last}）`,()=>{
+ const d=evaluateProgress(context({last_risk_severity:last,previous:{...previous,action:'report_to_user'},presentation_pending:true,report:{...report,payload:{kind:'risk',severity:'medium',summary:'確認事項があります'}}}));
+ assert.equal(d.signals.risk_escalation,false);assert.equal(d.action,'aggregate_wait');
+});
+for(const kind of ['question','decision_request','risk'] as const)test(`steer中の重要報告は内部受領せず再評価する（${kind}）`,()=>{
+ const payload=kind==='risk'?{kind,severity:'high' as const,summary:'重要な確認です'}:kind==='decision_request'?{kind,question:'方式を選んでください',options:['方式A','方式B']}:{kind,question:'続行できますか？'};
+ const d=evaluateProgress(context({control_pending:true,report:{...report,payload}}));assert.equal(d.action,'aggregate_wait');assert.equal(d.target?.message_id,report.message_id);assert.equal(d.reason,'task_control_pending');
 });

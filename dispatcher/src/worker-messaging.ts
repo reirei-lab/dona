@@ -245,6 +245,8 @@ export function migrateWorkerMessaging(db: Database.Database): void {
       applied_at TEXT NOT NULL
     );
 
+    CREATE INDEX IF NOT EXISTS worker_progress_applications_due_idx ON worker_progress_applications(next_check_at,decision_key) WHERE next_check_at IS NOT NULL;
+
     CREATE TABLE IF NOT EXISTS worker_message_activity (
       job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,activity_at TEXT NOT NULL
     );
@@ -421,9 +423,11 @@ export class WorkerMessageRepository {
           WHERE a.correlation_message_id=q.message_id AND a.kind='answer' AND d.consumer='worker' AND d.state='delivered')`).get(report.message_id);
       const pendingRisk=report?.kind==="risk"&&JSON.parse(report.payload_json).severity==="high"&&!this.db.prepare(`SELECT 1 FROM worker_progress_decisions p JOIN worker_progress_applications a USING(decision_key)
         WHERE p.job_id=? AND json_extract(p.decision_json,'$.target.message_id')=? AND json_extract(a.result_json,'$.state')='presentation_ready' LIMIT 1`).get(jobId,report.message_id);
-      const identity={report_current:!report||latestForJob?.message_id===report.message_id||!!pendingQuestion||!!pendingRisk,job_id:jobId,current:task?.current_attempt_id===jobId&&task.stop_state==="none"&&!task.steer_pending_event_id,desired_state:task?.desired_state??"cancelled",phase:job.status,
+      const priorRisk=report?this.db.prepare("SELECT json_extract(payload_json,'$.severity') severity FROM worker_messages WHERE job_id=? AND direction='worker_to_dona' AND kind='risk' AND producer_sequence<? AND json_extract(payload_json,'$.severity') IN ('low','medium','high') ORDER BY producer_sequence DESC LIMIT 1").get(jobId,report.producer_sequence) as {severity:'low'|'medium'|'high'}|undefined:undefined;
+      const identity={report_current:!report||latestForJob?.message_id===report.message_id||!!pendingQuestion||!!pendingRisk,job_id:jobId,current:task?.current_attempt_id===jobId&&task.stop_state==="none",control_pending:!!task?.steer_pending_event_id,desired_state:task?.desired_state??"cancelled",phase:job.status,
         members:members.map(m=>({job_id:m.job_id,phase:m.phase,message_id:m.report?.message_id??null})),
         group_attention:liveAttention||attentionActive,group_terminal:!!group?.all_terminal_event_id,context_complete:rows.length<=32,
+        ...(priorRisk?{last_risk_severity:priorRisk.severity}:{}),
         ...(!report&&cadence?.last_report_at?{silence_since:cadence.last_report_at}:{}),
         ...(pending?{pending_instruction:{message_id:pending.message_id,state:pending.attempt_count>0?"unknown":"pending"}}:{})};
       const snapshot=sha256(stableStringify({identity,control:{revision:task?.revision,stop_state:task?.stop_state,steer_event:task?.steer_pending_event_id,job_error:job.last_error_code}}));
@@ -471,7 +475,7 @@ export class WorkerMessageRepository {
       if(prior)return {...JSON.parse(prior.result_json),replayed:true,eligible_now:candidate.eligible_now};
       const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow;
       const task=this.db.prepare("SELECT desired_state,stop_state,steer_pending_event_id FROM tasks WHERE current_attempt_id=?").get(jobId) as {desired_state:string;stop_state:string;steer_pending_event_id:string|null}|undefined;
-      if(candidate.decision.action!=="ack_internal"&&(!task||task.desired_state!=="running"||task.stop_state!=="none"||task.steer_pending_event_id||!["running","blocked"].includes(job.status)))throw Error("progress_snapshot_changed");
+      if(candidate.decision.action!=="ack_internal"&&(!task||task.desired_state!=="running"||task.stop_state!=="none"||(task.steer_pending_event_id&&!(candidate.decision.action==="aggregate_wait"&&candidate.decision.reason==="task_control_pending"))||!["running","blocked"].includes(job.status)))throw Error("progress_snapshot_changed");
       const answer=candidate.decision.action==="ask_user"&&candidate.decision.target?.message_id
         ?this.db.prepare(`SELECT m.message_id,d.state,d.attempt_count FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
           WHERE m.job_id=? AND m.direction='dona_to_worker' AND m.kind='answer' AND m.correlation_message_id=?
@@ -501,13 +505,14 @@ export class WorkerMessageRepository {
       }else if(["report_to_user","ask_user"].includes(candidate.decision.action)){
         const binding=readEventJobBinding(this.db,job.source_event_id);
         if(!binding)throw Error("progress_destination_unverified");
+        const riskIds=stableStringify(candidate.decision.observed?.severity==='high'?[candidate.decision.target!.message_id!]:candidate.decision.signals.risk_escalation?candidate.decision.observed?.high_risk_message_ids??[]:[]);
         const reserved=candidate.decision.action==="report_to_user"&&this.db.prepare(`SELECT 1 FROM worker_progress_applications a
           JOIN worker_progress_decisions p USING(decision_key) JOIN jobs j ON j.job_id=p.job_id
           WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state') IN ('presentation_ready','presentation_delivered') AND json_extract(p.decision_json,'$.action')='report_to_user'
-            AND (json_extract(p.decision_json,'$.observed.group_fingerprint')=?
-              OR (? IS NOT NULL AND EXISTS(SELECT 1 FROM json_each(json_extract(p.decision_json,'$.observed.high_risk_message_ids')) r WHERE r.value=?))) LIMIT 1`)
-          .get(job.source_event_id,candidate.decision.observed?.group_fingerprint??null,
-            candidate.decision.observed?.severity==="high"?candidate.decision.target?.message_id:null,candidate.decision.target?.message_id??null);
+            AND ((json_array_length(?)=0 AND json_extract(p.decision_json,'$.observed.group_fingerprint')=?)
+              OR (json_array_length(?)>0 AND NOT EXISTS(SELECT 1 FROM json_each(?) incoming WHERE NOT EXISTS
+                (SELECT 1 FROM json_each(json_extract(p.decision_json,'$.observed.high_risk_message_ids')) reserved WHERE reserved.value=incoming.value)))) LIMIT 1`)
+          .get(job.source_event_id,riskIds,candidate.decision.observed?.group_fingerprint??null,riskIds,riskIds);
         const undelivered=candidate.decision.action==="report_to_user"&&!candidate.decision.signals.risk_escalation&&!candidate.decision.signals.eta_changed&&this.db.prepare(`SELECT 1 FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key)
           JOIN jobs j ON j.job_id=p.job_id WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready' LIMIT 1`).get(job.source_event_id);
         if(reserved){result.action="ack_internal";result.state="presentation_duplicate";}
@@ -532,7 +537,7 @@ export class WorkerMessageRepository {
   }
 
   presentationVerificationRequest(eventId:string,result:ResultEnvelope):JobNotificationVerificationRequest|undefined {
-    const posts=(result.actions??[]).filter(a=>a&&typeof a==='object'&&!Array.isArray(a)&&(a as Record<string,unknown>).tool==='dona_slack.post_message') as Array<Record<string,unknown>>;
+    const posts=(result.actions??[]).filter(a=>a&&typeof a==='object'&&!Array.isArray(a)&&['dona_slack.post_message','mcp__dona_slack__post_message'].includes(String((a as Record<string,unknown>).tool))) as Array<Record<string,unknown>>;
     const rows=this.db.prepare("SELECT decision_key,result_json FROM worker_progress_applications WHERE event_id=? AND json_extract(result_json,'$.state') IN ('presentation_ready','presentation_delivered','local_artifact_ready') LIMIT 2").all(eventId) as Array<{decision_key:string;result_json:string}>;
     if(!rows.length)return undefined;
     if(rows.length===1&&!posts.length&&JSON.parse(rows[0]!.result_json).artifact?.destination?.kind==='none')return undefined;
@@ -562,23 +567,27 @@ export class WorkerMessageRepository {
   publishDueProgressDecisions(limit=32,at=new Date()):number {
     if(!Number.isSafeInteger(limit)||limit<1||limit>100)throw Error("progress_publish_limit_invalid");
     return this.db.transaction(()=>{
-      const due=this.db.prepare(`SELECT a.decision_key,p.job_id FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key)
-        WHERE a.next_check_at<=? AND a.followup_event_id IS NULL ORDER BY a.next_check_at,a.decision_key LIMIT ?`).all(at.toISOString(),limit) as Array<{decision_key:string;job_id:string}>;
+      const due=this.db.prepare(`SELECT a.decision_key,p.job_id,p.decision_json FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key)
+        WHERE a.next_check_at<=? AND a.followup_event_id IS NULL ORDER BY a.next_check_at,a.decision_key LIMIT ?`).all(at.toISOString(),limit) as Array<{decision_key:string;job_id:string;decision_json:string}>;
       let count=0;
       for(const row of due){
         const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(row.job_id) as JobRow;
-        const task=this.db.prepare("SELECT task_id,desired_state FROM tasks WHERE current_attempt_id=?").get(row.job_id) as {task_id:string;desired_state:string}|undefined;
+        const task=this.db.prepare("SELECT task_id,desired_state,steer_pending_event_id FROM tasks WHERE current_attempt_id=?").get(row.job_id) as {task_id:string;desired_state:string;steer_pending_event_id:string|null}|undefined;
         if(!task||task.desired_state!=="running"||!["running","blocked"].includes(job.status)){
           this.db.prepare("UPDATE worker_progress_applications SET next_check_at=NULL WHERE decision_key=?").run(row.decision_key);continue;
         }
+        if(task.steer_pending_event_id){this.db.prepare("UPDATE worker_progress_applications SET next_check_at=? WHERE decision_key=?").run(new Date(at.getTime()+30000).toISOString(),row.decision_key);continue;}
+        const hintedId=(JSON.parse(row.decision_json) as ProgressDecision).target?.message_id;
+        const hinted=hintedId?this.db.prepare("SELECT * FROM worker_messages WHERE message_id=? AND job_id=? AND direction='worker_to_dona'").get(hintedId,row.job_id) as WorkerMessageRow|undefined:undefined;
+        const important=hinted&&(['question','decision_request'].includes(hinted.kind)||(hinted.kind==='risk'&&JSON.parse(hinted.payload_json).severity==='high'));
+        const message=important?hinted:this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND direction='worker_to_dona' ORDER BY producer_sequence DESC LIMIT 1").get(row.job_id) as WorkerMessageRow|undefined;
+        if(!message){this.db.prepare("UPDATE worker_progress_applications SET next_check_at=NULL WHERE decision_key=?").run(row.decision_key);continue;}
         const pendingPresentation=this.db.prepare(`SELECT 1 FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key)
           JOIN jobs j ON j.job_id=p.job_id WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready' LIMIT 1`).get(job.source_event_id);
-        if(pendingPresentation){
+        if(pendingPresentation&&!important){
           this.db.prepare("UPDATE worker_progress_applications SET next_check_at=? WHERE decision_key=? AND followup_event_id IS NULL")
             .run(new Date(at.getTime()+30000).toISOString(),row.decision_key);continue;
         }
-        const message=this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND direction='worker_to_dona' ORDER BY producer_sequence DESC LIMIT 1").get(row.job_id) as WorkerMessageRow|undefined;
-        if(!message){this.db.prepare("UPDATE worker_progress_applications SET next_check_at=NULL WHERE decision_key=?").run(row.decision_key);continue;}
         const original=this.db.prepare("SELECT subject_json FROM events WHERE event_id=?").get(job.source_event_id) as {subject_json:string};
         const binding=readEventJobBinding(this.db,job.source_event_id);if(!binding)throw Error("progress_owner_unverified");
         const eventId=`evt_${ulid(at.getTime())}`,externalId=`progress-aggregate:${row.decision_key}`;

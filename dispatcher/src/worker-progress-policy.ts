@@ -12,7 +12,7 @@ const projection=z.strictObject({message_id:z.string().min(1).max(80),payload:z.
 const member=z.strictObject({job_id:z.string().min(1).max(80),phase,report:projection.optional()});
 /** Only the server's owner-checked, transaction-consistent ledger projection may supply this context. */
 export const progressContextSchema=z.strictObject({event_id:z.string().min(1).max(80),job_id:z.string().min(1).max(80),
- reserved_high_risk_ids:z.array(z.string().max(80)).max(64).default([]),presentation_pending:z.boolean().default(false),report_current:z.boolean().default(true),current:z.boolean(),desired_state:z.enum(["running","paused","cancelled"]),phase,now:instant,
+ control_pending:z.boolean().default(false),last_risk_severity:z.enum(["low","medium","high"]).optional(),reserved_high_risk_ids:z.array(z.string().max(80)).max(64).default([]),presentation_pending:z.boolean().default(false),report_current:z.boolean().default(true),current:z.boolean(),desired_state:z.enum(["running","paused","cancelled"]),phase,now:instant,
  report:projection.optional(),silence_since:instant.optional(),members:z.array(member).min(1).max(32),
  group_attention:z.boolean(),group_terminal:z.boolean(),context_complete:z.boolean(),
  previous:z.strictObject({high_risk_message_ids:z.array(z.string().max(80)).max(64).optional(),fingerprint:z.string(),group_fingerprint:z.string().optional(),severity:z.enum(["low","medium","high"]).optional(),eta_minutes:z.number().int().nonnegative().optional(),
@@ -44,6 +44,7 @@ export function evaluateProgress(raw:unknown):ProgressDecision {
  if(!c.current||c.desired_state!=="running"||!["running","blocked"].includes(c.phase)){result.reason="attempt_unavailable";return result;}
  const urgent=c.report&&(["question","decision_request"].includes(c.report.payload.kind)||(c.report.payload.kind==="risk"&&c.report.payload.severity==="high"));
  if(c.group_terminal||(c.group_attention&&!urgent)){result.reason="terminal_notification_priority";return result;}
+ if(c.control_pending){result.action="aggregate_wait";result.reason="task_control_pending";return result;}
  if(!c.context_complete||!c.members.some(m=>m.job_id===c.job_id&&m.phase===c.phase)||new Set(c.members.map(m=>m.job_id)).size!==c.members.length){result.reason="context_incomplete";return result;}
  if(!c.report_current){result.reason="stale_report";return result;}
  if(denied(reportText(c.report))){
@@ -78,7 +79,7 @@ export function evaluateProgress(raw:unknown):ProgressDecision {
  const highRiskIds=[...new Set([...(payload.kind==="risk"&&payload.severity==="high"?[c.report.message_id]:[]),...c.members.flatMap(m=>m.report?.payload.kind==="risk"&&m.report.payload.severity==="high"?[m.report.message_id]:[])])];
  result.observed={high_risk_message_ids:highRiskIds,group_fingerprint:groupFingerprint,...(payload.kind==="risk"?{severity:payload.severity}:{}),...(eta!==undefined?{eta_minutes:eta}:{})};
  result.signals.eta_changed=eta!==undefined&&c.previous?.eta_minutes!==undefined&&Math.abs(eta-c.previous.eta_minutes)>=Math.max(5,c.previous.eta_minutes*0.25);
- result.signals.risk_escalation=(payload.kind==="risk"&&payload.severity!=="high"&&rank[payload.severity]>(c.previous?.severity?rank[c.previous.severity]:0))
+ result.signals.risk_escalation=(payload.kind==="risk"&&payload.severity!=="high"&&rank[payload.severity]>rank[c.last_risk_severity??c.previous?.severity??"low"])
   ||highRiskIds.some(id=>!c.reserved_high_risk_ids.includes(id));
  if(payload.kind==="question"||payload.kind==="decision_request"){
   result.signals.human_required=true;
@@ -89,7 +90,7 @@ export function evaluateProgress(raw:unknown):ProgressDecision {
  if(!result.signals.risk_escalation&&!result.signals.eta_changed&&existingInstruction())return result;
  const heartbeat=payload.kind==="checkpoint"&&/^(?:(?:作業|調査|確認)(?:を)?(?:継続(?:して|し)|続けて)います|(?:作業|調査|確認)中です)[。.!！]?$/u.test(normalized(payload.summary));
  if(heartbeat&&!result.signals.risk_escalation&&!result.signals.eta_changed){result.signals.novelty=false;result.reason="heartbeat_without_change";return result;}
- if(payload.kind==="checkpoint"&&c.last_presentation_fingerprint===groupFingerprint){result.reason="group_progress_already_reserved";return result;}
+ if(payload.kind==="checkpoint"&&!result.signals.risk_escalation&&!result.signals.eta_changed&&c.last_presentation_fingerprint===groupFingerprint){result.reason="group_progress_already_reserved";return result;}
  if(c.presentation_pending&&!result.signals.risk_escalation&&!result.signals.eta_changed){result.action="aggregate_wait";result.reason="presentation_undelivered";return result;}
  if(!result.signals.novelty&&!result.signals.risk_escalation&&!result.signals.eta_changed&&c.previous?.action!=="aggregate_wait"){result.reason="duplicate_report";return result;}
  const live=c.members.filter(m=>["running","blocked"].includes(m.phase));
