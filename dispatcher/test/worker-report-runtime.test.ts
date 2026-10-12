@@ -97,6 +97,15 @@ if(r.id==='rpc-report'&&r.result){fs.appendFileSync('responses.jsonl',JSON.strin
   assert.deepEqual(manager.workerInstructionReceipt(agent.name,key,text,scope),{state:"accepted",turnId:report.turn_id});
   assert.equal((store.db.prepare("SELECT state FROM operations WHERE agent=? AND operation_key=?").get(agent.name,key) as {state:string}).state,"accepted");
   assert.equal(manager.external.accept(caller,call).operation_key,key);
+  const resultMessage="msg_01h00000000000000000000002",resultKey=`worker-message:${resultMessage}`;
+  store.db.prepare("INSERT INTO operations VALUES(?,?,?,'unknown',?)").run(agent.name,resultKey,hash({text}),JSON.stringify(sent));
+  const evidence={message_id:resultMessage,result_sha256:"b".repeat(64)};
+  assert.throws(()=>manager.reconcileWorkerInstructionResult(agent!.name,resultKey,text,{...scope,generation:"other"},evidence),/not_current/);
+  assert.throws(()=>manager.reconcileWorkerInstructionResult(agent!.name,resultKey,"別の指示",scope,evidence),/conflict/);
+  assert.throws(()=>manager.reconcileWorkerInstructionResult(agent!.name,resultKey,text,scope,{...evidence,message_id:"msg_01h00000000000000000000003"}),/evidence_invalid/);
+  assert.equal(manager.reconcileWorkerInstructionResult(agent.name,resultKey,text,scope,evidence).state,"accepted");
+  assert.equal(JSON.parse((store.db.prepare("SELECT result_json FROM operations WHERE agent=? AND operation_key=?").get(agent.name,resultKey) as {result_json:string}).result_json).result_sha256,evidence.result_sha256);
+
   await manager.stop(agent.name,agent.generation);assert.throws(()=>manager.resolveWorkerReport(agent!.name,report.request_id,result),/not_current/);
  }finally{if(agent&&store.agent(agent.name)?.state!=="stopped")await manager.stop(agent.name,agent.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
 });
@@ -137,4 +146,18 @@ test("無効化は受付閉鎖後にRuntime残件を確認し、不明・非空�
  await assert.rejects(disableWorkerReportsAfterDrain({...runtime,workerReportDrainState:async()=>{throw Error("unavailable");}}),/disable_unavailable/);
  await assert.rejects(disableWorkerReportsAfterDrain({...runtime,workerReportDrainState:async()=>({protocol:1,recoverable_count:-1})}),/disable_unavailable/);
  calls.length=0;await assert.rejects(disableWorkerReportsAfterDrain({...runtime,workerReportAvailability:async()=>{throw Error("closed_unknown");}}),/disable_unavailable/);assert.deepEqual(calls,[]);
+});
+
+test("Runtime受付でDispatcher envelope分を予約し、多byte報告を後段で容量拒否しない",async t=>{
+ const {parseWorkerReport}=await import("../src/worker-messaging.js");
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-report-envelope-")),store=new RuntimeStore(path.join(root,"runtime.db"));
+ t.after(async()=>{store.close();await fs.rm(root,{recursive:true,force:true});});
+ const queue=new WorkerReportQueue(store);queue.availability(true);
+ const agent={name:"worker-envelope",generation:"generation-envelope",thread_id:"thread-envelope",turn_id:"turn-envelope",role:"worker",cwd:root,release:root,config_json:JSON.stringify({attemptId:attempt,workerMessaging:true,threadConfig:{}})} as AgentRecord;
+ const call=(length:number)=>({id:"rpc-envelope",method:"item/tool/call",params:{tool:workerReportTool.name,threadId:agent.thread_id,turnId:agent.turn_id,callId:"envelope",arguments:{report_key:"envelope",payload:{kind:"decision_request",question:"界".repeat(length),options:["選".repeat(1000),"択".repeat(1000)]}}}});
+ const oversized=call(3400);assert.ok(Buffer.byteLength(JSON.stringify(oversized.params.arguments))<16384);
+ assert.throws(()=>queue.accept(agent,oversized),/payload_denied/);assert.equal(queue.pending().length,0);
+ const accepted=queue.accept(agent,call(3300));assert.equal(accepted.request_sequence,1);
+ const value=JSON.parse(accepted.payload_json);
+ assert.doesNotThrow(()=>parseWorkerReport({schema_version:1,source_event_id:"evt_01h00000000000000000000000",producer_sequence:accepted.request_sequence,idempotency_key:accepted.report_key,occurred_at:accepted.created_at,payload:value.payload}));
 });

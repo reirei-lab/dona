@@ -321,6 +321,17 @@ export class AppServerManager {
     if(accepted.generation!==scope.generation||accepted.threadId!==scope.thread_id)throw Error("runtime_operation_generation_changed");
     return {state:"accepted" as const,turnId:accepted.turnId as string};
   }
+  reconcileWorkerInstructionResult(name:string,key:string,text:string,scope:{attempt_id:string;generation:string;thread_id:string},evidence:{message_id:string;result_sha256:string}) {
+    if(!evidence||key!==`worker-message:${evidence.message_id}`||!/^msg_[0-9a-hjkmnp-tv-z]{26}$/.test(evidence.message_id)||! /^[a-f0-9]{64}$/.test(evidence.result_sha256))throw Error("runtime_worker_result_evidence_invalid");
+    const receipt=this.workerInstructionReceipt(name,key,text,scope);
+    if(receipt.state!=="unknown")return receipt;
+    const prior=this.store.db.prepare("SELECT state,result_json FROM operations WHERE agent=? AND operation_key=?").get(name,key) as {state:string;result_json:string|null};
+    const sent=prior.result_json?JSON.parse(prior.result_json):null;
+    if(prior.state!=="unknown"||sent?.generation!==scope.generation||sent?.threadId!==scope.thread_id||typeof sent?.sentAt!=="string")return receipt;
+    const accepted={generation:scope.generation,threadId:scope.thread_id,turnId:sent.turnId??null,result_sha256:evidence.result_sha256};
+    this.store.db.prepare("UPDATE operations SET state='accepted',result_json=? WHERE agent=? AND operation_key=? AND state='unknown'").run(JSON.stringify(accepted),name,key);
+    return {state:"accepted" as const,...(typeof sent.turnId==="string"?{turnId:sent.turnId}:{})};
+  }
   async prompt(name:string,key:string,text:string,workerScope?:{attempt_id:string;generation:string;thread_id:string}):Promise<unknown> {
     return this.serialized(name,async()=>{
       const row=this.status(name),rpc=this.connections.get(name);

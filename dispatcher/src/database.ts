@@ -2536,8 +2536,19 @@ export class DispatcherDatabase {
     return this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()?this.workerMessages.resultPathForRead(jobId):job.result_path;
   }
 
-  private lateResultFile(job: JobRow): {result:JobResultEnvelope;sha256:string} {
-    const fd=fs.openSync(this.jobResultReadPath(job.job_id),fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);
+  workerInstructionResultEvidence(jobId:string,messageId:string,identity:string):{message_id:string;result_sha256:string}|undefined {
+    const task=this.tasks.forAttempt(jobId),job=this.getJob(jobId);
+    if(!job||!task||task.current_attempt_id!==jobId||task.desired_state!=="running"||this.getJobLiveSessionIdentity(jobId)?.herdr_agent_session_id!==identity)return;
+    this.workerMessages.bindInstructionRuntime(jobId,messageId,identity);
+    try{
+      const file=this.lateResultFile(job,this.workerMessages.instructionResultPath(jobId,messageId));
+      if(!file.result.worker_instruction_message_ids?.includes(messageId)||Date.parse(file.result.completed_at)>Date.now())return;
+      return {message_id:messageId,result_sha256:file.sha256};
+    }catch{return;}
+  }
+
+  private lateResultFile(job: JobRow,resultPath=this.jobResultReadPath(job.job_id)): {result:JobResultEnvelope;sha256:string} {
+    const fd=fs.openSync(resultPath,fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);
     try {
       const stat=fs.fstatSync(fd);
       if(!stat.isFile()||stat.size>jobResultEnvelopeMaxBytes) throw new Error("late_result_file_invalid");

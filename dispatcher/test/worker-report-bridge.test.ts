@@ -264,7 +264,7 @@ for(const pause of [false,true])test(`型付き質問待ちの停止操作と受
 });
 
 
-test("不明な指示は再送せず、現行runtimeの相関reportで配送を照合する",async()=>{
+for(const proof of ["report","result"])test(`不明な指示は再送せず、現行runtimeの${proof}で配送を照合する`,async()=>{
  const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);
  try{
   const source=db.enqueue(eventEnvelope("unknown-recovery")).row;
@@ -276,15 +276,34 @@ test("不明な指示は再送せず、現行runtimeの相関reportで配送を�
   class UnknownRuntime extends RuntimeClient {
    constructor(){super("unused");}
    override async workerInstructionReceipt(){return db.workerMessages.instructionReceived(job.job_id,instruction.message.message_id,identity)?{state:"accepted" as const,turnId:"turn"}:{state:"unknown" as const};}
+   override async reconcileWorkerInstructionResult(_name:string,_id:string,_text:string,_scope:unknown,evidence:{message_id:string;result_sha256:string}){assert.equal(evidence.message_id,instruction.message.message_id);assert.match(evidence.result_sha256,/^[a-f0-9]{64}$/);return {state:"accepted" as const,turnId:"turn"};}
    override async workerInstruction():Promise<never>{throw Error("不明な指示を再送してはいけない");}
   }
   const bridge=new WorkerInstructionBridge(db.workerMessages,new AppServerWorkerInstructionController(db,new UnknownRuntime()));
   await assert.rejects(bridge.runOnce(),/acceptance_unknown/);assert.equal(db.tasks.get(task.task_id)?.wait_reason,"external_effect_unknown");
   assert.equal(db.workerMessages.instructionReceived(job.job_id,instruction.message.message_id,identity),false);
+  if(proof==="report"){
   db.acceptTaskWorkerReport(job.job_id,identity,{schema_version:1,source_event_id:source.event_id,producer_sequence:2,idempotency_key:"received",occurred_at:new Date().toISOString(),correlation_message_id:instruction.message.message_id,conversation_revision:1,payload:{kind:"checkpoint",summary:"回答を受け取りました"}});
+  }else{
+   const resultPath=db.workerMessages.instructionResultPath(job.job_id,instruction.message.message_id);
+   await fs.mkdir(path.dirname(resultPath),{recursive:true});
+   const result={schema_version:1,job_id:job.job_id,status:"completed",summary:"指示を反映しました",completed_at:new Date().toISOString(),worker_instruction_message_ids:[instruction.message.message_id]};
+   await fs.writeFile(resultPath,JSON.stringify({...result,job_id:"job_01h00000000000000000000000"}));
+   assert.equal(db.workerInstructionResultEvidence(job.job_id,instruction.message.message_id,identity),undefined);
+   await fs.writeFile(resultPath,JSON.stringify({...result,worker_instruction_message_ids:[]}));
+   assert.equal(db.workerInstructionResultEvidence(job.job_id,instruction.message.message_id,identity),undefined);
+   await fs.writeFile(resultPath,JSON.stringify(result),{mode:0o600});
+   assert.ok(db.workerInstructionResultEvidence(job.job_id,instruction.message.message_id,identity));
+  }
   assert.equal(db.workerMessages.instructionReceived(job.job_id,instruction.message.message_id,JSON.stringify(["other-generation","thread"])),false);
   assert.equal(await bridge.runOnce(new Date(Date.now()+300001)),true);
   assert.equal(db.tasks.get(task.task_id)?.state,"active");assert.equal(db.tasks.get(task.task_id)?.wait_reason,null);assert.equal(db.getJob(job.job_id)?.status,"running");
+  if(proof==="result"){
+   const resultPath=db.workerMessages.instructionResultPath(job.job_id,instruction.message.message_id);
+   db.saveJobResult(job.job_id,JSON.parse(await fs.readFile(resultPath,"utf8")),resultPath);
+   assert.equal(db.tasks.get(task.task_id)?.state,"completed");
+  }
+
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
 
@@ -583,5 +602,23 @@ test("Runtime receipt照合中のpauseで送信前拒否されたleaseを即座�
   class Port extends RuntimeClient{constructor(){super('unused');}override async workerInstructionReceipt(){db.tasks.control(t.task_id,source.event_id,db.tasks.get(t.task_id)!.revision,'pause');return {state:'not_found' as const};}override async workerInstruction():Promise<never>{throw Error('pause後に送信してはいけない');}}
   await assert.rejects(new WorkerInstructionBridge(db.workerMessages,new AppServerWorkerInstructionController(db,new Port())).runOnce(),/attempt_not_current/);
   const delivery=db.workerMessages.reconcile(j.job_id,source.event_id,'dona-main','condition').delivery as {state:string;lease_owner:string|null};assert.equal(delivery.state,'pending');const Sqlite=(await import('better-sqlite3')).default,sql=new Sqlite(config.databasePath);assert.equal((sql.prepare("SELECT lease_owner FROM worker_message_deliveries WHERE message_id=? AND consumer='worker'").get(m.message.message_id) as {lease_owner:string|null}).lease_owner,null);sql.close();assert.equal(m.message.job_id,j.job_id);
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+for(const pausedBeforePublish of [false,true])test(`pause中のTaskをsilence対象にしない（生成前pause=${pausedBeforePublish}）`,async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);try{
+  const source=db.enqueue(eventEnvelope("pause-silence")).row,t=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"pause-silence",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  db.beginJobPreparation(t.current_attempt_id);db.setJobRuntime(t.current_attempt_id,"w","p","runtime");db.beginJobDispatch(t.current_attempt_id);db.markJobRunning(t.current_attempt_id);
+  db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"checkpoint",occurred_at:new Date().toISOString(),payload:{kind:"checkpoint",summary:"確認中です"}});
+  const pause=()=>db.tasks.control(t.task_id,source.event_id,db.tasks.get(t.task_id)!.revision,"pause");
+  if(pausedBeforePublish)pause();
+  const count=db.workerMessages.publishDueSilenceEvents(100,new Date(Date.now()+1000000));assert.equal(count,pausedBeforePublish?0:1);
+  if(!pausedBeforePublish){
+   const Sqlite=(await import("better-sqlite3")).default,sql=new Sqlite(config.databasePath);
+   try{const event=sql.prepare("SELECT event_id FROM events WHERE event_type='worker_message_silence'").get() as {event_id:string};sql.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
+    assert.equal(db.workerMessages.silenceEventState(t.current_attempt_id,event.event_id)?.worker_message_silence.current,true);pause();
+    assert.equal(db.workerMessages.silenceEventState(t.current_attempt_id,event.event_id)?.worker_message_silence.current,false);
+   }finally{sql.close();}
+  }
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });

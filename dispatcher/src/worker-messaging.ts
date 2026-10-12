@@ -926,6 +926,7 @@ export class WorkerMessageRepository {
       const rows=this.db.prepare(`SELECT c.job_id,c.generation,c.silence_interval_ms,j.source_event_id,j.workspace_id,j.channel_id,j.thread_ts
         FROM worker_message_cadence c JOIN jobs j USING(job_id) WHERE c.silence_due_at<=? AND j.status NOT IN ('completed','failed','cancelled','needs_review')
           AND NOT (j.status='blocked' AND j.last_error_code IN ('worker_message_question_pending','runtime_question_pending','runtime_external_approval_pending'))
+          AND (NOT EXISTS (SELECT 1 FROM task_attempts a WHERE a.attempt_id=j.job_id) OR EXISTS (SELECT 1 FROM tasks t WHERE t.current_attempt_id=j.job_id AND t.desired_state='running'))
         ORDER BY c.silence_due_at,c.job_id LIMIT ?`).all(now,limit) as Array<{job_id:string;generation:number;silence_interval_ms:number;source_event_id:string;workspace_id:string|null;channel_id:string|null;thread_ts:string|null}>;
       for(const row of rows){
         const task=this.db.prepare("SELECT task_id FROM tasks WHERE current_attempt_id=?").get(row.job_id) as {task_id:string}|undefined;
@@ -962,9 +963,10 @@ export class WorkerMessageRepository {
     if(projected.job_id!==jobId||!Number.isSafeInteger(projected.generation))return undefined;
     const cadence=this.db.prepare("SELECT generation FROM worker_message_cadence WHERE job_id=?").get(jobId) as {generation:number}|undefined;
     const job=this.db.prepare("SELECT status,last_error_code FROM jobs WHERE job_id=?").get(jobId) as Pick<JobRow,"status"|"last_error_code">|undefined;
+    const task=this.db.prepare("SELECT t.current_attempt_id,t.desired_state FROM tasks t JOIN task_attempts a USING(task_id) WHERE a.attempt_id=?").get(jobId) as {current_attempt_id:string;desired_state:string}|undefined;
     const currentGeneration=cadence?.generation ?? 0,eventGeneration=projected.generation as number;
     return {worker_message_silence:{event_id:eventId,event_generation:eventGeneration,current_generation:currentGeneration,
-      current:event.status==="waiting_agent"&&eventGeneration===currentGeneration&&!!job&&!terminal(job.status)&&job.status!=="needs_review"
+      current:(!task||(task.current_attempt_id===jobId&&task.desired_state==="running"))&&event.status==="waiting_agent"&&eventGeneration===currentGeneration&&!!job&&!terminal(job.status)&&job.status!=="needs_review"
         &&!(job.status==="blocked"&&["worker_message_question_pending","runtime_question_pending","runtime_external_approval_pending"].includes(job.last_error_code??""))}};
   }
 
@@ -1024,9 +1026,14 @@ export class WorkerMessageRepository {
     return latest?path.join(path.dirname(job.result_path),`${(latest as {message_id:string}).message_id}.json`):job.result_path;
   }
   resultPathForRead(jobId:string):string {
-    const revised=this.instructionResultPath(jobId);
-    if(existsSync(revised))return revised;
-    return (this.db.prepare("SELECT result_path FROM jobs WHERE job_id=?").get(jobId) as {result_path:string}).result_path;
+    const job=this.db.prepare("SELECT result_path FROM jobs WHERE job_id=?").get(jobId) as {result_path:string}|undefined;
+    if(!job)throw Error("job_not_found");
+    const delivered=this.db.prepare("SELECT m.message_id FROM worker_messages m JOIN worker_message_deliveries d USING(message_id) WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.consumer='worker' AND d.state='delivered' ORDER BY m.producer_sequence DESC").all(jobId) as {message_id:string}[];
+    for(const message of delivered){
+      const revised=path.join(path.dirname(job.result_path),`${message.message_id}.json`);
+      if(existsSync(revised))return revised;
+    }
+    return job.result_path;
   }
 
   instructionForDelivery(jobId:string,sourceEventId:string,messageId:string):string {
