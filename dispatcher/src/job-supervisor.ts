@@ -338,7 +338,7 @@ export class JobSupervisor {
         }
       }
       try { this.database.saveJobResult(job.job_id,result,job.result_path); }
-      catch { this.database.tasks.wait(task,"result_reconciliation_required"); }
+      catch(error) { if(!this.holdInstructionResult(job,error))this.database.tasks.wait(task,"result_reconciliation_required"); }
       return;
     } catch(error) {
       if(!(error instanceof JobResultNotFoundError)) {this.database.tasks.wait(task,"result_conflict");return;}
@@ -1361,6 +1361,13 @@ export class JobSupervisor {
     );
   }
 
+  private holdInstructionResult(job:JobRow,error:unknown):boolean {
+    if(!(error instanceof Error)||!["worker_instruction_delivery_pending","worker_instruction_result_stale"].includes(error.message))return false;
+    const task=this.database.tasks.forAttempt(job.job_id);
+    if(task)this.database.tasks.wait(task,error.message==="worker_instruction_delivery_pending"?"worker_instruction_delivery_pending":"worker_instruction_result_pending",1000);
+    return true;
+  }
+
   private async tryCompleteAfterUnknownAcceptance(row: JobRow): Promise<boolean> {
     try {
       const result = await this.readResult(row.result_path, row.job_id);
@@ -1368,6 +1375,7 @@ export class JobSupervisor {
       this.database.saveJobResult(row.job_id, result, row.result_path);
       return true;
     } catch (error) {
+      if(this.holdInstructionResult(row,error))return false;
       if (error instanceof JobResultNotFoundError) return false;
       this.database.markJobNeedsReview(row.job_id, "invalid_result", error instanceof Error ? error.message : String(error));
       return true;
@@ -1448,6 +1456,7 @@ export class JobSupervisor {
       this.database.saveJobResult(row.job_id, result, row.result_path);
       completed = this.database.getJob(row.job_id)!;
     } catch (error) {
+      if(this.holdInstructionResult(row,error))return false;
       if (error instanceof JobResultNotFoundError && !terminalAgentState) return false;
       if (this.database.getJob(row.job_id)?.status === "cancelled") return true;
       this.database.markJobNeedsReview(

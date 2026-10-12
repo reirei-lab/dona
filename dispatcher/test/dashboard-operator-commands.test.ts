@@ -1,3 +1,4 @@
+import {WorkerInstructionBridge} from "../src/worker-messaging.js";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import type Database from "better-sqlite3";
@@ -69,3 +70,23 @@ test("再起動後の再pairは旧端末のreceiptを現在の操作権限で照
  assert.throws(()=>operatorCommand(f.db,f.config,{token:next.token,...create,input:{...create.input,objective:'異なる依頼'}}),/conflict/);
  f.auth.revoke(next.session.device_id);assert.throws(()=>operatorCommand(f.db,f.config,{token:next.token,...lookup}),/denied/);
 }finally{await f.dispose();}});
+
+
+test("local typed questionを既存dashboardの回答UIへ投影し、現行ownerの回答を一度だけ配送する",async()=>{
+ const f=await fixture(["tasks:submit"]);try{
+  const created=f.db.createLocalDashboardTask(f.authority,create.input,f.config.jobsWorkspaceRoot,f.config.jobResultsDir),job=created.row;
+  f.db.beginJobPreparation(job.job_id);f.db.setJobRuntime(job.job_id,"w","p","runtime");f.db.beginJobDispatch(job.job_id);f.db.markJobRunning(job.job_id);
+  const question=f.db.workerMessages.appendWorkerReport(job.job_id,"runtime",{schema_version:1,source_event_id:job.source_event_id,producer_sequence:1,idempotency_key:"typed",occurred_at:new Date().toISOString(),payload:{kind:"decision_request",question:"方式を選んでください",options:["方式A","方式B"]}});
+  assert.equal(f.db.workerMessages.publishPendingReports(),1);
+  const found=await operatorQuestions(f.db,{token:f.session.token,task_id:created.task.task_id,kind:"question"},async()=>{throw Error("typed質問にnative runtime readは不要");});
+  assert.equal(found.questions.length,1);assert.equal(found.questions[0]!.question_id,question.message.message_id);
+  assert.equal((found.questions[0]!.request as {questions:Array<{id:string}>}).questions[0]!.id,"answer");
+  const input={request_id:"typed-answer",task_id:created.task.task_id,attempt_id:job.job_id,revision:found.revision,question_id:question.message.message_id,kind:"question" as const,answers:{answer:{answers:["方式A"]}}};
+  const accepted=operatorCommand(f.db,f.config,{token:f.session.token,operation:"question_reply",input});
+  assert.deepEqual(operatorCommand(f.db,f.config,{token:f.session.token,operation:"question_reply",input}).receipt,accepted.receipt);
+  assert.throws(()=>operatorCommand(f.db,f.config,{token:f.session.token,operation:"question_reply",input:{...input,request_id:"different-answer",answers:{answer:{answers:["方式B"]}}}}),/not_current/);
+  let sends=0;await new WorkerInstructionBridge(f.db.workerMessages,{async steer(_id,eventId,text){sends++;assert.equal(eventId,accepted.receipt!.event_id);assert.ok(text.includes(question.message.message_id));return {};}}).runOnce();
+  assert.equal(sends,1);assert.equal(f.db.getJob(job.job_id)?.status,"running");assert.equal(f.db.tasks.get(created.task.task_id)?.state,"active");
+  f.auth.revoke(f.session.session.device_id);assert.throws(()=>operatorCommand(f.db,f.config,{token:f.session.token,operation:"question_reply",input}),/denied/);
+ }finally{await f.dispose();}
+});

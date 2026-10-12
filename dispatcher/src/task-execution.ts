@@ -505,7 +505,7 @@ export class TaskRepository {
     return this.sql.prepare(`SELECT t.* FROM tasks t JOIN jobs j ON j.job_id=t.current_attempt_id
       WHERE t.state IN ('active','waiting','paused') AND NOT (t.state='paused' AND t.wait_reason='paused') AND (t.next_check_at IS NULL OR t.next_check_at<=?)
       AND NOT (t.desired_state='running' AND COALESCE(t.wait_reason,'')='runtime_profile_unavailable')
-      AND (j.status IN ('needs_review','blocked') OR t.desired_state<>'running' OR t.wait_reason IN ('cancel_requested','pause_requested','resume_requested','worker_stop_pending','steer_acceptance_unknown'))
+      AND (j.status IN ('needs_review','blocked') OR t.desired_state<>'running' OR t.wait_reason IN ('cancel_requested','pause_requested','resume_requested','worker_stop_pending','steer_acceptance_unknown','worker_instruction_delivery_pending','worker_instruction_result_pending'))
       ORDER BY COALESCE(t.next_check_at,t.created_at),t.task_id LIMIT 8`).all(at.toISOString()) as TaskRow[];
   }
   mayNotify(job:JobRow):boolean {

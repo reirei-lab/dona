@@ -68,6 +68,10 @@ export class AppServerWorkerInstructionController {
   const current=this.database.tasks.forAttempt(jobId),currentJob=this.database.getJob(jobId);
   if(!current||current.current_attempt_id!==jobId||current.desired_state!=="running"||!currentJob||!["running","blocked"].includes(currentJob.status)||this.database.getJobLiveSessionIdentity(jobId)?.herdr_agent_session_id!==identity)throw Error("worker_instruction_attempt_not_current");
   try{return await this.runtime.workerInstruction(job.agent_name,messageId,text,scope);}
-  catch(error){this.database.markWorkerInstructionUnknown(jobId,messageId);throw error;}
+  catch(error){
+    const detail=error as {code?:string;acceptance?:string};
+    if(detail.code!=="runtime_not_ready"&&detail.acceptance!=="not_sent"&&detail.acceptance!=="rejected")this.database.markWorkerInstructionUnknown(jobId,messageId);
+    throw error;
+  }
  }
 }

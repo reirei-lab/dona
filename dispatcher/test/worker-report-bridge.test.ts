@@ -1,3 +1,4 @@
+import type {JobRow} from "../src/types.js";
 import {envelopeFromRow,buildEventPrompt} from "../src/prompt.js";
 import {existsSync} from "node:fs";
 import {readJobResultEnvelope} from "../src/job-result.js";
@@ -10,7 +11,7 @@ import {taskRequestSchema} from "../src/task-execution.js";
 import {RuntimeStore} from "../src/app-server/store.js";
 import {AppServerManager} from "../src/app-server/manager.js";
 import {AppServerRpc} from "../src/app-server/rpc.js";
-import {RuntimeClient} from "../src/app-server/client.js";
+import {RuntimeClient,RuntimeResponseError} from "../src/app-server/client.js";
 import {AppServerWorkerReportBridge,AppServerWorkerInstructionController} from "../src/app-server/worker-report-bridge.js";
 import {WorkerInstructionBridge} from "../src/worker-messaging.js";
 import {eventEnvelope,tempConfig} from "./helpers.js";
@@ -293,5 +294,61 @@ for(const code of ["runtime_question_pending","runtime_external_approval_pending
   assert.equal(db.getJob(job.job_id)?.last_error_code,code);assert.equal(db.workerMessages.hasUnansweredQuestion(job.job_id),false);
   assert.throws(()=>db.acceptTaskWorkerReport(job.job_id,"runtime",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"secret",occurred_at:new Date().toISOString(),payload:{kind:"checkpoint",summary:"sk-proj-canary0123456789abcdef"}}),/credential-shaped/);
   assert.equal(db.workerMessages.reports(job.job_id,source.event_id).length,0);
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+
+test("最新20件から外れたevent対象riskの本文を必ず返す",async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);
+ try{
+  const authority={instance_id:"instance",owner_id:"owner",device_id:"device",grant_revision:1};
+  const created=db.createLocalDashboardTask(authority,{request_id:"old-report",objective:"調査する",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir),job=created.row;
+  db.beginJobPreparation(job.job_id);db.setJobRuntime(job.job_id,"w","p","runtime");db.beginJobDispatch(job.job_id);db.markJobRunning(job.job_id);
+  for(let i=1;i<=21;i++)db.workerMessages.appendWorkerReport(job.job_id,"runtime",{schema_version:1,source_event_id:job.source_event_id,producer_sequence:i,idempotency_key:"risk-"+i,occurred_at:new Date().toISOString(),payload:{kind:"risk",severity:"high",summary:"確認事項 "+i}});
+  assert.equal(db.workerMessages.publishPendingReports(),21);
+  const receipt=db.workerMessages.reconcileWorker(job.job_id,job.source_event_id,"runtime","risk-1") as {delivery:{delivery_id:string}};
+  const Sqlite=(await import("better-sqlite3")).default,sql=new Sqlite(config.databasePath);
+  const eventId=(sql.prepare("SELECT event_id FROM worker_message_deliveries WHERE delivery_id=?").get(receipt.delivery.delivery_id) as {event_id:string}).event_id;sql.close();
+  const reports=db.taskReports(created.task.task_id,eventId);assert.equal(reports.reports.length,20);assert.equal(reports.event_report?.payload.summary,"確認事項 1");
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("未配送の追加指示と、その受理より古いResultではTaskを完了しない",async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);
+ try{
+  const source=db.enqueue(eventEnvelope("result-fence")).row,task=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"result-fence",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,job=db.getJob(task.current_attempt_id)!;
+  db.beginJobPreparation(job.job_id);db.setJobRuntime(job.job_id,"w","p","runtime");db.beginJobDispatch(job.job_id);db.markJobRunning(job.job_id);
+  const old={schema_version:1 as const,job_id:job.job_id,status:"completed" as const,summary:"以前の調査が完了しました",completed_at:"2026-01-01T00:00:00Z"};
+  db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"condition",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"追加の検証も実施してください"}});
+  assert.throws(()=>db.saveJobResult(job.job_id,old,job.result_path),/delivery_pending/);assert.equal(db.tasks.get(task.task_id)?.state,"active");
+  await fs.mkdir(path.dirname(job.result_path),{recursive:true});await fs.writeFile(job.result_path,JSON.stringify(old));
+  const never=async()=>{throw Error("保留Resultがworkerを停止・再起動してはいけない");};
+  const runtime:JobAgentRuntime={prepare:never,prompt:never,get:never,wait:never,cancel:never,observeWorker:never,retireWorker:never};
+  const supervisor=new JobSupervisor(db,runtime,config,{debug(){},info(){},warn(){},error(){}},()=>{});
+  // Exercise the same idle-worker completion path as monitor, before typed delivery.
+  assert.equal(await (supervisor as unknown as {tryComplete(row:JobRow,terminal:boolean):Promise<boolean>}).tryComplete(job,true),false);
+  assert.equal(db.getJob(job.job_id)?.status,"running");assert.equal(db.tasks.get(task.task_id)?.wait_reason,"worker_instruction_delivery_pending");
+  await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();
+  assert.throws(()=>db.saveJobResult(job.job_id,old,job.result_path),/result_stale/);
+  assert.equal(await (supervisor as unknown as {tryComplete(row:JobRow,terminal:boolean):Promise<boolean>}).tryComplete(db.getJob(job.job_id)!,true),false);
+  assert.equal(db.tasks.get(task.task_id)?.wait_reason,"worker_instruction_result_pending");
+  await new Promise(resolve=>setTimeout(resolve,5));await fs.writeFile(job.result_path,JSON.stringify({...old,completed_at:new Date().toISOString()}));
+  db.tasks.wait(db.tasks.get(task.task_id)!,"worker_instruction_result_pending",-1);await supervisor.reconcileTasks();assert.equal(db.tasks.get(task.task_id)?.state,"completed");
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+
+for(const code of ["runtime_question_pending","runtime_external_approval_pending"])test(`native待機中の指示をclaimせず、確定未送信を受理不明にしない（${code}）`,async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);
+ try{
+  const source=db.enqueue(eventEnvelope("native-instruction-wait")).row,task=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"native-wait",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,job=db.getJob(task.current_attempt_id)!,identity=JSON.stringify(["generation","thread"]);
+  db.beginJobPreparation(job.job_id);db.setJobRuntime(job.job_id,"w","p",identity);db.beginJobDispatch(job.job_id);db.markJobRunning(job.job_id);
+  const instruction=db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"condition",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"検証結果も残してください"}});
+  db.markJobBlocked(job.job_id,"native待機",["running"],code);db.tasks.wait(db.tasks.get(task.task_id)!,"human_input");
+  assert.equal(db.workerMessages.claimNextWorkerInstruction("test-owner",300000),undefined);
+  class WaitingRuntime extends RuntimeClient {constructor(){super("unused");}override async workerInstructionReceipt(){return {state:"not_found" as const};}override async workerInstruction():Promise<never>{throw new RuntimeResponseError("runtime_not_ready",409);}}
+  const controller=new AppServerWorkerInstructionController(db,new WaitingRuntime());
+  await assert.rejects(controller.steer(job.job_id,source.event_id,db.workerMessages.instructionForDelivery(job.job_id,source.event_id,instruction.message.message_id),instruction.message.message_id),/runtime_not_ready/);
+  assert.equal(db.getJob(job.job_id)?.last_error_code,code);assert.equal(db.tasks.get(task.task_id)?.wait_reason,"human_input");
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });

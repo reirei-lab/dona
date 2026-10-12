@@ -15,6 +15,7 @@ type Operation=typeof operations[number];
 type Capability="tasks:submit"|"tasks:cancel"|"approvals:native";
 const capability=(operation:Operation):Capability=>operation==="cancel"?"tasks:cancel":operation==="native_approval"?"approvals:native":"tasks:submit";
 export type OperatorCommandDatabase=Pick<DispatcherDatabase,"createLocalDashboardTask"|"cancelLocalDashboardTask"|"enqueueLocalDashboardQuestionReply"|"getLocalDashboardReceipt"|"getLocalDashboardTask"|"getDashboardNativeApprovalTask"> & {
+  getLocalDashboardTypedQuestion?:DispatcherDatabase["getLocalDashboardTypedQuestion"];
   operatorAuth:{withSession<T>(token:string,capability:Capability,execute:(authority:LocalDashboardAuthority)=>T):T};
 };
 export interface OperatorCommandPaths {jobsWorkspaceRoot:string;jobResultsDir:string}
@@ -62,12 +63,12 @@ export async function operatorQuestions(database:OperatorCommandDatabase,raw:unk
   const body=z.strictObject({token:z.string().regex(/^[A-Za-z0-9_-]{43}$/),task_id:id,kind:z.enum(["question","approval"])}).parse(raw);
   const cap=body.kind==="approval"?"approvals:native":"tasks:submit";
   const before=database.operatorAuth.withSession(body.token,cap,authority=>body.kind==="approval"?database.getDashboardNativeApprovalTask(authority,body.task_id):database.getLocalDashboardTask(authority,body.task_id));
-  const questions=before.session_identity?await readQuestions(before.row.agent_name):[];
+  const questions=before.session_identity&&before.row.last_error_code!=="worker_message_question_pending"?await readQuestions(before.row.agent_name):[];
   return database.operatorAuth.withSession(body.token,cap,authority=>{
     const current=body.kind==="approval"?database.getDashboardNativeApprovalTask(authority,body.task_id):database.getLocalDashboardTask(authority,body.task_id);
     if(current.task.revision!==before.task.revision||current.task.current_attempt_id!==before.task.current_attempt_id||current.session_identity!==before.session_identity)throw Error("task_revision_conflict");
     return {task_id:current.task.task_id,current_attempt_id:current.task.current_attempt_id,revision:current.task.revision,
-      questions:questions.filter(q=>q.kind===body.kind&&q.state==="pending"&&q.agent===current.row.agent_name&&JSON.stringify([q.generation,q.thread_id])===current.session_identity)
-        .map(q=>({question_id:q.question_id,kind:q.kind,state:q.state,request:JSON.parse(q.payload_json)}))};
+      questions:[...(body.kind==="question"?database.getLocalDashboardTypedQuestion?.(authority,body.task_id)??[]:[]),...questions.filter(q=>q.kind===body.kind&&q.state==="pending"&&q.agent===current.row.agent_name&&JSON.stringify([q.generation,q.thread_id])===current.session_identity)
+        .map(q=>({question_id:q.question_id,kind:q.kind,state:q.state,request:JSON.parse(q.payload_json)}))]};
   });
 }

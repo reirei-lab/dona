@@ -359,6 +359,18 @@ export class WorkerMessageRepository {
     const next=(this.db.prepare("SELECT COALESCE(MAX(producer_sequence),0)+1 n FROM worker_messages WHERE job_id=? AND producer='dona-main'").get(jobId) as {n:number}).n;
     return {instructions:rows,next_producer_sequence:next};
   }
+  eventReport(jobId:string,eventId:string){
+    if(!this.ownsReportEvent(jobId,eventId))return undefined;
+    const event=this.db.prepare("SELECT payload_json FROM events WHERE event_id=?").get(eventId) as {payload_json:string};
+    const messageId=(JSON.parse(event.payload_json) as {message_id:string}).message_id;
+    const message=this.getMessage(jobId,messageId,eventId);
+    return message?{...this.project(message),payload:JSON.parse(message.payload_json)}:undefined;
+  }
+  hasPendingInstructions(jobId:string):boolean {
+    return !!this.db.prepare(`SELECT 1 FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
+      WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.consumer='worker' AND d.state IN ('pending','leased') LIMIT 1`).get(jobId);
+  }
+
   reports(jobId:string,sourceEventId:string){
     const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow|undefined;
     if(!job)throw Error("job_not_found");this.assertAuthorized(job,sourceEventId);
@@ -385,7 +397,10 @@ export class WorkerMessageRepository {
   appendInstruction(jobId: string, raw: unknown, at = new Date()) {
     const input=parseDonaInstruction(raw);
     const event=this.db.prepare("SELECT source FROM events WHERE event_id=?").get(input.source_event_id) as {source:string}|undefined;
-    if(event?.source!=="slack"&&!(event?.source==="dona_message"&&input.payload.operation==="answer"&&this.ownsReportEvent(jobId,input.source_event_id)&&input.correlation_message_id===(JSON.parse((this.db.prepare("SELECT subject_json FROM events WHERE event_id=?").get(input.source_event_id) as {subject_json:string}).subject_json).message_id)))throw new WorkerMessageError("worker_message_instruction_source_invalid","worker instructions require a Slack source event");
+    const localAnswer=event?.source==="web"&&input.payload.operation==="answer"&&!!this.db.prepare(`SELECT 1 FROM events e JOIN local_dashboard_command_receipts r ON r.event_id=e.event_id
+      WHERE e.event_id=? AND e.event_type='local_typed_question_reply' AND r.operation='question_reply' AND r.attempt_id=?
+      AND json_extract(e.payload_json,'$.message_id')=?`).get(input.source_event_id,jobId,input.correlation_message_id);
+    if(event?.source!=="slack"&&!localAnswer&&!(event?.source==="dona_message"&&input.payload.operation==="answer"&&this.ownsReportEvent(jobId,input.source_event_id)&&input.correlation_message_id===(JSON.parse((this.db.prepare("SELECT subject_json FROM events WHERE event_id=?").get(input.source_event_id) as {subject_json:string}).subject_json).message_id)))throw new WorkerMessageError("worker_message_instruction_source_invalid","worker instructions require a Slack source event");
     return this.append(jobId, "dona_to_worker", input, at);
   }
 
@@ -594,7 +609,7 @@ export class WorkerMessageRepository {
     }))};
     const row=rows[0];
     return row ? {ambiguous:false,message_id:row.message_id,kind:row.kind,next_producer_sequence:row.next_producer_sequence,
-      next_conversation_revision:row.next_conversation_revision} : undefined;
+      next_conversation_revision:row.next_conversation_revision,payload:JSON.parse(row.payload_json)} : undefined;
   }
 
   stoppedInstructionContext(jobId:string):string {
@@ -636,6 +651,7 @@ export class WorkerMessageRepository {
     this.assertAuthorized(job,sourceEventId);
     return this.db.transaction(() => {
       const now = at.toISOString();
+      if(consumer==="worker"&&["runtime_question_pending","runtime_external_approval_pending"].includes(job.last_error_code??""))return [];
       if(consumer==="worker"&&this.db.prepare("SELECT 1 FROM task_attempts a JOIN tasks t USING(task_id) WHERE a.attempt_id=? AND (t.current_attempt_id<>a.attempt_id OR t.desired_state<>'running')").get(jobId))return [];
       this.db.prepare(`UPDATE worker_message_deliveries SET state='pending',lease_owner=NULL,lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=?
         WHERE consumer=? AND state='leased' AND lease_expires_at<=?`).run(now, consumer, now);
@@ -674,6 +690,7 @@ export class WorkerMessageRepository {
       JOIN worker_messages m USING(message_id) JOIN jobs j USING(job_id)
       WHERE d.consumer='worker' AND d.state='pending' AND d.available_at<=?
         AND j.status IN ('running','blocked')
+        AND COALESCE(j.last_error_code,'') NOT IN ('runtime_question_pending','runtime_external_approval_pending')
         AND NOT EXISTS (SELECT 1 FROM task_attempts a JOIN tasks t USING(task_id) WHERE a.attempt_id=j.job_id AND (t.current_attempt_id<>j.job_id OR t.desired_state<>'running'))
         AND NOT EXISTS (
           SELECT 1 FROM worker_messages prior JOIN worker_message_deliveries prior_delivery USING(message_id)
@@ -721,7 +738,7 @@ export class WorkerMessageRepository {
           AND EXISTS(SELECT 1 FROM tasks WHERE current_attempt_id=jobs.job_id AND desired_state='running')`).run(now,jobId,message.kind,message.message_id);
         this.db.prepare(`UPDATE tasks SET state='active',wait_reason=NULL,next_check_at=NULL,revision=revision+1,
           project_state=CASE WHEN project_state IN ('attempting','unknown') THEN project_state ELSE 'pending' END,updated_at=?
-          WHERE current_attempt_id=? AND desired_state='running' AND state='waiting' AND wait_reason IN ('human_input','external_effect_unknown')
+          WHERE current_attempt_id=? AND desired_state='running' AND state='waiting' AND wait_reason IN ('human_input','external_effect_unknown','worker_instruction_delivery_pending')
           AND EXISTS(SELECT 1 FROM jobs WHERE job_id=? AND status='running' AND last_error_code IS NULL)`).run(now,jobId,jobId);
       }
       return { delivery: this.db.prepare("SELECT * FROM worker_message_deliveries WHERE delivery_id=?").get(deliveryId), receipt_id: receiptId, outcome: "delivered" as const };
