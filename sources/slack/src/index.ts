@@ -15,7 +15,7 @@ import { SlackUpdateNotificationReporter } from "./update-notification.js";
 import { SlackJobProgressReporter } from "./job-progress.js";
 import { SlackWorkspaceRegistry } from "./workspace-registry.js";
 import { SlackReminderConnector } from "./reminder-connector.js";
-import { authorizeRuntimeCommand, readRuntimeIngressConfig, RuntimeCommandHttpIngress } from "./runtime-command-ingress.js";
+import { authorizeRuntimeCommand, verifyRuntimeIngressWorkspaces, readRuntimeIngressConfig, RuntimeCommandHttpIngress } from "./runtime-command-ingress.js";
 
 async function main(): Promise<void> {
   const config = loadAdapterConfig();
@@ -70,16 +70,22 @@ async function main(): Promise<void> {
   );
   const runtimeConfigPath = process.env.SLACK_RUNTIME_INGRESS_CONFIG;
   if (runtimeConfigPath) {
-    await readRuntimeIngressConfig(runtimeConfigPath);
+    const initialRuntimeConfig = await readRuntimeIngressConfig(runtimeConfigPath);
+    const runtimeRegistry = await SlackWorkspaceRegistry.load(initialRuntimeConfig.workspaces.map(workspace => workspace.alias), keychain, logger);
+    const identities = await verifyRuntimeIngressWorkspaces(runtimeRegistry, initialRuntimeConfig, AbortSignal.timeout(2500));
     const ingress = new RuntimeCommandHttpIngress({
       configured: async () => {
         const current = await readRuntimeIngressConfig(runtimeConfigPath);
-        for (const workspace of current.workspaces) if (registry.get(workspace.alias).teamId !== workspace.team_id)
-          throw Error("runtime_command_workspace_unverified");
+        // このregistryのBot tokenは起動後immutable。設定のapp/team変更は毎回拒否する。
+        for (const workspace of current.workspaces) {
+          const identity = identities.get(workspace.alias);
+          if (identity?.teamId !== workspace.team_id || identity.appId !== workspace.app_id)
+            throw Error("runtime_command_workspace_unverified");
+        }
         return current;
       },
       stopping: () => adapter.isStopping(),
-      authorize: (request, signal) => authorizeRuntimeCommand(registry, request, signal),
+      authorize: (request, signal) => authorizeRuntimeCommand(runtimeRegistry, request, signal),
       persist: (request, signal) => dispatcher.postRuntimeCommand(request, signal),
       ready: signal => dispatcher.runtimeCommandIngressReady(signal),
     });

@@ -60,7 +60,7 @@ async function setup(t: { after(fn: () => Promise<void>): void }) {
     drainStatus: () => ({ quiescing: stopping, drained: stopping, in_flight: 0, unsafe_states: [] }) }, client, logger);
   server.setRuntimeCommandIngress(ingress); await server.start();
   t.after(async () => { await server.stop(); await api.stop(); database.close(); await fs.rm(root, { recursive: true, force: true }); });
-  return { root, config, signingConfig, socketPath, client, server, get database() { return database; }, count: () => persists, wakes: () => wakeCount,
+  return { root, config, signingConfig, socketPath, client, server, get database() { return database; }, count: () => persists, wakes: () => wakeCount, beginShutdown: () => api.beginShutdown(),
     deny: () => { permitted = false; }, stop: () => { stopping = true; }, lose: (value: boolean) => { loseResponse = value; },
     delay: () => { delayAuthorization = true; }, expire: () => { expireDuringAuthorization = true; },
     async restart() { await api.stop(); database.close(); database = new DispatcherDatabase(config.databasePath); api = makeApi(); await api.start(); } };
@@ -145,7 +145,7 @@ test("UDS応答の切断後はGETで照合し、再配送でもPOSTを繰り返�
   assert.equal(first.state, "pending"); assert.equal(posts, 1);
   assert.deepEqual(await client.postRuntimeCommand(input, AbortSignal.timeout(2500)), first); assert.equal(posts, 1);
 });
-test("POST受理不明かつGETで未確認なら同じclientの再配送をread-onlyに留める", async t => {
+test("POST受理不明かつGETで未確認ならAdapter再起動後の再配送もread-onlyに留める", async t => {
   const f = await setup(t), socket = path.join(f.root, "unknown.sock"); let posts = 0;
   const proxy = http.createServer((request, response) => {
     if (request.method === "POST") { posts++; request.resume(); response.destroy(); return; }
@@ -159,6 +159,8 @@ test("POST受理不明かつGETで未確認なら同じclientの再配送をread
   const body = raw(), signed = headers(body), input = { ...verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]), channel_type: "public_channel" as const };
   await assert.rejects(client.postRuntimeCommand(input, AbortSignal.timeout(2500)), /acceptance_unknown/);
   await assert.rejects(client.postRuntimeCommand(input, AbortSignal.timeout(2500)), /acceptance_unknown/);
+  const restarted = new DispatcherClient({ socketPath: socket, internalTokenPath: f.config.updateInternalTokenPath, timeoutMs: 1000, connectTimeoutMs: 100 });
+  await assert.rejects(restarted.postRuntimeCommand(input, AbortSignal.timeout(2500)), /acceptance_unknown/);
   assert.equal(posts, 1); assert.equal(f.database.runtimeCommandReceipt(input.request_id), null);
 });
 test("readinessは半端なenablement・config破損・token失効をreadyにしない", async t => {
@@ -207,4 +209,16 @@ test("inbox満杯のreadinessはnot-ready、既存receiptはGETで再利用す�
   assert.deepEqual(await f.client.postRuntimeCommand(input, AbortSignal.timeout(2500)), receipt);
   assert.equal((await post(f.socketPath, body)).status, 200);
   assert.equal((await post(f.socketPath, raw("status", "new.fixture"))).status, 503);
+});
+
+test("受付停止後も認証済みreceipt GETを維持する", async t => {
+  const f = await setup(t);
+  const body = raw(), signed = headers(body), input = { ...verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]), channel_type: "public_channel" as const };
+  const first = await f.client.postRuntimeCommand(input, AbortSignal.timeout(2500));
+  f.beginShutdown();
+  assert.equal(await f.client.runtimeCommandIngressReady(), false);
+  assert.deepEqual(await f.client.postRuntimeCommand(input, AbortSignal.timeout(2500)), first);
+  await f.restart(); f.config.slackRuntimeIngressEnabled = false;
+  assert.equal(await f.client.runtimeCommandIngressReady(), false);
+  assert.deepEqual(await f.client.postRuntimeCommand(input, AbortSignal.timeout(2500)), first);
 });

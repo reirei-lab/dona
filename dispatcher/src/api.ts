@@ -259,12 +259,10 @@ export class DispatcherApi {
       const url = new URL(request.url ?? "/", "http://localhost");
       if (url.pathname === "/v1/internal/slack-runtime-commands" || url.pathname === "/v1/internal/slack-runtime-commands/ready"
         || /^\/v1\/internal\/slack-runtime-commands\/[a-f0-9]{64}$/.test(url.pathname)) {
-        if (!this.config.slackRuntimeIngressEnabled || this.shuttingDown)
-          throw new ApiRequestError(503, "runtime_command_unavailable", "Runtime command ingress is disabled or quiescing");
         if (!await this.authorizedUpdateRequest(request)) throw new ApiRequestError(403, "forbidden", "Internal authentication failed");
         if (url.search) throw new ApiRequestError(400, "invalid_request", "Unexpected query");
         if (request.method === "GET" && url.pathname === "/v1/internal/slack-runtime-commands/ready") {
-          const ready = this.readiness().ready && this.database.runtimeCommandCapacity();
+          const ready = !!this.config.slackRuntimeIngressEnabled && !this.shuttingDown && this.readiness().ready && this.database.runtimeCommandCapacity();
           sendJson(response, ready ? 200 : 503, { protocol: "runtime-control.v1", ready, acceptance_only: true });
           return;
         }

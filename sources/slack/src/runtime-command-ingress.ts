@@ -17,7 +17,7 @@ export async function authorizeRuntimeCommand(registry: Pick<SlackWorkspaceRegis
     const principalValid = user.stateKnown === true && user.id === request.actor_id && user.teamId === request.workspace_id
       && !user.isBot && !user.isAppUser && !user.isDeleted && !user.isAgentforceBot && !user.isSuspended
       && channel.id === request.channel_id && !channel.isShared && !channel.isArchived
-      && (channel.isIm ? channel.userId === request.actor_id : channel.visibilityKnown === true && !channel.isMpim);
+      && (channel.isIm ? channel.userId === request.actor_id : channel.visibilityKnown === true && !channel.isMpim && (!channel.isPrivate || channel.isMember));
     if (!principalValid) return null;
     const permitted = channel.isIm || !!connection.client.hasChannelMember
       && await connection.client.hasChannelMember(request.channel_id, request.actor_id, signal);
@@ -46,6 +46,19 @@ export async function readRuntimeIngressConfig(filename: string): Promise<Runtim
       throw Error("runtime_ingress_config_unverified");
     return result;
   } finally { await file.close(); }
+}
+
+export async function verifyRuntimeIngressWorkspaces(registry: Pick<SlackWorkspaceRegistry, "get">,
+  config: RuntimeIngressConfig, signal: AbortSignal): Promise<Map<string, { teamId: string; appId: string }>> {
+  const identities = new Map<string, { teamId: string; appId: string }>();
+  await Promise.all(config.workspaces.map(async workspace => {
+    const connection = registry.get(workspace.alias);
+    const identity = await connection.client.runtimeCommandIdentity?.(signal);
+    if (connection.teamId !== workspace.team_id || identity?.teamId !== workspace.team_id || identity.appId !== workspace.app_id)
+      throw Error("runtime_command_workspace_unverified");
+    identities.set(workspace.alias, identity);
+  }));
+  return identities;
 }
 
 interface Receipt { request_id: string; canonical_sha256: string; state: "pending"; received_at: string }

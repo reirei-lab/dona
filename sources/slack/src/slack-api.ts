@@ -546,6 +546,7 @@ export interface SlackFileInfo {
 
 export interface SlackApiClient {
   authenticate(): Promise<SlackWorkspaceIdentity>;
+  runtimeCommandIdentity?(signal: AbortSignal): Promise<{ teamId: string; appId: string }>;
   listChannels(limit: number, cursor?: string): Promise<SlackChannelPage>;
   getChannel(channelId: string,signal?:AbortSignal): Promise<SlackChannel>;
   hasChannelMember?(channelId: string, userId: string,signal?:AbortSignal): Promise<boolean>;
@@ -782,6 +783,15 @@ export class SlackWebApiClient implements SlackApiClient {
     signal.throwIfAborted();
     return new WebClient(this.botToken,{logger:new StderrOnlyWebApiLogger(this.logger),retryConfig:{retries:0},timeout:15000,rejectRateLimitedCalls:true,
       fetch:(url,init)=>globalThis.fetch(url,{...init,signal:AbortSignal.any([signal,...(init?.signal?[init.signal]:[])])})});
+  }
+
+  async runtimeCommandIdentity(signal: AbortSignal): Promise<{ teamId: string; appId: string }> {
+    const client = this.readClient(signal);
+    const auth = await callSlack(() => client.auth.test());
+    const botId = nonEmpty(auth.bot_id, "bot_id");
+    const response = await callSlack(() => client.bots.info({ bot: botId }));
+    if (response.bot?.id !== botId || response.bot?.deleted === true) throw Error("runtime_command_bot_unverified");
+    return { teamId: nonEmpty(auth.team_id, "team_id"), appId: nonEmpty(response.bot?.app_id, "app_id") };
   }
 
   async authenticate(): Promise<SlackWorkspaceIdentity> {

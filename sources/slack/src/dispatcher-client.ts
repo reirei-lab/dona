@@ -1,5 +1,6 @@
 import { signSlackPrincipalProof } from "./principal-proof.js";
 import http from "node:http";
+import path from "node:path";
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
 import { runtimeCommandDigest, type AuthorizedRuntimeCommandRequest } from "./runtime-command.js";
@@ -19,7 +20,31 @@ export interface DispatcherClientOptions {
 export class DispatcherClient {
   constructor(private readonly options: DispatcherClientOptions) {}
 
-  private readonly ambiguousRuntimeRequests = new Set<string>();
+  private async reserveRuntimeCommand(requestId: string, digest: string, signal: AbortSignal): Promise<void> {
+    if (!this.options.internalTokenPath || !/^[a-f0-9]{64}$/.test(requestId)) throw Error("runtime_command_unavailable");
+    const directory = path.join(path.dirname(this.options.internalTokenPath), "runtime-command-outbound");
+    const parent = await fs.open(path.dirname(directory), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
+    try {
+      const info = await parent.stat();
+      if (info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0) throw Error("runtime_command_unavailable");
+      await fs.mkdir(directory, { mode: 0o700 }).catch(error => { if (error.code !== "EEXIST") throw error; });
+      await parent.sync();
+    } finally { await parent.close(); }
+    const dir = await fs.open(directory, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
+    try {
+      const info = await dir.stat();
+      if (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw Error("runtime_command_unavailable");
+      if ((await fs.readdir(directory)).length >= 1024) throw Error("runtime_command_acceptance_unknown");
+      signal.throwIfAborted();
+      // POST前のintentを永続化する。再起動後もreceipt GETだけで照合し、再POSTしない。
+      const file = await fs.open(path.join(directory, requestId), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+        .catch(error => { if (error.code === "EEXIST") throw Error("runtime_command_acceptance_unknown"); throw error; });
+      try { await file.writeFile(JSON.stringify({ request_id: requestId, canonical_sha256: digest })); await file.sync(); }
+      finally { await file.close(); }
+      await dir.sync();
+      signal.throwIfAborted();
+    } finally { await dir.close(); }
+  }
 
   private async runtimeCommandToken(signal: AbortSignal): Promise<string> {
     if (!this.options.internalTokenPath) throw Error("runtime_command_unavailable");
@@ -75,26 +100,23 @@ export class DispatcherClient {
       if (value.receipt === null) return null;
       return verify(value.receipt);
     };
-    // 再配送でも最初に照合する。同じclientでの受理不明は新しいPOSTで迂回しない。
+    // 再配送でも最初に照合する。永続intentがある場合は再POSTで迂回しない。
     const prior = await lookup();
-    if (prior) { this.ambiguousRuntimeRequests.delete(input.request_id); return prior; }
-    if (this.ambiguousRuntimeRequests.has(input.request_id) || this.ambiguousRuntimeRequests.size >= 1024)
-      throw Error("runtime_command_acceptance_unknown");
+    if (prior) return prior;
     if (!await this.runtimeCommandIngressReady(signal)) throw Error("runtime_command_unavailable");
+    await this.reserveRuntimeCommand(input.request_id, expected, signal);
     let response: DispatcherResponse;
     try {
       response = await this.request("POST", "/v1/internal/slack-runtime-commands", Buffer.from(JSON.stringify(input)), token, {}, signal);
     } catch {
-      this.ambiguousRuntimeRequests.add(input.request_id);
       const receipt = await lookup();
       if (!receipt) throw Error("runtime_command_acceptance_unknown");
-      this.ambiguousRuntimeRequests.delete(input.request_id); return receipt;
+      return receipt;
     }
     if (response.statusCode >= 500) {
-      this.ambiguousRuntimeRequests.add(input.request_id);
       const receipt = await lookup();
       if (!receipt) throw Error("runtime_command_acceptance_unknown");
-      this.ambiguousRuntimeRequests.delete(input.request_id); return receipt;
+      return receipt;
     }
     if (response.statusCode !== 200) throw Error("runtime_command_unavailable");
     return verify(JSON.parse(response.body));

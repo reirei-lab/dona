@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { test } from "node:test";
 import { parseRuntimeCommand, verifyRuntimeCommandRequest } from "../src/runtime-command.js";
-import { authorizeRuntimeCommand } from "../src/runtime-command-ingress.js";
+import { authorizeRuntimeCommand, verifyRuntimeIngressWorkspaces } from "../src/runtime-command-ingress.js";
 import type { SlackWorkspaceRegistry } from "../src/workspace-registry.js";
 import { SlackWebApiClient } from "../src/slack-api.js";
 
@@ -53,7 +53,8 @@ test("現在の本人所属とchannel状態を再取得し別workspace/人/DM/�
   }
   channel.isMember = false; assert.deepEqual(await check(), { channel_type: "public_channel" });
   actorMember = false; assert.equal(await check(), null); actorMember = true;
-  channel.isPrivate = true; assert.deepEqual(await check(), { channel_type: "private_channel" }); channel.isPrivate = false;
+  channel.isPrivate = true; assert.equal(await check(), null);
+  channel.isMember = true; assert.deepEqual(await check(), { channel_type: "private_channel" }); channel.isPrivate = false;
   for (const mutation of [{ id: "C2" }, { isShared: true }, { isArchived: true }, { visibilityKnown: false }]) {
     const old = channel; channel = { ...channel, ...mutation }; assert.equal(await check(), null); channel = old;
   }
@@ -74,4 +75,33 @@ test("Slack APIのsuspendedを保持し、不正な型を本人確認済みと�
   suspended = false; assert.equal((await read()).isSuspended, false);
   suspended = "false"; assert.equal((await read()).stateKnown, false);
   suspended = undefined; assert.equal((await read()).stateKnown, true); assert.equal((await read()).isSuspended, undefined);
+});
+
+test("runtime Bot identityはauth.testのBotとbots.infoのappを照合する", async t => {
+  let actualBot = "B1";
+  t.mock.method(globalThis, "fetch", async (url: string | URL | Request) => new Response(JSON.stringify(String(url).endsWith("auth.test")
+    ? { ok: true, team_id: "T1", bot_id: "B1" }
+    : { ok: true, bot: { id: actualBot, app_id: "A1", deleted: false } }), { headers: { "content-type": "application/json" } }));
+  const client = new SlackWebApiClient("fixture-token", { debug() {}, info() {}, warn() {}, error() {} });
+  assert.deepEqual(await client.runtimeCommandIdentity(AbortSignal.timeout(2500)), { teamId: "T1", appId: "A1" });
+  actualBot = "B2";
+  await assert.rejects(client.runtimeCommandIdentity(AbortSignal.timeout(2500)), /bot_unverified/);
+});
+
+test("同じteamの別App Botをruntime signing configへ結び付けない", async () => {
+  let appId = "A2";
+  const registry = { get: () => ({ teamId: "T1", client: { runtimeCommandIdentity: async () => ({ teamId: "T1", appId }) } }) } as unknown as Pick<SlackWorkspaceRegistry, "get">;
+  const config = { version: 1 as const, workspaces: [{ ...workspace, actor_ids: ["U1"] }] };
+  await assert.rejects(verifyRuntimeIngressWorkspaces(registry, config, AbortSignal.timeout(2500)), /workspace_unverified/);
+  appId = "A1";
+  assert.deepEqual((await verifyRuntimeIngressWorkspaces(registry, config, AbortSignal.timeout(2500))).get("test"), { teamId: "T1", appId: "A1" });
+});
+test("private channelのBot未参加によるAPIエラーをfail-closedにする", async () => {
+  const body = raw(), input = verifyRuntimeCommandRequest(body, timestamp, signature(body), [workspace], now);
+  const registry = { get: () => ({ teamId: "T1", client: {
+    getUser: async () => ({ stateKnown: true, id: "U1", teamId: "T1" }),
+    getChannel: async () => { throw Error("channel_not_found"); },
+    hasChannelMember: async () => true,
+  } }) } as unknown as Pick<SlackWorkspaceRegistry, "get">;
+  assert.equal(await authorizeRuntimeCommand(registry, input, AbortSignal.timeout(2500)), null);
 });
