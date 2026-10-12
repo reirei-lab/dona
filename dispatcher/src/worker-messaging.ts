@@ -433,7 +433,7 @@ export class WorkerMessageRepository {
       return { message: keyExisting, receipt_id: receipt.receipt_id, outcome: "reused" };
     }
     if (terminal(job.status)) throw new WorkerMessageError("worker_message_terminal_fence", "new messages are rejected after terminal job state");
-    if(direction==="dona_to_worker"&&!["queued","retryable_failed","running","blocked"].includes(job.status))
+    if(direction==="dona_to_worker"&&!["queued","retryable_failed","preparing","dispatching","running","blocked"].includes(job.status))
       throw new WorkerMessageError("worker_message_instruction_unavailable",`job in status ${job.status} cannot accept instructions`);
     if(direction==="worker_to_dona"&&["question","decision_request"].includes(kind)
       &&!["queued","retryable_failed","running","blocked"].includes(job.status))

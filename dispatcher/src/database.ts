@@ -1,3 +1,4 @@
+import {reportContainsPrivateValues} from "./worker-report-privacy.js";
 import {migrateWorkerMessaging,WorkerMessageRepository,parseDonaInstruction,parseWorkerReport,WorkerMessageError} from "./worker-messaging.js";
 import { envelopeFromRow } from "./prompt.js";
 import { migrateVerifiedPrincipalBindings, persistVerifiedPrincipalBinding, readVerifiedPrincipalBinding, readVerifiedPrincipalProofConsumption, PrincipalBindingConflictError } from "./principal-binding.js";
@@ -1073,7 +1074,9 @@ export class DispatcherDatabase {
         (j.status NOT IN ('completed','failed','cancelled') AND m.direction='worker_to_dona' AND m.kind IN ('question','decision_request')
           AND NOT EXISTS (SELECT 1 FROM worker_messages a JOIN worker_message_deliveries ad ON ad.message_id=a.message_id
             WHERE a.correlation_message_id=m.message_id AND a.kind='answer' AND ad.consumer='worker' AND ad.state='delivered')) LIMIT 1`).get();
-    if(outstanding)throw Error("worker_messaging_disable_requires_drain");
+    const silence=this.db.prepare(`SELECT 1 FROM events WHERE source='dona_message' AND event_type='worker_message_silence'
+      AND status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review') LIMIT 1`).get();
+    if(outstanding||silence)throw Error("worker_messaging_disable_requires_drain");
   }
 
   acceptTaskWorkerReport(attemptId:string,identity:string,raw:unknown){
@@ -1081,8 +1084,7 @@ export class DispatcherDatabase {
     return this.db.transaction(()=>{
       const task=this.tasks.forAttempt(attemptId),job=this.getJob(attemptId);
       if(!job||!task||task.current_attempt_id!==attemptId||task.desired_state!=="running"||!["running","blocked"].includes(job.status)||input.source_event_id!==job.source_event_id)throw new WorkerMessageError("worker_report_attempt_not_current","current Attempt does not accept reports");
-      const canonical=stableStringify(input.payload);
-      if([job.objective,job.workspace_path,job.result_path].some(value=>value&&canonical.includes(value)))throw new WorkerMessageError("worker_report_payload_denied","report payload is denied");
+      if(reportContainsPrivateValues(input.payload,job.objective,[job.workspace_path,job.result_path]))throw new WorkerMessageError("worker_report_payload_denied","report payload is denied");
       return this.workerMessages.acceptRuntimeReport(attemptId,identity,input);
     }).immediate();
   }
