@@ -16,6 +16,7 @@ import {
 import type { SlackReminderConnector } from "./reminder-connector.js";
 import { parseJobProgressRequest, type SlackJobProgressReporter } from "./job-progress.js";
 import { SlackApiError } from "./slack-api.js";
+import type { RuntimeCommandHttpIngress } from "./runtime-command-ingress.js";
 
 function send(response: ServerResponse, statusCode: number, body: unknown): void {
   const encoded = Buffer.from(JSON.stringify(body));
@@ -66,6 +67,8 @@ export interface AdapterHealthState {
 }
 
 export class SlackHealthServer {
+  private runtimeCommands: RuntimeCommandHttpIngress | undefined;
+  setRuntimeCommandIngress(ingress: RuntimeCommandHttpIngress | undefined): void { this.runtimeCommands = ingress; }
   private server: http.Server | undefined;
   private quiesceOperationId: string | undefined;
   private readonly progressOperations = new Set<Promise<unknown>>();
@@ -74,7 +77,7 @@ export class SlackHealthServer {
   constructor(
     private readonly socketPath: string,
     private readonly adapter: AdapterHealthState,
-    private readonly dispatcher: Pick<DispatcherClient, "healthReady">,
+    private readonly dispatcher: Pick<DispatcherClient, "healthReady"> & Partial<Pick<DispatcherClient, "runtimeCommandIngressState">>,
     private readonly logger: SlackLogger,
     private readonly buildSha = process.env.DONA_BUILD_SHA ?? "development",
     private readonly updateNotifications?: UpdateNotificationPort,
@@ -128,6 +131,11 @@ export class SlackHealthServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const method = request.method ?? "";
     const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+    if (pathname === "/slack/commands" && this.runtimeCommands) {
+      const operation = this.runtimeCommands.handle(request, response);
+      await (this.adapter.trackExternal ? this.adapter.trackExternal(operation) : operation);
+      return;
+    }
     if (method === "POST" && (pathname === "/v1/internal/slack-reminders/preflight" || pathname === "/v1/internal/slack-reminders")) {
       const operation = this.handleReminder(request, response, pathname.endsWith("/preflight"));
       if (this.adapter.trackOperation) await this.adapter.trackOperation(operation);
@@ -251,19 +259,23 @@ export class SlackHealthServer {
     }
     if (method === "GET" && pathname === "/health/ready") {
       const dispatcherReady = await this.dispatcher.healthReady();
-      const ready = !this.adapter.isStopping() && this.adapter.isSocketReady() && dispatcherReady;
+      const workspacesReady = !this.adapter.isStopping() && this.adapter.isSocketReady();
+      const runtimeCommandsReady = workspacesReady && dispatcherReady && await this.runtimeCommandReady();
+      const ready = workspacesReady && dispatcherReady && runtimeCommandsReady;
       send(response, ready ? 200 : 503, {
         schema_version: 1,
         status: ready ? "ready" : "not_ready",
         socket_mode: this.adapter.connectionStates(),
         dispatcher_ready: dispatcherReady,
+        runtime_commands: { configured: !!this.runtimeCommands, ready: !!this.runtimeCommands && runtimeCommandsReady },
       });
       return;
     }
     if (method === "GET" && pathname === "/health/version") {
       const dispatcherReady = await this.dispatcher.healthReady();
       const workspacesReady = !this.adapter.isStopping() && this.adapter.isSocketReady();
-      const ready = workspacesReady && dispatcherReady;
+      const runtimeCommandsReady = workspacesReady && dispatcherReady && await this.runtimeCommandReady();
+      const ready = workspacesReady && dispatcherReady && runtimeCommandsReady;
       const updateNotificationProtocolReady = this.updateNotifications !== undefined &&
         await this.internalTokenReady();
       send(response, ready ? 200 : 503, {
@@ -278,6 +290,8 @@ export class SlackHealthServer {
         app_schema_write: this.appSchemaWrite,
         config: 1,
         ...(updateNotificationProtocolReady ? { update_notification_protocol: 1 } : {}),
+        ...(this.runtimeCommands && runtimeCommandsReady ? { runtime_command_protocol: "runtime-control.v1" } : {}),
+        runtime_commands: { configured: !!this.runtimeCommands, ready: !!this.runtimeCommands && runtimeCommandsReady },
         workspaces_ready: workspacesReady,
         socket_mode: this.adapter.connectionStates(),
         dispatcher_ready: dispatcherReady,
@@ -327,6 +341,13 @@ export class SlackHealthServer {
     if(!this.adapter.isStopping()) return false;
     send(response,503,{schema_version:1,error:{code:"shutting_down",message:"Slack Adapter is stopping"}});
     return true;
+  }
+
+  private async runtimeCommandReady(): Promise<boolean> {
+    if (this.runtimeCommands) return this.runtimeCommands.ready();
+    if (!this.dispatcher.runtimeCommandIngressState) return true;
+    const state = await this.dispatcher.runtimeCommandIngressState();
+    return state !== null && !state.configured;
   }
 
   private async handleScheduledInternal(request:IncomingMessage,response:ServerResponse,pathname:string):Promise<void> {

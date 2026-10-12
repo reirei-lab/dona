@@ -1,0 +1,7 @@
+{
+  "extends": "../dispatcher/tsconfig.json",
+  "compilerOptions": {
+    "typeRoots": ["../dispatcher/node_modules/@types"]
+  },
+  "include": ["./slack-runtime-command.test.ts"]
+}

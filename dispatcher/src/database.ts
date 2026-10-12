@@ -13,6 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import Database from "better-sqlite3";
+import { RuntimeCommandInbox } from "./runtime-command-inbox.js";
 import { ulid } from "ulid";
 
 import { expandHome, jobResourceDefaults, jobResourceHardLimits } from "./config.js";
@@ -1052,6 +1053,21 @@ function pendingHandoffSql(source: string): string {
 
 export class DispatcherDatabase {
   private readonly db: Database.Database;
+  private runtimeInbox: RuntimeCommandInbox | undefined;
+
+  acceptRuntimeCommand(input: unknown) {
+    this.runtimeInbox ??= new RuntimeCommandInbox(this.db);
+    return this.runtimeInbox.accept(input);
+  }
+
+  runtimeCommandReceipt(requestId: string) {
+    this.runtimeInbox ??= new RuntimeCommandInbox(this.db);
+    return this.runtimeInbox.receipt(requestId);
+  }
+  runtimeCommandCapacity(): boolean {
+    this.runtimeInbox ??= new RuntimeCommandInbox(this.db);
+    return this.runtimeInbox.available();
+  }
   readonly scheduler: SchedulerRepository;
   readonly tasks: TaskRepository;
   readonly operatorAuth: OperatorAuthRegistry;

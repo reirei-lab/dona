@@ -257,6 +257,39 @@ export class DispatcherApi {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
+      if (url.pathname === "/v1/internal/slack-runtime-commands" || url.pathname === "/v1/internal/slack-runtime-commands/ready"
+        || /^\/v1\/internal\/slack-runtime-commands\/[a-f0-9]{64}$/.test(url.pathname)) {
+        if (!await this.authorizedUpdateRequest(request)) throw new ApiRequestError(403, "forbidden", "Internal authentication failed");
+        if (url.search) throw new ApiRequestError(400, "invalid_request", "Unexpected query");
+        if (request.method === "GET" && url.pathname === "/v1/internal/slack-runtime-commands/ready") {
+          const ready = !!this.config.slackRuntimeIngressEnabled && !this.shuttingDown && this.readiness().ready && this.database.runtimeCommandCapacity();
+          sendJson(response, ready ? 200 : 503, { protocol: "runtime-control.v1", ready, acceptance_only: true });
+          return;
+        }
+        if (request.method === "GET" && url.pathname !== "/v1/internal/slack-runtime-commands") {
+          sendJson(response, 200, { receipt: this.database.runtimeCommandReceipt(url.pathname.split("/").at(-1)!) });
+          return;
+        }
+        if (request.method === "POST" && url.pathname === "/v1/internal/slack-runtime-commands") {
+          try {
+            const input = await this.readJson(request);
+            if (!this.config.slackRuntimeIngressEnabled || this.shuttingDown)
+              throw new ApiRequestError(503, "runtime_command_unavailable", "Runtime command ingress is disabled or quiescing");
+            sendJson(response, 200, this.database.acceptRuntimeCommand(input));
+          }
+          catch (error) {
+            if (error instanceof Error && error.message === "runtime_command_conflict")
+              throw new ApiRequestError(409, "runtime_command_conflict", "Request identity conflicts");
+            if (error instanceof Error && error.message === "runtime_command_capacity")
+              throw new ApiRequestError(503, "runtime_command_capacity", "Inbox capacity reached");
+            if (error instanceof Error && error.name === "ZodError")
+              throw new ApiRequestError(400, "invalid_request", "Invalid typed command");
+            throw error;
+          }
+          return;
+        }
+        throw new ApiRequestError(405, "invalid_request", "Unsupported method");
+      }
       if(url.pathname.startsWith("/v1/dashboard/")) {
         if(this.shuttingDown)throw new ApiRequestError(503,"shutting_down","Dispatcher is shutting down");
         if(request.method!=="POST"||url.search)throw new ApiRequestError(400,"invalid_request","Invalid dashboard request");
@@ -304,6 +337,8 @@ export class DispatcherApi {
           app_schema_read_max: appSchema.read_max,
           app_schema_write: appSchema.write,
           config: 1,
+          runtime_command_ingress: { configured: this.config.slackRuntimeIngressEnabled === true,
+            ready: this.config.slackRuntimeIngressEnabled === true && !this.shuttingDown && health.ready && this.database.runtimeCommandCapacity() },
           scheduler: health.scheduler,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
         });

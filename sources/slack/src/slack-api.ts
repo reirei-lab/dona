@@ -487,6 +487,7 @@ export interface SlackChannelPage {
 }
 
 export interface SlackUser {
+  isSuspended?: boolean;
   stateKnown?:boolean;
   isAgentforceBot?:boolean;
   teamId?:string;
@@ -545,6 +546,7 @@ export interface SlackFileInfo {
 
 export interface SlackApiClient {
   authenticate(): Promise<SlackWorkspaceIdentity>;
+  runtimeCommandIdentity?(signal: AbortSignal): Promise<{ teamId: string; appId: string; enterpriseId: string | null }>;
   listChannels(limit: number, cursor?: string): Promise<SlackChannelPage>;
   getChannel(channelId: string,signal?:AbortSignal): Promise<SlackChannel>;
   hasChannelMember?(channelId: string, userId: string,signal?:AbortSignal): Promise<boolean>;
@@ -625,6 +627,7 @@ function channelFromResponse(channel: {
 }
 
 function userFromResponse(user: {
+  suspended?: boolean;
   team_id?:string;
   is_agentforce_bot?:boolean;
   id?: string;
@@ -646,7 +649,9 @@ function userFromResponse(user: {
     ...(user.profile?.title ? { title: user.profile.title } : {}),
     ...(user.tz ? { timezone: user.tz } : {}),
     isAgentforceBot:user.is_agentforce_bot===true,
-    stateKnown:typeof user.is_bot==="boolean"&&typeof user.is_app_user==="boolean"&&typeof user.deleted==="boolean",
+    ...(typeof user.suspended === "boolean" ? { isSuspended: user.suspended } : {}),
+    stateKnown:typeof user.is_bot==="boolean"&&typeof user.is_app_user==="boolean"&&typeof user.deleted==="boolean"
+      && (user.suspended === undefined || typeof user.suspended === "boolean"),
     ...(user.team_id?{teamId:user.team_id}:{}),
     isBot: user.is_bot ?? false,
     isAppUser: user.is_app_user ?? false,
@@ -778,6 +783,16 @@ export class SlackWebApiClient implements SlackApiClient {
     signal.throwIfAborted();
     return new WebClient(this.botToken,{logger:new StderrOnlyWebApiLogger(this.logger),retryConfig:{retries:0},timeout:15000,rejectRateLimitedCalls:true,
       fetch:(url,init)=>globalThis.fetch(url,{...init,signal:AbortSignal.any([signal,...(init?.signal?[init.signal]:[])])})});
+  }
+
+  async runtimeCommandIdentity(signal: AbortSignal): Promise<{ teamId: string; appId: string; enterpriseId: string | null }> {
+    const client = this.readClient(signal);
+    const auth = await callSlack(() => client.auth.test());
+    const botId = nonEmpty(auth.bot_id, "bot_id");
+    const response = await callSlack(() => client.bots.info({ bot: botId, team_id: nonEmpty(auth.team_id, "team_id") }));
+    if (response.bot?.id !== botId || response.bot?.deleted === true) throw Error("runtime_command_bot_unverified");
+    return { teamId: nonEmpty(auth.team_id, "team_id"), appId: nonEmpty(response.bot?.app_id, "app_id"),
+      enterpriseId: auth.enterprise_id == null ? null : nonEmpty(auth.enterprise_id, "enterprise_id") };
   }
 
   async authenticate(): Promise<SlackWorkspaceIdentity> {
