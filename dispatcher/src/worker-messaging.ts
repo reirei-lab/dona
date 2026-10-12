@@ -478,7 +478,7 @@ export class WorkerMessageRepository {
         result.state="presentation_ready";
         result.artifact={version:1,decision_id:decisionId,action:candidate.decision.action,
           source_event_id:job.source_event_id,destination:binding.destination,
-          operation_slot:decisionId,safe_projection:candidate.decision.safe_projection};
+          operation_slot:decisionId,reply_broadcast:false,safe_projection:candidate.decision.safe_projection};
       }
       this.db.prepare("INSERT INTO worker_progress_applications VALUES(?,?,?,?,NULL,?)").run(decisionId,eventId,stableStringify(result),nextCheck,at.toISOString());
       return result;

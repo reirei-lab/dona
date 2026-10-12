@@ -108,3 +108,47 @@ test("遅れた古いreportを最新の進捗として再投稿しない",async(
   assert.equal(c.decision.action,"ack_internal");assert.equal(c.decision.reason,"stale_report");assert.equal(c.decision.safe_projection,undefined);
  }finally{await f.dispose();}
 });
+
+
+for(const order of [[0,1],[1,0]])test(`並行した別質問を各exact jobへ束縛し、順序に依存しない（${order}）`,async()=>{
+ const f=await fixture();try{
+  const questions=["最初の作業で必要な選択は？","並行作業で必要な選択は？"],messages=new Map<number,string>();
+  for(const index of order){const m=f.db.workerMessages.appendWorkerReport(f.tasks[index]!.current_attempt_id,"runtime",{
+   schema_version:1,source_event_id:f.source.event_id,producer_sequence:1,idempotency_key:"question",occurred_at:new Date().toISOString(),payload:{kind:"question",question:questions[index]!}});messages.set(index,m.message.message_id);}
+  f.db.workerMessages.publishPendingReports();
+  for(const index of order){const task=f.tasks[index]!,event=f.eventFor(messages.get(index)!);
+   const c=f.db.workerMessages.progressDecisionCandidate(task.current_attempt_id,event)!;assert.equal(c.decision.action,"ask_user");assert.equal(c.decision.safe_projection?.question,questions[index]);
+   const a=f.db.applyTaskProgressDecision(task.task_id,event,c.decision_id),artifact=a.artifact as {reply_broadcast:boolean;safe_projection:{question:string}};
+   assert.equal(artifact.reply_broadcast,false);assert.equal(artifact.safe_projection.question,questions[index]);
+   assert.equal(f.db.workerMessages.progressDecisionCandidate(f.tasks[1-index]!.current_attempt_id,event),undefined);
+   assert.throws(()=>f.db.applyTaskProgressDecision(task.task_id,event,"f".repeat(64)),/progress_decision_not_current/);
+  }
+  f.reopen();for(const index of order){const t=f.tasks[index]!,event=f.eventFor(messages.get(index)!);assert.ok(f.db.taskReports(t.task_id,event).progress_decision_candidate!.application_receipt);}
+ }finally{await f.dispose();}
+});
+
+test("後続checkpointで未回答質問を失わず、保存済みanswerへ一度だけリンクする",async()=>{
+ const f=await fixture();try{
+  const t=f.tasks[0]!,q=f.db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:f.source.event_id,producer_sequence:1,idempotency_key:"question",occurred_at:new Date().toISOString(),payload:{kind:"question",question:"元の範囲で継続できますか？"}});
+  f.db.workerMessages.publishPendingReports();const event=f.eventFor(q.message.message_id);
+  f.db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:f.source.event_id,producer_sequence:2,idempotency_key:"waiting",occurred_at:new Date().toISOString(),payload:{kind:"checkpoint",summary:"回答を待っています"}});
+  const c=f.db.workerMessages.progressDecisionCandidate(t.current_attempt_id,event)!;assert.equal(c.decision.action,"ask_user");
+  const answer=f.db.instructTask(t.task_id,f.db.tasks.get(t.task_id)!.revision,{schema_version:1,source_event_id:event,producer_sequence:1,idempotency_key:"answer",occurred_at:new Date().toISOString(),correlation_message_id:q.message.message_id,conversation_revision:1,payload:{operation:"answer",text:"元の依頼範囲で継続してください"}});
+  const applied=f.db.applyTaskProgressDecision(t.task_id,event,c.decision_id);assert.equal(applied.state,"instruction_pending");assert.equal(applied.instruction_message_id,answer.message.message_id);
+  assert.equal(f.db.applyTaskProgressDecision(t.task_id,event,c.decision_id).replayed,true);assert.equal(f.db.workerMessages.instructionReceipts(t.current_attempt_id,event).instructions.length,1);
+ }finally{await f.dispose();}
+});
+
+test("別threadのeventとDB読取不能ではdecisionを作らずfail closedする",async()=>{
+ const f=await fixture();try{
+  const m=f.report(0,"確認が進みました");f.db.workerMessages.publishPendingReports();const event=f.eventFor(m.message.message_id),t=f.tasks[0]!;
+  const other=eventEnvelope("other-thread");other.subject.thread_ts="999.000001";const foreign=f.db.enqueue(other).row;
+  assert.equal(f.db.workerMessages.progressDecisionCandidate(t.current_attempt_id,foreign.event_id),undefined);
+  assert.equal(f.db.taskReports(t.task_id,foreign.event_id).progress_decision_candidate,undefined);
+  assert.throws(()=>f.db.applyTaskProgressDecision(t.task_id,foreign.event_id,"f".repeat(64)),/progress_decision_not_current/);
+  const sql=new Database(f.config.databasePath);sql.exec("ALTER TABLE worker_progress_decisions RENAME TO fixture_unavailable_decisions");
+  assert.throws(()=>f.db.workerMessages.progressDecisionCandidate(t.current_attempt_id,event),/no such table/);
+  sql.exec("ALTER TABLE fixture_unavailable_decisions RENAME TO worker_progress_decisions");sql.close();
+  assert.equal(f.db.workerMessages.progressDecisionCandidate(t.current_attempt_id,event)!.replayed,false);
+ }finally{await f.dispose();}
+});

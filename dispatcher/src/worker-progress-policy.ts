@@ -46,12 +46,14 @@ export function evaluateProgress(raw:unknown):ProgressDecision {
  if(!c.context_complete||!c.members.some(m=>m.job_id===c.job_id&&m.phase===c.phase)||new Set(c.members.map(m=>m.job_id)).size!==c.members.length){result.reason="context_incomplete";return result;}
  if([c.report,...c.members.map(m=>m.report)].some(r=>denied(reportText(r)))){result.reason="unsafe_projection";result.target=null;return result;}
  if(!c.report_current){result.reason="stale_report";return result;}
- if(c.pending_instruction&&c.pending_instruction.state!=="delivered"){
+ const existingInstruction=()=>{
+  if(!c.pending_instruction||c.pending_instruction.state==="delivered")return false;
   result.action="instruct_worker";result.reason="existing_instruction_receipt";result.target={job_id:c.job_id,message_id:c.pending_instruction.message_id};
-  result.operation=c.pending_instruction.state==="unknown"?"read_instruction_receipt":"deliver_existing_instruction";return result;
- }
+  result.operation=c.pending_instruction.state==="unknown"?"read_instruction_receipt":"deliver_existing_instruction";return true;
+ };
  const now=Date.parse(c.now);
  if(!c.report){
+  if(existingInstruction())return result;
   const silence=c.silence_since!==undefined&&now-Date.parse(c.silence_since)>=c.silence_threshold_ms;
   result.signals.silence=silence;
   if(silence&&!(c.previous?.action==="ask_worker"&&now-Date.parse(c.previous.decided_at)<c.silence_threshold_ms)){
@@ -74,6 +76,10 @@ export function evaluateProgress(raw:unknown):ProgressDecision {
   if(c.previous?.message_id===c.report.message_id&&c.previous.action==="ask_user"){result.reason="question_already_recorded";return result;}
   result.action="ask_user";result.reason="human_decision_required";result.safe_projection={question:payload.question,...(payload.kind==="decision_request"?{options:payload.options}:{})};return result;
  }
+ // Questions and risk/ETA escalation must not disappear behind an unrelated instruction receipt.
+ if(!result.signals.risk_escalation&&!result.signals.eta_changed&&existingInstruction())return result;
+ const heartbeat=payload.kind==="checkpoint"&&/^(?:(?:作業|調査|確認)(?:を)?(?:継続(?:して|し)|続けて)います|(?:作業|調査|確認)中です)[。.!！]?$/u.test(normalized(payload.summary));
+ if(heartbeat&&!result.signals.risk_escalation&&!result.signals.eta_changed){result.signals.novelty=false;result.reason="heartbeat_without_change";return result;}
  if(payload.kind==="checkpoint"&&c.last_presentation_fingerprint===groupFingerprint){result.reason="group_progress_already_reserved";return result;}
  if(!result.signals.novelty&&!result.signals.risk_escalation&&!result.signals.eta_changed&&c.previous?.action!=="aggregate_wait"){result.reason="duplicate_report";return result;}
  const live=c.members.filter(m=>["running","blocked"].includes(m.phase));

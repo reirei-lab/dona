@@ -46,3 +46,19 @@ test("見込み時間の全角数字も同じdeterministic評価へ正規化す�
 
 
 test("1 workerだけのhigh riskを集約待ちやcadenceで隠さない",()=>{const next=evaluateProgress(context({last_presentation_at:now,members:[{job_id:"job-one",phase:"running",report},{job_id:"job-two",phase:"running",report:{...report,payload:{kind:"risk",severity:"high",summary:"並行作業で確認が必要です"}}}]}));assert.equal(next.action,"report_to_user");assert.equal(next.signals.risk_escalation,true);assert.equal(next.safe_projection?.members?.length,2);});
+
+for(const summary of ["作業を継続しています。","調査を続けています","確認中です。"])
+ test(`具体的な変化のないheartbeatを内部受領する: ${summary}`,()=>{
+  const d=evaluateProgress(context({report:{...report,payload:{kind:"checkpoint",summary}}}));
+  assert.equal(d.action,"ack_internal");assert.equal(d.reason,"heartbeat_without_change");assert.equal(d.signals.novelty,false);
+ });
+for(const state of ["pending","unknown"] as const){
+ test(`指示${state}中も新しい質問を隠さない`,()=>{
+  const d=evaluateProgress(context({report:{...report,payload:{kind:"question",question:"利用者の選択は？"}},pending_instruction:{message_id:"instruction",state}}));
+  assert.equal(d.action,"ask_user");assert.equal(d.safe_projection?.question,"利用者の選択は？");
+ });
+ test(`指示${state}中もhigh riskを隠さない`,()=>{
+  const d=evaluateProgress(context({report:{...report,payload:{kind:"risk",severity:"high",summary:"確認が必要です"}},pending_instruction:{message_id:"instruction",state}}));
+  assert.equal(d.action,"report_to_user");assert.equal(d.signals.risk_escalation,true);
+ });
+}
