@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {createHash,createHmac} from "node:crypto";
 import {test} from "node:test";
+import {DispatcherWorker} from "../src/worker.js";
 import Database from "better-sqlite3";
 import {DispatcherDatabase} from "../src/database.js";
 import {taskRequestSchema} from "../src/task-execution.js";
@@ -10,7 +11,7 @@ import {principalProofKeyId,verifySlackPrincipalProof} from "../src/principal-pr
 import {stableStringify} from "../src/validation.js";
 import {AgentContextManager} from "../src/agent-context.js";
 import {envelopeFromRow} from "../src/prompt.js";
-import {eventEnvelope,tempConfig} from "./helpers.js";
+import {eventEnvelope,tempConfig,waitFor} from "./helpers.js";
 async function fixture(){
  const {root,config}=await tempConfig();let db=new DispatcherDatabase(config.databasePath);
  const e=eventEnvelope("progress-orchestration");e.trace={ingress_attempt:1};
@@ -188,7 +189,7 @@ test("未来のworker時刻でもserver受付から30秒で集約を進める",a
 
 test("未配送presentation待ちのtimerを未来へ戻し、取得枠を占有し続けない",async()=>{
  const f=await fixture();try{
-  const now=new Date(),a=f.report(0,"検証Aが進みました",now);f.report(1,"検証Bが進みました",now);f.db.workerMessages.publishPendingReports();
+  const now=new Date(),a=f.report(0,"検証Aが進みました",now);f.report(1,"検証Bが進みました",now);f.db.workerMessages.publishPendingReports();f.db.workerMessages.publishPendingReports(100,new Date(now.getTime()+61000));
   const event=f.eventFor(a.message.message_id),t=f.tasks[0]!,c=f.db.workerMessages.progressDecisionCandidate(t.current_attempt_id,event,now)!;
   assert.equal(f.db.workerMessages.applyProgressDecision(t.current_attempt_id,event,c.decision_id,now).state,"presentation_ready");
   const later=new Date(now.getTime()+61000),b=f.db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:f.source.event_id,producer_sequence:2,idempotency_key:"later",occurred_at:later.toISOString(),payload:{kind:"checkpoint",summary:"次の検証も進みました"}},later);
@@ -198,4 +199,48 @@ test("未配送presentation待ちのtimerを未来へ戻し、取得枠を占有
   const sql=new Database(f.config.databasePath),record=sql.prepare("SELECT next_check_at,followup_event_id FROM worker_progress_applications WHERE decision_key=?").get(waiting.decision_id) as {next_check_at:string;followup_event_id:string|null};sql.close();
   assert.ok(Date.parse(record.next_check_at)>due.getTime());assert.equal(record.followup_event_id,null);assert.equal(f.db.workerMessages.publishDueProgressDecisions(1,due),0);
  }finally{await f.dispose();}
+});
+
+
+test("未適用の質問candidateはsnapshot変更後にwrite準備で新しいidentityへ更新する",async()=>{
+ const f=await fixture();try{
+  const t=f.tasks[0]!,q=f.db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:f.source.event_id,producer_sequence:1,idempotency_key:"refresh-question",occurred_at:new Date().toISOString(),payload:{kind:"question",question:"どの方式にしますか？"}});
+  f.db.workerMessages.publishPendingReports();const event=f.eventFor(q.message.message_id),old=f.db.prepareTaskProgressDecision(t.task_id,event)!;
+  f.report(1,"siblingの検証が進みました");assert.equal(f.db.taskReports(t.task_id,event).progress_decision_candidate!.eligible_now,false);
+  const fresh=f.db.prepareTaskProgressDecision(t.task_id,event)!;assert.notEqual(fresh.decision_id,old.decision_id);assert.equal(fresh.decision.action,"ask_user");
+  assert.throws(()=>f.db.applyTaskProgressDecision(t.task_id,event,old.decision_id),/not_current/);
+  assert.equal(f.db.applyTaskProgressDecision(t.task_id,event,fresh.decision_id).state,"presentation_ready");
+  f.reopen();assert.equal(f.db.taskReports(t.task_id,event).progress_decision_candidate!.application_receipt.receipt_id,`policy_${fresh.decision_id}`);
+ }finally{await f.dispose();}
+});
+
+test("providerの宛先・本文・identity receiptを確認した時だけ予約を解放する",async()=>{
+ const f=await fixture();try{
+  const now=new Date(),m=f.report(0,"検証が進みました",now);f.report(1,"並行検証が進みました",now);f.db.workerMessages.publishPendingReports();f.db.workerMessages.publishPendingReports(100,new Date(now.getTime()+61000));
+  const event=f.eventFor(m.message.message_id),t=f.tasks[0]!,c=f.db.prepareTaskProgressDecision(t.task_id,event)!;
+  const a=f.db.applyTaskProgressDecision(t.task_id,event,c.decision_id),artifact=a.artifact as {rendered_body:string;destination:{workspace_id:string;channel_id:string;thread_ts:string}};
+  assert.ok(artifact.rendered_body);const ts=(Date.now()/1000).toFixed(6),result={schema_version:1 as const,event_id:event,status:"completed" as const,summary:"報告しました",completed_at:new Date().toISOString(),actions:[{tool:"dona_slack.post_message",event_id:event,workspace_id:artifact.destination.workspace_id,channel_id:artifact.destination.channel_id,thread_ts:artifact.destination.thread_ts,message_ts:ts,reply_broadcast:false,mrkdwn:true,parse:"none"}]};
+  const request=f.db.workerMessages.presentationVerificationRequest(event,result)!;
+  const evidence={event_id:event,workspace_id:request.workspace_id,channel_id:request.channel_id,thread_ts:request.thread_ts,message_ts:ts,body_sha256:request.body_sha256,posted_at:new Date(Number(ts)*1000).toISOString(),reply_broadcast:false as const,identity_block_verified:true,session_status:null};
+  assert.throws(()=>f.db.workerMessages.confirmPresentation(event,request,{...evidence,channel_id:"COTHER"}),/receipt_mismatch/);
+  assert.equal(f.db.taskReports(t.task_id,event).progress_decision_candidate!.application_receipt.state,"presentation_ready");
+  f.db.workerMessages.confirmPresentation(event,request,evidence);f.db.workerMessages.confirmPresentation(event,request,evidence);f.reopen();
+  assert.equal(f.db.taskReports(t.task_id,event).progress_decision_candidate!.application_receipt.state,"presentation_delivered");
+  const sql=new Database(f.config.databasePath);assert.equal((sql.prepare("SELECT COUNT(*) count FROM worker_progress_applications WHERE json_extract(result_json,'$.state')='presentation_ready'").get() as {count:number}).count,0);sql.close();
+ }finally{await f.dispose();}
+});
+
+
+for(const verified of [true,false])test(`親Resultの投稿actionをread-only verifierで照合する（成功=${verified}）`,async()=>{
+ const f=await fixture();let worker:DispatcherWorker|undefined;try{
+  f.config.workerMessagingEnabled=true;const now=new Date(),m=f.report(0,"検証が進みました",now);f.report(1,"並行検証が進みました",now);f.db.workerMessages.publishPendingReports();f.db.workerMessages.publishPendingReports(100,new Date(now.getTime()+61000));
+  const event=f.eventFor(m.message.message_id),t=f.tasks[0]!,c=f.db.prepareTaskProgressDecision(t.task_id,event)!;
+  const a=f.db.applyTaskProgressDecision(t.task_id,event,c.decision_id),artifact=a.artifact as {destination:{workspace_id:string;channel_id:string;thread_ts:string}};
+  const resultPath=path.join(f.root,"parent-progress-result.json");f.db.beginDispatch(event,resultPath);f.db.markWaiting(event);
+  const ts=(Date.now()/1000).toFixed(6);await fs.writeFile(resultPath,JSON.stringify({schema_version:1,event_id:event,status:"completed",summary:"進捗を報告しました",completed_at:new Date().toISOString(),actions:[{tool:"dona_slack.post_message",event_id:event,workspace_id:artifact.destination.workspace_id,channel_id:artifact.destination.channel_id,thread_ts:artifact.destination.thread_ts,message_ts:ts,reply_broadcast:false,mrkdwn:true,parse:"none"}]}));
+  let calls=0;const never=async()=>{throw Error("model再投入・session変更をしてはいけない");};
+  worker=new DispatcherWorker(f.db,{get:never,prompt:never,wait:never},f.config,{debug(){},info(){},warn(){},error(){}},{settle:never,async verify(request){calls++;worker!.quiesceAfterCurrent();if(!verified)throw Error("job_delivery_not_confirmed");return {event_id:request.event_id,workspace_id:request.workspace_id,channel_id:request.channel_id,thread_ts:request.thread_ts,message_ts:ts,body_sha256:request.body_sha256,posted_at:new Date(Number(ts)*1000).toISOString(),reply_broadcast:false,identity_block_verified:true,session_status:null};}});
+  worker.start();await waitFor(()=>f.db.get(event)?.status===(verified?"completed":"needs_review"));await worker.stop();
+  assert.equal(calls,1);const sql=new Database(f.config.databasePath),state=JSON.parse((sql.prepare("SELECT result_json FROM worker_progress_applications WHERE decision_key=?").get(c.decision_id) as {result_json:string}).result_json).state;sql.close();assert.equal(state,verified?"presentation_delivered":"presentation_ready");
+ }finally{await worker?.stop();await f.dispose();}
 });

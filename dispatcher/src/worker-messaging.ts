@@ -8,7 +8,8 @@ import { ulid } from "ulid";
 import { z } from "zod";
 
 import { insertEventJobBinding, readEventJobBinding } from "./job-routing.js";
-import type { JobRow } from "./types.js";
+import type { JobRow,ResultEnvelope } from "./types.js";
+import type {JobNotificationEvidence,JobNotificationVerificationRequest} from "./database.js";
 import { jobObjectiveCharacterMax, stableStringify } from "./validation.js";
 
 export const workerMessageProtocolVersion = 1 as const;
@@ -230,6 +231,9 @@ export function migrateWorkerMessaging(db: Database.Database): void {
       decided_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS worker_progress_decisions_job_idx ON worker_progress_decisions(job_id,decided_at);
+    CREATE TABLE IF NOT EXISTS worker_progress_decision_roots (
+      root_key TEXT PRIMARY KEY,decision_key TEXT NOT NULL REFERENCES worker_progress_decisions(decision_key)
+    );
     CREATE TABLE IF NOT EXISTS worker_progress_applications (
       decision_key TEXT PRIMARY KEY REFERENCES worker_progress_decisions(decision_key),
       event_id TEXT NOT NULL REFERENCES events(event_id),
@@ -417,24 +421,36 @@ export class WorkerMessageRepository {
         group_attention:liveAttention||attentionActive,group_terminal:!!group?.all_terminal_event_id,context_complete:rows.length<=32,
         ...(pending?{pending_instruction:{message_id:pending.message_id,state:pending.attempt_count>0?"unknown":"pending"}}:{})};
       const snapshot=sha256(stableStringify({identity,control:{revision:task?.revision,stop_state:task?.stop_state,steer_event:task?.steer_pending_event_id,job_error:job.last_error_code}}));
-      const key=sha256(stableStringify({version:1,job_id:jobId,report_id:report?.message_id??event.external_event_id,...(event.event_type==="worker_message_aggregate"?{stage:event.external_event_id}:{})}));
-      const saved=this.db.prepare("SELECT * FROM worker_progress_decisions WHERE decision_key=?").get(key) as {snapshot_sha256:string;decision_json:string;decided_at:string}|undefined;
+      const root=sha256(stableStringify({version:1,job_id:jobId,report_id:report?.message_id??event.external_event_id,...(event.event_type==="worker_message_aggregate"?{stage:event.external_event_id}:{})}));
+      const pointer=this.db.prepare("SELECT decision_key FROM worker_progress_decision_roots WHERE root_key=?").get(root) as {decision_key:string}|undefined;
+      const priorKey=pointer?.decision_key??root;
+      const saved=this.db.prepare("SELECT * FROM worker_progress_decisions WHERE decision_key=?").get(priorKey) as {snapshot_sha256:string;decision_json:string;decided_at:string}|undefined;
       if(saved){
-        const application=this.db.prepare("SELECT result_json FROM worker_progress_applications WHERE decision_key=?").get(key) as {result_json:string}|undefined;
-        return {decision_id:key,decision:JSON.parse(saved.decision_json) as ProgressDecision,eligible_now:saved.snapshot_sha256===snapshot,replayed:true,
+        const application=this.db.prepare("SELECT result_json FROM worker_progress_applications WHERE decision_key=?").get(priorKey) as {result_json:string}|undefined;
+        if(application||saved.snapshot_sha256===snapshot||!persist)return {decision_id:priorKey,decision:JSON.parse(saved.decision_json) as ProgressDecision,eligible_now:saved.snapshot_sha256===snapshot,replayed:true,
           decided_at:saved.decided_at,applied:!!application,...(application?{application_receipt:JSON.parse(application.result_json)}:{})};
       }
       if(!persist)return undefined;
+      const key=sha256(stableStringify({root,snapshot}));
       const prior=this.db.prepare("SELECT p.decision_json,p.decided_at FROM worker_progress_decisions p JOIN worker_progress_applications a USING(decision_key) WHERE p.job_id=? ORDER BY p.decided_at DESC,p.decision_key DESC LIMIT 1").get(jobId) as {decision_json:string;decided_at:string}|undefined;
       const previous=prior?JSON.parse(prior.decision_json) as ProgressDecision:undefined;
       const presentation=this.db.prepare(`SELECT a.applied_at,p.decision_json FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key) JOIN jobs j ON j.job_id=p.job_id
         WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready' ORDER BY a.applied_at DESC,a.decision_key DESC LIMIT 1`).get(job.source_event_id) as {applied_at:string;decision_json:string}|undefined;
       const reserved=presentation?JSON.parse(presentation.decision_json) as ProgressDecision:undefined;
-      const decision=evaluateProgress({event_id:eventId,...identity,context_complete:rows.length<=32,now:at.toISOString(),members,presentation_pending:!!presentation,...(presentation?{last_presentation_at:presentation.applied_at,last_presentation_fingerprint:reserved?.observed?.group_fingerprint}:{}),...(report?{report:project(report)}:{}),
+      const currentHighIds=[...new Set([...(report?.kind==='risk'&&JSON.parse(report.payload_json).severity==='high'?[report.message_id]:[]),...members.flatMap(m=>m.report?.payload.kind==='risk'&&m.report.payload.severity==='high'?[m.report.message_id]:[])])];
+      const reservedHighIds=currentHighIds.length?(this.db.prepare(`SELECT DISTINCT risk.value AS message_id FROM worker_progress_applications a
+        JOIN worker_progress_decisions p USING(decision_key) JOIN jobs j ON j.job_id=p.job_id JOIN json_each(p.decision_json,'$.observed.high_risk_message_ids') risk
+        WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state') IN ('presentation_ready','presentation_delivered','presentation_duplicate','local_artifact_ready')
+          AND json_extract(p.decision_json,'$.action')='report_to_user' AND risk.value IN (${currentHighIds.map(()=>'?').join(',')}) LIMIT 64`)
+        .all(job.source_event_id,...currentHighIds) as Array<{message_id:string}>).map(r=>r.message_id):[];
+      const delivered=this.db.prepare(`SELECT MAX(json_extract(a.result_json,'$.provider_receipt.posted_at')) posted_at FROM worker_progress_applications a
+        JOIN worker_progress_decisions p USING(decision_key) JOIN jobs j ON j.job_id=p.job_id WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_delivered'`).get(job.source_event_id) as {posted_at:string|null};
+      const decision=evaluateProgress({event_id:eventId,...identity,context_complete:rows.length<=32,now:at.toISOString(),members,reserved_high_risk_ids:reservedHighIds,presentation_pending:!!presentation,...(delivered.posted_at?{last_user_report_at:delivered.posted_at}:{}),...(presentation?{last_presentation_fingerprint:reserved?.observed?.group_fingerprint}:{}),...(report?{report:project(report)}:{}),
         ...(!report&&cadence?.last_report_at?{silence_since:cadence.last_report_at}:{}),
         ...(pending?{pending_instruction:{message_id:pending.message_id,state:pending.attempt_count>0?"unknown":"pending"}}:{}),
         ...(previous&&prior?{previous:{fingerprint:previous.fingerprint??"",action:previous.action,decided_at:prior.decided_at,...previous.observed,...(previous.target?.message_id?{message_id:previous.target.message_id}:{})}}:{})});
-      this.db.prepare("INSERT INTO worker_progress_decisions VALUES(?,?,?,?,?,?)").run(key,jobId,eventId,snapshot,stableStringify(decision),at.toISOString());
+      this.db.prepare("INSERT OR IGNORE INTO worker_progress_decisions VALUES(?,?,?,?,?,?)").run(key,jobId,eventId,snapshot,stableStringify(decision),at.toISOString());
+      this.db.prepare("INSERT INTO worker_progress_decision_roots VALUES(?,?) ON CONFLICT(root_key) DO UPDATE SET decision_key=excluded.decision_key").run(root,key);
       return {decision_id:key,decision,eligible_now:true,replayed:false,decided_at:at.toISOString(),applied:false};
     });
     return persist?operation.immediate():operation();
@@ -443,7 +459,7 @@ export class WorkerMessageRepository {
   applyProgressDecision(jobId:string,eventId:string,decisionId:string,at=new Date()) {
     if(!/^[0-9a-f]{64}$/.test(decisionId))throw Error("progress_decision_invalid");
     return this.db.transaction(()=>{
-      const candidate=this.progressDecisionCandidate(jobId,eventId,at);
+      const candidate=this.progressDecisionCandidate(jobId,eventId,at,false);
       if(!candidate||candidate.decision_id!==decisionId)throw Error("progress_decision_not_current");
       const prior=this.db.prepare("SELECT result_json FROM worker_progress_applications WHERE decision_key=?").get(decisionId) as {result_json:string}|undefined;
       if(prior)return {...JSON.parse(prior.result_json),replayed:true,eligible_now:candidate.eligible_now};
@@ -481,7 +497,7 @@ export class WorkerMessageRepository {
         if(!binding)throw Error("progress_destination_unverified");
         const reserved=candidate.decision.action==="report_to_user"&&this.db.prepare(`SELECT 1 FROM worker_progress_applications a
           JOIN worker_progress_decisions p USING(decision_key) JOIN jobs j ON j.job_id=p.job_id
-          WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready'
+          WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state') IN ('presentation_ready','presentation_delivered') AND json_extract(p.decision_json,'$.action')='report_to_user'
             AND json_extract(p.decision_json,'$.observed.group_fingerprint')=?
             AND (? IS NULL OR json_extract(p.decision_json,'$.fingerprint')=?) LIMIT 1`)
           .get(job.source_event_id,candidate.decision.observed?.group_fingerprint??null,
@@ -490,13 +506,49 @@ export class WorkerMessageRepository {
           JOIN jobs j ON j.job_id=p.job_id WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready' LIMIT 1`).get(job.source_event_id);
         if(reserved){result.action="ack_internal";result.state="presentation_duplicate";}
         else if(undelivered){result.action="aggregate_wait";result.state="aggregate_wait";nextCheck=new Date(at.getTime()+30000).toISOString();result.next_check_at=nextCheck;}
-        else {result.state="presentation_ready";
+        else {result.state=binding.destination.kind==='none'?"local_artifact_ready":"presentation_ready";
+        const body=this.renderPresentation(candidate.decision);
         result.artifact={version:1,decision_id:decisionId,action:candidate.decision.action,
           source_event_id:job.source_event_id,destination:binding.destination,
-          operation_slot:decisionId,reply_broadcast:false,safe_projection:candidate.decision.safe_projection};}
+          operation_slot:decisionId,reply_broadcast:false,safe_projection:candidate.decision.safe_projection,rendered_body:body,rendered_body_sha256:sha256(body)};}
       }
       this.db.prepare("INSERT INTO worker_progress_applications VALUES(?,?,?,?,NULL,?)").run(decisionId,eventId,stableStringify(result),nextCheck,at.toISOString());
       return result;
+    }).immediate();
+  }
+
+  private renderPresentation(decision:ProgressDecision):string {
+    const p=decision.safe_projection;if(!p)throw Error("progress_projection_missing");
+    const lines=[p.question??p.summary??"進捗を確認しました",...(p.options??[]).map(option=>`- ${option}`),
+      ...(decision.action==='report_to_user'?(p.members??[]).map((m,i)=>`並行作業 ${i+1}: ${Array.from(m.summary??m.phase).slice(0,100).join("")}`):[])];
+    const body=Buffer.from(lines.join("\n"),"utf8").toString("utf8").replace(/<!(?:channel|here|everyone)(?:\|[^>]+)?>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+(?:\|[^>]+)?>/gi,mention=>`&lt;${mention.slice(1)}`);
+    if(body.length>12000)throw Error("progress_presentation_body_limit");return body;
+  }
+
+  presentationVerificationRequest(eventId:string,result:ResultEnvelope):JobNotificationVerificationRequest|undefined {
+    const posts=(result.actions??[]).filter(a=>a&&typeof a==='object'&&!Array.isArray(a)&&(a as Record<string,unknown>).tool==='dona_slack.post_message') as Array<Record<string,unknown>>;
+    if(!posts.length)return undefined;
+    const rows=this.db.prepare("SELECT decision_key,result_json FROM worker_progress_applications WHERE event_id=? AND json_extract(result_json,'$.state') IN ('presentation_ready','presentation_delivered','local_artifact_ready') LIMIT 2").all(eventId) as Array<{decision_key:string;result_json:string}>;
+    if(!rows.length)return undefined;
+    if(rows.length!==1||posts.length!==1)throw Error("progress_presentation_ambiguous");
+    const artifact=JSON.parse(rows[0]!.result_json).artifact as {destination:{kind:string;workspace_id?:string;channel_id?:string;thread_ts?:string};rendered_body?:string;rendered_body_sha256?:string};
+    const target=artifact.destination,post=posts[0]!;
+    if(target.kind!=='slack_thread'||typeof artifact.rendered_body_sha256!=='string'||!/^[a-f0-9]{64}$/.test(artifact.rendered_body_sha256))throw Error("progress_presentation_body_unbound");
+    if(post.event_id!==eventId||post.workspace_id!==target.workspace_id||post.channel_id!==target.channel_id||post.thread_ts!==target.thread_ts||post.reply_broadcast!==false||post.parse!=='none'||post.mrkdwn!==true||typeof post.message_ts!=='string'||!/^\d{1,20}\.\d{6}$/.test(post.message_ts))throw Error("progress_presentation_action_mismatch");
+    return {schema_version:1,event_id:eventId,workspace_id:target.workspace_id!,channel_id:target.channel_id!,thread_ts:target.thread_ts!,message_ts:post.message_ts,body_sha256:artifact.rendered_body_sha256!,desired_session_status:null};
+  }
+
+  confirmPresentation(eventId:string,request:JobNotificationVerificationRequest,evidence:JobNotificationEvidence):void {
+    this.db.transaction(()=>{
+      const rows=this.db.prepare("SELECT decision_key,result_json FROM worker_progress_applications WHERE event_id=? AND json_extract(result_json,'$.state') IN ('presentation_ready','presentation_delivered','local_artifact_ready') LIMIT 2").all(eventId) as Array<{decision_key:string;result_json:string}>;
+      if(rows.length!==1)throw Error("progress_presentation_not_found");
+      const row=rows[0]!,result=JSON.parse(row.result_json),artifact=result.artifact;
+      if(request.event_id!==eventId||evidence.event_id!==eventId||evidence.workspace_id!==artifact.destination.workspace_id||evidence.channel_id!==artifact.destination.channel_id||evidence.thread_ts!==artifact.destination.thread_ts||evidence.message_ts!==request.message_ts||evidence.body_sha256!==artifact.rendered_body_sha256||request.body_sha256!==evidence.body_sha256||evidence.reply_broadcast!==false||evidence.identity_block_verified!==true||evidence.session_status!==null||!Number.isFinite(Date.parse(evidence.posted_at)))throw Error("progress_presentation_receipt_mismatch");
+      if(result.state==='presentation_delivered'){
+        if(stableStringify(result.provider_receipt)!==stableStringify(evidence))throw Error("progress_presentation_receipt_conflict");return;
+      }
+      result.state='presentation_delivered';result.provider_receipt=evidence;
+      this.db.prepare("UPDATE worker_progress_applications SET result_json=? WHERE decision_key=?").run(stableStringify(result),row.decision_key);
     }).immediate();
   }
 
@@ -1151,7 +1203,7 @@ export class WorkerMessageRepository {
         .run(at.toISOString(),cutoff);
       this.db.prepare(`UPDATE worker_progress_decisions SET decision_json=json_set(json_remove(decision_json,'$.safe_projection'),'$.payload_retired',json('true'))
         WHERE decided_at<? AND job_id IN (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled'))`).run(cutoff);
-      this.db.prepare(`UPDATE worker_progress_applications SET result_json=json_set(json_remove(result_json,'$.artifact.safe_projection'),'$.payload_retired',json('true')),
+      this.db.prepare(`UPDATE worker_progress_applications SET result_json=json_set(json_remove(result_json,'$.artifact.safe_projection','$.artifact.rendered_body'),'$.payload_retired',json('true')),
         next_check_at=NULL WHERE decision_key IN (SELECT decision_key FROM worker_progress_decisions WHERE decided_at<?
           AND job_id IN (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled')))` ).run(cutoff);
       const deleted=this.db.prepare(`DELETE FROM worker_messages WHERE accepted_at<? AND job_id IN

@@ -3,7 +3,7 @@ import {test} from "node:test";
 import {evaluateProgress,progressActions,type ProgressContext} from "../src/worker-progress-policy.js";
 const now="2026-10-12T08:00:00.000Z";
 const report={message_id:"message-one",payload:{kind:"checkpoint" as const,summary:"検証が進みました"},occurred_at:now,accepted_at:now};
-function context(patch:Partial<ProgressContext>={}):ProgressContext{return {event_id:"event-one",job_id:"job-one",presentation_pending:false,report_current:true,current:true,desired_state:"running",phase:"running",now,report,
+function context(patch:Partial<ProgressContext>={}):ProgressContext{return {event_id:"event-one",job_id:"job-one",reserved_high_risk_ids:[],presentation_pending:false,report_current:true,current:true,desired_state:"running",phase:"running",now,report,
  members:[{job_id:"job-one",phase:"running",report}],group_attention:false,group_terminal:false,context_complete:true,silence_threshold_ms:900000,minimum_report_interval_ms:60000,...patch};}
 const first=evaluateProgress(context());
 const previous={fingerprint:first.fingerprint!,action:first.action,decided_at:"2026-10-12T07:55:00.000Z"};
@@ -76,4 +76,11 @@ test("attention中のhigh riskを内部受領だけで失わない",()=>{
 for(const kind of ["question","decision_request"] as const)test(`unsafe siblingがあっても安全な${kind}を保持する`,()=>{
  const canary="https://private.invalid/sibling",d=evaluateProgress(context({report:{...report,payload:kind==="question"?{kind,question:"どちらにしますか？"}:{kind,question:"方式を選んでください",options:["方式A","方式B"]}},members:[{job_id:"job-one",phase:"running",report},{job_id:"job-two",phase:"running",report:{...report,payload:{kind:"checkpoint",summary:canary}}}]}));
  assert.equal(d.action,"ask_user");assert.ok(!JSON.stringify(d).includes(canary));
+});
+
+
+test("別workerのcheckpoint変化で同じhigh riskを再escalationしない",()=>{
+ const risk={...report,message_id:"known-risk",payload:{kind:"risk" as const,severity:"high" as const,summary:"確認が必要です"}};
+ const d=evaluateProgress(context({reserved_high_risk_ids:[risk.message_id],presentation_pending:true,members:[{job_id:"job-one",phase:"running",report},{job_id:"job-two",phase:"running",report:risk}]}));
+ assert.equal(d.signals.risk_escalation,false);assert.equal(d.action,"aggregate_wait");
 });
