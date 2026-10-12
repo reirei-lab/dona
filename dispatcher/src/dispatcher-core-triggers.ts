@@ -1,3 +1,4 @@
+import {legacyNotificationApprovalTriggers} from "./legacy-notification-approval-schema.js";
 import {runtimeBindingTriggers} from "./runtime-binding-archive.js";
 /** mainのDispatcher migrationが所有する既知triggerの固定定義。
  * DBから観測した定義を信頼済みとして登録しない。変更時は宣言元DDLと
@@ -71,6 +72,6 @@ const dispatcherCoreTriggers: readonly { name: string; tbl_name: string; sql: st
 ];
 
 export function isDispatcherCoreTrigger(row: { name: string; tbl_name: string; sql: string }): boolean {
-  return [...dispatcherCoreTriggers,...runtimeBindingTriggers].some(expected => expected.name === row.name
+  return [...dispatcherCoreTriggers,...runtimeBindingTriggers,...legacyNotificationApprovalTriggers].some(expected => expected.name === row.name
     && expected.tbl_name === row.tbl_name && expected.sql === row.sql);
 }

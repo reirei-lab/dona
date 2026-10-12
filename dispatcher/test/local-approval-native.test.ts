@@ -49,3 +49,11 @@ test("rotationは無効化完了前にreadyにせず旧configの更新前crash�
  const writes=entry.revision;assert.equal(rotateProtectedKeys(store,1,2,"a".repeat(64),ports),2);assert.equal(entry.revision,writes);assert.equal(trace.length,5);
  assert.throws(()=>rotateProtectedKeys(store,1,2,"b".repeat(64),ports));assert.throws(()=>rotateProtectedKeys(store,2,4,"a".repeat(64),ports));
 });
+
+test("履歴通知approvalの固定triggerだけを承認DBと共存させる",t=>{
+ const f=fixture(t,false);installApprovalExecutionMarkerSchema(f.db);
+ const dispatcher=new DispatcherDatabase(f.filename);t.after(()=>dispatcher.close());
+ initializeLocalApprovalRoots(f.db,f.providers,scope);
+ f.db.exec("DROP TRIGGER legacy_post_approval_no_update; CREATE TRIGGER legacy_post_approval_no_update BEFORE UPDATE ON job_legacy_notification_post_approvals BEGIN SELECT 1; END");
+ assert.throws(()=>new ApprovalRecordRepository(f.db,f.providers.auditAnchors,f.providers.auditKeys,scope).readListHead({record_kind:"request",membership:"all"},1));
+});

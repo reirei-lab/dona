@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { fork } from "node:child_process";
+import { fork, execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs/promises";
@@ -481,7 +482,7 @@ describe("DispatcherDatabase", () => {
     checked.close();
   });
 
-  test("legacy notification classification keeps uncertain evidence isolated and queues proven unsent once", async () => {
+  test("legacy notification classification keeps proven unsent held until exact post approval", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     await createSchemaV2Fixture(config.databasePath);
@@ -499,6 +500,10 @@ describe("DispatcherDatabase", () => {
     assert.equal((state.get("job-cancelled") as {state:string}).state, "acceptance_unknown");
     raw.close();
     const database = new DispatcherDatabase(config.databasePath);
+    assert.deepEqual(database.listJobsNeedingNotification(), []);
+    assert.throws(() => database.enqueueJobNotification("job-blocked"), /post_approval_required/);
+    const preview = database.legacyNotificationPostPreview("job-blocked");
+    database.approveLegacyNotificationPost("job-blocked",preview.preview_sha256,"legacy-post-approval-one");
     assert.deepEqual(database.listJobsNeedingNotification().map(row => row.job_id), ["job-blocked"]);
     const first = database.enqueueJobNotification("job-blocked");
     assert.equal(first.duplicate, false);
@@ -575,6 +580,8 @@ describe("DispatcherDatabase", () => {
     raw.close();
     const first = new DispatcherDatabase(config.databasePath);
     const second = new DispatcherDatabase(config.databasePath);
+    const preview = first.legacyNotificationPostPreview("job-blocked");
+    first.approveLegacyNotificationPost("job-blocked",preview.preview_sha256,"legacy-post-scanner-approval");
     assert.equal(first.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), true);
     assert.equal(second.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), true);
     const a = first.enqueueJobNotification("job-blocked");
@@ -603,7 +610,7 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
-  test("a new legacy sandbox reason is not hidden by an old needs_review marker", async () => {
+  test("migration sandbox reclassification stays held without historical post approval", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     await createSchemaV2Fixture(config.databasePath);
@@ -620,15 +627,15 @@ describe("DispatcherDatabase", () => {
     raw.close();
     const database = new DispatcherDatabase(config.databasePath);
     assert.equal(database.getJob("job-needs_review")?.last_error_code, "legacy_agent_sandbox_unknown");
-    assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-needs_review"), true);
-    assert.equal(database.enqueueJobNotification("job-needs_review").duplicate, false);
+    assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-needs_review"), false);
+    assert.throws(() => database.enqueueJobNotification("job-needs_review"), /post_approval_required/);
     database.close();
     const checked = new Database(config.databasePath);
     assert.deepEqual(checked.prepare("SELECT job_status,last_error_code,state,classified_at FROM job_legacy_notification_migration WHERE job_id='job-needs_review'").get(), marker);
     checked.close();
   });
 
-  test("operator-confirmed no-post resolution is audited and allows one normal enqueue", async () => {
+  test("operator-confirmed no-post resolution is separate from historical post approval", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     await createSchemaV2Fixture(config.databasePath);
@@ -648,7 +655,47 @@ describe("DispatcherDatabase", () => {
       String(marker.job_updated_at),String(marker.classified_at),"a".repeat(64));
     assert.equal(resolved.state, "not_sent");
     assert.equal(database.legacyNotificationMigration("job-blocked")?.evidence_sha256, "a".repeat(64));
+    assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), false);
+    const runCli = async (...args: string[]) => {
+      const value = await promisify(execFile)(process.execPath, [new URL("../node_modules/tsx/dist/cli.mjs",import.meta.url).pathname,
+        new URL("../src/cli.ts",import.meta.url).pathname,"job",...args], {
+        cwd: new URL("..",import.meta.url).pathname,
+        env: {...process.env,DONA_DATABASE_PATH:config.databasePath,DONA_RESULTS_DIR:config.resultsDir},timeout:10000,
+      });
+      return JSON.parse(value.stdout) as Record<string,unknown>;
+    };
+    const cliPreview = await runCli("preview-legacy-notification-post","job-blocked");
+    const preview = database.legacyNotificationPostPreview("job-blocked");
+    assert.equal(cliPreview.preview_sha256,preview.preview_sha256); assert.equal(cliPreview.count,1);
+    await assert.rejects(runCli("approve-legacy-notification-post","job-blocked",preview.preview_sha256,"legacy-post-reconciled-one"));
+    const approved = await runCli("approve-legacy-notification-post","job-blocked",preview.preview_sha256,"legacy-post-reconciled-one","--approve-historical-post");
+    assert.deepEqual(database.approveLegacyNotificationPost("job-blocked",preview.preview_sha256,"legacy-post-reconciled-one"),approved);
+    assert.throws(() => database.approveLegacyNotificationPost("job-blocked","b".repeat(64),"legacy-post-reconciled-one"), /conflict/);
     assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), true);
+    const contender = new Database(config.databasePath);
+    contender.prepare("UPDATE jobs SET updated_at=? WHERE job_id='job-blocked'").run("2026-09-04T00:00:00.000Z");
+    assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), false);
+    assert.throws(() => database.enqueueJobNotification("job-blocked"), /post_approval_required/);
+    assert.throws(() => database.approveLegacyNotificationPost("job-blocked",preview.preview_sha256,"legacy-post-stale-new-id"), /preview_changed/);
+    const revised = database.legacyNotificationPostPreview("job-blocked");
+    database.approveLegacyNotificationPost("job-blocked",revised.preview_sha256,"legacy-post-revised-one");
+    contender.prepare("UPDATE events SET updated_at=? WHERE event_id='evt-source-blocked'").run("2026-09-05T00:00:00.000Z");
+    assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), false);
+    assert.throws(() => database.enqueueJobNotification("job-blocked"), /post_approval_required/);
+    const fresh = database.legacyNotificationPostPreview("job-blocked");
+    database.approveLegacyNotificationPost("job-blocked",fresh.preview_sha256,"legacy-post-source-revised-one");
+    assert.equal((contender.prepare("SELECT COUNT(*) AS count FROM job_legacy_notification_post_approvals").get() as {count:number}).count, 3);
+    assert.throws(() => contender.prepare("DELETE FROM job_legacy_notification_post_approvals").run(), /immutable/);
+    const originalThread = database.getJob("job-blocked")!.thread_ts;
+    contender.prepare("UPDATE jobs SET thread_ts='1756722030.999999' WHERE job_id='job-blocked'").run();
+    assert.equal(database.legacyNotificationPostPreview("job-blocked").ready_for_approval,false);
+    assert.throws(() => database.enqueueJobNotification("job-blocked"), /post_approval_required/);
+    contender.prepare("UPDATE jobs SET thread_ts=? WHERE job_id='job-blocked'").run(originalThread);
+    const originalSource = contender.prepare("SELECT result_json FROM events WHERE event_id='evt-source-blocked'").get() as {result_json:string};
+    contender.prepare("UPDATE events SET result_json='{}' WHERE event_id='evt-source-blocked'").run();
+    assert.throws(() => database.enqueueJobNotification("job-blocked"), /post_approval_required/);
+    contender.prepare("UPDATE events SET result_json=? WHERE event_id='evt-source-blocked'").run(originalSource.result_json);
+    contender.close();
     const first = database.enqueueJobNotification("job-blocked");
     assert.equal(first.duplicate, false);
     database.close();

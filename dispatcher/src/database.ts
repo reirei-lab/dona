@@ -1,3 +1,4 @@
+import { legacyNotificationApprovalTriggers } from "./legacy-notification-approval-schema.js";
 import { envelopeFromRow } from "./prompt.js";
 import { migrateVerifiedPrincipalBindings, persistVerifiedPrincipalBinding, readVerifiedPrincipalBinding, readVerifiedPrincipalProofConsumption, PrincipalBindingConflictError } from "./principal-binding.js";
 import type { VerifiedSlackPrincipalProof } from "./principal-proof.js";
@@ -615,7 +616,21 @@ function ensureLegacyNotificationMigration(db: Database.Database): void {
     evidence_sha256 TEXT NOT NULL,
     decision TEXT NOT NULL CHECK (decision='not_sent'),
     reconciled_at TEXT NOT NULL
-  )`);
+  );
+  CREATE TABLE IF NOT EXISTS job_legacy_notification_post_approvals (
+    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+    preview_sha256 TEXT NOT NULL CHECK(length(preview_sha256)=64),
+    approval_id TEXT PRIMARY KEY,
+    job_updated_at TEXT NOT NULL,
+    source_updated_at TEXT NOT NULL,
+    job_status TEXT NOT NULL,
+    job_error_code TEXT,
+    approved_at TEXT NOT NULL,
+    operator_uid INTEGER NOT NULL,
+    UNIQUE(job_id,preview_sha256)
+  );
+`);
+  for (const trigger of legacyNotificationApprovalTriggers) db.exec(trigger.sql.replace("CREATE TRIGGER ", "CREATE TRIGGER IF NOT EXISTS "));
 }
 
 function classifyMigratedLegacyNotifications(db: Database.Database): void {
@@ -2256,6 +2271,7 @@ export class DispatcherDatabase {
     return this.db.prepare(`
       SELECT j.* FROM jobs j
       JOIN job_owner_bindings b ON b.job_id=j.job_id
+      JOIN events source ON source.event_id=j.source_event_id
       LEFT JOIN job_groups g ON g.source_event_id=j.source_event_id
       WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review')
         AND NOT EXISTS (SELECT 1 FROM task_attempts a JOIN tasks t ON t.task_id=a.task_id
@@ -2267,6 +2283,11 @@ export class DispatcherDatabase {
           AND NOT EXISTS (SELECT 1 FROM job_legacy_notification_migration m
             WHERE m.job_id=j.job_id AND m.job_status=j.status AND m.last_error_code IS j.last_error_code
               AND m.state IN ('notified','acceptance_unknown'))
+          AND NOT EXISTS (SELECT 1 FROM job_legacy_notification_migration m WHERE m.job_id=j.job_id
+            AND ((m.job_status=j.status AND m.last_error_code IS j.last_error_code AND m.state='not_sent')
+              OR j.last_error_code='legacy_agent_sandbox_unknown')
+            AND NOT EXISTS (SELECT 1 FROM job_legacy_notification_post_approvals a WHERE a.job_id=j.job_id AND a.job_updated_at=j.updated_at
+              AND a.job_status=j.status AND a.job_error_code IS j.last_error_code AND a.source_updated_at=source.updated_at))
           AND (g.notification_mode='legacy' OR (g.sealed_at IS NOT NULL AND g.all_terminal_event_id IS NULL))
           AND (j.completion_event_id IS NULL
             OR (g.notification_mode='grouped'
@@ -2302,6 +2323,62 @@ export class DispatcherDatabase {
       FROM job_legacy_notification_migration m JOIN jobs j ON j.job_id=m.job_id
       LEFT JOIN job_legacy_notification_reconciliations r ON r.job_id=m.job_id WHERE m.job_id=?`)
       .get(jobId) as Record<string, unknown> | undefined;
+  }
+
+  legacyNotificationPostPreview(jobId: string): {
+    version: 1; count: 1; job_id: string; source_event_id: string; reason: string;
+    period: { created_at: string; terminal_at: string | null };
+    destination: { workspace_id: string | null; channel_id: string | null; thread_ts: string | null };
+    status: JobStatus; ready_for_approval: boolean; preview_sha256: string;
+  } {
+    const job = this.getJobRequired(jobId), marker = this.legacyNotificationMigration(jobId);
+    if (!marker) throw Error("legacy_notification_marker_not_found");
+    this.assertJobSourceMatchesThread(jobId, job.source_event_id);
+    const binding = readEventJobBinding(this.db, job.source_event_id)!;
+    const group = this.getJobGroupRequired(job.source_event_id), source = this.getRequired(job.source_event_id);
+    const destinationMatches = binding.owner.kind === "slack_thread" && job.workspace_id === binding.owner.workspace_id
+      && job.channel_id === binding.owner.channel_id && job.thread_ts === binding.owner.thread_ts;
+    const ready = destinationMatches && source.status === "completed" && jobNotificationStatuses.has(job.status) && marker.state === "not_sent" && marker.job_status === job.status
+      && marker.last_error_code === job.last_error_code && job.completion_event_id === null
+      && binding.owner.kind === "slack_thread" && (group.notification_mode === "legacy"
+        || group.notification_mode === "grouped" && !group.attention_event_id && !group.all_terminal_event_id)
+        && (this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE source_event_id=?").get(job.source_event_id) as {count:number}).count === 1;
+    const snapshot = { job_id: jobId, source_event_id: job.source_event_id, status: job.status,
+      updated_at: job.updated_at, completed_at: job.completed_at, last_error_code: job.last_error_code,
+      result_sha256: createHash("sha256").update(job.result_json ?? "").digest("hex"),
+      binding, group, marker, created_at: job.created_at,
+      destination: { workspace_id: job.workspace_id, channel_id: job.channel_id, thread_ts: job.thread_ts },
+      source: { updated_at: source.updated_at, status: source.status,
+        result_sha256: createHash("sha256").update(source.result_json ?? "").digest("hex"),
+        reply_target_sha256: createHash("sha256").update(source.reply_target_json ?? "").digest("hex") } };
+    return { version: 1, count: 1, job_id: jobId, source_event_id: job.source_event_id,
+      reason: ready ? "legacy_confirmed_unsent" : "delivery_evidence_required",
+      period: { created_at: job.created_at, terminal_at: job.completed_at },
+      destination: { workspace_id: job.workspace_id, channel_id: job.channel_id, thread_ts: job.thread_ts },
+      status: job.status, ready_for_approval: !!ready,
+      preview_sha256: createHash("sha256").update("dona.legacy-notification-post.v1\0").update(stableStringify(snapshot)).digest("hex") };
+  }
+
+  approveLegacyNotificationPost(jobId: string, previewSha256: string, approvalId: string, at = new Date()):
+    { job_id: string; preview_sha256: string; approval_id: string; approved_at: string; operator_uid: number } {
+    if (!/^[a-f0-9]{64}$/.test(previewSha256) || !/^[A-Za-z0-9_-]{16,128}$/.test(approvalId))
+      throw Error("legacy_notification_post_approval_invalid");
+    return this.db.transaction(() => {
+      const prior = this.db.prepare("SELECT job_id,preview_sha256,approval_id,approved_at,operator_uid FROM job_legacy_notification_post_approvals WHERE approval_id=?").get(approvalId) as
+        { job_id: string; preview_sha256: string; approval_id: string; approved_at: string; operator_uid: number } | undefined;
+      if (prior) {
+        if (prior.job_id !== jobId || prior.preview_sha256 !== previewSha256 || prior.approval_id !== approvalId) throw Error("legacy_notification_post_approval_conflict");
+        return prior;
+      }
+      const preview = this.legacyNotificationPostPreview(jobId);
+      if (!preview.ready_for_approval || preview.preview_sha256 !== previewSha256) throw Error("legacy_notification_post_preview_changed");
+      const operatorUid = process.getuid?.(); if (operatorUid === undefined) throw Error("legacy_notification_operator_unavailable");
+      const receipt = { job_id: jobId, preview_sha256: previewSha256, approval_id: approvalId, approved_at: at.toISOString(), operator_uid: operatorUid };
+      const job = this.getJobRequired(jobId);
+      this.db.prepare("INSERT INTO job_legacy_notification_post_approvals (job_id,preview_sha256,approval_id,job_updated_at,source_updated_at,job_status,job_error_code,approved_at,operator_uid) VALUES (?,?,?,?,?,?,?,?,?)")
+        .run(jobId,previewSha256,approvalId,job.updated_at,this.getRequired(job.source_event_id).updated_at,job.status,job.last_error_code,receipt.approved_at,operatorUid);
+      return receipt;
+    }).immediate();
   }
 
   reconcileLegacyNotificationNotSent(
@@ -3371,6 +3448,14 @@ export class DispatcherDatabase {
         .get(jobId,job.status,job.last_error_code) as {state:LegacyNotificationState}|undefined;
       if (legacyState?.state === "notified" || legacyState?.state === "acceptance_unknown") {
         throw new Error(`legacy_notification_${legacyState.state}`);
+      }
+      const migration = this.legacyNotificationMigration(jobId);
+      if (migration && !job.completion_event_id && (legacyState?.state === "not_sent" || job.last_error_code === "legacy_agent_sandbox_unknown")) {
+        const preview = this.legacyNotificationPostPreview(jobId);
+        const approval = this.db.prepare("SELECT preview_sha256 FROM job_legacy_notification_post_approvals WHERE job_id=? AND preview_sha256=?")
+          .get(jobId,preview.preview_sha256) as {preview_sha256:string}|undefined;
+        if (!approval || !preview.ready_for_approval || approval.preview_sha256 !== preview.preview_sha256)
+          throw Error("legacy_notification_post_approval_required");
       }
       const timestamp = at.toISOString();
       let group = this.getJobGroupRequired(job.source_event_id);
