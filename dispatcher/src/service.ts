@@ -34,7 +34,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     jobsPerEventMax: config.jobsPerEventMax,
     jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,
   });
-  database.tasks.assertFreshExecutionModel();
+  try{database.tasks.assertFreshExecutionModel();database.assertWorkerMessagingMode(config.workerMessagingEnabled===true);}
+  catch(error){database.close();throw error;}
   const updateNotificationDatabase = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
   let jobProgressStore: JobProgressStore | undefined;
   try {

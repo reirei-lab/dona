@@ -57,4 +57,9 @@ pause中・旧Attemptの指示をclaimしない。停止確認後のAttempt交�
 
 親は最新20件の履歴とは別に、現在eventに一致する `event_report` の本文を取得する。ローカルTaskの型付きquestion/decision_requestも既存dashboardの質問フォームに投影し、現行owner・device capability・Task revision・Attemptを再検証して回答receiptと相関answerを同じtransactionで保存する。承認要求はnative/external承認経路を維持し、型付き回答では代替しない。
 
-未配送の追加指示がある間はResultを受理しない。配送後も、その指示の受理より古いcompleted_atのResultは保留し、指示を反映した新しいatomic Resultを待つ。native質問・外部承認待ちの指示はclaimせず、送信前の確定拒否を受理不明で上書きしない。
+未配送の追加指示がある間はResultを受理しない。配送後も、その指示の配送完了時刻以前のcompleted_atのResultは保留し、指示を反映した新しいatomic Resultを待つ。native質問・外部承認待ちの指示はclaimせず、送信前の確定拒否を受理不明で上書きしない。
+
+
+## 機能を無効化するとき
+
+未配送・lease中のmessage、未処理の親event、未回答の型付き質問が残るDBでは、無効化しての起動を `worker_messaging_disable_requires_drain` で拒否する。既存機能を有効にしたままreceiptを照合してdrainし、質問・指示・親eventがsettleした後に無効化する。DBやclaimを手動で消して迂回しない。無効化拒否はTaskの失敗・完了を意味しない。
