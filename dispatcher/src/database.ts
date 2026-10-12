@@ -1079,12 +1079,23 @@ export class DispatcherDatabase {
     this.db.transaction(()=>{
       const task=this.tasks.forAttempt(jobId),job=this.getJob(jobId);
       if(!task||task.current_attempt_id!==jobId||task.desired_state!=="running"||!job||!["running","blocked"].includes(job.status))return;
+      if(job.status==="blocked"&&!["worker_message_question_pending","worker_instruction_acceptance_unknown"].includes(job.last_error_code??""))return;
       if(job.last_error_code==="worker_instruction_acceptance_unknown"&&job.last_error_message===messageId)return;
       this.db.prepare("UPDATE jobs SET status='blocked',last_error_code='worker_instruction_acceptance_unknown',last_error_message=?,updated_at=? WHERE job_id=?").run(messageId,new Date().toISOString(),jobId);
       this.tasks.wait(task,"external_effect_unknown",30000);
     }).immediate();
   }
-  taskReports(id:string,eventId:string){const task=this.tasks.assertOwner(id,eventId,true),job=this.getJob(task.current_attempt_id)!;return {schema_version:1,task_id:id,attempt_id:task.current_attempt_id,revision:task.revision,phase:job.status,wait_reason:task.wait_reason,diagnostic:job.last_error_code,desired_state:task.desired_state,progress_decision_candidate:this.workerMessages.progressDecisionCandidate(task.current_attempt_id,eventId),pending_question:task.desired_state==="running"&&["running","blocked"].includes(job.status)?this.workerMessages.pendingQuestion(task.current_attempt_id):undefined,reports:task.desired_state==="running"&&["running","blocked"].includes(job.status)?this.workerMessages.reports(task.current_attempt_id,eventId):[],...this.workerMessages.instructionReceipts(task.current_attempt_id,eventId),limit:20};}
+  taskReports(id:string,eventId:string){
+    const task=this.tasks.assertOwner(id,eventId,true),job=this.getJob(task.current_attempt_id)!;
+    const readable=task.desired_state==="running"&&["running","blocked"].includes(job.status);
+    return {schema_version:1,task_id:id,attempt_id:task.current_attempt_id,revision:task.revision,phase:job.status,
+      wait_reason:task.wait_reason,diagnostic:job.last_error_code,desired_state:task.desired_state,
+      progress_decision_candidate:this.workerMessages.progressDecisionCandidate(task.current_attempt_id,eventId),
+      event_report:readable?this.workerMessages.eventReport(task.current_attempt_id,eventId):undefined,
+      pending_question:readable?this.workerMessages.pendingQuestion(task.current_attempt_id):undefined,
+      reports:readable?this.workerMessages.reports(task.current_attempt_id,eventId):[],
+      ...this.workerMessages.instructionReceipts(task.current_attempt_id,eventId),limit:20};
+  }
   instructTask(id:string,revision:number,raw:unknown){
     const input=parseDonaInstruction(raw);
     return this.db.transaction(()=>{
@@ -1759,6 +1770,7 @@ export class DispatcherDatabase {
   cancelLocalDashboardTask(authority:LocalDashboardAuthority,input:LocalDashboardCancel) {
     return this.localDashboard.cancel(authority,input);
   }
+  getLocalDashboardTypedQuestion(authority:LocalDashboardAuthority,taskId:string){return this.localDashboard.typedQuestion(authority,taskId);}
   enqueueLocalDashboardQuestionReply(authority:LocalDashboardAuthority,input:LocalDashboardQuestionReply) {
     return this.localDashboard.reply(authority,input);
   }
@@ -3196,6 +3208,10 @@ export class DispatcherDatabase {
       this.assertJobCompletionBinding(job);
       if (result.job_id !== jobId) throw new Error("job_result_identity_mismatch");
       if (job.result_json === stableStringify(result) && job.status === result.status) return;
+      if(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()) {
+        if(this.workerMessages.hasPendingInstructions(jobId))throw Error("worker_instruction_delivery_pending");
+        if(this.db.prepare("SELECT 1 FROM worker_messages WHERE job_id=? AND direction='dona_to_worker' AND julianday(accepted_at)>=julianday(?) LIMIT 1").get(jobId,result.completed_at))throw Error("worker_instruction_result_stale");
+      }
       const binding = readEventJobBinding(this.db,job.source_event_id);
       if (binding?.owner.kind === "schedule") {
         const serialized=stableStringify(result);

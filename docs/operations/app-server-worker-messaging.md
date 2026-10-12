@@ -51,3 +51,10 @@ local dashboard Taskも既存のcreate receiptとimmutable ownerから報告even
 既存のnative質問・外部承認などでblockedの場合、新しい型付きquestionは拒否し、元のwaitとattentionを保持する。先に既存waitを解消してから報告する。指示の受理不明は `external_effect_unknown` として表示し、同じruntimeの相関reportで配送を読み取り照合する。
 
 pause中・旧Attemptの指示をclaimしない。停止確認後のAttempt交代では、受理済み未配送指示と配送済みの追加条件・優先度を元message ID・delivery state・attempt count付きで新objectiveへ一度引き継ぐ。未投入の指示は残作業に含め、投入済みか不明な指示は成果・外部操作を照合するまで再実行しない。旧deliveryはterminal fenceでsettleし、相関IDを新Attemptのanswer対象に流用しない。
+
+
+## 報告eventと回答・Resultの競合
+
+親は最新20件の履歴とは別に、現在eventに一致する `event_report` の本文を取得する。ローカルTaskの型付きquestion/decision_requestも既存dashboardの質問フォームに投影し、現行owner・device capability・Task revision・Attemptを再検証して回答receiptと相関answerを同じtransactionで保存する。承認要求はnative/external承認経路を維持し、型付き回答では代替しない。
+
+未配送の追加指示がある間はResultを受理しない。配送後も、その指示の受理より古いcompleted_atのResultは保留し、指示を反映した新しいatomic Resultを待つ。native質問・外部承認待ちの指示はclaimせず、送信前の確定拒否を受理不明で上書きしない。
