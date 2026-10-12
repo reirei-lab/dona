@@ -60,9 +60,30 @@ export class DispatcherClient {
     } finally { await file.close(); }
   }
 
+  private async runtimeCommandOutboundReady(signal: AbortSignal): Promise<boolean> {
+    if (!this.options.internalTokenPath) return false;
+    signal.throwIfAborted();
+    const directory = path.join(path.dirname(this.options.internalTokenPath), "runtime-command-outbound");
+    const parent = await fs.open(path.dirname(directory), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
+    try {
+      const info = await parent.stat();
+      if (info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0) return false;
+    } finally { await parent.close(); }
+    let dir;
+    try { dir = await fs.open(directory, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return true; throw error; }
+    try {
+      const info = await dir.stat();
+      if (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) return false;
+      const available = (await fs.readdir(directory)).length < 1024;
+      signal.throwIfAborted(); return available;
+    } finally { await dir.close(); }
+  }
+
   async runtimeCommandIngressReady(signal = AbortSignal.timeout(2500)): Promise<boolean> {
     try {
       const token = await this.runtimeCommandToken(signal);
+      if (!await this.runtimeCommandOutboundReady(signal)) return false;
       const response = await this.request("GET", "/v1/internal/slack-runtime-commands/ready", undefined, token, {}, signal);
       const body = JSON.parse(response.body) as Record<string, unknown>;
       return response.statusCode === 200 && body.ready === true && body.protocol === "runtime-control.v1"

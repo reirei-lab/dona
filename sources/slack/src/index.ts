@@ -87,7 +87,10 @@ async function main(): Promise<void> {
       stopping: () => adapter.isStopping(),
       authorize: (request, signal) => authorizeRuntimeCommand(runtimeRegistry, request, signal),
       persist: (request, signal) => dispatcher.postRuntimeCommand(request, signal),
-      ready: signal => dispatcher.runtimeCommandIngressReady(signal),
+      ready: async signal => {
+        await verifyRuntimeIngressWorkspaces(runtimeRegistry, await readRuntimeIngressConfig(runtimeConfigPath), signal);
+        return dispatcher.runtimeCommandIngressReady(signal);
+      },
     });
     if (!await ingress.ready()) throw Error("runtime_command_ingress_not_ready");
     health.setRuntimeCommandIngress(ingress);

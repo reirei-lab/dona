@@ -789,7 +789,7 @@ export class SlackWebApiClient implements SlackApiClient {
     const client = this.readClient(signal);
     const auth = await callSlack(() => client.auth.test());
     const botId = nonEmpty(auth.bot_id, "bot_id");
-    const response = await callSlack(() => client.bots.info({ bot: botId }));
+    const response = await callSlack(() => client.bots.info({ bot: botId, team_id: nonEmpty(auth.team_id, "team_id") }));
     if (response.bot?.id !== botId || response.bot?.deleted === true) throw Error("runtime_command_bot_unverified");
     return { teamId: nonEmpty(auth.team_id, "team_id"), appId: nonEmpty(response.bot?.app_id, "app_id") };
   }

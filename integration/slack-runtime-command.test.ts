@@ -222,3 +222,18 @@ test("受付停止後も認証済みreceipt GETを維持する", async t => {
   assert.equal(await f.client.runtimeCommandIngressReady(), false);
   assert.deepEqual(await f.client.postRuntimeCommand(input, AbortSignal.timeout(2500)), first);
 });
+
+test("outbound intentだけの容量不足も受付healthをnot-readyにする", async t => {
+  const f = await setup(t), body = raw();
+  assert.equal((await post(f.socketPath, body)).status, 200);
+  const directory = path.join(path.dirname(f.config.updateInternalTokenPath), "runtime-command-outbound");
+  for (let i = 0; i < 1023; i++) await fs.writeFile(path.join(directory, String(i).padStart(64, "0")), "fixture", { mode: 0o600 });
+  assert.equal(f.database.runtimeCommandCapacity(), true);
+  assert.equal(await f.client.runtimeCommandIngressReady(), false);
+  const request = (route: string) => new Promise<number>((resolve, reject) => {
+    const req = http.get({ socketPath: f.socketPath, path: route }, response => { response.resume(); response.once("end", () => resolve(response.statusCode!)); });
+    req.once("error", reject);
+  });
+  assert.equal(await request("/health/ready"), 503); assert.equal(await request("/health/version"), 503);
+  assert.equal((await post(f.socketPath, body)).status, 200);
+});

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { test } from "node:test";
 import { parseRuntimeCommand, verifyRuntimeCommandRequest } from "../src/runtime-command.js";
-import { authorizeRuntimeCommand, verifyRuntimeIngressWorkspaces } from "../src/runtime-command-ingress.js";
+import { authorizeRuntimeCommand, verifyRuntimeIngressWorkspaces, RuntimeCommandHttpIngress } from "../src/runtime-command-ingress.js";
 import type { SlackWorkspaceRegistry } from "../src/workspace-registry.js";
 import { SlackWebApiClient } from "../src/slack-api.js";
 
@@ -79,9 +79,11 @@ test("Slack APIのsuspendedを保持し、不正な型を本人確認済みと�
 
 test("runtime Bot identityはauth.testのBotとbots.infoのappを照合する", async t => {
   let actualBot = "B1";
-  t.mock.method(globalThis, "fetch", async (url: string | URL | Request) => new Response(JSON.stringify(String(url).endsWith("auth.test")
+  t.mock.method(globalThis, "fetch", async (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url).endsWith("bots.info")) assert.match(String(init?.body), /team_id=T1/);
+    return new Response(JSON.stringify(String(url).endsWith("auth.test")
     ? { ok: true, team_id: "T1", bot_id: "B1" }
-    : { ok: true, bot: { id: actualBot, app_id: "A1", deleted: false } }), { headers: { "content-type": "application/json" } }));
+    : { ok: true, bot: { id: actualBot, app_id: "A1", deleted: false } }), { headers: { "content-type": "application/json" } }); });
   const client = new SlackWebApiClient("fixture-token", { debug() {}, info() {}, warn() {}, error() {} });
   assert.deepEqual(await client.runtimeCommandIdentity(AbortSignal.timeout(2500)), { teamId: "T1", appId: "A1" });
   actualBot = "B2";
@@ -104,4 +106,21 @@ test("private channelのBot未参加によるAPIエラーをfail-closedにする
     hasChannelMember: async () => true,
   } }) } as unknown as Pick<SlackWorkspaceRegistry, "get">;
   assert.equal(await authorizeRuntimeCommand(registry, input, AbortSignal.timeout(2500)), null);
+});
+
+test("runtime継続readinessは起動後のBot token失効を検知する", async t => {
+  let revoked = false;
+  t.mock.method(globalThis, "fetch", async (url: string | URL | Request) => new Response(JSON.stringify(revoked
+    ? { ok: false, error: "token_revoked" }
+    : String(url).endsWith("auth.test") ? { ok: true, team_id: "T1", bot_id: "B1" }
+    : { ok: true, bot: { id: "B1", app_id: "A1", deleted: false } }), { headers: { "content-type": "application/json" } }));
+  const client = new SlackWebApiClient("fixture-token", { debug() {}, info() {}, warn() {}, error() {} });
+  const registry = { get: () => ({ teamId: "T1", client }) } as unknown as Pick<SlackWorkspaceRegistry, "get">;
+  const config = { version: 1 as const, workspaces: [{ ...workspace, actor_ids: ["U1"] }] };
+  await verifyRuntimeIngressWorkspaces(registry, config, AbortSignal.timeout(2500));
+  const ingress = new RuntimeCommandHttpIngress({ configured: async () => config, stopping: () => false,
+    ready: async signal => { await verifyRuntimeIngressWorkspaces(registry, config, signal); return true; },
+    authorize: async () => null, persist: async () => { throw Error("must_not_write"); } });
+  assert.equal(await ingress.ready(), true);
+  revoked = true; assert.equal(await ingress.ready(), false);
 });
