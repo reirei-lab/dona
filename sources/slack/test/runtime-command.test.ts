@@ -136,3 +136,16 @@ test("Enterprise IDの設定誤りを起動と継続readinessで拒否する", a
   config.workspaces[0]!.enterprise_id = "E1";
   assert.equal((await verifyRuntimeIngressWorkspaces(registry, config, AbortSignal.timeout(2500))).get("test")?.enterpriseId, "E1");
 });
+
+test("認可照会が一方失敗したら残る兄弟照会を直ちにabortする", async () => {
+  const body = raw(), input = verifyRuntimeCommandRequest(body, timestamp, signature(body), [workspace], now);
+  let aborted = false;
+  const registry = { get: () => ({ teamId: "T1", client: {
+    getUser: async () => { throw Error("token_revoked"); },
+    getChannel: (_id: string, signal: AbortSignal) => new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => { aborted = true; reject(Error("aborted")); }, { once: true });
+    }),
+  } }) } as unknown as Pick<SlackWorkspaceRegistry, "get">;
+  assert.equal(await authorizeRuntimeCommand(registry, input, AbortSignal.timeout(2500)), null);
+  assert.equal(aborted, true);
+});

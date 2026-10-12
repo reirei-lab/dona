@@ -17,50 +17,76 @@ export interface DispatcherClientOptions {
   internalTokenPath?: string;
 }
 
+interface RuntimeIntent { directory: string; filePath: string; directoryDevice: number; directoryInode: number; device: number; inode: number }
+
 export class DispatcherClient {
   constructor(private readonly options: DispatcherClientOptions) {}
 
-  private async reserveRuntimeCommand(requestId: string, digest: string, signal: AbortSignal): Promise<void> {
+  private async discardUnsentRuntimeIntent(intent: RuntimeIntent): Promise<void> {
+    const dir = await fs.open(intent.directory, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
+    try {
+      const info = await dir.stat(), current = await fs.lstat(intent.filePath);
+      if (info.dev !== intent.directoryDevice || info.ino !== intent.directoryInode || info.uid !== process.getuid?.()
+        || (info.mode & 0o777) !== 0o700 || !current.isFile() || current.dev !== intent.device || current.ino !== intent.inode
+        || current.uid !== process.getuid?.() || current.nlink !== 1 || (current.mode & 0o077) !== 0)
+        throw Error("runtime_command_acceptance_unknown");
+      await fs.unlink(intent.filePath); await dir.sync();
+    } finally { await dir.close(); }
+  }
+
+  private async reserveRuntimeCommand(requestId: string, digest: string, signal: AbortSignal): Promise<RuntimeIntent> {
     if (!this.options.internalTokenPath || !/^[a-f0-9]{64}$/.test(requestId)) throw Error("runtime_command_unavailable");
     const directory = path.join(path.dirname(this.options.internalTokenPath), "runtime-command-outbound");
-    const parent = await fs.open(path.dirname(directory), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
+    let intent: RuntimeIntent | undefined;
     try {
-      const info = await parent.stat();
-      if (info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0 || (info.mode & 0o700) !== 0o700) throw Error("runtime_command_unavailable");
-      await fs.mkdir(directory, { mode: 0o700 }).catch(error => { if (error.code !== "EEXIST") throw error; });
-      await parent.sync();
-    } finally { await parent.close(); }
-    const dir = await fs.open(directory, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
-    try {
-      const info = await dir.stat();
-      if (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0 || (info.mode & 0o700) !== 0o700) throw Error("runtime_command_unavailable");
-      const lockPath = path.join(directory, "reservation.lock");
-      const lock = await fs.open(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
-        .catch(() => { throw Error("runtime_command_unavailable"); });
-      let lockIdentity: Awaited<ReturnType<typeof lock.stat>> | undefined;
+      const parent = await fs.open(path.dirname(directory), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
       try {
-        lockIdentity = await lock.stat();
-        // process間でも容量判定と予約を排他する。crashで残ったlockは自動回収しない。
-        await dir.sync();
-        const entries = (await fs.readdir(directory)).filter(name => name !== "reservation.lock");
-        if (entries.some(name => !/^[a-f0-9]{64}$/.test(name))) throw Error("runtime_command_unavailable");
-        if (entries.length >= 1024) throw Error("runtime_command_acceptance_unknown");
-        signal.throwIfAborted();
-        const file = await fs.open(path.join(directory, requestId), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
-          .catch(error => { if (error.code === "EEXIST") throw Error("runtime_command_acceptance_unknown"); throw error; });
-        try { await file.writeFile(JSON.stringify({ request_id: requestId, canonical_sha256: digest })); await file.sync(); }
-        finally { await file.close(); }
-        await dir.sync();
-        signal.throwIfAborted();
-      } finally {
+        const info = await parent.stat();
+        if (info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0 || (info.mode & 0o700) !== 0o700) throw Error("runtime_command_unavailable");
+        await fs.mkdir(directory, { mode: 0o700 }).catch(error => { if (error.code !== "EEXIST") throw error; });
+        await parent.sync();
+      } finally { await parent.close(); }
+      const dir = await fs.open(directory, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
+      try {
+        const info = await dir.stat();
+        if (info.uid !== process.getuid?.() || (info.mode & 0o777) !== 0o700) throw Error("runtime_command_unavailable");
+        const lockPath = path.join(directory, "reservation.lock");
+        const lock = await fs.open(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+          .catch(() => { throw Error("runtime_command_unavailable"); });
+        let lockIdentity: Awaited<ReturnType<typeof lock.stat>> | undefined;
         try {
-          const current = await fs.lstat(lockPath);
-          if (!lockIdentity || !current.isFile() || current.dev !== lockIdentity.dev || current.ino !== lockIdentity.ino || current.nlink !== 1)
-            throw Error("runtime_command_unavailable");
-          await fs.unlink(lockPath); await dir.sync();
-        } finally { await lock.close(); }
-      }
-    } finally { await dir.close(); }
+          lockIdentity = await lock.stat();
+          // process間でも容量判定と予約を排他する。crashで残ったlockは自動回収しない。
+          await dir.sync();
+          const entries = (await fs.readdir(directory)).filter(name => name !== "reservation.lock");
+          if (entries.some(name => !/^[a-f0-9]{64}$/.test(name))) throw Error("runtime_command_unavailable");
+          if (entries.length >= 1024) throw Error("runtime_command_acceptance_unknown");
+          signal.throwIfAborted();
+          const filePath = path.join(directory, requestId);
+          const file = await fs.open(filePath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+            .catch(error => { if (error.code === "EEXIST") throw Error("runtime_command_acceptance_unknown"); throw error; });
+          try {
+            const identity = await file.stat();
+            intent = { directory, filePath, directoryDevice: info.dev, directoryInode: info.ino, device: identity.dev, inode: identity.ino };
+            await file.writeFile(JSON.stringify({ request_id: requestId, canonical_sha256: digest })); await file.sync();
+          } finally { await file.close(); }
+          await dir.sync(); signal.throwIfAborted();
+        } finally {
+          try {
+            const current = await fs.lstat(lockPath);
+            if (!lockIdentity || !current.isFile() || current.dev !== lockIdentity.dev || current.ino !== lockIdentity.ino || current.nlink !== 1)
+              throw Error("runtime_command_unavailable");
+            await fs.unlink(lockPath); await dir.sync();
+          } finally { await lock.close(); }
+        }
+      } finally { await dir.close(); }
+      signal.throwIfAborted();
+      return intent!;
+    } catch (error) {
+      // このmethod内ではPOSTを開始しない。取得済みの自分のinodeだけを回収する。
+      if (intent) await this.discardUnsentRuntimeIntent(intent);
+      throw error;
+    }
   }
 
   private async runtimeCommandToken(signal: AbortSignal): Promise<string> {
@@ -143,10 +169,13 @@ export class DispatcherClient {
     const prior = await lookup();
     if (prior) return prior;
     if (!await this.runtimeCommandIngressReady(signal)) throw Error("runtime_command_unavailable");
-    await this.reserveRuntimeCommand(input.request_id, expected, signal);
+    const body = Buffer.from(JSON.stringify(input));
+    const intent = await this.reserveRuntimeCommand(input.request_id, expected, signal);
+    try { signal.throwIfAborted(); }
+    catch (error) { await this.discardUnsentRuntimeIntent(intent); throw error; }
     let response: DispatcherResponse;
     try {
-      response = await this.request("POST", "/v1/internal/slack-runtime-commands", Buffer.from(JSON.stringify(input)), token, {}, signal);
+      response = await this.request("POST", "/v1/internal/slack-runtime-commands", body, token, {}, signal);
     } catch {
       const receipt = await lookup();
       if (!receipt) throw Error("runtime_command_acceptance_unknown");

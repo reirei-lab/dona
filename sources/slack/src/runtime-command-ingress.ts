@@ -7,6 +7,8 @@ import type { SlackWorkspaceRegistry } from "./workspace-registry.js";
 
 export async function authorizeRuntimeCommand(registry: Pick<SlackWorkspaceRegistry, "get">,
   request: RuntimeCommandRequest, signal: AbortSignal): Promise<{ channel_type: AuthorizedRuntimeCommandRequest["channel_type"] } | null> {
+  const controller = new AbortController();
+  signal = AbortSignal.any([signal, controller.signal]);
   try {
     const connection = registry.get(request.workspace);
     if (connection.teamId !== request.workspace_id) return null;
@@ -23,7 +25,7 @@ export async function authorizeRuntimeCommand(registry: Pick<SlackWorkspaceRegis
       && await connection.client.hasChannelMember(request.channel_id, request.actor_id, signal);
     signal.throwIfAborted();
     return permitted ? { channel_type: channel.isIm ? "im" : channel.isPrivate ? "private_channel" : "public_channel" } : null;
-  } catch { return null; }
+  } catch { return null; } finally { controller.abort(); }
 }
 
 const configSchema = z.strictObject({ version: z.literal(1), workspaces: z.array(z.strictObject({
@@ -50,15 +52,19 @@ export async function readRuntimeIngressConfig(filename: string): Promise<Runtim
 
 export async function verifyRuntimeIngressWorkspaces(registry: Pick<SlackWorkspaceRegistry, "get">,
   config: RuntimeIngressConfig, signal: AbortSignal): Promise<Map<string, { teamId: string; appId: string; enterpriseId: string | null }>> {
+  const controller = new AbortController();
+  signal = AbortSignal.any([signal, controller.signal]);
   const identities = new Map<string, { teamId: string; appId: string; enterpriseId: string | null }>();
-  await Promise.all(config.workspaces.map(async workspace => {
-    const connection = registry.get(workspace.alias);
-    const identity = await connection.client.runtimeCommandIdentity?.(signal);
-    if (connection.teamId !== workspace.team_id || identity?.teamId !== workspace.team_id || identity.appId !== workspace.app_id || identity.enterpriseId !== workspace.enterprise_id)
-      throw Error("runtime_command_workspace_unverified");
-    identities.set(workspace.alias, identity);
-  }));
-  return identities;
+  try {
+    await Promise.all(config.workspaces.map(async workspace => {
+      const connection = registry.get(workspace.alias);
+      const identity = await connection.client.runtimeCommandIdentity?.(signal);
+      if (connection.teamId !== workspace.team_id || identity?.teamId !== workspace.team_id || identity.appId !== workspace.app_id || identity.enterpriseId !== workspace.enterprise_id)
+        throw Error("runtime_command_workspace_unverified");
+      identities.set(workspace.alias, identity);
+    }));
+    return identities;
+  } finally { controller.abort(); }
 }
 
 interface Receipt { request_id: string; canonical_sha256: string; state: "pending"; received_at: string }
@@ -145,6 +151,6 @@ export class RuntimeCommandHttpIngress {
       if (code === "invalid_command") send(200, "命令の形式を確認してください。status、restart plan、update planなどの完全一致形式を使います。この入力は受け付けていません。");
       else send(code === "too_large" ? 413 : code === "invalid_request" ? 400 : code === "unauthenticated" ? 403 : 503,
         "要求を受け付けられません。操作成功は確認されていません。");
-    } finally { clearTimeout(timer); }
+    } finally { controller.abort(); clearTimeout(timer); }
   }
 }

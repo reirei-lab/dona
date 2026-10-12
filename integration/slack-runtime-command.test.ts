@@ -262,3 +262,27 @@ test("同時要求でもoutbound intentの1024件上限を超えない", async t
   const entries = await fs.readdir(directory); assert.equal(entries.length, 1024); assert.equal(entries.includes("reservation.lock"), false);
   assert.equal(await f.client.runtimeCommandIngressReady(), false);
 });
+for (const cut of ["intent_sync", "lock_close"] as const) test(`POST前の${cut}でabortしたintentは回収し同じ配送を再受付できる`, async t => {
+  const f = await setup(t), body = raw(), signed = headers(body);
+  const input = { ...verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]), channel_type: "public_channel" as const };
+  const controller = new AbortController(), originalOpen = fs.open.bind(fs); let abortOnce = true;
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const handle = await originalOpen(...args);
+    if (abortOnce && (cut === "intent_sync" ? String(args[0]).endsWith(input.request_id) : String(args[0]).endsWith("reservation.lock"))) {
+      abortOnce = false;
+      if (cut === "intent_sync") {
+        const sync = handle.sync.bind(handle);
+        t.mock.method(handle, "sync", async () => { controller.abort(); await sync(); });
+      } else {
+        const close = handle.close.bind(handle);
+        t.mock.method(handle, "close", async () => { await close(); controller.abort(); });
+      }
+    }
+    return handle;
+  });
+  await assert.rejects(f.client.postRuntimeCommand(input, controller.signal));
+  assert.equal(f.database.runtimeCommandReceipt(input.request_id), null);
+  const directory = path.join(path.dirname(f.config.updateInternalTokenPath), "runtime-command-outbound");
+  assert.deepEqual(await fs.readdir(directory), []);
+  assert.equal((await f.client.postRuntimeCommand(input, AbortSignal.timeout(2500))).state, "pending");
+});
