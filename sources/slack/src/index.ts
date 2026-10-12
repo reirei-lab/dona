@@ -85,6 +85,8 @@ async function main(): Promise<void> {
     });
     if (!await ingress.ready()) throw Error("runtime_command_ingress_not_ready");
     health.setRuntimeCommandIngress(ingress);
+  } else if ((await dispatcher.runtimeCommandIngressState())?.configured) {
+    throw Error("runtime_command_ingress_config_missing");
   }
   await health.start();
   try {

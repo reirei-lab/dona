@@ -47,19 +47,21 @@ test("現在の本人所属とchannel状態を再取得し別workspace/人/DM/�
   const registry = { get: () => ({ teamId: "T1", client: { getUser: async () => user, getChannel: async () => channel,
     hasChannelMember: async (channelId: string, actorId: string) => { assert.equal(channelId, "C1"); assert.equal(actorId, "U1"); return actorMember; } } }) } as unknown as Pick<SlackWorkspaceRegistry, "get">;
   const check = () => authorizeRuntimeCommand(registry, input, new AbortController().signal);
-  assert.equal(await check(), true);
+  assert.deepEqual(await check(), { channel_type: "public_channel" });
   for (const mutation of [{ stateKnown: false }, { id: "U2" }, { teamId: "T2" }, { isBot: true }, { isAppUser: true }, { isDeleted: true }, { isSuspended: true }]) {
-    const old = user; user = { ...user, ...mutation }; assert.equal(await check(), false); user = old;
+    const old = user; user = { ...user, ...mutation }; assert.equal(await check(), null); user = old;
   }
-  channel.isMember = false; assert.equal(await check(), true);
-  actorMember = false; assert.equal(await check(), false); actorMember = true;
+  channel.isMember = false; assert.deepEqual(await check(), { channel_type: "public_channel" });
+  actorMember = false; assert.equal(await check(), null); actorMember = true;
+  channel.isPrivate = true; assert.deepEqual(await check(), { channel_type: "private_channel" }); channel.isPrivate = false;
   for (const mutation of [{ id: "C2" }, { isShared: true }, { isArchived: true }, { visibilityKnown: false }]) {
-    const old = channel; channel = { ...channel, ...mutation }; assert.equal(await check(), false); channel = old;
+    const old = channel; channel = { ...channel, ...mutation }; assert.equal(await check(), null); channel = old;
   }
   channel = { ...channel, id: "C1", isIm: true, userId: "U2" } as typeof channel;
-  assert.equal(await check(), false);
+  assert.equal(await check(), null);
+  channel = { ...channel, userId: "U1" } as typeof channel; assert.deepEqual(await check(), { channel_type: "im" });
   const aborted = new AbortController(); aborted.abort();
-  assert.equal(await authorizeRuntimeCommand(registry, input, aborted.signal), false);
+  assert.equal(await authorizeRuntimeCommand(registry, input, aborted.signal), null);
 });
 test("Slack APIのsuspendedを保持し、不正な型を本人確認済みとしない", async t => {
   let suspended: unknown = true;

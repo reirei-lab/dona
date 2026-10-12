@@ -68,7 +68,7 @@ export interface AdapterHealthState {
 
 export class SlackHealthServer {
   private runtimeCommands: RuntimeCommandHttpIngress | undefined;
-  setRuntimeCommandIngress(ingress: RuntimeCommandHttpIngress): void { this.runtimeCommands = ingress; }
+  setRuntimeCommandIngress(ingress: RuntimeCommandHttpIngress | undefined): void { this.runtimeCommands = ingress; }
   private server: http.Server | undefined;
   private quiesceOperationId: string | undefined;
   private readonly progressOperations = new Set<Promise<unknown>>();
@@ -77,7 +77,7 @@ export class SlackHealthServer {
   constructor(
     private readonly socketPath: string,
     private readonly adapter: AdapterHealthState,
-    private readonly dispatcher: Pick<DispatcherClient, "healthReady">,
+    private readonly dispatcher: Pick<DispatcherClient, "healthReady"> & Partial<Pick<DispatcherClient, "runtimeCommandIngressState">>,
     private readonly logger: SlackLogger,
     private readonly buildSha = process.env.DONA_BUILD_SHA ?? "development",
     private readonly updateNotifications?: UpdateNotificationPort,
@@ -259,21 +259,21 @@ export class SlackHealthServer {
     }
     if (method === "GET" && pathname === "/health/ready") {
       const dispatcherReady = await this.dispatcher.healthReady();
-      const runtimeCommandsReady = this.runtimeCommands ? await this.runtimeCommands.ready() : true;
+      const runtimeCommandsReady = await this.runtimeCommandReady();
       const ready = !this.adapter.isStopping() && this.adapter.isSocketReady() && dispatcherReady && runtimeCommandsReady;
       send(response, ready ? 200 : 503, {
         schema_version: 1,
         status: ready ? "ready" : "not_ready",
         socket_mode: this.adapter.connectionStates(),
         dispatcher_ready: dispatcherReady,
-        runtime_commands: { configured: !!this.runtimeCommands, ready: runtimeCommandsReady },
+        runtime_commands: { configured: !!this.runtimeCommands, ready: !!this.runtimeCommands && runtimeCommandsReady },
       });
       return;
     }
     if (method === "GET" && pathname === "/health/version") {
       const dispatcherReady = await this.dispatcher.healthReady();
       const workspacesReady = !this.adapter.isStopping() && this.adapter.isSocketReady();
-      const runtimeCommandsReady = this.runtimeCommands ? await this.runtimeCommands.ready() : true;
+      const runtimeCommandsReady = await this.runtimeCommandReady();
       const ready = workspacesReady && dispatcherReady && runtimeCommandsReady;
       const updateNotificationProtocolReady = this.updateNotifications !== undefined &&
         await this.internalTokenReady();
@@ -290,7 +290,7 @@ export class SlackHealthServer {
         config: 1,
         ...(updateNotificationProtocolReady ? { update_notification_protocol: 1 } : {}),
         ...(this.runtimeCommands && runtimeCommandsReady ? { runtime_command_protocol: "runtime-control.v1" } : {}),
-        runtime_commands: { configured: !!this.runtimeCommands, ready: runtimeCommandsReady },
+        runtime_commands: { configured: !!this.runtimeCommands, ready: !!this.runtimeCommands && runtimeCommandsReady },
         workspaces_ready: workspacesReady,
         socket_mode: this.adapter.connectionStates(),
         dispatcher_ready: dispatcherReady,
@@ -340,6 +340,13 @@ export class SlackHealthServer {
     if(!this.adapter.isStopping()) return false;
     send(response,503,{schema_version:1,error:{code:"shutting_down",message:"Slack Adapter is stopping"}});
     return true;
+  }
+
+  private async runtimeCommandReady(): Promise<boolean> {
+    if (this.runtimeCommands) return this.runtimeCommands.ready();
+    if (!this.dispatcher.runtimeCommandIngressState) return true;
+    const state = await this.dispatcher.runtimeCommandIngressState();
+    return state !== null && !state.configured;
   }
 
   private async handleScheduledInternal(request:IncomingMessage,response:ServerResponse,pathname:string):Promise<void> {

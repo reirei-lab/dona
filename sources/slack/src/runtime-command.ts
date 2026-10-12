@@ -51,6 +51,9 @@ export interface RuntimeCommandRequest {
   channel_id: string;
   command: RuntimeCommand;
 }
+export interface AuthorizedRuntimeCommandRequest extends RuntimeCommandRequest {
+  channel_type: "im" | "public_channel" | "private_channel";
+}
 
 /** raw bytesを先に検証。署名検証前にform、URL、自由文を解釈しない。 */
 export function verifyRuntimeCommandRequest(body: Buffer, timestamp: string, signature: string,
@@ -95,7 +98,7 @@ export function verifyRuntimeCommandRequest(body: Buffer, timestamp: string, sig
 }
 
 /** internal typed requestのcodec。inboxのcanonical commitmentと照合する。 */
-export function runtimeCommandDigest(input: RuntimeCommandRequest): string {
+export function runtimeCommandDigest(input: AuthorizedRuntimeCommandRequest): string {
   const canonical = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(canonical);
     if (value !== null && typeof value === "object") return Object.fromEntries(Object.keys(value).sort()

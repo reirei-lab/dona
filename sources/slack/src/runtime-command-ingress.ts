@@ -2,14 +2,14 @@ import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
-import { RuntimeCommandError, verifyRuntimeCommandRequest, type RuntimeCommandRequest } from "./runtime-command.js";
+import { RuntimeCommandError, verifyRuntimeCommandRequest, type RuntimeCommandRequest, type AuthorizedRuntimeCommandRequest } from "./runtime-command.js";
 import type { SlackWorkspaceRegistry } from "./workspace-registry.js";
 
 export async function authorizeRuntimeCommand(registry: Pick<SlackWorkspaceRegistry, "get">,
-  request: RuntimeCommandRequest, signal: AbortSignal): Promise<boolean> {
+  request: RuntimeCommandRequest, signal: AbortSignal): Promise<{ channel_type: AuthorizedRuntimeCommandRequest["channel_type"] } | null> {
   try {
     const connection = registry.get(request.workspace);
-    if (connection.teamId !== request.workspace_id) return false;
+    if (connection.teamId !== request.workspace_id) return null;
     const [user, channel] = await Promise.all([
       connection.client.getUser(request.actor_id, signal), connection.client.getChannel(request.channel_id, signal),
     ]);
@@ -18,11 +18,12 @@ export async function authorizeRuntimeCommand(registry: Pick<SlackWorkspaceRegis
       && !user.isBot && !user.isAppUser && !user.isDeleted && !user.isAgentforceBot && !user.isSuspended
       && channel.id === request.channel_id && !channel.isShared && !channel.isArchived
       && (channel.isIm ? channel.userId === request.actor_id : channel.visibilityKnown === true && !channel.isMpim);
-    if (!principalValid) return false;
+    if (!principalValid) return null;
     const permitted = channel.isIm || !!connection.client.hasChannelMember
       && await connection.client.hasChannelMember(request.channel_id, request.actor_id, signal);
-    signal.throwIfAborted(); return permitted;
-  } catch { return false; }
+    signal.throwIfAborted();
+    return permitted ? { channel_type: channel.isIm ? "im" : channel.isPrivate ? "private_channel" : "public_channel" } : null;
+  } catch { return null; }
 }
 
 const configSchema = z.strictObject({ version: z.literal(1), workspaces: z.array(z.strictObject({
@@ -50,8 +51,8 @@ export async function readRuntimeIngressConfig(filename: string): Promise<Runtim
 interface Receipt { request_id: string; canonical_sha256: string; state: "pending"; received_at: string }
 export interface RuntimeIngressPorts {
   configured(): Promise<RuntimeIngressConfig>;
-  authorize(request: RuntimeCommandRequest, signal: AbortSignal): Promise<boolean>;
-  persist(request: RuntimeCommandRequest, signal: AbortSignal): Promise<Receipt>;
+  authorize(request: RuntimeCommandRequest, signal: AbortSignal): Promise<{ channel_type: AuthorizedRuntimeCommandRequest["channel_type"] } | null>;
+  persist(request: AuthorizedRuntimeCommandRequest, signal: AbortSignal): Promise<Receipt>;
   stopping(): boolean;
   ready(signal: AbortSignal): Promise<boolean>;
 }
@@ -114,13 +115,15 @@ export class RuntimeCommandHttpIngress {
       if (!config.workspaces.find(w => w.alias === input.workspace)?.actor_ids.includes(input.actor_id))
         throw new RuntimeCommandError("unauthenticated");
       if (!await this.ports.ready(controller.signal)) throw new RuntimeCommandError("unavailable");
-      if (!await this.ports.authorize(input, controller.signal)) throw new RuntimeCommandError("unauthenticated");
+      const evidence = await this.ports.authorize(input, controller.signal);
+      if (!evidence || !["im", "public_channel", "private_channel"].includes(evidence.channel_type))
+        throw new RuntimeCommandError("unauthenticated");
       controller.signal.throwIfAborted();
       if (this.ports.stopping() || JSON.stringify(await this.ports.configured()) !== JSON.stringify(config))
         throw new RuntimeCommandError("unavailable");
       controller.signal.throwIfAborted();
       verifyRuntimeCommandRequest(body, timestamp, signature, config.workspaces, this.now());
-      const receipt = await this.ports.persist(input, controller.signal);
+      const receipt = await this.ports.persist({ ...input, channel_type: evidence.channel_type }, controller.signal);
       controller.signal.throwIfAborted();
       if (receipt.request_id !== input.request_id || receipt.state !== "pending" || !Number.isFinite(Date.parse(receipt.received_at)))
         throw new RuntimeCommandError("unavailable");

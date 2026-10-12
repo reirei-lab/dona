@@ -11,6 +11,7 @@ export const runtimeCommandRequestSchema = z.strictObject({
   workspace: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/), workspace_id: id, app_id: id,
   enterprise_id: id.nullable(), actor_id: z.string().regex(/^[UW][A-Z0-9]{1,127}$/),
   channel_id: z.string().regex(/^[CDG][A-Z0-9]{1,127}$/),
+  channel_type: z.enum(["im", "public_channel", "private_channel"]),
   command: z.discriminatedUnion("operation", [
     z.strictObject({ operation: z.literal("runtime.status.read.v1") }),
     z.strictObject({ operation: z.literal("runtime.restart.plan.v1") }),

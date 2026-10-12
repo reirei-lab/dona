@@ -2,7 +2,7 @@ import { signSlackPrincipalProof } from "./principal-proof.js";
 import http from "node:http";
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
-import { runtimeCommandDigest, type RuntimeCommandRequest } from "./runtime-command.js";
+import { runtimeCommandDigest, type AuthorizedRuntimeCommandRequest } from "./runtime-command.js";
 
 export interface DispatcherResponse {
   statusCode: number;
@@ -45,7 +45,20 @@ export class DispatcherClient {
     } catch { return false; }
   }
 
-  async postRuntimeCommand(input: RuntimeCommandRequest, signal: AbortSignal) {
+  async runtimeCommandIngressState(): Promise<{ configured: boolean; ready: boolean } | null> {
+    try {
+      const response = await this.request("GET", "/health/version");
+      if (![200, 503].includes(response.statusCode)) return null;
+      const body = JSON.parse(response.body) as { runtime_command_ingress?: { configured?: unknown; ready?: unknown } };
+      // 旧Dispatcherはこの機能を持たない。未設定Adapterの通常message互換を保つ。
+      if (body.runtime_command_ingress === undefined) return { configured: false, ready: response.statusCode === 200 };
+      const state = body.runtime_command_ingress;
+      if (!state || typeof state.configured !== "boolean" || typeof state.ready !== "boolean") return null;
+      return { configured: state.configured, ready: state.ready };
+    } catch { return null; }
+  }
+
+  async postRuntimeCommand(input: AuthorizedRuntimeCommandRequest, signal: AbortSignal) {
     const token = await this.runtimeCommandToken(signal);
     const expected = runtimeCommandDigest(input);
     type Receipt = { request_id: string; canonical_sha256: string; state: "pending"; received_at: string };

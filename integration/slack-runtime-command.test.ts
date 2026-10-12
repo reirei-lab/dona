@@ -50,7 +50,7 @@ async function setup(t: { after(fn: () => Promise<void>): void }) {
     authorize: async (_request, signal) => {
       if (delayAuthorization) await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(Error("deadline")), { once: true }));
       if (expireDuringAuthorization) clockOffset = 301000;
-      return permitted;
+      return permitted ? { channel_type: "public_channel" } : null;
     }, stopping: () => stopping,
     persist: async (input, signal) => { persists++; const receipt = await client.postRuntimeCommand(input, signal); if (loseResponse) throw Error("lost response"); return receipt; },
     ready: signal => client.runtimeCommandIngressReady(signal) }, () => Date.now() + clockOffset);
@@ -60,7 +60,7 @@ async function setup(t: { after(fn: () => Promise<void>): void }) {
     drainStatus: () => ({ quiescing: stopping, drained: stopping, in_flight: 0, unsafe_states: [] }) }, client, logger);
   server.setRuntimeCommandIngress(ingress); await server.start();
   t.after(async () => { await server.stop(); await api.stop(); database.close(); await fs.rm(root, { recursive: true, force: true }); });
-  return { root, config, signingConfig, socketPath, client, get database() { return database; }, count: () => persists, wakes: () => wakeCount,
+  return { root, config, signingConfig, socketPath, client, server, get database() { return database; }, count: () => persists, wakes: () => wakeCount,
     deny: () => { permitted = false; }, stop: () => { stopping = true; }, lose: (value: boolean) => { loseResponse = value; },
     delay: () => { delayAuthorization = true; }, expire: () => { expireDuringAuthorization = true; },
     async restart() { await api.stop(); database.close(); database = new DispatcherDatabase(config.databasePath); api = makeApi(); await api.start(); } };
@@ -68,7 +68,7 @@ async function setup(t: { after(fn: () => Promise<void>): void }) {
 test("署名HTTP→internal UDS→SQLite durable intake、重複とrestartを通して外部操作0", async t => {
   const f = await setup(t), body = raw();
   const first = await post(f.socketPath, body); assert.equal(first.status, 200); assert.match(first.text, /まだ実行されていません/);
-  const signed = headers(body), input = verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]);
+  const signed = headers(body), input = { ...verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]), channel_type: "public_channel" as const };
   const receipt = f.database.runtimeCommandReceipt(input.request_id); assert.equal(receipt?.state, "pending");
   assert.equal((await post(f.socketPath, body)).status, 200);
   await f.restart(); assert.deepEqual(f.database.runtimeCommandReceipt(input.request_id), receipt);
@@ -82,7 +82,7 @@ test("署名HTTP→internal UDS→SQLite durable intake、重複とrestartを通
 test("commit後のresponse lossを成功ACKにせず、redeliveryは同一receiptに収束", async t => {
   const f = await setup(t), body = raw(); f.lose(true);
   assert.equal((await post(f.socketPath, body)).status, 503);
-  const signed = headers(body), input = verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]);
+  const signed = headers(body), input = { ...verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]), channel_type: "public_channel" as const };
   const receipt = f.database.runtimeCommandReceipt(input.request_id); assert.ok(receipt);
   f.lose(false); await f.restart(); assert.equal((await post(f.socketPath, body)).status, 200);
   assert.deepEqual(f.database.runtimeCommandReceipt(input.request_id), receipt);
@@ -100,7 +100,7 @@ test("Dispatcherのgateとinternal authenticationを別々に検証", async t =>
   assert.equal((await post(f.socketPath, body)).status, 503);
   f.config.slackRuntimeIngressEnabled = true;
   const badClient = new DispatcherClient({ socketPath: f.config.socketPath, timeoutMs: 500, connectTimeoutMs: 100 });
-  const signed = headers(body), input = verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]);
+  const signed = headers(body), input = { ...verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]), channel_type: "public_channel" as const };
   await assert.rejects(badClient.postRuntimeCommand(input, new AbortController().signal));
   assert.equal(f.database.runtimeCommandReceipt(input.request_id), null);
 });
@@ -140,7 +140,7 @@ test("UDS応答の切断後はGETで照合し、再配送でもPOSTを繰り返�
   await new Promise<void>(resolve => proxy.listen(socket, resolve));
   t.after(() => new Promise<void>(resolve => proxy.close(() => resolve())));
   const client = new DispatcherClient({ socketPath: socket, internalTokenPath: f.config.updateInternalTokenPath, timeoutMs: 1000, connectTimeoutMs: 100 });
-  const body = raw(), signed = headers(body), input = verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]);
+  const body = raw(), signed = headers(body), input = { ...verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]), channel_type: "public_channel" as const };
   const first = await client.postRuntimeCommand(input, AbortSignal.timeout(2500));
   assert.equal(first.state, "pending"); assert.equal(posts, 1);
   assert.deepEqual(await client.postRuntimeCommand(input, AbortSignal.timeout(2500)), first); assert.equal(posts, 1);
@@ -156,7 +156,7 @@ test("POST受理不明かつGETで未確認なら同じclientの再配送をread
   await new Promise<void>(resolve => proxy.listen(socket, resolve));
   t.after(() => new Promise<void>(resolve => proxy.close(() => resolve())));
   const client = new DispatcherClient({ socketPath: socket, internalTokenPath: f.config.updateInternalTokenPath, timeoutMs: 1000, connectTimeoutMs: 100 });
-  const body = raw(), signed = headers(body), input = verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]);
+  const body = raw(), signed = headers(body), input = { ...verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]), channel_type: "public_channel" as const };
   await assert.rejects(client.postRuntimeCommand(input, AbortSignal.timeout(2500)), /acceptance_unknown/);
   await assert.rejects(client.postRuntimeCommand(input, AbortSignal.timeout(2500)), /acceptance_unknown/);
   assert.equal(posts, 1); assert.equal(f.database.runtimeCommandReceipt(input.request_id), null);
@@ -175,4 +175,15 @@ test("readinessは半端なenablement・config破損・token失効をreadyにし
   await fs.writeFile(f.signingConfig, "not-json"); assert.equal(await read("/health/version"), 503);
   await fs.writeFile(f.signingConfig, JSON.stringify({ version: 1, workspaces: [workspace] }));
   await fs.chmod(f.config.updateInternalTokenPath, 0o644); assert.equal(await read("/health/ready"), 503);
+});
+test("Adapter route未設定/Dispatcherだけ有効を両側無効と区別する", async t => {
+  const f = await setup(t); f.server.setRuntimeCommandIngress(undefined);
+  const read = (route: string) => new Promise<number>((resolve, reject) => {
+    const request = http.get({ socketPath: f.socketPath, path: route }, response => { response.resume(); response.once("end", () => resolve(response.statusCode!)); });
+    request.once("error", reject);
+  });
+  assert.equal(await read("/health/ready"), 503); assert.equal(await read("/health/version"), 503);
+  assert.equal((await post(f.socketPath, raw())).status, 404);
+  f.config.slackRuntimeIngressEnabled = false;
+  assert.equal(await read("/health/ready"), 200); assert.equal(await read("/health/version"), 200);
 });

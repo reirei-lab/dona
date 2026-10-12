@@ -339,6 +339,8 @@ export class DispatcherApi {
           app_schema_read_max: appSchema.read_max,
           app_schema_write: appSchema.write,
           config: 1,
+          runtime_command_ingress: { configured: this.config.slackRuntimeIngressEnabled === true,
+            ready: this.config.slackRuntimeIngressEnabled === true && !this.shuttingDown && health.ready },
           scheduler: health.scheduler,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
         });

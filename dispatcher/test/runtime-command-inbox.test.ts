@@ -6,7 +6,7 @@ import { RuntimeCommandInbox } from "../src/runtime-command-inbox.js";
 
 function request(n = 0) { return { version: "runtime-control.v1", request_id: createHash("sha256").update(String(n)).digest("hex"),
   body_sha256: "a".repeat(64), workspace: "test", workspace_id: "T1", app_id: "A1", enterprise_id: null,
-  actor_id: "U1", channel_id: "C1", command: { operation: "runtime.status.read.v1" } }; }
+  actor_id: "U1", channel_id: "C1", channel_type: "public_channel", command: { operation: "runtime.status.read.v1" } }; }
 test("read-only照合とinvalid requestは空DBへschemaを書かない", t => {
   const db = new Database(":memory:"); t.after(() => db.close()); const inbox = new RuntimeCommandInbox(db);
   assert.equal(inbox.receipt(request().request_id), null);
@@ -23,4 +23,14 @@ test("quota到達後も既存receiptを再読し、異内容と新しい要求�
   assert.throws(() => inbox.accept(request(1024)), /runtime_command_capacity/);
   assert.equal(db.prepare("SELECT count(*) FROM slack_runtime_command_inbox").pluck().get(), 1024);
   assert.equal(db.pragma("synchronous", { simple: true }), 2);
+});
+test("受付のchannel種別をcanonical recordへ保存し欠落/改変を拒否", t => {
+  const db = new Database(":memory:"); t.after(() => db.close()); const inbox = new RuntimeCommandInbox(db);
+  for (const [n, channel_type] of ["public_channel", "private_channel", "im"].entries()) {
+    const input = { ...request(n), channel_type }; inbox.accept(input);
+    const stored = JSON.parse(db.prepare("SELECT request_json FROM slack_runtime_command_inbox WHERE request_id=?").pluck().get(input.request_id) as string);
+    assert.equal(stored.channel_type, channel_type);
+    assert.throws(() => inbox.accept({ ...input, channel_type: "mpim" }));
+  }
+  const { channel_type: _unused, ...raw } = request(99); assert.throws(() => inbox.accept(raw));
 });
