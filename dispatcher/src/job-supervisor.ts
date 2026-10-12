@@ -318,6 +318,19 @@ export class JobSupervisor {
     if(task.wait_reason==="steer_acceptance_unknown"&&job.steer_state==="accepted"&&job.steer_event_id&&task.steer_pending_event_id===job.steer_event_id) {
       this.database.tasks.finishSteer(task.task_id,job.steer_event_id);return;
     }
+    if(task.desired_state==="running"&&task.stop_state==="none"&&job.last_error_code==="runtime_question_pending"&&this.runtime.questions){
+      const native=await this.runtime.questions(job.agent_name);
+      if(native.length){this.database.tasks.wait(task,"human_input");return;}
+      const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
+      if(observed.ok&&["working","idle","done"].includes(observed.agentStatus??"")){
+        this.database.tasks.reconnect(task);
+        if(this.config.workerMessagingEnabled&&this.database.workerMessages.hasUnansweredQuestion(job.job_id)){
+          this.database.markJobBlocked(job.job_id,"Worker typed question remains unanswered",["running"],"worker_message_question_pending");
+          this.database.tasks.wait(this.database.tasks.get(task.task_id)!,"human_input");
+        }
+        this.wake();return;
+      }
+    }
     // A result is evidence belonging to this attempt, never to its successor.
     try {
       const result=await readJobResultEnvelope(job.result_path,job.job_id);
@@ -1362,9 +1375,9 @@ export class JobSupervisor {
   }
 
   private holdInstructionResult(job:JobRow,error:unknown):boolean {
-    if(!(error instanceof Error)||!["worker_instruction_delivery_pending","worker_instruction_result_stale"].includes(error.message))return false;
+    if(!(error instanceof Error)||!["worker_instruction_delivery_pending","worker_instruction_result_stale","worker_message_question_pending"].includes(error.message))return false;
     const task=this.database.tasks.forAttempt(job.job_id);
-    if(task)this.database.tasks.wait(task,error.message==="worker_instruction_delivery_pending"?"worker_instruction_delivery_pending":"worker_instruction_result_pending",1000);
+    if(task)this.database.tasks.wait(task,error.message==="worker_message_question_pending"?"human_input":error.message==="worker_instruction_delivery_pending"?"worker_instruction_delivery_pending":"worker_instruction_result_pending",1000);
     return true;
   }
 

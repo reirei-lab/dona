@@ -381,3 +381,61 @@ test("既存messageが未処理なら無効化を拒否し、再起動後にdrai
   db.assertWorkerMessagingMode(false);
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+
+test("型付き質問中のResultはhuman_inputを保ち、native解消後に型付き回答を配送できる",async()=>{
+ const {root,config}=await tempConfig();config.workerMessagingEnabled=true;const db=new DispatcherDatabase(config.databasePath);
+ try{
+  const source=db.enqueue(eventEnvelope("both-waits")).row,task=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"waits",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,job=db.getJob(task.current_attempt_id)!;
+  db.beginJobPreparation(job.job_id);db.setJobRuntime(job.job_id,"w","p","runtime");db.beginJobDispatch(job.job_id);db.markJobRunning(job.job_id);
+  const question=db.workerMessages.appendWorkerReport(job.job_id,"runtime",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"question",occurred_at:new Date().toISOString(),payload:{kind:"question",question:"継続できますか？"}});
+  await fs.mkdir(path.dirname(job.result_path),{recursive:true});await fs.writeFile(job.result_path,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"確認中です",completed_at:new Date().toISOString()}));
+  const never=async()=>{throw Error("再起動・停止してはいけない");};
+  const runtime:JobAgentRuntime={prepare:never,prompt:never,wait:never,cancel:never,observeWorker:never,retireWorker:never,async get(){return {ok:true,exitCode:0,stdout:"",stderr:"",agentStatus:"working",timedOut:false,aborted:false};},async questions(){return [];}};
+  const supervisor=new JobSupervisor(db,runtime,config,{debug(){},info(){},warn(){},error(){}},()=>{});
+  await supervisor.reconcileTasks();assert.equal(db.tasks.get(task.task_id)?.wait_reason,"human_input");
+  db.markJobBlocked(job.job_id,"native wait",["blocked"],"runtime_question_pending");db.tasks.wait(db.tasks.get(task.task_id)!,"human_input",-1);
+  await supervisor.reconcileTasks();assert.equal(db.getJob(job.job_id)?.last_error_code,"worker_message_question_pending");assert.equal(db.tasks.get(task.task_id)?.wait_reason,"human_input");
+  db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"answer",occurred_at:new Date().toISOString(),correlation_message_id:question.message.message_id,conversation_revision:1,payload:{operation:"answer",text:"元の範囲で続行してください"}});
+  await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();assert.equal(db.tasks.get(task.task_id)?.state,"active");
+  const future={schema_version:1 as const,job_id:job.job_id,status:"completed" as const,summary:"確認しました",completed_at:new Date(Date.now()+60000).toISOString()};
+  assert.throws(()=>db.saveJobResult(job.job_id,future,job.result_path),/completed_at_is_in_the_future/);assert.notEqual(db.tasks.get(task.task_id)?.state,"completed");
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("queuedの型付き予約量を後続steerとJob admissionでも合算する",async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath,{jobsPerEventMax:8,jobObjectiveTotalMaxBytes:100000});
+ try{
+  const source=db.enqueue(eventEnvelope("reserved-budget")).row,task=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"budget",objective:"x".repeat(95000),workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  db.workerMessages.appendInstruction(task.current_attempt_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"condition",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"a".repeat(3000)}});
+  const steer=db.enqueue(eventEnvelope("budget-steer")).row;
+  assert.throws(()=>db.appendQueuedJobInstruction(task.current_attempt_id,steer.event_id,"b".repeat(3000)));
+  assert.throws(()=>db.tasks.prepareSteer(task.task_id,steer.event_id,db.tasks.get(task.task_id)!.revision,"b".repeat(3000)),/task_objective_limit/);
+  assert.equal(db.tasks.get(task.task_id)?.steer_pending_event_id,null);
+  assert.throws(()=>db.createJob({source_event_id:source.event_id,job_key:"sibling",objective:"c".repeat(3000),workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir),/limit exceeded/);
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+
+for(const state of ["paused","completed"] as const)test(`停止済み同identityのhistorical reportをread-only照合する（${state}）`,async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);
+ try{
+  const source=db.enqueue(eventEnvelope("historical-"+state)).row,task=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"historical",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,job=db.getJob(task.current_attempt_id)!,identity=JSON.stringify(["generation","thread"]),created=new Date().toISOString();
+  db.beginJobPreparation(job.job_id);db.setJobRuntime(job.job_id,"w","p",identity);db.beginJobDispatch(job.job_id);db.markJobRunning(job.job_id);
+  const accepted=db.acceptTaskWorkerReport(job.job_id,identity,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"checkpoint",occurred_at:created,payload:{kind:"checkpoint",summary:"確認しました"}});
+  if(state==="paused")db.tasks.control(task.task_id,source.event_id,db.tasks.get(task.task_id)!.revision,"pause");
+  else db.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了しました",completed_at:new Date().toISOString()},job.result_path);
+  let generation="generation",reconciled=false;
+  class Port extends RuntimeClient {
+   constructor(){super("unused");}
+   override async workerReportAvailability(){return {enabled:true,ttl_ms:30000};}
+   override async workerReports(){return [{request_id:"request",agent:job.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"rpc"',attempt_id:job.job_id,report_key:"checkpoint",request_sequence:1,payload_json:stableStringify({report_key:"checkpoint",payload:{kind:"checkpoint",summary:"確認しました"}}),payload_sha256:"hash",created_at:created,state:"resolved" as const,result_json:'{"state":"unknown","diagnostic":"receipt_unavailable"}'}];}
+   override async status(){return {name:job.agent_name,role:"worker",generation,thread_id:"thread",state:"stopped"} as Awaited<ReturnType<RuntimeClient["status"]>>;}
+   override async reconcileWorkerReport(_name:string,_id:string,result:unknown){assert.deepEqual(result,{message_id:accepted.message.message_id,receipt_id:accepted.receipt_id,outcome:"created"});reconciled=true;return {};}
+   override async resolveWorkerReport():Promise<never>{throw Error("historical RPCを再送してはいけない");}
+  }
+  const oldAccept=db.acceptTaskWorkerReport;db.acceptTaskWorkerReport=()=>{throw Error("historical報告を新規受理してはいけない");};
+  const bridge=new AppServerWorkerReportBridge(db,new Port());generation="other-generation";assert.equal(await bridge.runOnce(),0);assert.equal(reconciled,false);
+  generation="generation";assert.equal(await bridge.runOnce(),1);assert.equal(reconciled,true);db.acceptTaskWorkerReport=oldAccept;
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});

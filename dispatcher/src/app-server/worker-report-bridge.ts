@@ -12,6 +12,16 @@ export class AppServerWorkerReportBridge {
   for(const request of await this.runtime.workerReports()) {
    try {
    const job=this.database.getJob(request.attempt_id),task=this.database.tasks.forAttempt(request.attempt_id);
+   // Historical reads retain the Runtime's exact generation/thread guard; they never admit a new report.
+   if(request.state!=="pending"){
+    if(!job||job.agent_name!==request.agent)continue;
+    const agent=await this.runtime.status(request.agent);
+    if(!agent||agent.role!=="worker"||agent.generation!==request.generation||agent.thread_id!==request.thread_id)continue;
+    const input=JSON.parse(request.payload_json) as {payload:unknown;correlation_message_id?:string;conversation_revision?:number};
+    const result=this.database.workerMessages.reconcileRuntimeReport(job.job_id,JSON.stringify([request.generation,request.thread_id]),{schema_version:1,source_event_id:job.source_event_id,producer_sequence:request.request_sequence,idempotency_key:request.report_key,occurred_at:request.created_at,payload:input.payload,...(input.correlation_message_id?{correlation_message_id:input.correlation_message_id}:{}),...(input.conversation_revision!==undefined?{conversation_revision:input.conversation_revision}:{})});
+    if(result){await this.runtime.reconcileWorkerReport(request.agent,request.request_id,{message_id:result.message.message_id,receipt_id:result.receipt_id,outcome:result.outcome});accepted++;}
+    continue;
+   }
    if(!job||!task||task.current_attempt_id!==job.job_id||task.desired_state!=="running"||job.agent_name!==request.agent||["cancelling","completed","failed","cancelled","needs_review","retryable_failed"].includes(job.status)){
     if(request.state==="pending")await this.runtime.resolveWorkerReport(request.agent,request.request_id,{state:"denied",diagnostic:"attempt_unavailable"});continue;
    }

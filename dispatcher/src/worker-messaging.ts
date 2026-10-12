@@ -275,6 +275,11 @@ export class WorkerMessageRepository {
       JSON.parse(row.payload_json),row.correlation_message_id,row.conversation_revision)}\n[/DONA_FOLLOW_UP]`}));
   }
 
+  reservedQueuedInstructionCharacters(jobId:string):number {
+    const job=this.db.prepare("SELECT source_event_id FROM jobs WHERE job_id=?").get(jobId) as {source_event_id:string};
+    return this.queuedInstructionReservations(job.source_event_id).filter(row=>row.job_id===jobId).reduce((sum,row)=>sum+[...row.addition].length,0);
+  }
+
   reservedQueuedInstructionBytes(sourceEventId:string):number {
     return this.queuedInstructionReservations(sourceEventId)
       .reduce((sum,row)=>sum+Buffer.byteLength(row.addition,"utf8"),0);

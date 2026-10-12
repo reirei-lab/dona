@@ -417,6 +417,7 @@ export class TaskRepository {
       if(task.revision!==revision||(!answer&&task.state!=="active")||task.desired_state!=="running"||task.stop_state!=="none")throw new Error("task_control_conflict");
       const objective=task.objective+"\n\n利用者の追加指示（既存の承認境界を維持）:\n"+instruction;
       if([...objective].length>100_000)throw new Error("task_objective_limit");
+      this.dispatcher.assertTaskSteerReservationBudget(task.current_attempt_id,objective);
       this.sql.prepare("UPDATE tasks SET objective=?,revision=revision+1,state='waiting',wait_reason='steer_acceptance_unknown',steer_pending_event_id=? WHERE task_id=?").run(objective,eventId,id);
       const checkpoint=this.sql.prepare("SELECT json_extract(checkpoint_json,'$.sequence') AS sequence FROM task_attempts WHERE attempt_id=?").get(task.current_attempt_id) as {sequence:number|null};
       this.sql.prepare("INSERT INTO task_controls(task_id,source_event_id,request_sha256,checkpoint_sequence) VALUES(?,?,?,?)").run(id,eventId,digest,checkpoint.sequence);return true;
