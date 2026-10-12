@@ -67,3 +67,13 @@ for(const state of ["pending","unknown"] as const){
 test("attention中も利用者が答えるべき質問を保持する",()=>{const d=evaluateProgress(context({group_attention:true,report:{...report,payload:{kind:"question",question:"選択が必要です"}}}));assert.equal(d.action,"ask_user");});
 test("古いsibling報告を今回の集約参加済みとみなさない",()=>{const d=evaluateProgress(context({members:[{job_id:"job-one",phase:"running",report},{job_id:"job-two",phase:"running",report:{...report,message_id:"old",accepted_at:"2026-10-12T07:00:00.000Z"}}]}));assert.equal(d.action,"aggregate_wait");assert.equal(d.reason,"sibling_reports_pending");});
 test("未配送artifactは時間が経っても通常進捗の次予約を止める",()=>{const d=evaluateProgress(context({presentation_pending:true,last_presentation_at:"2026-10-12T07:00:00.000Z"}));assert.equal(d.action,"aggregate_wait");assert.equal(d.reason,"presentation_undelivered");});
+
+
+test("attention中のhigh riskを内部受領だけで失わない",()=>{
+ const d=evaluateProgress(context({group_attention:true,report:{...report,payload:{kind:"risk",severity:"high",summary:"新しい重要な確認です"}}}));
+ assert.equal(d.action,"report_to_user");assert.equal(d.signals.risk_escalation,true);
+});
+for(const kind of ["question","decision_request"] as const)test(`unsafe siblingがあっても安全な${kind}を保持する`,()=>{
+ const canary="https://private.invalid/sibling",d=evaluateProgress(context({report:{...report,payload:kind==="question"?{kind,question:"どちらにしますか？"}:{kind,question:"方式を選んでください",options:["方式A","方式B"]}},members:[{job_id:"job-one",phase:"running",report},{job_id:"job-two",phase:"running",report:{...report,payload:{kind:"checkpoint",summary:canary}}}]}));
+ assert.equal(d.action,"ask_user");assert.ok(!JSON.stringify(d).includes(canary));
+});

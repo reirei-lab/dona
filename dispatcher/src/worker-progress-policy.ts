@@ -42,9 +42,12 @@ export function evaluateProgress(raw:unknown):ProgressDecision {
  const target={job_id:c.job_id,...(c.report?{message_id:c.report.message_id}:{})};
  const result:ProgressDecision={version:1,action:"ack_internal",reason:"no_action",fingerprint:null,target,signals:emptySignals()};
  if(!c.current||c.desired_state!=="running"||!["running","blocked"].includes(c.phase)){result.reason="attempt_unavailable";return result;}
- if(c.group_terminal||(c.group_attention&&!["question","decision_request"].includes(c.report?.payload.kind??""))){result.reason="terminal_notification_priority";return result;}
+ const urgent=c.report&&(["question","decision_request"].includes(c.report.payload.kind)||(c.report.payload.kind==="risk"&&c.report.payload.severity==="high"));
+ if(c.group_terminal||(c.group_attention&&!urgent)){result.reason="terminal_notification_priority";return result;}
  if(!c.context_complete||!c.members.some(m=>m.job_id===c.job_id&&m.phase===c.phase)||new Set(c.members.map(m=>m.job_id)).size!==c.members.length){result.reason="context_incomplete";return result;}
- if([c.report,...c.members.map(m=>m.report)].some(r=>denied(reportText(r)))){result.reason="unsafe_projection";result.target=null;return result;}
+ if(denied(reportText(c.report))){result.reason="unsafe_projection";result.target=null;return result;}
+ if(urgent){c.members=c.members.map(m=>denied(reportText(m.report))?{job_id:m.job_id,phase:m.phase}:m);}
+ else if(c.members.some(m=>denied(reportText(m.report)))){result.reason="unsafe_projection";result.target=null;return result;}
  if(!c.report_current){result.reason="stale_report";return result;}
  const existingInstruction=()=>{
   if(!c.pending_instruction||c.pending_instruction.state==="delivered")return false;

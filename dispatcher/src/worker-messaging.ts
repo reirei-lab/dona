@@ -514,7 +514,10 @@ export class WorkerMessageRepository {
         }
         const pendingPresentation=this.db.prepare(`SELECT 1 FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key)
           JOIN jobs j ON j.job_id=p.job_id WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready' LIMIT 1`).get(job.source_event_id);
-        if(pendingPresentation)continue;
+        if(pendingPresentation){
+          this.db.prepare("UPDATE worker_progress_applications SET next_check_at=? WHERE decision_key=? AND followup_event_id IS NULL")
+            .run(new Date(at.getTime()+30000).toISOString(),row.decision_key);continue;
+        }
         const message=this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND direction='worker_to_dona' ORDER BY producer_sequence DESC LIMIT 1").get(row.job_id) as WorkerMessageRow|undefined;
         if(!message){this.db.prepare("UPDATE worker_progress_applications SET next_check_at=NULL WHERE decision_key=?").run(row.decision_key);continue;}
         const original=this.db.prepare("SELECT subject_json FROM events WHERE event_id=?").get(job.source_event_id) as {subject_json:string};

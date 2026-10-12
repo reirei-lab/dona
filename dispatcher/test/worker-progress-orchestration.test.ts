@@ -184,3 +184,18 @@ test("未来のworker時刻でもserver受付から30秒で集約を進める",a
   assert.equal(f.db.workerMessages.progressDecisionCandidate(t.current_attempt_id,next,due)!.decision.action,"report_to_user");
  }finally{await f.dispose();}
 });
+
+
+test("未配送presentation待ちのtimerを未来へ戻し、取得枠を占有し続けない",async()=>{
+ const f=await fixture();try{
+  const now=new Date(),a=f.report(0,"検証Aが進みました",now);f.report(1,"検証Bが進みました",now);f.db.workerMessages.publishPendingReports();
+  const event=f.eventFor(a.message.message_id),t=f.tasks[0]!,c=f.db.workerMessages.progressDecisionCandidate(t.current_attempt_id,event,now)!;
+  assert.equal(f.db.workerMessages.applyProgressDecision(t.current_attempt_id,event,c.decision_id,now).state,"presentation_ready");
+  const later=new Date(now.getTime()+61000),b=f.db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:f.source.event_id,producer_sequence:2,idempotency_key:"later",occurred_at:later.toISOString(),payload:{kind:"checkpoint",summary:"次の検証も進みました"}},later);
+  f.db.workerMessages.publishPendingReports(100,later);const current=new Date(later.getTime()+61000);f.db.workerMessages.publishPendingReports(100,current);const next=f.eventFor(b.message.message_id),waiting=f.db.workerMessages.progressDecisionCandidate(t.current_attempt_id,next,current)!;
+  assert.equal(waiting.decision.action,"aggregate_wait");f.db.workerMessages.applyProgressDecision(t.current_attempt_id,next,waiting.decision_id,current);
+  const due=new Date(current.getTime()+31000);assert.equal(f.db.workerMessages.publishDueProgressDecisions(1,due),0);
+  const sql=new Database(f.config.databasePath),record=sql.prepare("SELECT next_check_at,followup_event_id FROM worker_progress_applications WHERE decision_key=?").get(waiting.decision_id) as {next_check_at:string;followup_event_id:string|null};sql.close();
+  assert.ok(Date.parse(record.next_check_at)>due.getTime());assert.equal(record.followup_event_id,null);assert.equal(f.db.workerMessages.publishDueProgressDecisions(1,due),0);
+ }finally{await f.dispose();}
+});
