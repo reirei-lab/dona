@@ -20,7 +20,7 @@ questionを既存の依頼・根拠で回答できる場合、親は既存の`in
 
 ## 集約とpresentation
 
-`aggregate_wait`は30秒の期限をdurableに保存する。publisherは再起動後も期限を巡回し、現行Taskと最新報告を再検証して内部aggregate eventを一度だけqueueする。古いsnapshotのまま全件完了・投稿を決めない。pause/cancel/terminalの場合は追加eventを作らない。
+`aggregate_wait`は30秒の期限をdurableに保存する。publisherは再起動後も期限を巡回し、現行Taskと最新報告を再検証して内部aggregate eventを一度だけqueueする。古いsnapshotのまま全件完了・投稿を決めない。後続のreportが保存済みなら古いcheckpoint/risk eventをstale_reportとして内部受領する。未回答questionは後続checkpointがあっても判断対象として維持する。pause/cancel/terminalの場合は追加eventを作らない。
 
 `presentation_ready`は投稿済みではない。成果物はsafe projection、固定destination、deterministic operation slotを含み、投稿consumerがcurrent eligibilityとprovider receiptを照合して扱う。local dashboardのdestinationは`none`で、Slackへ転送しない。同じgroupの準備済み報告と短周期の新規進捗は重複抑止・集約待ちにする。high riskと利用者判断は見落とさない。
 

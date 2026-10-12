@@ -12,7 +12,7 @@ const projection=z.strictObject({message_id:z.string().min(1).max(80),payload:z.
 const member=z.strictObject({job_id:z.string().min(1).max(80),phase,report:projection.optional()});
 /** Only the server's owner-checked, transaction-consistent ledger projection may supply this context. */
 export const progressContextSchema=z.strictObject({event_id:z.string().min(1).max(80),job_id:z.string().min(1).max(80),
- current:z.boolean(),desired_state:z.enum(["running","paused","cancelled"]),phase,now:instant,
+ report_current:z.boolean().default(true),current:z.boolean(),desired_state:z.enum(["running","paused","cancelled"]),phase,now:instant,
  report:projection.optional(),silence_since:instant.optional(),members:z.array(member).min(1).max(32),
  group_attention:z.boolean(),group_terminal:z.boolean(),context_complete:z.boolean(),
  previous:z.strictObject({fingerprint:z.string(),group_fingerprint:z.string().optional(),severity:z.enum(["low","medium","high"]).optional(),eta_minutes:z.number().int().nonnegative().optional(),
@@ -45,6 +45,7 @@ export function evaluateProgress(raw:unknown):ProgressDecision {
  if(c.group_attention||c.group_terminal){result.reason="terminal_notification_priority";return result;}
  if(!c.context_complete||!c.members.some(m=>m.job_id===c.job_id&&m.phase===c.phase)||new Set(c.members.map(m=>m.job_id)).size!==c.members.length){result.reason="context_incomplete";return result;}
  if([c.report,...c.members.map(m=>m.report)].some(r=>denied(reportText(r)))){result.reason="unsafe_projection";result.target=null;return result;}
+ if(!c.report_current){result.reason="stale_report";return result;}
  if(c.pending_instruction&&c.pending_instruction.state!=="delivered"){
   result.action="instruct_worker";result.reason="existing_instruction_receipt";result.target={job_id:c.job_id,message_id:c.pending_instruction.message_id};
   result.operation=c.pending_instruction.state==="unknown"?"read_instruction_receipt":"deliver_existing_instruction";return result;

@@ -405,7 +405,12 @@ export class WorkerMessageRepository {
       const pending=this.db.prepare(`SELECT m.message_id,d.attempt_count FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
         WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.state IN ('pending','leased') ORDER BY m.producer_sequence LIMIT 1`).get(jobId) as {message_id:string;attempt_count:number}|undefined;
       const cadence=this.db.prepare("SELECT last_report_at FROM worker_message_cadence WHERE job_id=?").get(jobId) as {last_report_at:string|null}|undefined;
-      const identity={job_id:jobId,current:task?.current_attempt_id===jobId&&task.stop_state==="none"&&!task.steer_pending_event_id,desired_state:task?.desired_state??"cancelled",phase:job.status,
+      const latestForJob=members.find(m=>m.job_id===jobId)?.report;
+      // A retained unanswered question remains actionable even after a later checkpoint.
+      const pendingQuestion=report&&["question","decision_request"].includes(report.kind)&&!!this.db.prepare(`SELECT 1 FROM worker_messages q
+        WHERE q.message_id=? AND NOT EXISTS (SELECT 1 FROM worker_messages a JOIN worker_message_deliveries d USING(message_id)
+          WHERE a.correlation_message_id=q.message_id AND a.kind='answer' AND d.consumer='worker' AND d.state='delivered')`).get(report.message_id);
+      const identity={report_current:!report||latestForJob?.message_id===report.message_id||!!pendingQuestion,job_id:jobId,current:task?.current_attempt_id===jobId&&task.stop_state==="none"&&!task.steer_pending_event_id,desired_state:task?.desired_state??"cancelled",phase:job.status,
         members:members.map(m=>({job_id:m.job_id,phase:m.phase,message_id:m.report?.message_id??null})),
         group_attention:liveAttention||attentionActive,group_terminal:!!group?.all_terminal_event_id,context_complete:rows.length<=32,
         ...(pending?{pending_instruction:{message_id:pending.message_id,state:pending.attempt_count>0?"unknown":"pending"}}:{})};

@@ -98,3 +98,13 @@ test("未処理aggregate timerの無効化を拒否し、終端後の本文だ�
   assert.equal(JSON.parse(receipt.result_json).receipt_id,`policy_${c.decision_id}`);assert.equal(receipt.next_check_at,null);sql.close();
  }finally{await f.dispose();}
 });
+
+
+test("遅れた古いreportを最新の進捗として再投稿しない",async()=>{
+ const f=await fixture();try{
+  const now=new Date(),old=f.report(0,"最初の検証を開始しました",now);f.db.workerMessages.publishPendingReports();const event=f.eventFor(old.message.message_id);
+  f.db.workerMessages.appendWorkerReport(f.tasks[0]!.current_attempt_id,"runtime",{schema_version:1,source_event_id:f.source.event_id,producer_sequence:2,idempotency_key:"newest",occurred_at:now.toISOString(),payload:{kind:"checkpoint",summary:"最新の検証が進みました"}},now);
+  const c=f.db.workerMessages.progressDecisionCandidate(f.tasks[0]!.current_attempt_id,event,now)!;
+  assert.equal(c.decision.action,"ack_internal");assert.equal(c.decision.reason,"stale_report");assert.equal(c.decision.safe_projection,undefined);
+ }finally{await f.dispose();}
+});

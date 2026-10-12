@@ -3,12 +3,13 @@ import {test} from "node:test";
 import {evaluateProgress,progressActions,type ProgressContext} from "../src/worker-progress-policy.js";
 const now="2026-10-12T08:00:00.000Z";
 const report={message_id:"message-one",payload:{kind:"checkpoint" as const,summary:"検証が進みました"},occurred_at:now};
-function context(patch:Partial<ProgressContext>={}):ProgressContext{return {event_id:"event-one",job_id:"job-one",current:true,desired_state:"running",phase:"running",now,report,
+function context(patch:Partial<ProgressContext>={}):ProgressContext{return {event_id:"event-one",job_id:"job-one",report_current:true,current:true,desired_state:"running",phase:"running",now,report,
  members:[{job_id:"job-one",phase:"running",report}],group_attention:false,group_terminal:false,context_complete:true,silence_threshold_ms:900000,minimum_report_interval_ms:60000,...patch};}
 const first=evaluateProgress(context());
 const previous={fingerprint:first.fingerprint!,action:first.action,decided_at:"2026-10-12T07:55:00.000Z"};
 const cases:Array<[string,Partial<ProgressContext>,string,string?]>=[
  ["初回checkpoint",{},"report_to_user"],
+ ["後続報告で置き換わったevent",{report_current:false},"ack_internal","stale_report"],
  ["同じ内容の別sequence",{report:{...report,message_id:"message-two"},previous},"ack_internal","duplicate_report"],
  ["NFKCと空白の違い",{report:{...report,payload:{kind:"checkpoint",summary:" 検証が進みました  "}},previous},"ack_internal"],
  ["低価値の短周期報告",{last_user_report_at:"2026-10-12T07:59:50.000Z"},"aggregate_wait","report_cadence"],
