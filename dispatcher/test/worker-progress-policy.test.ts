@@ -11,7 +11,7 @@ const cases:Array<[string,Partial<ProgressContext>,string,string?]>=[
  ["初回checkpoint",{},"report_to_user"],
  ["同じ内容の別sequence",{report:{...report,message_id:"message-two"},previous},"ack_internal","duplicate_report"],
  ["NFKCと空白の違い",{report:{...report,payload:{kind:"checkpoint",summary:" 検証が進みました  "}},previous},"ack_internal"],
- ["低価値の短周期報告",{last_user_report_at:"2026-10-12T07:59:50.000Z"},"ack_internal","report_cadence"],
+ ["低価値の短周期報告",{last_user_report_at:"2026-10-12T07:59:50.000Z"},"aggregate_wait","report_cadence"],
  ["risk上昇はcadenceより優先",{report:{...report,payload:{kind:"risk",summary:"確認が必要です",severity:"high"}},previous:{...previous,severity:"low"},last_user_report_at:now},"report_to_user","risk_escalation"],
  ["ETA変化はcadenceより優先",{report:{...report,payload:{kind:"checkpoint",summary:"見込み 40 分"}},previous:{...previous,eta_minutes:10},last_user_report_at:now},"report_to_user","eta_drift"],
  ["question",{report:{...report,payload:{kind:"question",question:"どちらを選びますか？"}}},"ask_user"],
@@ -37,3 +37,11 @@ for(const canary of ["sk-proj-canary0123456789abcdef","https://private.invalid/d
 });
 test("group siblingのcanaryもLLM入力候補から拒否する",()=>{const result=evaluateProgress(context({members:[{job_id:"job-one",phase:"running",report},{job_id:"job-two",phase:"running",report:{...report,payload:{kind:"risk",severity:"high",summary:"sk-proj-canary0123456789abcdef"}}}]}));assert.equal(result.reason,"unsafe_projection");assert.equal(result.safe_projection,undefined);});
 test("schema不一致・group上限・モデル入力不明はfail closed",()=>{for(const raw of [null,{...context(),extra:"forged"},{...context(),members:Array(33).fill(context().members[0])}]){const result=evaluateProgress(raw);assert.equal(result.reason,"policy_input_invalid");assert.equal(result.target,null);}});
+
+
+test("同じgroupの準備済み報告を再び投稿候補にしない",()=>{const first=evaluateProgress(context());const next=evaluateProgress(context({last_presentation_fingerprint:first.observed!.group_fingerprint,last_presentation_at:now}));assert.equal(next.action,"ack_internal");assert.equal(next.reason,"group_progress_already_reserved");});
+test("短周期の新しい意味はdurableな集約待ちへ送る",()=>{const next=evaluateProgress(context({report:{...report,payload:{kind:"checkpoint",summary:"別の検証も完了しました"}},last_presentation_at:now}));assert.equal(next.action,"aggregate_wait");assert.equal(next.reason,"report_cadence");});
+test("見込み時間の全角数字も同じdeterministic評価へ正規化する",()=>{const next=evaluateProgress(context({report:{...report,payload:{kind:"checkpoint",summary:"残り４０分"}},previous:{...previous,eta_minutes:10}}));assert.equal(next.signals.eta_changed,true);assert.equal(next.observed?.eta_minutes,40);});
+
+
+test("1 workerだけのhigh riskを集約待ちやcadenceで隠さない",()=>{const next=evaluateProgress(context({last_presentation_at:now,members:[{job_id:"job-one",phase:"running",report},{job_id:"job-two",phase:"running",report:{...report,payload:{kind:"risk",severity:"high",summary:"並行作業で確認が必要です"}}}]}));assert.equal(next.action,"report_to_user");assert.equal(next.signals.risk_escalation,true);assert.equal(next.safe_projection?.members?.length,2);});

@@ -121,6 +121,12 @@ test("親APIは永続report receiptから元ownerだけを継承し、対応す�
   const message={schema_version:1,source_event_id:notification.event_id,producer_sequence:1,idempotency_key:"answer.one",occurred_at:new Date().toISOString(),correlation_message_id:question.message.message_id,conversation_revision:1,payload:{operation:"answer",text:"既存の依頼範囲で継続してください"}};
   await assert.rejects(client.instructTask(task.task_id,read.revision as number,{...message,payload:{operation:"add_condition",text:"別の条件"}}));
   const accepted=await client.instructTask(task.task_id,read.revision as number,message);assert.equal(accepted.outcome,"created");assert.equal((await client.instructTask(task.task_id,read.revision as number,message)).outcome,"reused");
+  const policy=await client.applyTaskProgressDecision(task.task_id,notification.event_id,candidate.decision_id);
+  assert.equal(policy.state,"instruction_pending");assert.equal(policy.action,"instruct_worker");assert.equal(policy.artifact,undefined);
+  const policyRead=await client.getTaskReports(task.task_id,notification.event_id);
+  assert.equal(((policyRead.progress_decision_candidate as {application_receipt:{receipt_id:string}}).application_receipt).receipt_id,policy.receipt_id);
+  assert.equal((await client.applyTaskProgressDecision(task.task_id,notification.event_id,candidate.decision_id)).replayed,true);
+  await assert.rejects(client.applyTaskProgressDecision(task.task_id,notification.event_id,"f".repeat(64)));
   const receipts=await client.getTaskReports(task.task_id,notification.event_id);assert.equal((receipts.instructions as unknown[]).length,1);assert.equal((receipts.progress_decision_candidate as typeof candidate).eligible_now,false);
   await assert.rejects(client.createTask({source_event_id:notification.event_id,task_key:"new",objective:"別作業",workspace:{kind:"scratch"}}));
   assert.equal(db.tasks.get(task.task_id)?.state,"waiting");

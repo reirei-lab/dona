@@ -24,7 +24,7 @@ export function envelopeFromRow(row: {
   reply_target_json: string | null;
   trace_json: string | null;
 }): EventEnvelope {
-  if (row.source !== "dona_approval" && row.source !== "slack" && row.source !== "dona_job" && row.source !== "dona_update" && row.source !== "dona_schedule" && !(row.source === "dona_message" && ["worker_message_report","worker_message_silence"].includes(row.event_type)) && !(row.source === "web" && ["worker_question","worker_question_reply"].includes(row.event_type))) {
+  if (row.source !== "dona_approval" && row.source !== "slack" && row.source !== "dona_job" && row.source !== "dona_update" && row.source !== "dona_schedule" && !(row.source === "dona_message" && ["worker_message_report","worker_message_silence","worker_message_aggregate"].includes(row.event_type)) && !(row.source === "web" && ["worker_question","worker_question_reply"].includes(row.event_type))) {
     throw new Error(`Unsupported event source: ${row.source}`);
   }
   const envelope: EventEnvelope = {

@@ -1096,6 +1096,10 @@ export class DispatcherDatabase {
       reports:readable?this.workerMessages.reports(task.current_attempt_id,eventId):[],
       ...this.workerMessages.instructionReceipts(task.current_attempt_id,eventId),limit:20};
   }
+  applyTaskProgressDecision(id:string,eventId:string,decisionId:string){
+    const task=this.tasks.assertOwner(id,eventId,true);
+    return this.workerMessages.applyProgressDecision(task.current_attempt_id,eventId,decisionId);
+  }
   instructTask(id:string,revision:number,raw:unknown){
     const input=parseDonaInstruction(raw);
     return this.db.transaction(()=>{

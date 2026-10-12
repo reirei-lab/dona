@@ -15,17 +15,17 @@ export const progressContextSchema=z.strictObject({event_id:z.string().min(1).ma
  current:z.boolean(),desired_state:z.enum(["running","paused","cancelled"]),phase,now:instant,
  report:projection.optional(),silence_since:instant.optional(),members:z.array(member).min(1).max(32),
  group_attention:z.boolean(),group_terminal:z.boolean(),context_complete:z.boolean(),
- previous:z.strictObject({fingerprint:z.string(),severity:z.enum(["low","medium","high"]).optional(),eta_minutes:z.number().int().nonnegative().optional(),
+ previous:z.strictObject({fingerprint:z.string(),group_fingerprint:z.string().optional(),severity:z.enum(["low","medium","high"]).optional(),eta_minutes:z.number().int().nonnegative().optional(),
   action:z.enum(progressActions),decided_at:instant,message_id:z.string().optional()}).optional(),
- last_user_report_at:instant.optional(),pending_instruction:z.strictObject({message_id:z.string(),state:z.enum(["pending","unknown","delivered"])}).optional(),
+ last_user_report_at:instant.optional(),last_presentation_at:instant.optional(),last_presentation_fingerprint:z.string().optional(),pending_instruction:z.strictObject({message_id:z.string(),state:z.enum(["pending","unknown","delivered"])}).optional(),
  silence_threshold_ms:z.number().int().min(60000).max(86400000).default(900000),minimum_report_interval_ms:z.number().int().min(1000).max(86400000).default(60000)});
 export type ProgressContext=z.infer<typeof progressContextSchema>;
 export interface ProgressDecision {
  version:1;action:typeof progressActions[number];reason:string;fingerprint:string|null;
  target:{job_id:string;message_id?:string}|null;
- safe_projection?:{summary?:string;question?:string;options?:string[]};
+ safe_projection?:{summary?:string;question?:string;options?:string[];members?:Array<{job_id:string;phase:string;summary?:string}>};
  signals:{novelty:boolean;human_required:boolean;silence:boolean;risk_escalation:boolean;eta_changed:boolean};
- observed?:{severity?:"low"|"medium"|"high";eta_minutes?:number};
+ observed?:{group_fingerprint?:string;severity?:"low"|"medium"|"high";eta_minutes?:number};
  operation?:"read_instruction_receipt"|"deliver_existing_instruction"|"request_status";
 }
 const rank={low:0,medium:1,high:2};
@@ -61,20 +61,24 @@ export function evaluateProgress(raw:unknown):ProgressDecision {
  const payload=c.report.payload;
  const canonical=Object.fromEntries(Object.entries(payload).map(([k,v])=>[k,typeof v==="string"?normalized(v):Array.isArray(v)?v.map(normalized):v]));
  const fingerprint=hash(canonical);result.fingerprint=fingerprint;
- result.signals.novelty=fingerprint!==c.previous?.fingerprint;
- const etaMatch=reportText(c.report).match(/(?:残り|あと|見込み)\s*([0-9]{1,5})\s*分/u),eta=etaMatch?Number(etaMatch[1]):undefined;
- result.observed={...(payload.kind==="risk"?{severity:payload.severity}:{}),...(eta!==undefined?{eta_minutes:eta}:{})};
+ const groupFingerprint=hash(c.members.map(m=>({job_id:m.job_id,phase:m.phase,payload:m.report?Object.fromEntries(Object.entries(m.report.payload).map(([k,v])=>[k,typeof v==="string"?normalized(v):Array.isArray(v)?v.map(normalized):v])):null})).sort((a,b)=>a.job_id.localeCompare(b.job_id)));
+ result.signals.novelty=fingerprint!==c.previous?.fingerprint||!!(c.previous?.group_fingerprint&&groupFingerprint!==c.previous.group_fingerprint);
+ const etaMatch=normalized(reportText(c.report)).match(/(?:残り|あと|見込み)\s*([0-9]{1,5})\s*分/u),eta=etaMatch?Number(etaMatch[1]):undefined;
+ result.observed={group_fingerprint:groupFingerprint,...(payload.kind==="risk"?{severity:payload.severity}:{}),...(eta!==undefined?{eta_minutes:eta}:{})};
  result.signals.eta_changed=eta!==undefined&&c.previous?.eta_minutes!==undefined&&Math.abs(eta-c.previous.eta_minutes)>=Math.max(5,c.previous.eta_minutes*0.25);
- result.signals.risk_escalation=payload.kind==="risk"&&rank[payload.severity]>(c.previous?.severity?rank[c.previous.severity]:0);
+ result.signals.risk_escalation=(payload.kind==="risk"&&rank[payload.severity]>(c.previous?.severity?rank[c.previous.severity]:0))
+  ||(c.members.some(m=>m.report?.payload.kind==="risk"&&m.report.payload.severity==="high")&&groupFingerprint!==c.last_presentation_fingerprint&&groupFingerprint!==c.previous?.group_fingerprint);
  if(payload.kind==="question"||payload.kind==="decision_request"){
   result.signals.human_required=true;
   if(c.previous?.message_id===c.report.message_id&&c.previous.action==="ask_user"){result.reason="question_already_recorded";return result;}
   result.action="ask_user";result.reason="human_decision_required";result.safe_projection={question:payload.question,...(payload.kind==="decision_request"?{options:payload.options}:{})};return result;
  }
- if(!result.signals.novelty&&!result.signals.risk_escalation&&!result.signals.eta_changed){result.reason="duplicate_report";return result;}
+ if(payload.kind==="checkpoint"&&c.last_presentation_fingerprint===groupFingerprint){result.reason="group_progress_already_reserved";return result;}
+ if(!result.signals.novelty&&!result.signals.risk_escalation&&!result.signals.eta_changed&&c.previous?.action!=="aggregate_wait"){result.reason="duplicate_report";return result;}
  const live=c.members.filter(m=>["running","blocked"].includes(m.phase));
  if(!result.signals.risk_escalation&&!result.signals.eta_changed&&live.length>1&&live.some(m=>!m.report)&&now-Date.parse(c.report.occurred_at)<30000){result.action="aggregate_wait";result.reason="sibling_reports_pending";return result;}
- if(!result.signals.risk_escalation&&!result.signals.eta_changed&&c.last_user_report_at&&now-Date.parse(c.last_user_report_at)<c.minimum_report_interval_ms){result.reason="report_cadence";return result;}
+ const lastReport=Math.max(c.last_user_report_at?Date.parse(c.last_user_report_at):0,c.last_presentation_at?Date.parse(c.last_presentation_at):0);
+ if(!result.signals.risk_escalation&&!result.signals.eta_changed&&lastReport&&now-lastReport<c.minimum_report_interval_ms){result.action="aggregate_wait";result.reason="report_cadence";return result;}
  result.action="report_to_user";result.reason=result.signals.risk_escalation?"risk_escalation":result.signals.eta_changed?"eta_drift":"new_progress";
- result.safe_projection={summary:payload.summary};return result;
+ result.safe_projection={summary:payload.summary,members:c.members.map(m=>({job_id:m.job_id,phase:m.phase,...(m.report?{summary:Array.from(reportText(m.report)).slice(0,240).join("")}:{})}))};return result;
 }
