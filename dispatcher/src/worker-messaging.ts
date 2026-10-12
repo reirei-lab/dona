@@ -1091,6 +1091,11 @@ export class WorkerMessageRepository {
           AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d WHERE d.message_id=m.message_id AND d.state IN ('pending','leased'))
           AND NOT EXISTS (SELECT 1 FROM worker_messages child WHERE child.correlation_message_id=m.message_id))`)
         .run(at.toISOString(),cutoff);
+      this.db.prepare(`UPDATE worker_progress_decisions SET decision_json=json_set(json_remove(decision_json,'$.safe_projection'),'$.payload_retired',json('true'))
+        WHERE decided_at<? AND job_id IN (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled'))`).run(cutoff);
+      this.db.prepare(`UPDATE worker_progress_applications SET result_json=json_set(json_remove(result_json,'$.artifact.safe_projection'),'$.payload_retired',json('true')),
+        next_check_at=NULL WHERE decision_key IN (SELECT decision_key FROM worker_progress_decisions WHERE decided_at<?
+          AND job_id IN (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled')))` ).run(cutoff);
       const deleted=this.db.prepare(`DELETE FROM worker_messages WHERE accepted_at<? AND job_id IN
         (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled'))
         AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d WHERE d.message_id=worker_messages.message_id AND d.state IN ('pending','leased'))

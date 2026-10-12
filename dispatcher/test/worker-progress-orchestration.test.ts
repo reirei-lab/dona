@@ -79,3 +79,22 @@ test("適用receipt commit前の失敗で指示もrollbackし、read-only照合�
   sql.exec("DROP TRIGGER fixture_fail_policy_receipt");sql.close();
  }finally{await f.dispose();}
 });
+
+
+test("未処理aggregate timerの無効化を拒否し、終端後の本文だけをretireする",async()=>{
+ const f=await fixture();try{
+  const now=new Date(),m=f.report(0,"保管期限のある進捗本文",now);f.db.workerMessages.publishPendingReports();const event=f.eventFor(m.message.message_id),jobId=f.tasks[0]!.current_attempt_id;
+  const c=f.db.workerMessages.progressDecisionCandidate(jobId,event,now)!;f.db.applyTaskProgressDecision(f.tasks[0]!.task_id,event,c.decision_id);
+  const sql=new Database(f.config.databasePath);
+  sql.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=? WHERE event_id=?").run(now.toISOString(),now.toISOString(),event);
+  assert.throws(()=>f.db.assertWorkerMessagingMode(false),/disable_requires_drain/);
+  const future=new Date(now.getTime()+31*86400000);f.db.workerMessages.purge(future);
+  assert.equal((sql.prepare("SELECT decision_json FROM worker_progress_decisions WHERE decision_key=?").get(c.decision_id) as {decision_json:string}).decision_json.includes("payload_retired"),false);
+  f.db.saveJobResult(jobId,{schema_version:1,job_id:jobId,status:"completed",summary:"確認しました",completed_at:new Date().toISOString()},f.db.getJob(jobId)!.result_path);
+  f.db.workerMessages.purge(future);
+  const record=sql.prepare("SELECT decision_json FROM worker_progress_decisions WHERE decision_key=?").get(c.decision_id) as {decision_json:string};
+  assert.equal(JSON.parse(record.decision_json).payload_retired,true);assert.equal(JSON.parse(record.decision_json).safe_projection,undefined);
+  const receipt=sql.prepare("SELECT result_json,next_check_at FROM worker_progress_applications WHERE decision_key=?").get(c.decision_id) as {result_json:string;next_check_at:string|null};
+  assert.equal(JSON.parse(receipt.result_json).receipt_id,`policy_${c.decision_id}`);assert.equal(receipt.next_check_at,null);sql.close();
+ }finally{await f.dispose();}
+});

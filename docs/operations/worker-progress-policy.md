@@ -29,3 +29,7 @@ questionを既存の依頼・根拠で回答できる場合、親は既存の`in
 policy、API/MCP、event projection、署名済みowner、DB再起動、timer重複、pause、異なるdecision、commit前fault、応答喪失後のreceipt照合をtemp DBで検証している。
 
 実Dona-mainでの会話評価・再接続、任意の言い換えに対するsemantic novelty、presentation consumerとの全fault/authorization matrix、実Slack、全Issue acceptanceは未確認。読み取りだけのcandidateと適用receiptを、実投稿・Task全体の完了の代わりにしない。
+
+## 無効化とretention
+
+未処理aggregate timerまたは未処理のaggregate eventがある状態での機能無効化は、既存messageと同じdrain gateで拒否する。終端Taskのdecision/成果物本文は30日後にretireし、decision identity・fingerprint・receipt IDは監査用に残す。進行中Taskの本文はこの期限処理で消さない。`payload_retired:true`は投稿・操作成功の証拠ではない。

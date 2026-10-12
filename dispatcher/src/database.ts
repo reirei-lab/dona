@@ -1073,7 +1073,10 @@ export class DispatcherDatabase {
         (j.status NOT IN ('completed','failed','cancelled') AND m.direction='worker_to_dona' AND m.kind IN ('question','decision_request')
           AND NOT EXISTS (SELECT 1 FROM worker_messages a JOIN worker_message_deliveries ad ON ad.message_id=a.message_id
             WHERE a.correlation_message_id=m.message_id AND a.kind='answer' AND ad.consumer='worker' AND ad.state='delivered')) LIMIT 1`).get();
-    if(outstanding)throw Error("worker_messaging_disable_requires_drain");
+    const policyPending=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_progress_applications'").get()
+      ?this.db.prepare(`SELECT 1 FROM worker_progress_applications a LEFT JOIN events e ON e.event_id=a.followup_event_id
+        WHERE a.next_check_at IS NOT NULL OR (a.followup_event_id IS NOT NULL AND e.status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review')) LIMIT 1`).get():undefined;
+    if(outstanding||policyPending)throw Error("worker_messaging_disable_requires_drain");
   }
 
   acceptTaskWorkerReport(attemptId:string,identity:string,raw:unknown){
