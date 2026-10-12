@@ -1075,9 +1075,13 @@ export class DispatcherDatabase {
         (j.status NOT IN ('completed','failed','cancelled') AND m.direction='worker_to_dona' AND m.kind IN ('question','decision_request')
           AND NOT EXISTS (SELECT 1 FROM worker_messages a JOIN worker_message_deliveries ad ON ad.message_id=a.message_id
             WHERE a.correlation_message_id=m.message_id AND a.kind='answer' AND ad.consumer='worker' AND ad.state='delivered')) LIMIT 1`).get();
+    const policyPending=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_progress_applications'").get()
+      ?this.db.prepare(`SELECT 1 FROM worker_progress_applications a LEFT JOIN events e ON e.event_id=a.followup_event_id
+        WHERE a.next_check_at IS NOT NULL OR (a.followup_event_id IS NOT NULL AND e.status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review')) LIMIT 1`).get():undefined;
     const silence=this.db.prepare(`SELECT 1 FROM events WHERE source='dona_message' AND event_type='worker_message_silence'
       AND status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review') LIMIT 1`).get();
-    if(outstanding||silence)throw Error("worker_messaging_disable_requires_drain");
+    if(outstanding||silence||policyPending)throw Error("worker_messaging_disable_requires_drain");
+
   }
 
   acceptTaskWorkerReport(attemptId:string,identity:string,raw:unknown){
@@ -1100,7 +1104,27 @@ export class DispatcherDatabase {
       this.tasks.wait(task,"external_effect_unknown",30000);
     }).immediate();
   }
-  taskReports(id:string,eventId:string){const task=this.tasks.assertOwner(id,eventId,true),job=this.getJob(task.current_attempt_id)!;return {schema_version:1,task_id:id,attempt_id:task.current_attempt_id,revision:task.revision,phase:job.status,wait_reason:task.wait_reason,diagnostic:job.last_error_code,desired_state:task.desired_state,event_report:task.desired_state==="running"&&["running","blocked"].includes(job.status)?this.workerMessages.eventReport(task.current_attempt_id,eventId):undefined,pending_question:task.desired_state==="running"&&["running","blocked"].includes(job.status)?this.workerMessages.pendingQuestion(task.current_attempt_id):undefined,reports:task.desired_state==="running"&&["running","blocked"].includes(job.status)?this.workerMessages.reports(task.current_attempt_id,eventId):[],...this.workerMessages.silenceEventState(task.current_attempt_id,eventId),...this.workerMessages.instructionReceipts(task.current_attempt_id,eventId),limit:20};}
+  taskReports(id:string,eventId:string){
+    const task=this.tasks.assertOwner(id,eventId,true),job=this.getJob(task.current_attempt_id)!;
+    const readable=task.desired_state==="running"&&["running","blocked"].includes(job.status);
+    return {schema_version:1,task_id:id,attempt_id:task.current_attempt_id,revision:task.revision,phase:job.status,
+      wait_reason:task.wait_reason,diagnostic:job.last_error_code,desired_state:task.desired_state,
+      progress_decision_candidate:this.workerMessages.progressDecisionCandidate(task.current_attempt_id,eventId,new Date(),false),
+      event_report:readable?this.workerMessages.eventReport(task.current_attempt_id,eventId):undefined,
+      pending_question:readable?this.workerMessages.pendingQuestion(task.current_attempt_id):undefined,
+      reports:readable?this.workerMessages.reports(task.current_attempt_id,eventId):[],
+      ...this.workerMessages.silenceEventState(task.current_attempt_id,eventId),...this.workerMessages.instructionReceipts(task.current_attempt_id,eventId),limit:20};
+  }
+  prepareTaskProgressDecision(id:string,eventId:string){
+    const task=this.tasks.assertOwner(id,eventId,true);
+    const candidate=this.workerMessages.progressDecisionCandidate(task.current_attempt_id,eventId);
+    if(!candidate)throw Error("progress_decision_not_current");
+    return candidate;
+  }
+  applyTaskProgressDecision(id:string,eventId:string,decisionId:string){
+    const task=this.tasks.assertOwner(id,eventId,true);
+    return this.workerMessages.applyProgressDecision(task.current_attempt_id,eventId,decisionId);
+  }
   instructTask(id:string,revision:number,raw:unknown){
     const input=parseDonaInstruction(raw);
     return this.db.transaction(()=>{
@@ -3960,6 +3984,7 @@ export class DispatcherDatabase {
         .run(status, attemptCount, availableAt, code, message, at.toISOString(), eventId);
       if(status==="dead_letter") {
         if(row.source==="dona_message"&&row.event_type==="worker_message_report")this.workerMessages.rearmUndispatchedReport(eventId,retryAt(Math.max(1,row.attempt_count),at),at);
+        if(row.source==="dona_message"&&row.event_type==="worker_message_aggregate")this.workerMessages.rearmUndispatchedAggregate(eventId,retryAt(Math.max(1,row.attempt_count),at));
         this.sealJobGroupIfPresent(eventId, at.toISOString());
         this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
         this.setNotificationState(eventId,"failed",at);
@@ -3982,6 +4007,7 @@ export class DispatcherDatabase {
         .run(status, availableAt, code, message, at.toISOString(), eventId);
       if(status==="dead_letter") {
         if(row.source==="dona_message"&&row.event_type==="worker_message_report")this.workerMessages.rearmUndispatchedReport(eventId,retryAt(Math.max(1,row.attempt_count),at),at);
+        if(row.source==="dona_message"&&row.event_type==="worker_message_aggregate")this.workerMessages.rearmUndispatchedAggregate(eventId,retryAt(Math.max(1,row.attempt_count),at));
         this.sealJobGroupIfPresent(eventId, at.toISOString());
         this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
         this.setNotificationState(eventId,"failed",at);

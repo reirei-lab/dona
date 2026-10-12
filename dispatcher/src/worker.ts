@@ -313,6 +313,14 @@ export class DispatcherWorker {
       const result = await readResultEnvelope(row.result_path!, row.event_id);
       const verification=this.database.notificationVerificationRequest(row.event_id,result);
       const evidence=verification?(this.notificationVerifier?await this.notificationVerifier.settle(verification):undefined):undefined;
+      if(this.config.workerMessagingEnabled&&row.source==='dona_message'){
+        const progress=this.database.workerMessages.presentationVerificationRequest(row.event_id,result);
+        if(progress){
+          if(!this.notificationVerifier)throw Error("progress_presentation_verifier_unavailable");
+          const confirmed=progress.desired_session_status===null?await this.notificationVerifier.verify(progress):await this.notificationVerifier.settle(progress);
+          this.database.workerMessages.confirmPresentation(row.event_id,progress,confirmed);
+        }
+      }
       if (result.status === "completed") this.database.saveCompleted(row.event_id, result, row.result_path!,new Date(),evidence);
       else this.database.saveFailedResult(row.event_id, result, row.result_path!,new Date(),evidence);
       this.logCurrentTransition(row, Date.now());

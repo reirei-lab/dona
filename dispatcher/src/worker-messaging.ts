@@ -1,3 +1,4 @@
+import {evaluateProgress,type ProgressDecision} from "./worker-progress-policy.js";
 import path from "node:path";
 import {existsSync} from "node:fs";
 import {credentialShaped} from "./credential-shaped.js";
@@ -9,7 +10,8 @@ import { ulid } from "ulid";
 import { z } from "zod";
 
 import { insertEventJobBinding, readEventJobBinding } from "./job-routing.js";
-import type { JobRow } from "./types.js";
+import type { JobRow,ResultEnvelope } from "./types.js";
+import type {JobNotificationEvidence,JobNotificationVerificationRequest} from "./database.js";
 import { jobObjectiveCharacterMax, stableStringify } from "./validation.js";
 
 export const workerMessageProtocolVersion = 1 as const;
@@ -222,6 +224,29 @@ export function migrateWorkerMessaging(db: Database.Database): void {
       updated_at             TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS worker_progress_decisions (
+      decision_key TEXT PRIMARY KEY,
+      job_id TEXT NOT NULL REFERENCES jobs(job_id),
+      event_id TEXT NOT NULL REFERENCES events(event_id),
+      snapshot_sha256 TEXT NOT NULL,
+      decision_json TEXT NOT NULL,
+      decided_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS worker_progress_decisions_job_idx ON worker_progress_decisions(job_id,decided_at);
+    CREATE TABLE IF NOT EXISTS worker_progress_decision_roots (
+      root_key TEXT PRIMARY KEY,decision_key TEXT NOT NULL REFERENCES worker_progress_decisions(decision_key)
+    );
+    CREATE TABLE IF NOT EXISTS worker_progress_applications (
+      decision_key TEXT PRIMARY KEY REFERENCES worker_progress_decisions(decision_key),
+      event_id TEXT NOT NULL REFERENCES events(event_id),
+      result_json TEXT NOT NULL,
+      next_check_at TEXT,
+      followup_event_id TEXT REFERENCES events(event_id),
+      applied_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS worker_progress_applications_due_idx ON worker_progress_applications(next_check_at,decision_key) WHERE next_check_at IS NOT NULL;
+
     CREATE TABLE IF NOT EXISTS worker_message_activity (
       job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,activity_at TEXT NOT NULL
     );
@@ -235,6 +260,7 @@ export function migrateWorkerMessaging(db: Database.Database): void {
   const trigger=db.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?").get(workerMessageTerminalTrigger.name) as {sql:string}|undefined;
   if(trigger&&trigger.sql!==workerMessageTerminalTrigger.sql)throw new WorkerMessageError("worker_message_schema_invalid","terminal fence was modified");
   if(!trigger)db.exec(workerMessageTerminalTrigger.sql);
+  if(!(db.pragma("table_info(worker_progress_applications)") as {name:string}[]).some(c=>c.name==="followup_generation"))db.exec("ALTER TABLE worker_progress_applications ADD COLUMN followup_generation INTEGER NOT NULL DEFAULT 0");
   const runtimeIdentityColumns=new Set((db.pragma("table_info(worker_message_runtime_identities)") as Array<{name:string}>).map(row=>row.name));
   if(runtimeIdentityColumns.has("job_id"))db.exec(`
     CREATE TABLE worker_message_runtime_identities_v2 (
@@ -292,6 +318,12 @@ export class WorkerMessageRepository {
   reservedQueuedInstructionBytes(sourceEventId:string):number {
     return this.queuedInstructionReservations(sourceEventId)
       .reduce((sum,row)=>sum+Buffer.byteLength(row.addition,"utf8"),0);
+  }
+
+  rearmUndispatchedAggregate(eventId:string,availableAt:string):boolean {
+    return this.db.prepare(`UPDATE worker_progress_applications SET followup_event_id=NULL,next_check_at=?,followup_generation=followup_generation+1
+      WHERE followup_event_id=? AND EXISTS (SELECT 1 FROM events e WHERE e.event_id=? AND e.source='dona_message' AND e.event_type='worker_message_aggregate' AND e.status='dead_letter')`)
+      .run(availableAt,eventId,eventId).changes>0;
   }
 
   rearmUndispatchedReport(eventId:string,availableAt:string,at=new Date()):boolean {
@@ -365,6 +397,230 @@ export class WorkerMessageRepository {
     return !!this.db.prepare(`SELECT 1 FROM worker_messages m WHERE m.job_id=? AND m.direction='worker_to_dona' AND m.kind IN ('question','decision_request') AND NOT EXISTS (
       SELECT 1 FROM worker_messages a JOIN worker_message_deliveries d USING(message_id) WHERE a.correlation_message_id=m.message_id AND a.kind='answer' AND d.consumer='worker' AND d.state='delivered')`).get(jobId);
   }
+  progressDecisionCandidate(jobId:string,eventId:string,at=new Date(),persist=true) {
+    const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow|undefined;
+    if(!job)throw Error("job_not_found");
+    this.assertAuthorized(job,eventId);
+    if(!this.ownsMessageEvent(jobId,eventId))return undefined;
+    const operation=this.db.transaction(()=>{
+      const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow|undefined;
+      if(!job)throw Error("job_not_found");
+      this.assertAuthorized(job,eventId);
+      if(!this.ownsMessageEvent(jobId,eventId))return undefined;
+      const event=this.db.prepare("SELECT * FROM events WHERE event_id=?").get(eventId) as {payload_json:string;external_event_id:string;event_type:string};
+      const payload=JSON.parse(event.payload_json) as {message_id?:string};
+      const task=this.db.prepare("SELECT current_attempt_id,desired_state,revision,stop_state,steer_pending_event_id FROM tasks WHERE current_attempt_id=?").get(jobId) as {current_attempt_id:string;desired_state:string;revision:number;stop_state:string;steer_pending_event_id:string|null}|undefined;
+      const rows=this.db.prepare(`SELECT j.job_id,j.status,j.last_error_code FROM jobs j LEFT JOIN tasks t ON t.current_attempt_id=j.job_id
+        WHERE j.source_event_id=? AND (t.task_id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM task_attempts a WHERE a.attempt_id=j.job_id))
+        ORDER BY j.created_at,j.job_id LIMIT 33`).all(job.source_event_id) as Array<{job_id:string;status:string;last_error_code:string|null}>;
+      const project=(message:WorkerMessageRow)=>({message_id:message.message_id,payload:JSON.parse(message.payload_json),occurred_at:message.occurred_at,accepted_at:message.accepted_at});
+      const report=payload.message_id?this.db.prepare("SELECT * FROM worker_messages WHERE message_id=? AND job_id=? AND direction='worker_to_dona'").get(payload.message_id,jobId) as WorkerMessageRow|undefined:undefined;
+      const members=rows.slice(0,32).map(row=>{
+        const latest=this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND direction='worker_to_dona' ORDER BY producer_sequence DESC LIMIT 1").get(row.job_id) as WorkerMessageRow|undefined;
+        return {job_id:row.job_id,phase:row.status,...(latest?{report:project(latest)}:{})};
+      });
+      const group=this.db.prepare("SELECT attention_event_id,all_terminal_event_id FROM job_groups WHERE source_event_id=?").get(job.source_event_id) as {attention_event_id:string|null;all_terminal_event_id:string|null}|undefined;
+      const liveAttention=rows.some(row=>["failed","needs_review","blocked"].includes(row.status)
+        &&!["worker_message_question_pending","worker_instruction_acceptance_unknown"].includes(row.last_error_code??"")
+        &&!this.db.prepare("SELECT 1 FROM job_attention_resolutions WHERE job_id=? AND status_at_resolution=?").get(row.job_id,row.status));
+      const attentionActive=!!group?.attention_event_id&&!!this.db.prepare("SELECT 1 FROM events WHERE event_id=? AND status NOT IN ('completed','dead_letter')").get(group.attention_event_id);
+      const pending=this.db.prepare(`SELECT m.message_id,d.attempt_count FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
+        WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.state IN ('pending','leased') ORDER BY m.producer_sequence LIMIT 1`).get(jobId) as {message_id:string;attempt_count:number}|undefined;
+      const cadence=this.db.prepare("SELECT COALESCE(a.activity_at,c.last_report_at) last_report_at FROM worker_message_cadence c LEFT JOIN worker_message_activity a USING(job_id) WHERE c.job_id=?").get(jobId) as {last_report_at:string|null}|undefined;
+      const latestForJob=members.find(m=>m.job_id===jobId)?.report;
+      // A retained unanswered question remains actionable even after a later checkpoint.
+      const pendingQuestion=report&&["question","decision_request"].includes(report.kind)&&!!this.db.prepare(`SELECT 1 FROM worker_messages q
+        WHERE q.message_id=? AND NOT EXISTS (SELECT 1 FROM worker_messages a JOIN worker_message_deliveries d USING(message_id)
+          WHERE a.correlation_message_id=q.message_id AND a.kind='answer' AND d.consumer='worker' AND d.state='delivered')`).get(report.message_id);
+      const pendingRisk=report?.kind==="risk"&&JSON.parse(report.payload_json).severity==="high"&&!this.db.prepare(`SELECT 1 FROM worker_progress_decisions p JOIN worker_progress_applications a USING(decision_key)
+        WHERE p.job_id=? AND json_extract(p.decision_json,'$.target.message_id')=? AND json_extract(a.result_json,'$.state')='presentation_ready' LIMIT 1`).get(jobId,report.message_id);
+      const priorRisk=report?this.db.prepare("SELECT json_extract(payload_json,'$.severity') severity FROM worker_messages WHERE job_id=? AND direction='worker_to_dona' AND kind='risk' AND producer_sequence<? AND json_extract(payload_json,'$.severity') IN ('low','medium','high') ORDER BY producer_sequence DESC LIMIT 1").get(jobId,report.producer_sequence) as {severity:'low'|'medium'|'high'}|undefined:undefined;
+      const identity={report_current:!report||latestForJob?.message_id===report.message_id||!!pendingQuestion||!!pendingRisk,job_id:jobId,current:task?.current_attempt_id===jobId&&task.stop_state==="none",control_pending:!!task?.steer_pending_event_id,desired_state:task?.desired_state??"cancelled",phase:job.status,
+        members:members.map(m=>({job_id:m.job_id,phase:m.phase,message_id:m.report?.message_id??null})),
+        group_attention:liveAttention||attentionActive,group_terminal:!!group?.all_terminal_event_id,context_complete:rows.length<=32,
+        ...(priorRisk?{last_risk_severity:priorRisk.severity}:{}),
+        ...(!report&&cadence?.last_report_at?{silence_since:cadence.last_report_at}:{}),
+        ...(pending?{pending_instruction:{message_id:pending.message_id,state:pending.attempt_count>0?"unknown":"pending"}}:{})};
+      const snapshot=sha256(stableStringify({identity,control:{revision:task?.revision,stop_state:task?.stop_state,steer_event:task?.steer_pending_event_id,job_error:job.last_error_code}}));
+      const root=sha256(stableStringify({version:1,job_id:jobId,report_id:report?.message_id??event.external_event_id,...(event.event_type==="worker_message_aggregate"?{stage:event.external_event_id}:{})}));
+      const pointer=this.db.prepare("SELECT decision_key FROM worker_progress_decision_roots WHERE root_key=?").get(root) as {decision_key:string}|undefined;
+      const priorKey=pointer?.decision_key??root;
+      const saved=this.db.prepare("SELECT * FROM worker_progress_decisions WHERE decision_key=?").get(priorKey) as {snapshot_sha256:string;decision_json:string;decided_at:string}|undefined;
+      if(saved){
+        const application=this.db.prepare("SELECT result_json FROM worker_progress_applications WHERE decision_key=?").get(priorKey) as {result_json:string}|undefined;
+        if(application||saved.snapshot_sha256===snapshot||!persist)return {decision_id:priorKey,decision:JSON.parse(saved.decision_json) as ProgressDecision,eligible_now:saved.snapshot_sha256===snapshot,replayed:true,
+          decided_at:saved.decided_at,applied:!!application,...(application?{application_receipt:JSON.parse(application.result_json)}:{})};
+      }
+      if(!persist)return undefined;
+      const key=sha256(stableStringify({root,snapshot}));
+      const prior=this.db.prepare("SELECT p.decision_json,p.decided_at FROM worker_progress_decisions p JOIN worker_progress_applications a USING(decision_key) WHERE p.job_id=? ORDER BY p.decided_at DESC,p.decision_key DESC LIMIT 1").get(jobId) as {decision_json:string;decided_at:string}|undefined;
+      const previous=prior?JSON.parse(prior.decision_json) as ProgressDecision:undefined;
+      const lastEta=this.db.prepare(`SELECT json_extract(p.decision_json,'$.observed.eta_minutes') eta_minutes
+        FROM worker_progress_decisions p JOIN worker_progress_applications a USING(decision_key)
+        WHERE p.job_id=? AND json_type(p.decision_json,'$.observed.eta_minutes')='integer'
+        ORDER BY p.decided_at DESC,p.decision_key DESC LIMIT 1`).get(jobId) as {eta_minutes:number}|undefined;
+      const presentation=this.db.prepare(`SELECT a.applied_at,p.decision_json FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key) JOIN jobs j ON j.job_id=p.job_id
+        WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready' ORDER BY a.applied_at DESC,a.decision_key DESC LIMIT 1`).get(job.source_event_id) as {applied_at:string;decision_json:string}|undefined;
+      const reserved=presentation?JSON.parse(presentation.decision_json) as ProgressDecision:undefined;
+      const currentHighIds=[...new Set([...(report?.kind==='risk'&&JSON.parse(report.payload_json).severity==='high'?[report.message_id]:[]),...members.flatMap(m=>m.report?.payload.kind==='risk'&&m.report.payload.severity==='high'?[m.report.message_id]:[])])];
+      const reservedHighIds=currentHighIds.length?(this.db.prepare(`SELECT DISTINCT risk.value AS message_id FROM worker_progress_applications a
+        JOIN worker_progress_decisions p USING(decision_key) JOIN jobs j ON j.job_id=p.job_id JOIN json_each(p.decision_json,'$.observed.high_risk_message_ids') risk
+        WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state') IN ('presentation_ready','presentation_delivered','presentation_duplicate','local_artifact_ready')
+          AND json_extract(p.decision_json,'$.action')='report_to_user' AND risk.value IN (${currentHighIds.map(()=>'?').join(',')}) LIMIT 64`)
+        .all(job.source_event_id,...currentHighIds) as Array<{message_id:string}>).map(r=>r.message_id):[];
+      const delivered=this.db.prepare(`SELECT MAX(json_extract(a.result_json,'$.provider_receipt.posted_at')) posted_at FROM worker_progress_applications a
+        JOIN worker_progress_decisions p USING(decision_key) JOIN jobs j ON j.job_id=p.job_id WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_delivered'`).get(job.source_event_id) as {posted_at:string|null};
+      const decision=evaluateProgress({event_id:eventId,...identity,context_complete:rows.length<=32,...(lastEta?{last_eta_minutes:lastEta.eta_minutes}:{}),now:at.toISOString(),members,reserved_high_risk_ids:reservedHighIds,presentation_pending:!!presentation,...(delivered.posted_at?{last_user_report_at:delivered.posted_at}:{}),...(presentation?{last_presentation_fingerprint:reserved?.observed?.group_fingerprint}:{}),...(report?{report:project(report)}:{}),
+        ...(!report&&cadence?.last_report_at?{silence_since:cadence.last_report_at}:{}),
+        ...(pending?{pending_instruction:{message_id:pending.message_id,state:pending.attempt_count>0?"unknown":"pending"}}:{}),
+        ...(previous&&prior?{previous:{fingerprint:previous.fingerprint??"",action:previous.action,decided_at:prior.decided_at,...previous.observed,...(previous.target?.message_id?{message_id:previous.target.message_id}:{})}}:{})});
+      this.db.prepare("INSERT OR IGNORE INTO worker_progress_decisions VALUES(?,?,?,?,?,?)").run(key,jobId,eventId,snapshot,stableStringify(decision),at.toISOString());
+      this.db.prepare("INSERT INTO worker_progress_decision_roots VALUES(?,?) ON CONFLICT(root_key) DO UPDATE SET decision_key=excluded.decision_key").run(root,key);
+      return {decision_id:key,decision,eligible_now:true,replayed:false,decided_at:at.toISOString(),applied:false};
+    });
+    return persist?operation.immediate():operation();
+  }
+
+  applyProgressDecision(jobId:string,eventId:string,decisionId:string,at=new Date()) {
+    if(!/^[0-9a-f]{64}$/.test(decisionId))throw Error("progress_decision_invalid");
+    return this.db.transaction(()=>{
+      const candidate=this.progressDecisionCandidate(jobId,eventId,at,false);
+      if(!candidate||candidate.decision_id!==decisionId)throw Error("progress_decision_not_current");
+      const prior=this.db.prepare("SELECT result_json FROM worker_progress_applications WHERE decision_key=?").get(decisionId) as {result_json:string}|undefined;
+      if(prior)return {...JSON.parse(prior.result_json),replayed:true,eligible_now:candidate.eligible_now};
+      const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow;
+      const task=this.db.prepare("SELECT desired_state,stop_state,steer_pending_event_id FROM tasks WHERE current_attempt_id=?").get(jobId) as {desired_state:string;stop_state:string;steer_pending_event_id:string|null}|undefined;
+      if(candidate.decision.action!=="ack_internal"&&(!task||task.desired_state!=="running"||task.stop_state!=="none"||(task.steer_pending_event_id&&!(candidate.decision.action==="aggregate_wait"&&candidate.decision.reason==="task_control_pending"))||!["running","blocked"].includes(job.status)))throw Error("progress_snapshot_changed");
+      const answer=candidate.decision.action==="ask_user"&&candidate.decision.target?.message_id
+        ?this.db.prepare(`SELECT m.message_id,d.state,d.attempt_count FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
+          WHERE m.job_id=? AND m.direction='dona_to_worker' AND m.kind='answer' AND m.correlation_message_id=?
+            AND d.consumer='worker' AND d.state!='superseded' LIMIT 1`).get(jobId,candidate.decision.target.message_id) as {message_id:string;state:string;attempt_count:number}|undefined:undefined;
+      if(!candidate.eligible_now&&!answer)throw Error("progress_snapshot_changed");
+      const result:Record<string,unknown>={version:1,decision_id:decisionId,job_id:jobId,source_event_id:eventId,
+        action:candidate.decision.action,state:"recorded",receipt_id:`policy_${decisionId}`,replayed:false,eligible_now:candidate.eligible_now};
+      let nextCheck:string|null=null;
+      if(answer){
+        result.action="instruct_worker";result.state=answer.state==="delivered"?"instruction_delivered":answer.attempt_count>0?"instruction_unknown":"instruction_pending";
+        result.instruction_message_id=answer.message_id;
+      }else if(candidate.decision.action==="ask_worker"){
+        if(job.status!=="running"||this.hasUnansweredQuestion(jobId)||this.hasPendingInstructions(jobId)){
+          result.action="ack_internal";result.state="worker_wait_priority";
+        }else{
+          const next=this.instructionReceipts(jobId,eventId).next_producer_sequence;
+          const accepted=this.append(jobId,"dona_to_worker",parseDonaInstruction({schema_version:1,source_event_id:eventId,producer_sequence:next,
+            idempotency_key:`policy-${decisionId}`,occurred_at:at.toISOString(),payload:{operation:"add_condition",
+              text:"現在の進捗・残作業・見込み時間・riskを短く報告してください。既存成果を読み取りだけで照合し、新しい外部操作・承認・作業範囲の変更は行わないでください。"}}),at);
+          result.state="instruction_pending";result.instruction_message_id=accepted.message.message_id;result.instruction_receipt_id=accepted.receipt_id;
+        }
+      }else if(candidate.decision.action==="instruct_worker"){
+        result.state=candidate.decision.operation==="read_instruction_receipt"?"instruction_unknown":"instruction_pending";
+        result.instruction_message_id=candidate.decision.target?.message_id;
+      }else if(candidate.decision.action==="aggregate_wait"){
+        result.state="aggregate_wait";nextCheck=new Date(at.getTime()+30000).toISOString();result.next_check_at=nextCheck;
+      }else if(["report_to_user","ask_user"].includes(candidate.decision.action)){
+        const binding=readEventJobBinding(this.db,job.source_event_id);
+        if(!binding)throw Error("progress_destination_unverified");
+        const riskIds=stableStringify(candidate.decision.observed?.severity==='high'?[candidate.decision.target!.message_id!]:candidate.decision.signals.risk_escalation?candidate.decision.observed?.high_risk_message_ids??[]:[]);
+        const reserved=candidate.decision.action==="report_to_user"&&this.db.prepare(`SELECT 1 FROM worker_progress_applications a
+          JOIN worker_progress_decisions p USING(decision_key) JOIN jobs j ON j.job_id=p.job_id
+          WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state') IN ('presentation_ready','presentation_delivered') AND json_extract(p.decision_json,'$.action')='report_to_user'
+            AND ((json_array_length(?)=0 AND json_extract(p.decision_json,'$.observed.group_fingerprint')=?)
+              OR (json_array_length(?)>0 AND NOT EXISTS(SELECT 1 FROM json_each(?) incoming WHERE NOT EXISTS
+                (SELECT 1 FROM json_each(json_extract(p.decision_json,'$.observed.high_risk_message_ids')) reserved WHERE reserved.value=incoming.value)))) LIMIT 1`)
+          .get(job.source_event_id,riskIds,candidate.decision.observed?.group_fingerprint??null,riskIds,riskIds);
+        const undelivered=candidate.decision.action==="report_to_user"&&!candidate.decision.signals.risk_escalation&&!candidate.decision.signals.eta_changed&&this.db.prepare(`SELECT 1 FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key)
+          JOIN jobs j ON j.job_id=p.job_id WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready' LIMIT 1`).get(job.source_event_id);
+        if(reserved){result.action="ack_internal";result.state="presentation_duplicate";}
+        else if(undelivered){result.action="aggregate_wait";result.state="aggregate_wait";nextCheck=new Date(at.getTime()+30000).toISOString();result.next_check_at=nextCheck;}
+        else {result.state=binding.destination.kind==='none'?"local_artifact_ready":"presentation_ready";
+        const body=this.renderPresentation(candidate.decision);
+        result.artifact={version:1,decision_id:decisionId,action:candidate.decision.action,
+          source_event_id:job.source_event_id,destination:binding.destination,
+          operation_slot:decisionId,reply_broadcast:false,desired_session_status:candidate.decision.action==="ask_user"?"suspended":null,safe_projection:candidate.decision.safe_projection,rendered_body:body,rendered_body_sha256:sha256(body)};}
+      }
+      this.db.prepare("INSERT INTO worker_progress_applications(decision_key,event_id,result_json,next_check_at,followup_event_id,applied_at) VALUES(?,?,?,?,NULL,?)").run(decisionId,eventId,stableStringify(result),nextCheck,at.toISOString());
+      return result;
+    }).immediate();
+  }
+
+  private renderPresentation(decision:ProgressDecision):string {
+    const p=decision.safe_projection;if(!p)throw Error("progress_projection_missing");
+    const lines=[p.question??p.summary??"進捗を確認しました",...(p.options??[]).map(option=>`- ${option}`),
+      ...(decision.action==='report_to_user'?(p.members??[]).map((m,i)=>`並行作業 ${i+1}: ${Array.from(m.summary??m.phase).slice(0,100).join("")}`):[])];
+    const body=Buffer.from(lines.join("\n"),"utf8").toString("utf8").replace(/<!(?:channel|here|everyone)(?:\|[^>]+)?>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+(?:\|[^>]+)?>/gi,mention=>`&lt;${mention.slice(1)}`);
+    // question 4,000 + options 8×1,000。mention無効化の展開（最大2倍）と8行の接頭辞を含める。
+    if(body.length>24_024)throw Error("progress_presentation_body_limit");return body;
+  }
+
+  presentationVerificationRequest(eventId:string,result:ResultEnvelope):JobNotificationVerificationRequest|undefined {
+    const posts=(result.actions??[]).filter(a=>a&&typeof a==='object'&&!Array.isArray(a)&&['dona_slack.post_message','mcp__dona_slack__post_message'].includes(String((a as Record<string,unknown>).tool))) as Array<Record<string,unknown>>;
+    const rows=this.db.prepare("SELECT decision_key,result_json FROM worker_progress_applications WHERE event_id=? AND json_extract(result_json,'$.state') IN ('presentation_ready','presentation_delivered','local_artifact_ready') LIMIT 2").all(eventId) as Array<{decision_key:string;result_json:string}>;
+    if(!rows.length)return undefined;
+    if(rows.length===1&&!posts.length&&JSON.parse(rows[0]!.result_json).artifact?.destination?.kind==='none')return undefined;
+    if(!posts.length)throw Error("progress_presentation_action_missing");
+    if(rows.length!==1||posts.length!==1)throw Error("progress_presentation_ambiguous");
+    const artifact=JSON.parse(rows[0]!.result_json).artifact as {action:string;destination:{kind:string;workspace_id?:string;channel_id?:string;thread_ts?:string};rendered_body?:string;rendered_body_sha256?:string};
+    const target=artifact.destination,post=posts[0]!;
+    if(target.kind!=='slack_thread'||typeof artifact.rendered_body_sha256!=='string'||!/^[a-f0-9]{64}$/.test(artifact.rendered_body_sha256))throw Error("progress_presentation_body_unbound");
+    if(post.event_id!==eventId||post.workspace_id!==target.workspace_id||post.channel_id!==target.channel_id||post.thread_ts!==target.thread_ts||post.reply_broadcast!==false||post.parse!=='none'||post.mrkdwn!==true||typeof post.message_ts!=='string'||!/^\d{1,20}\.\d{6}$/.test(post.message_ts))throw Error("progress_presentation_action_mismatch");
+    return {schema_version:1,event_id:eventId,workspace_id:target.workspace_id!,channel_id:target.channel_id!,thread_ts:target.thread_ts!,message_ts:post.message_ts,body_sha256:artifact.rendered_body_sha256!,desired_session_status:artifact.action==="ask_user"?"suspended":null};
+  }
+
+  confirmPresentation(eventId:string,request:JobNotificationVerificationRequest,evidence:JobNotificationEvidence):void {
+    this.db.transaction(()=>{
+      const rows=this.db.prepare("SELECT decision_key,result_json FROM worker_progress_applications WHERE event_id=? AND json_extract(result_json,'$.state') IN ('presentation_ready','presentation_delivered','local_artifact_ready') LIMIT 2").all(eventId) as Array<{decision_key:string;result_json:string}>;
+      if(rows.length!==1)throw Error("progress_presentation_not_found");
+      const row=rows[0]!,result=JSON.parse(row.result_json),artifact=result.artifact;
+      if(request.event_id!==eventId||evidence.event_id!==eventId||evidence.workspace_id!==artifact.destination.workspace_id||evidence.channel_id!==artifact.destination.channel_id||evidence.thread_ts!==artifact.destination.thread_ts||evidence.message_ts!==request.message_ts||evidence.body_sha256!==artifact.rendered_body_sha256||request.body_sha256!==evidence.body_sha256||evidence.reply_broadcast!==false||evidence.identity_block_verified!==true||request.desired_session_status!==(artifact.action==="ask_user"?"suspended":null)||evidence.session_status!==(artifact.action==="ask_user"?"suspended":null)||!Number.isFinite(Date.parse(evidence.posted_at)))throw Error("progress_presentation_receipt_mismatch");
+      if(result.state==='presentation_delivered'){
+        if(stableStringify(result.provider_receipt)!==stableStringify(evidence))throw Error("progress_presentation_receipt_conflict");return;
+      }
+      result.state='presentation_delivered';result.provider_receipt=evidence;
+      this.db.prepare("UPDATE worker_progress_applications SET result_json=? WHERE decision_key=?").run(stableStringify(result),row.decision_key);
+    }).immediate();
+  }
+
+  publishDueProgressDecisions(limit=32,at=new Date()):number {
+    if(!Number.isSafeInteger(limit)||limit<1||limit>100)throw Error("progress_publish_limit_invalid");
+    return this.db.transaction(()=>{
+      const due=this.db.prepare(`SELECT a.decision_key,a.followup_generation,p.job_id,p.decision_json FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key)
+        WHERE a.next_check_at<=? AND a.followup_event_id IS NULL ORDER BY a.next_check_at,a.decision_key LIMIT ?`).all(at.toISOString(),limit) as Array<{decision_key:string;followup_generation:number;job_id:string;decision_json:string}>;
+      let count=0;
+      for(const row of due){
+        const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(row.job_id) as JobRow;
+        const task=this.db.prepare("SELECT task_id,desired_state,steer_pending_event_id FROM tasks WHERE current_attempt_id=?").get(row.job_id) as {task_id:string;desired_state:string;steer_pending_event_id:string|null}|undefined;
+        if(!task||task.desired_state!=="running"||!["running","blocked"].includes(job.status)){
+          this.db.prepare("UPDATE worker_progress_applications SET next_check_at=NULL WHERE decision_key=?").run(row.decision_key);continue;
+        }
+        if(task.steer_pending_event_id){this.db.prepare("UPDATE worker_progress_applications SET next_check_at=? WHERE decision_key=?").run(new Date(at.getTime()+30000).toISOString(),row.decision_key);continue;}
+        const hintedId=(JSON.parse(row.decision_json) as ProgressDecision).target?.message_id;
+        const hinted=hintedId?this.db.prepare("SELECT * FROM worker_messages WHERE message_id=? AND job_id=? AND direction='worker_to_dona'").get(hintedId,row.job_id) as WorkerMessageRow|undefined:undefined;
+        const important=hinted&&(['question','decision_request'].includes(hinted.kind)||(hinted.kind==='risk'&&JSON.parse(hinted.payload_json).severity==='high'));
+        const message=important?hinted:this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND direction='worker_to_dona' ORDER BY producer_sequence DESC LIMIT 1").get(row.job_id) as WorkerMessageRow|undefined;
+        if(!message){this.db.prepare("UPDATE worker_progress_applications SET next_check_at=NULL WHERE decision_key=?").run(row.decision_key);continue;}
+        const pendingPresentation=this.db.prepare(`SELECT 1 FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key)
+          JOIN jobs j ON j.job_id=p.job_id WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready' LIMIT 1`).get(job.source_event_id);
+        if(pendingPresentation&&!important){
+          this.db.prepare("UPDATE worker_progress_applications SET next_check_at=? WHERE decision_key=? AND followup_event_id IS NULL")
+            .run(new Date(at.getTime()+30000).toISOString(),row.decision_key);continue;
+        }
+        const original=this.db.prepare("SELECT subject_json FROM events WHERE event_id=?").get(job.source_event_id) as {subject_json:string};
+        const binding=readEventJobBinding(this.db,job.source_event_id);if(!binding)throw Error("progress_owner_unverified");
+        const eventId=`evt_${ulid(at.getTime())}`,externalId=`progress-aggregate:${row.decision_key}${row.followup_generation?`:${row.followup_generation}`:""}`;
+        const subject=stableStringify({job_id:row.job_id,message_id:message.message_id,source_event_id:job.source_event_id,actor_id:JSON.parse(original.subject_json).actor_id});
+        const payload=stableStringify({schema_version:1,job_id:row.job_id,task_id:task.task_id,message_id:message.message_id,source_event_id:job.source_event_id,owner_kind:binding.owner.kind,decision_id:row.decision_key});
+        const reply=job.workspace_id&&job.channel_id&&job.thread_ts?stableStringify({kind:"slack_thread",workspace_id:job.workspace_id,channel_id:job.channel_id,thread_ts:job.thread_ts}):null;
+        this.db.prepare(`INSERT OR IGNORE INTO events(event_id,schema_version,source,external_event_id,event_type,occurred_at,subject_json,payload_json,reply_target_json,trace_json,status,available_at,created_at,updated_at)
+          VALUES(?,1,'dona_message',?,'worker_message_aggregate',?,?,?,?,?,'queued',?,?,?)`).run(eventId,externalId,at.toISOString(),subject,payload,reply,stableStringify({decision_id:row.decision_key}),at.toISOString(),at.toISOString(),at.toISOString());
+        const event=this.db.prepare("SELECT event_id,subject_json,payload_json,event_type FROM events WHERE source='dona_message' AND external_event_id=?").get(externalId) as {event_id:string;subject_json:string;payload_json:string;event_type:string};
+        if(event.subject_json!==subject||event.payload_json!==payload||event.event_type!=="worker_message_aggregate")throw Error("progress_event_conflict");
+        insertEventJobBinding(this.db,event.event_id,binding);
+        this.db.prepare("UPDATE worker_progress_applications SET followup_event_id=?,next_check_at=NULL WHERE decision_key=? AND followup_event_id IS NULL").run(event.event_id,row.decision_key);count++;
+      }
+      return count;
+    }).immediate();
+  }
+
   instructionReceipts(jobId:string,sourceEventId:string){
     const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow|undefined;
     if(!job)throw Error("job_not_found");this.assertAuthorized(job,sourceEventId);
@@ -374,6 +630,12 @@ export class WorkerMessageRepository {
     return {instructions:rows,next_producer_sequence:next};
   }
   eventReport(jobId:string,eventId:string){
+    if(this.ownsProgressAggregateEvent(jobId,eventId)){
+      const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow;this.assertAuthorized(job,eventId);
+      if(terminal(job.status))return undefined;
+      const id=(JSON.parse((this.db.prepare("SELECT payload_json FROM events WHERE event_id=?").get(eventId) as {payload_json:string}).payload_json) as {message_id:string}).message_id;
+      const message=this.getMessageRequired(id);return {...this.project(message),payload:JSON.parse(message.payload_json)};
+    }
     if(!this.ownsReportEvent(jobId,eventId))return undefined;
     const event=this.db.prepare("SELECT payload_json FROM events WHERE event_id=?").get(eventId) as {payload_json:string};
     const messageId=(JSON.parse(event.payload_json) as {message_id:string}).message_id;
@@ -390,8 +652,17 @@ export class WorkerMessageRepository {
     if(!job)throw Error("job_not_found");this.assertAuthorized(job,sourceEventId);
     return (this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND direction='worker_to_dona' ORDER BY producer_sequence DESC LIMIT 20").all(jobId) as WorkerMessageRow[]).map(row=>({...this.project(row),payload:JSON.parse(row.payload_json)}));
   }
+  ownsProgressAggregateEvent(jobId:string,eventId:string):boolean {
+    return !!this.db.prepare(`SELECT 1 FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key)
+      JOIN events e ON e.event_id=a.followup_event_id JOIN jobs j ON j.job_id=p.job_id JOIN worker_messages m ON m.message_id=json_extract(e.payload_json,'$.message_id')
+      WHERE p.job_id=? AND e.event_id=? AND e.source='dona_message' AND e.event_type='worker_message_aggregate'
+        AND e.external_event_id='progress-aggregate:'||a.decision_key||CASE WHEN a.followup_generation>0 THEN ':'||a.followup_generation ELSE '' END AND m.job_id=p.job_id AND m.direction='worker_to_dona'
+        AND json_extract(e.subject_json,'$.job_id')=p.job_id AND json_extract(e.subject_json,'$.source_event_id')=j.source_event_id
+        AND json_extract(e.payload_json,'$.job_id')=p.job_id AND json_extract(e.payload_json,'$.source_event_id')=j.source_event_id`).get(jobId,eventId);
+  }
+
   ownsMessageEvent(jobId:string,eventId:string):boolean {
-    if(this.ownsReportEvent(jobId,eventId))return true;
+    if(this.ownsReportEvent(jobId,eventId)||this.ownsProgressAggregateEvent(jobId,eventId))return true;
     return !!this.db.prepare(`SELECT 1 FROM events e JOIN jobs j ON j.job_id=? JOIN worker_message_cadence c USING(job_id)
       WHERE e.event_id=? AND e.source='dona_message' AND e.event_type='worker_message_silence'
       AND e.external_event_id='worker-message-silence:'||j.job_id||':'||c.generation
@@ -414,7 +685,7 @@ export class WorkerMessageRepository {
     const localAnswer=event?.source==="web"&&input.payload.operation==="answer"&&!!this.db.prepare(`SELECT 1 FROM events e JOIN local_dashboard_command_receipts r ON r.event_id=e.event_id
       WHERE e.event_id=? AND e.event_type='local_typed_question_reply' AND r.operation='question_reply' AND r.attempt_id=?
       AND json_extract(e.payload_json,'$.message_id')=?`).get(input.source_event_id,jobId,input.correlation_message_id);
-    if(event?.source!=="slack"&&!localAnswer&&!(event?.source==="dona_message"&&input.payload.operation==="answer"&&this.ownsReportEvent(jobId,input.source_event_id)&&input.correlation_message_id===(JSON.parse((this.db.prepare("SELECT subject_json FROM events WHERE event_id=?").get(input.source_event_id) as {subject_json:string}).subject_json).message_id)))throw new WorkerMessageError("worker_message_instruction_source_invalid","worker instructions require a Slack source event");
+    if(event?.source!=="slack"&&!localAnswer&&!(event?.source==="dona_message"&&input.payload.operation==="answer"&&(this.ownsReportEvent(jobId,input.source_event_id)||this.ownsProgressAggregateEvent(jobId,input.source_event_id))&&input.correlation_message_id===(JSON.parse((this.db.prepare("SELECT subject_json FROM events WHERE event_id=?").get(input.source_event_id) as {subject_json:string}).subject_json).message_id)))throw new WorkerMessageError("worker_message_instruction_source_invalid","worker instructions require a Slack source event");
     return this.append(jobId, "dona_to_worker", input, at);
   }
 
@@ -991,6 +1262,11 @@ export class WorkerMessageRepository {
           AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d WHERE d.message_id=m.message_id AND d.state IN ('pending','leased'))
           AND NOT EXISTS (SELECT 1 FROM worker_messages child WHERE child.correlation_message_id=m.message_id))`)
         .run(at.toISOString(),cutoff);
+      this.db.prepare(`UPDATE worker_progress_decisions SET decision_json=json_set(json_remove(decision_json,'$.safe_projection'),'$.payload_retired',json('true'))
+        WHERE decided_at<? AND job_id IN (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled'))`).run(cutoff);
+      this.db.prepare(`UPDATE worker_progress_applications SET result_json=json_set(json_remove(result_json,'$.artifact.safe_projection','$.artifact.rendered_body'),'$.payload_retired',json('true')),
+        next_check_at=NULL WHERE decision_key IN (SELECT decision_key FROM worker_progress_decisions WHERE decided_at<?
+          AND job_id IN (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled')))` ).run(cutoff);
       const deleted=this.db.prepare(`DELETE FROM worker_messages WHERE accepted_at<? AND job_id IN
         (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled'))
         AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d WHERE d.message_id=worker_messages.message_id AND d.state IN ('pending','leased'))
@@ -1101,8 +1377,9 @@ export class WorkerMessagePublisher {
     try {
       const published=this.repository.publishPendingReports(100,at);
       const silence=this.repository.publishDueSilenceEvents(100,at);
+      const decisions=this.repository.publishDueProgressDecisions(32,at);
       this.repository.purge(at);
-      if(published+silence>0)this.wake();
+      if(published+silence+decisions>0)this.wake();
     }
     catch(error){this.onError(error);}
   }
