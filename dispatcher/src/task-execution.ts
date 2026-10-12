@@ -533,7 +533,7 @@ export class TaskRepository {
       if(fresh.stop_state!=="none")return fresh;
       if((evidence.state!=="stopped"&&(!evidence.process_ids.length||!evidence.process_groups.length))||!(fresh.desired_state!=="running"?["working","waiting","inactive","stopped","unreachable"]:["inactive","stopped","unreachable"]).includes(evidence.state))throw new Error("task_stop_evidence_missing");
       const job=this.dispatcher.getJob(task.current_attempt_id)!;
-      if(job.result_json||fs.existsSync(job.result_path)||job.steer_state==="dispatching")throw new Error("task_reconciliation_required");
+      if(job.result_json||fs.existsSync(this.dispatcher.jobResultReadPath(job.job_id))||job.steer_state==="dispatching")throw new Error("task_reconciliation_required");
       this.sql.prepare("UPDATE jobs SET status='needs_review',last_error_code='task_stop_pending' WHERE job_id=?").run(job.job_id);
       this.sql.prepare("UPDATE tasks SET stop_state='not_sent',stop_evidence_json=?,wait_reason='worker_stop_pending' WHERE task_id=?")
         .run(JSON.stringify(evidence),task.task_id);
@@ -643,7 +643,7 @@ export class TaskRepository {
       const task=this.get(taskId)!;
       if(task.stop_state!=="stopped"||["completed","failed","cancelled"].includes(task.state))throw new Error("task_stop_required");
       const old=this.dispatcher.getJob(task.current_attempt_id)!;
-      if(old.result_json||(recoveryDigest?!this.recoveryResultMatches(old,recoveryDigest):fs.existsSync(old.result_path)))throw new Error("task_result_requires_reconciliation");
+      if(old.result_json||(recoveryDigest?!this.recoveryResultMatches(old,recoveryDigest):fs.existsSync(this.dispatcher.jobResultReadPath(old.job_id))))throw new Error("task_result_requires_reconciliation");
       if(task.desired_state==="paused"){this.sql.prepare("UPDATE tasks SET wait_reason='paused',next_check_at=NULL WHERE task_id=?").run(taskId);return;}
       if(task.desired_state==="cancelled") {
         this.dispatcher.beginJobCancellation(old.job_id,old.source_event_id);

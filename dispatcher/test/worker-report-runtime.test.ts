@@ -34,7 +34,7 @@ test("worker reportを現在のruntime identityへ固定し同key/異内容を�
  queue.expireRestart();assert.equal(queue.get(second.request_id)?.state,"expired");assert.throws(()=>queue.accept(agent,call("two",{kind:"risk",summary:"確認が必要です",severity:"high"})),/conflict/);
 });
 
-import {AppServerManager} from "../src/app-server/manager.js";
+import {AppServerManager,hash} from "../src/app-server/manager.js";
 import {AppServerRpc} from "../src/app-server/rpc.js";
 async function until(check:()=>boolean){for(let i=0;i<100;i++){if(check())return;await new Promise(resolve=>setTimeout(resolve,20));}assert.fail("RPC state did not settle");}
 for(const completeBeforeReply of [false,true])for(const outage of [false,true])test(`実RPCでworker reportを受理しreceiptを一度だけ返す（turn先行完了=${completeBeforeReply}, broker停止=${outage}）`,async()=>{
@@ -44,13 +44,24 @@ const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
 readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);
 if(r.method==='initialize')send({id:r.id,result:{userAgent:'test'}});
 if(r.method==='thread/start'){fs.writeFileSync('tools.json',JSON.stringify(r.params.dynamicTools??[]));send({id:r.id,result:{thread:{id:'thread-report'}}});}
-if(r.method==='turn/start'){send({method:'turn/started',params:{threadId:'thread-report',turn:{id:'turn-report'}}});send({id:r.id,result:{turn:{id:'turn-report'}}});send({id:'rpc-report',method:'item/tool/call',params:{threadId:'thread-report',turnId:'turn-report',callId:'report-call',tool:'dona_worker_report',namespace:null,arguments:{report_key:'checkpoint.one',payload:{kind:'checkpoint',summary:'検証を進めました'}}}});${completeBeforeReply?"send({method:'turn/completed',params:{threadId:'thread-report',turn:{id:'turn-report',status:'completed'}}});":""}}
+if(r.method==='turn/start'){send({method:'turn/started',params:{threadId:'thread-report',turn:{id:'turn-report'}}});send({id:r.id,result:{turn:{id:'turn-report'}}});send({id:'rpc-report',method:'item/tool/call',params:{threadId:'thread-report',turnId:'turn-report',callId:'report-call',tool:'dona_worker_report',namespace:null,arguments:{report_key:'checkpoint.one',correlation_message_id:'msg_01h00000000000000000000001',payload:{kind:'checkpoint',summary:'検証を進めました'}}}});${completeBeforeReply?"send({method:'turn/completed',params:{threadId:'thread-report',turn:{id:'turn-report',status:'completed'}}});":""}}
 if(r.id==='rpc-report'&&r.result){fs.appendFileSync('responses.jsonl',JSON.stringify(r.result)+'\\n');send({method:'serverRequest/resolved',params:{threadId:'thread-report',requestId:'rpc-report'}});${completeBeforeReply?"":"send({method:'turn/completed',params:{threadId:'thread-report',turn:{id:'turn-report',status:'completed'}}});"}}
 });`);
  const store=new RuntimeStore(path.join(root,"runtime.db")),manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));let agent:AgentRecord|undefined;
  try{
   agent=await manager.start({name:"worker-report-test",attemptId:attempt,role:"worker",cwd:root,release:root,args:[],workerMessaging:true,threadConfig:{}});manager.workerReports.availability(true);
   const tools=JSON.parse(await fs.readFile(path.join(root,"tools.json"),"utf8"));assert.deepEqual(tools.map((x:{name:string})=>x.name),["dona_request_thread_reply",workerReportTool.name,workerReportStatusTool.name]);
+  const savedConfig=store.agent(agent.name)!.config_json;
+  for(const legacyConfig of [
+   {...JSON.parse(savedConfig),workerMessaging:undefined},
+   {...JSON.parse(savedConfig),workerMessaging:false},
+   {...JSON.parse(savedConfig),threadConfig:{config:{"features.default_mode_request_user_input":false}}},
+  ]){
+   store.db.prepare("UPDATE agents SET config_json=? WHERE name=?").run(JSON.stringify(legacyConfig),agent.name);
+   await assert.rejects(manager.prompt(agent.name,"worker-message:unsupported","追加指示",{attempt_id:attempt,generation:agent.generation,thread_id:agent.thread_id!}),{message:"runtime_worker_messaging_unsupported",acceptance:"not_sent"});
+   assert.equal(store.db.prepare("SELECT 1 FROM operations WHERE agent=? AND operation_key=?").get(agent.name,"worker-message:unsupported"),undefined);
+  }
+  store.db.prepare("UPDATE agents SET config_json=? WHERE name=?").run(savedConfig,agent.name);
   await manager.prompt(agent.name,"start-report","進捗を報告してください");await until(()=>manager.workerReports.pending().length===1&&(!completeBeforeReply||store.agent(agent!.name)?.turn_id===null));
   const report=manager.workerReports.pending()[0]!;assert.equal(report.generation,agent.generation);assert.equal(report.thread_id,agent.thread_id);assert.equal(manager.status(agent.name)?.state,"waiting");
   const result={message_id:"msg_01h00000000000000000000000",receipt_id:"rcpt_01h00000000000000000000000",outcome:"created"};
@@ -59,10 +70,33 @@ if(r.id==='rpc-report'&&r.result){fs.appendFileSync('responses.jsonl',JSON.strin
    assert.deepEqual(JSON.parse(manager.workerReports.get(report.request_id)!.result_json!),{state:"unknown",diagnostic:"receipt_unavailable"});assert.equal(manager.workerReports.drainState().recoverable_count,1);
    assert.equal((await fs.readFile(path.join(root,"responses.jsonl"),"utf8")).trim().split("\n").length,1);return;
   }
+  manager.external.availability(true);
+  const external=manager.external.accept({...store.agent(agent.name)!,turn_id:report.turn_id},{id:"rpc-external",method:"item/tool/call",params:{threadId:report.thread_id,turnId:report.turn_id,callId:"external-overlap",tool:"dona_request_thread_reply",arguments:{operation_slot:"overlap",text:"確認しました"}}});
+  manager.resolveExternal(agent.name,external.request_id,{request_id:"approval-overlap",state:"pending"});
+  manager.external.resolved(agent.name,agent.generation,"rpc-external");
+  // 解消済みreceiptの再照合でも、同じturnの未応答reportを追い越さない。
+  manager.resolveExternal(agent.name,external.request_id,{request_id:"approval-overlap",state:"pending"});
+  assert.equal(manager.status(agent.name)?.state,"waiting");
+  assert.equal(manager.workerReports.get(report.request_id)?.state,"pending");
+  assert.notEqual(manager.workerReports.get(report.request_id)?.payload_json,"");
   manager.resolveWorkerReport(agent.name,report.request_id,result);await until(()=>manager.workerReports.get(report.request_id)?.state==="resolved"&&manager.status(agent!.name)?.state==="idle");
   manager.resolveWorkerReport(agent.name,report.request_id,result);
   const responses=(await fs.readFile(path.join(root,"responses.jsonl"),"utf8")).trim().split("\n");assert.equal(responses.length,1);assert.deepEqual(JSON.parse(JSON.parse(responses[0]!).contentItems[0].text),result);
   assert.throws(()=>manager.resolveWorkerReport(agent!.name,report.request_id,{...result,outcome:"reused"}),/conflict/);
+  const key="worker-message:msg_01h00000000000000000000001",text="指示を処理してください";
+  const scope={attempt_id:attempt,generation:agent.generation,thread_id:agent.thread_id!};
+  const sent={generation:agent.generation,threadId:agent.thread_id,turnId:report.turn_id,sentAt:report.created_at};
+  const journal=(snapshot:unknown)=>store.db.prepare("INSERT OR REPLACE INTO operations VALUES(?,?,?,'unknown',?)").run(agent!.name,key,hash({text}),snapshot===null?null:JSON.stringify(snapshot));
+  for(const snapshot of [null,{...sent,generation:"old-generation"},{...sent,turnId:"other-turn"},{...sent,sentAt:"2999-01-01T00:00:00.000Z"}]){
+   journal(snapshot);assert.equal(manager.workerInstructionReceipt(agent.name,key,text,scope).state,"unknown");
+  }
+  journal(sent);
+  const caller={...store.agent(agent.name)!,turn_id:report.turn_id};
+  const call={id:"after-reconcile",method:"item/tool/call",params:{threadId:report.thread_id,turnId:report.turn_id,callId:"after-reconcile",tool:"dona_request_thread_reply",arguments:{operation_slot:"after_reconcile",text:"確認しました"}}};
+  assert.throws(()=>manager.external.accept(caller,call),/source_unavailable/);
+  assert.deepEqual(manager.workerInstructionReceipt(agent.name,key,text,scope),{state:"accepted",turnId:report.turn_id});
+  assert.equal((store.db.prepare("SELECT state FROM operations WHERE agent=? AND operation_key=?").get(agent.name,key) as {state:string}).state,"accepted");
+  assert.equal(manager.external.accept(caller,call).operation_key,key);
   await manager.stop(agent.name,agent.generation);assert.throws(()=>manager.resolveWorkerReport(agent!.name,report.request_id,result),/not_current/);
  }finally{if(agent&&store.agent(agent.name)?.state!=="stopped")await manager.stop(agent.name,agent.generation);store.close();await fs.rm(root,{recursive:true,force:true});}
 });
