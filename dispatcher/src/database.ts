@@ -2530,8 +2530,13 @@ export class DispatcherDatabase {
     throw new Error("maintenance_fence_receipt_required");
   }
 
+  jobResultReadPath(jobId:string):string {
+    const job=this.getJobRequired(jobId);
+    return this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()?this.workerMessages.resultPathForRead(jobId):job.result_path;
+  }
+
   private lateResultFile(job: JobRow): {result:JobResultEnvelope;sha256:string} {
-    const fd=fs.openSync(job.result_path,fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);
+    const fd=fs.openSync(this.jobResultReadPath(job.job_id),fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);
     try {
       const stat=fs.fstatSync(fd);
       if(!stat.isFile()||stat.size>jobResultEnvelopeMaxBytes) throw new Error("late_result_file_invalid");
@@ -2574,7 +2579,7 @@ export class DispatcherDatabase {
 
   private operatorResultFile(job:JobRow):{kind:"valid"|"invalid"|"missing";sha256:string|null;result?:JobResultEnvelope} {
     let fd:number;
-    try {fd=fs.openSync(job.result_path,fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);}
+    try {fd=fs.openSync(this.jobResultReadPath(job.job_id),fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);}
     catch(error) {
       if((error as NodeJS.ErrnoException).code==="ENOENT") return {kind:"missing",sha256:null};
       throw new Error("operator_result_file_unreadable");
@@ -2661,7 +2666,7 @@ export class DispatcherDatabase {
       if(file.kind!==input.expectedResultClass||file.sha256!==input.expectedResultSha256)
         throw new Error("operator_result_drift");
       if(file.kind==="valid") {
-        this.saveJobResultInternal(job.job_id,file.result!,job.result_path,at,()=>{},true);
+        this.saveJobResultInternal(job.job_id,file.result!,this.jobResultReadPath(job.job_id),at,()=>{},true);
       } else {
         for(const id of new Set([job.completion_event_id,group.attention_event_id])) {
           if(!id) continue;
@@ -2766,7 +2771,7 @@ export class DispatcherDatabase {
       const file=this.lateResultFile(job);
       if(file.sha256!==expectedDigest) throw new Error("late_result_digest_drift");
       this.assertMaintenanceFenceReceipt();
-      this.saveJobResultInternal(jobId,file.result,job.result_path,at,()=>{},true);
+      this.saveJobResultInternal(jobId,file.result,this.jobResultReadPath(jobId),at,()=>{},true);
       if(this.lateResultFile(job).sha256!==expectedDigest) throw new Error("late_result_digest_drift");
       this.markTerminalWorkerStopProof(jobId);
       this.enqueueJobNotification(jobId,at);

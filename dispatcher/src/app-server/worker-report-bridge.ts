@@ -6,9 +6,12 @@ import {RuntimeClient} from "./client.js";
 /** host queue→既存ledger。workerのidentity/宛先申告を受けず現在Attemptを再照合する。 */
 export class AppServerWorkerReportBridge {
  private timer:NodeJS.Timeout|undefined;private operation:Promise<void>|undefined;private stopping=false;
- constructor(private readonly database:DispatcherDatabase,private readonly runtime:RuntimeClient,private readonly onError:(error:unknown)=>void=()=>{}){}
+ constructor(private readonly database:DispatcherDatabase,private readonly runtime:RuntimeClient,private readonly onError:(error:unknown)=>void=()=>{},private readonly heartbeatMs=10000){if(!Number.isFinite(heartbeatMs)||heartbeatMs<=0||heartbeatMs>10000)throw Error("worker_report_heartbeat_invalid");}
  async runOnce():Promise<number>{
   await this.runtime.workerReportAvailability(true);let accepted=0;
+  let heartbeat:Promise<void>|undefined;
+  const timer=setInterval(()=>{if(heartbeat)return;heartbeat=this.runtime.workerReportAvailability(true).then(()=>{},this.onError).finally(()=>{heartbeat=undefined;});},this.heartbeatMs);timer.unref();
+  try {
   for(const request of await this.runtime.workerReports()) {
    try {
    const job=this.database.getJob(request.attempt_id),task=this.database.tasks.forAttempt(request.attempt_id);
@@ -47,6 +50,7 @@ export class AppServerWorkerReportBridge {
    }catch(error){this.onError(error);}
   }
   return accepted;
+  }finally{clearInterval(timer);await heartbeat;}
  }
  start(){this.stopping=false;this.run();this.timer=setInterval(()=>this.run(),1000);this.timer.unref();}
  private run(){if(this.operation||this.stopping)return;this.operation=this.runOnce().then(()=>{},this.onError).finally(()=>{this.operation=undefined;});}
@@ -54,12 +58,16 @@ export class AppServerWorkerReportBridge {
 }
 
 /** ledgerの指示だけを元owner/current Attempt/current runtimeへ配送する。 */
+class WorkerInstructionNotSentError extends Error {
+ readonly acceptance="not_sent";
+ constructor(readonly code:string){super(code);}
+}
 export class AppServerWorkerInstructionController {
  constructor(private readonly database:DispatcherDatabase,private readonly runtime:RuntimeClient){}
  async steer(jobId:string,sourceEventId:string,text:string,messageId?:string):Promise<unknown>{
   if(!messageId)throw Error("worker_instruction_identity_required");
   const task=this.database.tasks.forAttempt(jobId),job=this.database.getJob(jobId);
-  if(!job||!task||task.current_attempt_id!==jobId||task.desired_state!=="running"||!["running","blocked"].includes(job.status))throw Error("worker_instruction_attempt_not_current");
+  if(!job||!task||task.current_attempt_id!==jobId||task.desired_state!=="running"||!["running","blocked"].includes(job.status))throw new WorkerInstructionNotSentError("worker_instruction_attempt_not_current");
   this.database.tasks.assertOwner(task.task_id,sourceEventId,true);
   if(this.database.workerMessages.instructionForDelivery(jobId,sourceEventId,messageId)!==text)throw Error("worker_instruction_content_conflict");
   const identity=this.database.getJobLiveSessionIdentity(jobId)?.herdr_agent_session_id;
@@ -75,7 +83,7 @@ export class AppServerWorkerInstructionController {
    this.database.markWorkerInstructionUnknown(jobId,messageId);throw Error("worker_instruction_acceptance_unknown");
   }
   const current=this.database.tasks.forAttempt(jobId),currentJob=this.database.getJob(jobId);
-  if(!current||current.current_attempt_id!==jobId||current.desired_state!=="running"||!currentJob||!["running","blocked"].includes(currentJob.status)||this.database.getJobLiveSessionIdentity(jobId)?.herdr_agent_session_id!==identity)throw Error("worker_instruction_attempt_not_current");
+  if(!current||current.current_attempt_id!==jobId||current.desired_state!=="running"||!currentJob||!["running","blocked"].includes(currentJob.status)||this.database.getJobLiveSessionIdentity(jobId)?.herdr_agent_session_id!==identity)throw new WorkerInstructionNotSentError("worker_instruction_attempt_not_current");
   try{return await this.runtime.workerInstruction(job.agent_name,messageId,text,scope);}
   catch(error){
     const detail=error as {code?:string;acceptance?:string};

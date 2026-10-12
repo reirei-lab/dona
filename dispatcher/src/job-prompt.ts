@@ -75,7 +75,7 @@ ${progressEnabled ? `工程が変わるたび、Dispatcherが指定したprogres
   "completed_at": "末尾ZのUTC RFC 3339文字列"
 }
 
-同じAttemptでDONA_TYPED_INSTRUCTIONを受信した場合、全message_idをworker_instruction_message_ids配列へ含めてください。対応前のResult、欠落・重複・別AttemptのIDは受理しません。
+同じAttemptでDONA_TYPED_INSTRUCTIONを受信した場合、最新指示のresult_fileをresult_pathと同じディレクトリへ公開してください。元finalは保全し、指示ごとに別のfileへ公開するため上書きは禁止です。全message_idをworker_instruction_message_ids配列へ含めてください。対応前のResult、欠落・重複・別AttemptのIDは受理しません。
 
 completed_atは末尾Zが必須です。秒のみ、または小数秒1桁以上（3・6・9桁を含む）を許可し、精度を丸めません。Nodeでは new Date().toISOString()、Pythonでは datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z') で生成してください。任意文字列や非UTC offsetをZへ付け替えてはいけません。
 一時ファイルを公開する前に、同じreader/schemaを使う検証コマンド ${validatorCommand} <tmpの絶対パス> <契約のjob_id> を実行し、exit code 0の場合だけrenameしてください。JSON parseや往復一致だけではschema検証になりません。検証失敗・コマンド利用不能なら公開しないでください。既存final Resultがある場合も新規公開を停止し、上書きせずread-onlyで照合してください。rename後は同じコマンドでread-backしてください。公開結果が曖昧な場合は再writeせず、file・DB status・receiptをread-onlyで照合し、needs_reviewを解除しないでください。

@@ -1,3 +1,5 @@
+import path from "node:path";
+import {existsSync} from "node:fs";
 import {credentialShaped} from "./credential-shaped.js";
 import {workerMessageTerminalTrigger} from "./worker-message-schema.js";
 import { createHash, randomBytes } from "node:crypto";
@@ -259,7 +261,7 @@ function terminal(status: JobRow["status"]): boolean { return status === "comple
 function reportKind(input: WorkerReportInput): WorkerMessageKind { return input.payload.kind; }
 function instructionKind(input: DonaInstructionInput): WorkerMessageKind { return input.payload.operation; }
 function typedInstructionText(messageId:string,kind:WorkerMessageKind,payload:unknown,correlationMessageId:string|null,conversationRevision:number|null):string {
-  const instruction=stableStringify({schema_version:workerMessageProtocolVersion,message_id:messageId,
+  const instruction=stableStringify({schema_version:workerMessageProtocolVersion,message_id:messageId,result_file:`${messageId}.json`,
     correlation_message_id:correlationMessageId,conversation_revision:conversationRevision,operation:kind,payload});
   return `[DONA_TYPED_INSTRUCTION]\n${instruction}\n[/DONA_TYPED_INSTRUCTION]`;
 }
@@ -1012,6 +1014,19 @@ export class WorkerMessageRepository {
       JOIN worker_message_runtime_identities received ON received.message_id=report.message_id
       WHERE i.job_id=? AND i.message_id=? AND i.direction='dona_to_worker' AND bound.runtime_identity_sha256=? AND received.runtime_identity_sha256=bound.runtime_identity_sha256
       AND COALESCE(report.conversation_revision,-1)=COALESCE(i.conversation_revision,-1) AND report.occurred_at>=i.accepted_at`).get(jobId,messageId,sha256(identity));
+  }
+
+  instructionResultPath(jobId:string,messageId?:string):string {
+    const job=this.db.prepare("SELECT result_path FROM jobs WHERE job_id=?").get(jobId) as {result_path:string}|undefined;
+    if(!job)throw Error("job_not_found");
+    const latest=messageId?this.db.prepare("SELECT message_id FROM worker_messages WHERE job_id=? AND message_id=? AND direction='dona_to_worker'").get(jobId,messageId):this.db.prepare("SELECT m.message_id FROM worker_messages m JOIN worker_message_deliveries d USING(message_id) WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.consumer='worker' AND d.state='delivered' ORDER BY m.producer_sequence DESC LIMIT 1").get(jobId);
+    if(messageId&&!latest)throw Error("worker_message_instruction_mismatch");
+    return latest?path.join(path.dirname(job.result_path),`${(latest as {message_id:string}).message_id}.json`):job.result_path;
+  }
+  resultPathForRead(jobId:string):string {
+    const revised=this.instructionResultPath(jobId);
+    if(existsSync(revised))return revised;
+    return (this.db.prepare("SELECT result_path FROM jobs WHERE job_id=?").get(jobId) as {result_path:string}).result_path;
   }
 
   instructionForDelivery(jobId:string,sourceEventId:string,messageId:string):string {
