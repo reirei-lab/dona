@@ -13,7 +13,7 @@ test("worker reportを現在のruntime identityへ固定し同key/異内容を�
  const queue=new WorkerReportQueue(store),agent={name:"worker-name",generation:"generation-secret",thread_id:"thread-id",turn_id:"turn-id",role:"worker",cwd:root,release:root,config_json:JSON.stringify({attemptId:attempt,workerMessaging:true,threadConfig:{}})} as AgentRecord;
  const call=(key="one",payload:unknown={kind:"checkpoint",summary:"確認しました"},id="call-one")=>({id,method:"item/tool/call",params:{tool:workerReportTool.name,threadId:agent.thread_id,turnId:agent.turn_id,callId:id,arguments:{report_key:key,payload}}});
  assert.throws(()=>queue.accept(agent,call()),/unavailable/);queue.availability(true);
- const first=queue.accept(agent,call());assert.equal(first.attempt_id,attempt);assert.equal(first.request_sequence,1);
+ const first=queue.accept(agent,call());assert.deepEqual(queue.drainState(),{protocol:1,recoverable_count:1});assert.equal(first.attempt_id,attempt);assert.equal(first.request_sequence,1);
  assert.deepEqual(queue.accept(agent,call()),first);
  assert.throws(()=>queue.accept(agent,call("one",{kind:"checkpoint",summary:"変更しました"})),/conflict/);
  assert.throws(()=>queue.accept(agent,call("one",undefined,"another-call")),/already_pending/);
@@ -21,12 +21,12 @@ test("worker reportを現在のruntime identityへ固定し同key/異内容を�
  assert.throws(()=>queue.accept({...agent,role:"main"},call("wrong-role")),/unavailable/);
  const stale=call("stale");stale.params.turnId="old-turn";assert.throws(()=>queue.accept(agent,stale),/identity_invalid/);
  const accepted={message_id:"msg_01h00000000000000000000000",receipt_id:"rcpt_01h00000000000000000000000",outcome:"created"};
- assert.equal(queue.resolve(first.request_id,accepted).state,"answering");assert.equal(queue.pending().length,0);
+ assert.equal(queue.resolve(first.request_id,accepted).state,"answering");assert.equal(queue.pending().length,0);assert.equal(queue.drainState().recoverable_count,1);
  assert.throws(()=>queue.resolve(first.request_id,{...accepted,outcome:"reused"}),/conflict/);
  const statusCall={id:"status-call",method:"item/tool/call",params:{tool:workerReportStatusTool.name,threadId:agent.thread_id,turnId:agent.turn_id,arguments:{report_key:"one"}}};
  assert.deepEqual(queue.status(agent,statusCall),{state:"answering",receipt:accepted});
  assert.throws(()=>queue.status({...agent,role:"main"},statusCall),/not_current/);
- queue.resolved(agent.name,agent.generation,"call-one");assert.equal(queue.get(first.request_id)?.state,"resolved");
+ queue.resolved(agent.name,agent.generation,"call-one");assert.equal(queue.get(first.request_id)?.state,"resolved");assert.equal(queue.drainState().recoverable_count,0);
  assert.equal(queue.accept(agent,call("one",undefined,"retry-call")).result_json,queue.get(first.request_id)?.result_json);
  assert.equal(queue.retirePayloads(new Date(Date.now()+31*86400000)),1);assert.equal(queue.get(first.request_id)?.payload_json,"");
  assert.equal(queue.accept(agent,call("one",undefined,"after-retention")).result_json,queue.get(first.request_id)?.result_json);
@@ -56,7 +56,7 @@ if(r.id==='rpc-report'&&r.result){fs.appendFileSync('responses.jsonl',JSON.strin
   const result={message_id:"msg_01h00000000000000000000000",receipt_id:"rcpt_01h00000000000000000000000",outcome:"created"};
   assert.throws(()=>manager.resolveWorkerReport("other-worker",report.request_id,result),/not_current/);
   if(outage){manager.workerReports.availability(false);await manager.recover();await until(()=>manager.workerReports.get(report.request_id)?.state==="resolved"&&manager.status(agent!.name)?.state==="idle");
-   assert.deepEqual(JSON.parse(manager.workerReports.get(report.request_id)!.result_json!),{state:"unknown",diagnostic:"receipt_unavailable"});
+   assert.deepEqual(JSON.parse(manager.workerReports.get(report.request_id)!.result_json!),{state:"unknown",diagnostic:"receipt_unavailable"});assert.equal(manager.workerReports.drainState().recoverable_count,1);
    assert.equal((await fs.readFile(path.join(root,"responses.jsonl"),"utf8")).trim().split("\n").length,1);return;
   }
   manager.resolveWorkerReport(agent.name,report.request_id,result);await until(()=>manager.workerReports.get(report.request_id)?.state==="resolved"&&manager.status(agent!.name)?.state==="idle");
@@ -92,4 +92,15 @@ import {workerEnvironment} from "../src/app-server/worker-environment.js";
 test("worker起動環境にSlack credentialと汎用Dispatcher endpointを継承しない",()=>{
  const input={PATH:"path",HOME:"home",OPENAI_API_KEY:"model-key",GH_TOKEN:"github-key",SLACK_BOT_TOKEN:"xoxb-canary",SLACK_SIGNING_SECRET:"signing-canary",DONA_SOCKET_PATH:"management-socket",DONA_UPDATE_INTERNAL_TOKEN:"management-secret",HERDR_SOCKET:"legacy-socket",CUSTOM_SECRET:"xoxp-canary"};
  assert.deepEqual(workerEnvironment(input),{PATH:"path",HOME:"home",OPENAI_API_KEY:"model-key",GH_TOKEN:"github-key"});assert.equal(input.SLACK_BOT_TOKEN,"xoxb-canary");
+});
+
+import {disableWorkerReportsAfterDrain} from "../src/app-server/client.js";
+test("無効化は受付閉鎖後にRuntime残件を確認し、不明・非空なら起動を拒否する",async()=>{
+ const calls:string[]=[];
+ const runtime={workerReportAvailability:async(enabled:boolean)=>{calls.push("close");assert.equal(enabled,false);return {enabled:false,ttl_ms:0};},workerReportDrainState:async()=>{calls.push("inventory");return {protocol:1 as const,recoverable_count:0};}};
+ await disableWorkerReportsAfterDrain(runtime);assert.deepEqual(calls,["close","inventory"]);
+ await assert.rejects(disableWorkerReportsAfterDrain({...runtime,workerReportDrainState:async()=>({protocol:1,recoverable_count:1})}),/requires_runtime_drain/);
+ await assert.rejects(disableWorkerReportsAfterDrain({...runtime,workerReportDrainState:async()=>{throw Error("unavailable");}}),/disable_unavailable/);
+ await assert.rejects(disableWorkerReportsAfterDrain({...runtime,workerReportDrainState:async()=>({protocol:1,recoverable_count:-1})}),/disable_unavailable/);
+ calls.length=0;await assert.rejects(disableWorkerReportsAfterDrain({...runtime,workerReportAvailability:async()=>{throw Error("closed_unknown");}}),/disable_unavailable/);assert.deepEqual(calls,[]);
 });

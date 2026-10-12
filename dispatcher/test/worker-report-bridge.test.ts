@@ -32,8 +32,8 @@ if(r.method==='thread/start')send({id:r.id,result:{thread:{id:'worker-thread'}}}
 if(r.method==='turn/start'){send({method:'turn/started',params:{threadId:'worker-thread',turn:{id:'worker-turn'}}});send({id:r.id,result:{turn:{id:'worker-turn'}}});${denyFirst?"send({id:'denied-report',method:'item/tool/call',params:{threadId:'worker-thread',turnId:'worker-turn',callId:'denied-call',tool:'dona_worker_report',namespace:null,arguments:{report_key:'denied.one',payload:{kind:'checkpoint',summary:'調査する'}}}});":"report();"}}
 if(r.id==='denied-report'&&r.result){fs.writeFileSync('denial.json',JSON.stringify(r.result));send({method:'serverRequest/resolved',params:{threadId:'worker-thread',requestId:'denied-report'}});report();}
 if(r.id==='rpc-report'&&r.result)send({method:'serverRequest/resolved',params:{threadId:'worker-thread',requestId:'rpc-report'}});
-if(r.method==='turn/steer'){fs.appendFileSync('steers.jsonl',JSON.stringify(r.params)+'\\n');send({id:r.id,result:{turnId:'worker-turn'}});const typed=JSON.parse(r.params.input[0].text.split('\\n').slice(1,-1).join('\\n'));send({id:'correlated-report',method:'item/tool/call',params:{threadId:'worker-thread',turnId:'worker-turn',callId:'correlated-call',tool:'dona_worker_report',namespace:null,arguments:{report_key:'checkpoint.after-answer',correlation_message_id:typed.message_id,conversation_revision:typed.conversation_revision,payload:{kind:'checkpoint',summary:'回答に対応しました'}}}});}
-if(r.id==='correlated-report'&&r.result){send({method:'serverRequest/resolved',params:{threadId:'worker-thread',requestId:'correlated-report'}});const target=${JSON.stringify(job.result_path)};fs.writeFileSync(target+'.tmp',JSON.stringify({schema_version:1,job_id:${JSON.stringify(job.job_id)},status:'completed',summary:'確認が完了しました',completed_at:new Date().toISOString()}));fs.renameSync(target+'.tmp',target);}
+if(r.method==='turn/steer'){fs.appendFileSync('steers.jsonl',JSON.stringify(r.params)+'\\n');send({id:r.id,result:{turnId:'worker-turn'}});const typed=JSON.parse(r.params.input[0].text.split('\\n').slice(1,-1).join('\\n'));globalThis.lastInstruction=typed.message_id;send({id:'correlated-report',method:'item/tool/call',params:{threadId:'worker-thread',turnId:'worker-turn',callId:'correlated-call',tool:'dona_worker_report',namespace:null,arguments:{report_key:'checkpoint.after-answer',correlation_message_id:typed.message_id,conversation_revision:typed.conversation_revision,payload:{kind:'checkpoint',summary:'回答に対応しました'}}}});}
+if(r.id==='correlated-report'&&r.result){send({method:'serverRequest/resolved',params:{threadId:'worker-thread',requestId:'correlated-report'}});const target=${JSON.stringify(job.result_path)};fs.writeFileSync(target+'.tmp',JSON.stringify({schema_version:1,job_id:${JSON.stringify(job.job_id)},status:'completed',summary:'確認が完了しました',worker_instruction_message_ids:[globalThis.lastInstruction],completed_at:new Date().toISOString()}));fs.renameSync(target+'.tmp',target);}
 });`);
  const manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));
  let dropReport=true,dropInstruction=true;
@@ -335,13 +335,13 @@ test("最新20件から外れたevent対象riskの本文を必ず返す",async()
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
 
-test("未配送の追加指示と、その受理より古いResultではTaskを完了しない",async()=>{
+for(const precision of ["same-millisecond","seconds"])test(`未配送・未確認の追加指示では完了せず、確認済みResultは時刻精度によらず受理する（${precision}）`,async()=>{
  const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);
  try{
   const source=db.enqueue(eventEnvelope("result-fence")).row,task=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"result-fence",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,job=db.getJob(task.current_attempt_id)!;
   db.beginJobPreparation(job.job_id);db.setJobRuntime(job.job_id,"w","p","runtime");db.beginJobDispatch(job.job_id);db.markJobRunning(job.job_id);
   const old={schema_version:1 as const,job_id:job.job_id,status:"completed" as const,summary:"以前の調査が完了しました",completed_at:"2026-01-01T00:00:00Z"};
-  db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"condition",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"追加の検証も実施してください"}});
+  const instruction=db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"condition",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"追加の検証も実施してください"}});
   assert.throws(()=>db.saveJobResult(job.job_id,old,job.result_path),/delivery_pending/);assert.equal(db.tasks.get(task.task_id)?.state,"active");
   await fs.mkdir(path.dirname(job.result_path),{recursive:true});await fs.writeFile(job.result_path,JSON.stringify(old));
   const never=async()=>{throw Error("保留Resultがworkerを停止・再起動してはいけない");};
@@ -358,7 +358,12 @@ test("未配送の追加指示と、その受理より古いResultではTaskを�
   assert.throws(()=>db.saveJobResult(job.job_id,old,job.result_path),/result_stale/);
   assert.equal(await (supervisor as unknown as {tryComplete(row:JobRow,terminal:boolean):Promise<boolean>}).tryComplete(db.getJob(job.job_id)!,true),false);
   assert.equal(db.tasks.get(task.task_id)?.wait_reason,"worker_instruction_result_pending");
-  await new Promise(resolve=>setTimeout(resolve,5));await fs.writeFile(job.result_path,JSON.stringify({...old,completed_at:new Date().toISOString()}));
+  const Sqlite=(await import("better-sqlite3")).default,sql=new Sqlite(config.databasePath);
+  const deliveredAt=(sql.prepare("SELECT delivered_at FROM worker_message_deliveries WHERE message_id=? AND consumer='worker'").get(instruction.message.message_id) as {delivered_at:string}).delivered_at;sql.close();
+  const completedAt=precision==="seconds"?deliveredAt.replace(/\.\d+Z$/,"Z"):deliveredAt;
+  for(const ids of [[],["msg_01h00000000000000000000000"],[instruction.message.message_id,instruction.message.message_id]])assert.throws(()=>db.saveJobResult(job.job_id,{...old,worker_instruction_message_ids:ids,completed_at:completedAt},job.result_path),/result_stale/);
+  assert.throws(()=>db.saveJobResult(job.job_id,{...old,completed_at:new Date().toISOString()},job.result_path),/result_stale/);
+  await fs.writeFile(job.result_path,JSON.stringify({...old,worker_instruction_message_ids:[instruction.message.message_id],completed_at:completedAt}));
   db.tasks.wait(db.tasks.get(task.task_id)!,"worker_instruction_result_pending",-1);await supervisor.reconcileTasks();assert.equal(db.tasks.get(task.task_id)?.state,"completed");
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
@@ -386,7 +391,7 @@ test("既存messageが未処理なら無効化を拒否し、再起動後にdrai
   db.assertWorkerMessagingMode(false);
   const source=db.enqueue(eventEnvelope("disable-drain")).row,task=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"disable",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,job=db.getJob(task.current_attempt_id)!;
   db.beginJobPreparation(job.job_id);db.setJobRuntime(job.job_id,"w","p","runtime");db.beginJobDispatch(job.job_id);db.markJobRunning(job.job_id);
-  db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"condition",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"検証を追加してください"}});
+  const instruction=db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"condition",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"検証を追加してください"}});
   assert.throws(()=>db.assertWorkerMessagingMode(false),/disable_requires_drain/);db.assertWorkerMessagingMode(true);
   await assert.rejects(runService({...config,workerMessagingEnabled:false}),/disable_requires_drain/);
   assert.equal(existsSync(config.socketPath),false);assert.equal(db.tasks.get(task.task_id)?.current_attempt_id,job.job_id);
@@ -417,11 +422,11 @@ for(const nativeCode of ["runtime_question_pending","runtime_external_approval_p
   await supervisor.reconcileTasks();assert.equal(db.tasks.get(task.task_id)?.wait_reason,"human_input");
   db.markJobBlocked(job.job_id,"native wait",["blocked"],nativeCode);db.tasks.wait(db.tasks.get(task.task_id)!,"human_input",-1);
   await supervisor.reconcileTasks();assert.equal(db.getJob(job.job_id)?.last_error_code,"worker_message_question_pending");assert.equal(db.tasks.get(task.task_id)?.wait_reason,"human_input");
-  db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"answer",occurred_at:new Date().toISOString(),correlation_message_id:question.message.message_id,conversation_revision:1,payload:{operation:"answer",text:"元の範囲で続行してください"}});
+  const answer=db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"answer",occurred_at:new Date().toISOString(),correlation_message_id:question.message.message_id,conversation_revision:1,payload:{operation:"answer",text:"元の範囲で続行してください"}});
   await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();assert.equal(db.tasks.get(task.task_id)?.state,"active");
   assert.ok(db.workerMessages.stoppedInstructionContext(job.job_id).includes("元の範囲で続行してください"));
   assert.ok(db.workerMessages.stoppedInstructionContext(job.job_id).includes("継続できますか？"));
-  const future={schema_version:1 as const,job_id:job.job_id,status:"completed" as const,summary:"確認しました",completed_at:new Date(Date.now()+60000).toISOString()};
+  const future={schema_version:1 as const,job_id:job.job_id,status:"completed" as const,worker_instruction_message_ids:[answer.message.message_id],summary:"確認しました",completed_at:new Date(Date.now()+60000).toISOString()};
   assert.throws(()=>db.saveJobResult(job.job_id,future,job.result_path),/completed_at_is_in_the_future/);assert.notEqual(db.tasks.get(task.task_id)?.state,"completed");
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
@@ -564,5 +569,17 @@ test("未回答の前Attempt質問と選択肢をpause後も引き継ぐ",async(
   const question=db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"question",occurred_at:new Date().toISOString(),payload:{kind:"decision_request",question:"方式を選んでください",options:["方式A","方式B"]}});
   db.tasks.control(t.task_id,source.event_id,db.tasks.get(t.task_id)!.revision,"pause");const context=db.workerMessages.stoppedInstructionContext(t.current_attempt_id);
   assert.ok(context.includes("方式を選んでください"));assert.ok(context.includes("方式A"));assert.ok(context.includes(question.message.message_id));assert.ok(context.includes("新しいmessage_id"));
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("長い質問待ち後の回答配送からsilence intervalを数え直す",async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);try{
+  const source=db.enqueue(eventEnvelope("silence-resume-window")).row,t=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"window",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  db.beginJobPreparation(t.current_attempt_id);db.setJobRuntime(t.current_attempt_id,"w","p","runtime");db.beginJobDispatch(t.current_attempt_id);db.markJobRunning(t.current_attempt_id);
+  const past=new Date(Date.now()-1800000),q=db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"question",occurred_at:past.toISOString(),payload:{kind:"question",question:"続行できますか？"}},past);
+  assert.equal(db.workerMessages.publishDueSilenceEvents(),0);
+  db.workerMessages.appendInstruction(t.current_attempt_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"answer",occurred_at:new Date().toISOString(),correlation_message_id:q.message.message_id,conversation_revision:1,payload:{operation:"answer",text:"元の範囲で続行してください"}});
+  await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();
+  assert.equal(db.workerMessages.publishDueSilenceEvents(),0);assert.equal(db.workerMessages.publishDueSilenceEvents(100,new Date(Date.now()+901000)),1);
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });

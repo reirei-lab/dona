@@ -3240,9 +3240,10 @@ export class DispatcherDatabase {
       if(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()) {
         if(this.workerMessages.hasUnansweredQuestion(jobId))throw Error("worker_message_question_pending");
         if(this.workerMessages.hasPendingInstructions(jobId))throw Error("worker_instruction_delivery_pending");
-        if(this.db.prepare(`SELECT 1 FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
-          WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.consumer='worker' AND d.state='delivered'
-            AND julianday(d.delivered_at)>=julianday(?) LIMIT 1`).get(jobId,result.completed_at))throw Error("worker_instruction_result_stale");
+        const delivered=this.db.prepare(`SELECT m.message_id FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
+          WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.consumer='worker' AND d.state='delivered'`).all(jobId) as Array<{message_id:string}>;
+        const acknowledged=result.worker_instruction_message_ids??[];
+        if(!Array.isArray(acknowledged)||acknowledged.length!==delivered.length||new Set(acknowledged).size!==acknowledged.length||delivered.some(row=>!acknowledged.includes(row.message_id)))throw Error("worker_instruction_result_stale");
       }
       const binding = readEventJobBinding(this.db,job.source_event_id);
       if (binding?.owner.kind === "schedule") {

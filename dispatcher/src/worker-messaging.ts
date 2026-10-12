@@ -243,6 +243,9 @@ export function migrateWorkerMessaging(db: Database.Database): void {
       applied_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS worker_message_activity (
+      job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,activity_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS worker_message_workspace_cadence (
       workspace_id           TEXT PRIMARY KEY,
       minimum_interval_ms    INTEGER NOT NULL DEFAULT 60000 CHECK (minimum_interval_ms BETWEEN 0 AND 3600000),
@@ -408,7 +411,7 @@ export class WorkerMessageRepository {
       const attentionActive=!!group?.attention_event_id&&!!this.db.prepare("SELECT 1 FROM events WHERE event_id=? AND status NOT IN ('completed','dead_letter')").get(group.attention_event_id);
       const pending=this.db.prepare(`SELECT m.message_id,d.attempt_count FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
         WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.state IN ('pending','leased') ORDER BY m.producer_sequence LIMIT 1`).get(jobId) as {message_id:string;attempt_count:number}|undefined;
-      const cadence=this.db.prepare("SELECT last_report_at FROM worker_message_cadence WHERE job_id=?").get(jobId) as {last_report_at:string|null}|undefined;
+      const cadence=this.db.prepare("SELECT COALESCE(a.activity_at,c.last_report_at) last_report_at FROM worker_message_cadence c LEFT JOIN worker_message_activity a USING(job_id) WHERE c.job_id=?").get(jobId) as {last_report_at:string|null}|undefined;
       const latestForJob=members.find(m=>m.job_id===jobId)?.report;
       // A retained unanswered question remains actionable even after a later checkpoint.
       const pendingQuestion=report&&["question","decision_request"].includes(report.kind)&&!!this.db.prepare(`SELECT 1 FROM worker_messages q
@@ -419,6 +422,7 @@ export class WorkerMessageRepository {
       const identity={report_current:!report||latestForJob?.message_id===report.message_id||!!pendingQuestion||!!pendingRisk,job_id:jobId,current:task?.current_attempt_id===jobId&&task.stop_state==="none"&&!task.steer_pending_event_id,desired_state:task?.desired_state??"cancelled",phase:job.status,
         members:members.map(m=>({job_id:m.job_id,phase:m.phase,message_id:m.report?.message_id??null})),
         group_attention:liveAttention||attentionActive,group_terminal:!!group?.all_terminal_event_id,context_complete:rows.length<=32,
+        ...(!report&&cadence?.last_report_at?{silence_since:cadence.last_report_at}:{}),
         ...(pending?{pending_instruction:{message_id:pending.message_id,state:pending.attempt_count>0?"unknown":"pending"}}:{})};
       const snapshot=sha256(stableStringify({identity,control:{revision:task?.revision,stop_state:task?.stop_state,steer_event:task?.steer_pending_event_id,job_error:job.last_error_code}}));
       const root=sha256(stableStringify({version:1,job_id:jobId,report_id:report?.message_id??event.external_event_id,...(event.event_type==="worker_message_aggregate"?{stage:event.external_event_id}:{})}));
@@ -801,6 +805,7 @@ export class WorkerMessageRepository {
 
       let availableAt = acceptedAt;
       if (direction === "worker_to_dona") {
+        this.db.prepare("INSERT INTO worker_message_activity VALUES(?,?) ON CONFLICT(job_id) DO UPDATE SET activity_at=excluded.activity_at").run(jobId,acceptedAt);
         const silencePrefix=`worker-message-silence:${jobId}:`;
         this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,
           last_error_code='worker_message_silence_superseded',last_error_message=NULL
@@ -1039,6 +1044,10 @@ export class WorkerMessageRepository {
           WHERE current_attempt_id=? AND desired_state='running' AND state='waiting' AND wait_reason IN ('human_input','external_effect_unknown','worker_instruction_delivery_pending')
           AND EXISTS(SELECT 1 FROM jobs WHERE job_id=? AND status='running' AND last_error_code IS NULL)`).run(now,jobId,jobId);
       }
+      if(row.consumer==='worker'&&job.status==='blocked'){
+        const resumed=this.db.prepare("SELECT status,last_error_code FROM jobs WHERE job_id=?").get(jobId) as {status:string;last_error_code:string|null};
+        if(resumed.status==='running'&&resumed.last_error_code===null)this.resetSilenceAfterInput(jobId,at);
+      }
       return { delivery: this.db.prepare("SELECT * FROM worker_message_deliveries WHERE delivery_id=?").get(deliveryId), receipt_id: receiptId, outcome: "delivered" as const };
     }).immediate();
   }
@@ -1150,6 +1159,13 @@ export class WorkerMessageRepository {
       }
       return published;
     }).immediate();
+  }
+
+  resetSilenceAfterInput(jobId:string,at=new Date()):void {
+    const now=at.toISOString();
+    this.db.prepare("UPDATE worker_message_cadence SET silence_due_at=strftime('%Y-%m-%dT%H:%M:%fZ',?, '+'||(silence_interval_ms/1000)||' seconds'),generation=generation+1,updated_at=? WHERE job_id=?").run(now,now,jobId);
+    this.db.prepare("INSERT INTO worker_message_activity VALUES(?,?) ON CONFLICT(job_id) DO UPDATE SET activity_at=excluded.activity_at").run(jobId,now);
+    this.db.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='worker_message_input_resumed' WHERE source='dona_message' AND event_type='worker_message_silence' AND json_extract(payload_json,'$.job_id')=? AND status IN ('queued','retryable_failed')").run(now,now,jobId);
   }
 
   publishDueSilenceEvents(limit = 100, at = new Date()): number {

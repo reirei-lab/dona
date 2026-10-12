@@ -814,6 +814,7 @@ function compareCodePoints(left: string, right: string): number {
 
 const jsonValue: z.ZodType<unknown> = z.json();
 const requestSchema = z.object({
+  worker_instruction_message_ids: z.array(z.string().regex(/^msg_[0-9a-hjkmnp-tv-z]{26}$/)).max(256).refine(ids=>new Set(ids).size===ids.length).optional(),
   schema_version: z.literal(1),
   status: z.enum(["completed", "failed"]),
   summary: z.string().min(1).refine(value => displayProjection(value.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "")).trim().length > 0),
@@ -903,6 +904,7 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
   const envelope: JobResultEnvelope = {
     schema_version: 1,
     job_id: job.job_id,
+    ...(parsed.data.worker_instruction_message_ids===undefined?{}:{worker_instruction_message_ids:parsed.data.worker_instruction_message_ids}),
     status: parsed.data.status,
     summary: parsed.data.summary,
     ...(parsed.data.output === undefined ? {} : { output: parsed.data.output }),

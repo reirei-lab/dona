@@ -2,7 +2,7 @@ import {AppServerWorkerReportBridge,AppServerWorkerInstructionController} from "
 import {WorkerMessagePublisher,WorkerInstructionBridge} from "./worker-messaging.js";
 import path from "node:path";
 import { AgentContextManager } from "./agent-context.js";
-import {RuntimeClient} from "./app-server/client.js";
+import {RuntimeClient,disableWorkerReportsAfterDrain} from "./app-server/client.js";
 import {openLocalApprovalService} from "./approval/local-service.js";
 import { assertTaskGenerationFile } from "./task-execution.js";
 import type { DispatcherConfig } from "./config.js";
@@ -141,9 +141,10 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       api.disableJobProgress();
       }
     }
+    if(!reportBridge)await disableWorkerReportsAfterDrain(new RuntimeClient(runtimeSocket(config),5000));
     if(external)await external.start();
     else await new RuntimeClient(runtimeSocket(config),5000).externalAvailability(false).catch(()=>{});
-    if(!reportBridge)await new RuntimeClient(runtimeSocket(config),5000).workerReportAvailability(false).catch(()=>apiLogger.warn("Worker report ingress disable could not be confirmed",{error_code:"worker_report_disable_unavailable"}));
+
     messages?.start();reportBridge?.start();instructions?.start();
     worker.start();
     scheduler.start();
