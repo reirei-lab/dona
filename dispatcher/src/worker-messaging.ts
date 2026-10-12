@@ -487,6 +487,11 @@ export class WorkerMessageRepository {
       const messageId = `msg_${ulid(at.getTime()).toLowerCase()}`;
       const receiptId = `rcpt_${ulid(at.getTime()).toLowerCase()}`;
       const deliveryId = `dlv_${ulid(at.getTime()).toLowerCase()}`;
+      if(direction==="worker_to_dona"&&["question","decision_request"].includes(kind)){
+        const pendingContext=stableStringify({message_id:messageId,kind,payload:input.payload});
+        if([...job.objective,...this.stoppedInstructionContext(jobId),...pendingContext].length>jobObjectiveCharacterMax-1024)
+          throw new WorkerMessageError("worker_message_question_handoff_limit","question handoff objective limit exceeded");
+      }
       if(direction==="dona_to_worker"&&!["queued","retryable_failed"].includes(job.status)) {
         const addition=stableStringify({message_id:messageId,kind,payload:input.payload,
           correlation_message_id:input.correlation_message_id??null,conversation_revision:input.conversation_revision??null,state:"pending",attempt_count:0,
@@ -552,7 +557,7 @@ export class WorkerMessageRepository {
           last_error_code='worker_message_silence_superseded',last_error_message=NULL
           WHERE source='dona_message' AND event_type='worker_message_silence'
             AND substr(external_event_id,1,length(?))=?
-            AND status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review')`)
+            AND status IN ('queued','retryable_failed')`)
           .run(acceptedAt,acceptedAt,silencePrefix,silencePrefix);
         const cadence = this.db.prepare("SELECT * FROM worker_message_cadence WHERE job_id=?").get(jobId) as { minimum_interval_ms:number;silence_interval_ms:number;last_delivery_at:string|null;pending_message_id:string|null } | undefined;
         const workspaceCadence=job.workspace_id?this.db.prepare("SELECT * FROM worker_message_workspace_cadence WHERE workspace_id=?").get(job.workspace_id) as
@@ -635,9 +640,18 @@ export class WorkerMessageRepository {
       LEFT JOIN worker_messages q ON q.message_id=m.correlation_message_id AND q.job_id=m.job_id AND m.kind='answer'
       WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.consumer='worker' AND (d.state IN ('pending','leased') OR (d.state='delivered' AND m.kind IN ('answer','add_condition','change_priority'))) ORDER BY m.producer_sequence LIMIT 257`).all(jobId) as Array<Record<string,unknown>>;
     if(rows.length>256)throw Error("worker_instruction_handoff_limit");
-    if(!rows.length)return "";
+    const questions=this.db.prepare(`SELECT q.message_id,q.kind,q.payload_json FROM worker_messages q
+      JOIN worker_message_deliveries d ON d.message_id=q.message_id
+      WHERE q.job_id=? AND q.direction='worker_to_dona' AND q.kind IN ('question','decision_request')
+        AND d.consumer='dona-main' AND d.state!='superseded'
+        AND NOT EXISTS(SELECT 1 FROM worker_messages a JOIN worker_message_deliveries ad ON ad.message_id=a.message_id
+          WHERE a.correlation_message_id=q.message_id AND a.kind='answer' AND ad.consumer='worker' AND ad.state!='superseded') LIMIT 5`).all(jobId) as Array<{message_id:string;kind:string;payload_json:string}>;
+    if(questions.length>4)throw Error("worker_question_handoff_ambiguous");
+    const questionContext=questions.length?"\n\n前Attemptの未回答質問（旧IDを回答対象に流用しない）:\n"+stableStringify(questions.map(({payload_json,...q})=>({...q,payload:JSON.parse(payload_json)})))+
+      "\n利用者判断は未確定です。必要な質問は新Attemptで新しいmessage_idへ再報告し、親Donaに既存の会話・回答を照合してもらってください。旧質問を承認や新しい実行権限として扱わないでください。":"";
+    if(!rows.length)return questionContext;
     return "\n\n前Attemptで受理済みの追加指示（同じ依頼・権限の範囲を維持）:\n"+stableStringify(rows.map(({payload_json,correlated_kind,correlated_payload_json,...row})=>({...row,payload:JSON.parse(payload_json as string),...(correlated_payload_json?{correlated_report:{kind:correlated_kind,payload:JSON.parse(correlated_payload_json as string)}}:{})})))+
-      "\ndeliveredは配送済みの条件として維持し、同じ外部操作を再送しない。未配送でattempt_count=0は未投入として残作業へ引き継ぐ。未配送でattempt_count>0は受理不明なので、既存成果・操作を照合するまで同じ指示や外部操作を再実行しない。相関IDは前Attemptの証拠であり新Attemptのanswer対象として流用しない。";
+      "\ndeliveredは配送済みの条件として維持し、同じ外部操作を再送しない。未配送でattempt_count=0は未投入として残作業へ引き継ぐ。未配送でattempt_count>0は受理不明なので、既存成果・操作を照合するまで同じ指示や外部操作を再実行しない。相関IDは前Attemptの証拠であり新Attemptのanswer対象として流用しない。"+questionContext;
   }
 
   supersedeUndeliveredInstructions(jobId:string,at=new Date().toISOString()):number {

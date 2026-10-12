@@ -318,8 +318,13 @@ export class JobSupervisor {
     if(task.wait_reason==="steer_acceptance_unknown"&&job.steer_state==="accepted"&&job.steer_event_id&&task.steer_pending_event_id===job.steer_event_id) {
       this.database.tasks.finishSteer(task.task_id,job.steer_event_id);return;
     }
-    if(task.desired_state==="running"&&task.stop_state==="none"&&job.last_error_code==="runtime_question_pending"&&this.runtime.questions){
-      const native=await this.runtime.questions(job.agent_name);
+    const typedOverlap=this.config.workerMessagingEnabled&&job.last_error_code==="runtime_external_approval_pending"&&this.database.workerMessages.hasUnansweredQuestion(job.job_id);
+    if(task.desired_state==="running"&&task.stop_state==="none"&&((job.last_error_code==="runtime_question_pending"&&this.runtime.questions)||typedOverlap)){
+      if(job.last_error_code==="runtime_external_approval_pending"){
+        const recovery=this.database.tasks.externalApprovalRecovery(job.job_id);
+        if(recovery.state!=="ready"){this.database.tasks.wait(task,recovery.state==="unknown"?"external_effect_unknown":"external_approval",30000);return;}
+      }
+      const native=this.runtime.questions?await this.runtime.questions(job.agent_name):[];
       if(native.length){this.database.tasks.wait(task,"human_input");return;}
       const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
       if(observed.ok&&["working","idle","done"].includes(observed.agentStatus??"")){
