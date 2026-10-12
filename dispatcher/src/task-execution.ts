@@ -386,7 +386,7 @@ export class TaskRepository {
       if(task.revision!==revision)throw new Error("task_revision_conflict");
       if(["completed","failed","cancelled"].includes(task.state))throw new Error("task_terminal");
       if(action==="resume"&&!["paused","waiting"].includes(task.state))throw new Error("task_resume_requires_waiting_or_paused");
-      if(action==="pause"&&this.dispatcher.getJob(task.current_attempt_id)?.status==="blocked"&&this.dispatcher.getJob(task.current_attempt_id)?.last_error_code!=="runtime_question_pending")throw new Error("task_human_input_pending");
+      if(action==="pause"&&this.dispatcher.getJob(task.current_attempt_id)?.status==="blocked"&&!["runtime_question_pending","worker_message_question_pending"].includes(this.dispatcher.getJob(task.current_attempt_id)?.last_error_code??""))throw new Error("task_human_input_pending");
       const state=action==="pause"?"paused":action==="resume"?"waiting":"waiting";
       const reason=action==="cancel"?"cancel_requested":action==="pause"?"pause_requested":"resume_requested";
       this.sql.prepare("UPDATE tasks SET state=?,desired_state=?,wait_reason=?,next_check_at=?,revision=revision+1,updated_at=? WHERE task_id=?")
@@ -509,7 +509,7 @@ export class TaskRepository {
       ORDER BY COALESCE(t.next_check_at,t.created_at),t.task_id LIMIT 8`).all(at.toISOString()) as TaskRow[];
   }
   mayNotify(job:JobRow):boolean {
-    if(job.last_error_code==="runtime_question_pending")return false;
+    if(["runtime_question_pending","worker_message_question_pending"].includes(job.last_error_code??""))return false;
     const task=this.forAttempt(job.job_id);if(!task)return true;
     if(task.current_attempt_id!==job.job_id)return false;
     if(["completed","failed","cancelled"].includes(task.state))return true;

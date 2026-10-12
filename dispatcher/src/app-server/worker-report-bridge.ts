@@ -57,12 +57,17 @@ export class AppServerWorkerInstructionController {
   if(!identity)throw Error("worker_instruction_runtime_unbound");
   const [generation,thread_id]=JSON.parse(identity) as unknown[];
   if(typeof generation!=="string"||typeof thread_id!=="string")throw Error("worker_instruction_runtime_unbound");
+  this.database.workerMessages.bindInstructionRuntime(jobId,messageId,identity);
   const scope={attempt_id:jobId,generation,thread_id};
   const receipt=await this.runtime.workerInstructionReceipt(job.agent_name,messageId,text,scope);
   if(receipt.state==="accepted")return receipt;
-  if(receipt.state!=="not_found")throw Error("worker_instruction_acceptance_unknown");
+  if(receipt.state!=="not_found"){
+   if(this.database.workerMessages.instructionReceived(jobId,messageId,identity))return {state:"accepted",evidence:"correlated_worker_report"};
+   this.database.markWorkerInstructionUnknown(jobId,messageId);throw Error("worker_instruction_acceptance_unknown");
+  }
   const current=this.database.tasks.forAttempt(jobId),currentJob=this.database.getJob(jobId);
   if(!current||current.current_attempt_id!==jobId||current.desired_state!=="running"||!currentJob||!["running","blocked"].includes(currentJob.status)||this.database.getJobLiveSessionIdentity(jobId)?.herdr_agent_session_id!==identity)throw Error("worker_instruction_attempt_not_current");
-  return this.runtime.workerInstruction(job.agent_name,messageId,text,scope);
+  try{return await this.runtime.workerInstruction(job.agent_name,messageId,text,scope);}
+  catch(error){this.database.markWorkerInstructionUnknown(jobId,messageId);throw error;}
  }
 }

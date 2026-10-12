@@ -1069,7 +1069,16 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
-  taskReports(id:string,eventId:string){const task=this.tasks.assertOwner(id,eventId,true),job=this.getJob(task.current_attempt_id)!;return {schema_version:1,task_id:id,attempt_id:task.current_attempt_id,revision:task.revision,phase:job.status,desired_state:task.desired_state,reports:task.desired_state==="running"&&["running","blocked"].includes(job.status)?this.workerMessages.reports(task.current_attempt_id,eventId):[],...this.workerMessages.instructionReceipts(task.current_attempt_id,eventId),limit:20};}
+  markWorkerInstructionUnknown(jobId:string,messageId:string){
+    this.db.transaction(()=>{
+      const task=this.tasks.forAttempt(jobId),job=this.getJob(jobId);
+      if(!task||task.current_attempt_id!==jobId||task.desired_state!=="running"||!job||!["running","blocked"].includes(job.status))return;
+      if(job.last_error_code==="worker_instruction_acceptance_unknown"&&job.last_error_message===messageId)return;
+      this.db.prepare("UPDATE jobs SET status='blocked',last_error_code='worker_instruction_acceptance_unknown',last_error_message=?,updated_at=? WHERE job_id=?").run(messageId,new Date().toISOString(),jobId);
+      this.tasks.wait(task,"external_effect_unknown",30000);
+    }).immediate();
+  }
+  taskReports(id:string,eventId:string){const task=this.tasks.assertOwner(id,eventId,true),job=this.getJob(task.current_attempt_id)!;return {schema_version:1,task_id:id,attempt_id:task.current_attempt_id,revision:task.revision,phase:job.status,wait_reason:task.wait_reason,diagnostic:job.last_error_code,desired_state:task.desired_state,pending_question:task.desired_state==="running"&&["running","blocked"].includes(job.status)?this.workerMessages.pendingQuestion(task.current_attempt_id):undefined,reports:task.desired_state==="running"&&["running","blocked"].includes(job.status)?this.workerMessages.reports(task.current_attempt_id,eventId):[],...this.workerMessages.instructionReceipts(task.current_attempt_id,eventId),limit:20};}
   instructTask(id:string,revision:number,raw:unknown){
     const input=parseDonaInstruction(raw);
     return this.db.transaction(()=>{

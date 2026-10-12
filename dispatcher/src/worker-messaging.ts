@@ -701,12 +701,12 @@ export class WorkerMessageRepository {
       if (row.consumer === "dona-main") this.db.prepare(`UPDATE worker_message_cadence SET last_delivery_at=?,pending_message_id=CASE WHEN pending_message_id=? THEN NULL ELSE pending_message_id END,updated_at=? WHERE job_id=?`)
         .run(now, row.message_id, now, message.job_id);
       if(row.consumer==="dona-main"&&message.workspace_id)this.recordWorkspaceDelivery(message.workspace_id,now);
-      if(row.consumer==="worker"&&message.kind==="answer") {
-        this.db.prepare(`UPDATE jobs SET status='running',last_error_code=NULL,last_error_message=NULL,updated_at=? WHERE job_id=? AND status='blocked' AND last_error_code='worker_message_question_pending'
-          AND EXISTS(SELECT 1 FROM tasks WHERE current_attempt_id=jobs.job_id AND desired_state='running')`).run(now,jobId);
+      if(row.consumer==="worker") {
+        this.db.prepare(`UPDATE jobs SET status='running',last_error_code=NULL,last_error_message=NULL,updated_at=? WHERE job_id=? AND status='blocked' AND ((last_error_code='worker_message_question_pending' AND ?='answer') OR (last_error_code='worker_instruction_acceptance_unknown' AND last_error_message=?))
+          AND EXISTS(SELECT 1 FROM tasks WHERE current_attempt_id=jobs.job_id AND desired_state='running')`).run(now,jobId,message.kind,message.message_id);
         this.db.prepare(`UPDATE tasks SET state='active',wait_reason=NULL,next_check_at=NULL,revision=revision+1,
           project_state=CASE WHEN project_state IN ('attempting','unknown') THEN project_state ELSE 'pending' END,updated_at=?
-          WHERE current_attempt_id=? AND desired_state='running' AND state='waiting' AND wait_reason='human_input'
+          WHERE current_attempt_id=? AND desired_state='running' AND state='waiting' AND wait_reason IN ('human_input','external_effect_unknown')
           AND EXISTS(SELECT 1 FROM jobs WHERE job_id=? AND status='running' AND last_error_code IS NULL)`).run(now,jobId,jobId);
       }
       return { delivery: this.db.prepare("SELECT * FROM worker_message_deliveries WHERE delivery_id=?").get(deliveryId), receipt_id: receiptId, outcome: "delivered" as const };
@@ -899,6 +899,21 @@ export class WorkerMessageRepository {
       direction: row.direction, kind: row.kind, producer_sequence: row.producer_sequence, correlation_message_id: row.correlation_message_id,
       conversation_revision: row.conversation_revision, occurred_at: row.occurred_at, accepted_at: row.accepted_at,
       ...(safeSummary ? { safe_summary: Array.from(safeSummary).slice(0, 240).join("") } : {}) };
+  }
+
+  bindInstructionRuntime(jobId:string,messageId:string,identity:string){
+    this.assertWorkerRuntime(jobId,identity);
+    const message=this.getMessageRequired(messageId);if(message.job_id!==jobId||message.direction!=="dona_to_worker")throw Error("worker_instruction_identity_invalid");
+    const old=this.db.prepare("SELECT runtime_identity_sha256 FROM worker_message_runtime_identities WHERE message_id=?").get(messageId) as {runtime_identity_sha256:string}|undefined;
+    if(old&&old.runtime_identity_sha256!==sha256(identity))throw Error("worker_instruction_runtime_changed");
+    this.db.prepare("INSERT OR IGNORE INTO worker_message_runtime_identities VALUES(?,?,?)").run(messageId,sha256(identity),new Date().toISOString());
+  }
+  instructionReceived(jobId:string,messageId:string,identity:string):boolean {
+    return !!this.db.prepare(`SELECT 1 FROM worker_messages i JOIN worker_message_runtime_identities bound ON bound.message_id=i.message_id
+      JOIN worker_messages report ON report.job_id=i.job_id AND report.correlation_message_id=i.message_id AND report.direction='worker_to_dona'
+      JOIN worker_message_runtime_identities received ON received.message_id=report.message_id
+      WHERE i.job_id=? AND i.message_id=? AND i.direction='dona_to_worker' AND bound.runtime_identity_sha256=? AND received.runtime_identity_sha256=bound.runtime_identity_sha256
+      AND COALESCE(report.conversation_revision,-1)=COALESCE(i.conversation_revision,-1) AND report.occurred_at>=i.accepted_at`).get(jobId,messageId,sha256(identity));
   }
 
   instructionForDelivery(jobId:string,sourceEventId:string,messageId:string):string {
