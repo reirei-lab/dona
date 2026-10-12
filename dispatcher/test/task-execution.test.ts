@@ -86,14 +86,27 @@ test("worker停止中の取消が後継起動より優先される",async()=>{
   }finally{await f.dispose();}
 });
 
-test("pauseは停止を待ち、resume後もTaskと予算を保持する",async()=>{
+for(const deliveryState of ["pending","leased","delivered"] as const)test(`pauseは停止を待ち、resume後もTask・予算・追加指示を保持する（${deliveryState}）`,async()=>{
   const f=await fixture();try{
-    f.start();const event=f.db.enqueue(eventEnvelope("pause")).row;
+    f.start();const follow=f.db.enqueue(eventEnvelope("typed-condition")).row;
+    const instruction=f.db.workerMessages.appendInstruction(f.task.current_attempt_id,{schema_version:1,source_event_id:follow.event_id,producer_sequence:1,idempotency_key:"condition",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"既存の要件を保って検証結果を残してください"}});
+    if(deliveryState!=="pending"){
+      const claimed=f.db.workerMessages.claimNextWorkerInstruction("test-owner",300000)!;
+      if(deliveryState==="delivered")f.db.workerMessages.acknowledge(f.task.current_attempt_id,follow.event_id,claimed.delivery.delivery_id,"test-owner",claimed.lease_token,claimed.delivery.fence);
+    }
+    const event=f.db.enqueue(eventEnvelope("pause")).row;
     f.db.tasks.control(f.task.task_id,event.event_id,f.db.tasks.get(f.task.task_id)!.revision,"pause");await f.supervisor().reconcileTasks();
     const paused=f.db.tasks.get(f.task.task_id)!;assert.equal(paused.state,"paused");assert.equal(paused.stop_state,"stopped");assert.equal(paused.attempt_number,1);
+    assert.equal(f.db.workerMessages.claimNextWorkerInstruction("test-owner",300000),undefined);
     const resume=f.db.enqueue(eventEnvelope("resume")).row;
     f.db.tasks.control(paused.task_id,resume.event_id,paused.revision,"resume");await f.supervisor().reconcileTasks();
-    assert.equal(f.db.tasks.get(paused.task_id)!.attempt_number,2);assert.equal(f.sends(),1);
+    const next=f.db.tasks.get(paused.task_id)!;
+    assert.equal(next.attempt_number,2);assert.equal(f.sends(),1);
+    assert.match(f.db.getJob(next.current_attempt_id)!.objective,/既存の要件を保って検証結果を残してください/);
+    assert.ok(f.db.getJob(next.current_attempt_id)!.objective.includes(instruction.message.message_id));
+    assert.ok(f.db.getJob(next.current_attempt_id)!.objective.includes(`"attempt_count":${deliveryState==="pending"?0:1}`));
+    const receipt=f.db.workerMessages.reconcile(f.task.current_attempt_id,follow.event_id,"dona-main","condition") as {delivery:{state:string}};
+    assert.equal(receipt.delivery.state,deliveryState==="delivered"?"delivered":"superseded");
   }finally{await f.dispose();}
 });
 

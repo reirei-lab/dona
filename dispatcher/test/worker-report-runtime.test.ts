@@ -50,7 +50,7 @@ if(r.id==='rpc-report'&&r.result){fs.appendFileSync('responses.jsonl',JSON.strin
  const store=new RuntimeStore(path.join(root,"runtime.db")),manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));let agent:AgentRecord|undefined;
  try{
   agent=await manager.start({name:"worker-report-test",attemptId:attempt,role:"worker",cwd:root,release:root,args:[],workerMessaging:true,threadConfig:{}});manager.workerReports.availability(true);
-  const tools=JSON.parse(await fs.readFile(path.join(root,"tools.json"),"utf8"));assert.deepEqual(tools.map((x:{name:string})=>x.name),[workerReportTool.name,workerReportStatusTool.name]);
+  const tools=JSON.parse(await fs.readFile(path.join(root,"tools.json"),"utf8"));assert.deepEqual(tools.map((x:{name:string})=>x.name),["dona_request_thread_reply",workerReportTool.name,workerReportStatusTool.name]);
   await manager.prompt(agent.name,"start-report","進捗を報告してください");await until(()=>manager.workerReports.pending().length===1&&(!completeBeforeReply||store.agent(agent!.name)?.turn_id===null));
   const report=manager.workerReports.pending()[0]!;assert.equal(report.generation,agent.generation);assert.equal(report.thread_id,agent.thread_id);assert.equal(manager.status(agent.name)?.state,"waiting");
   const result={message_id:"msg_01h00000000000000000000000",receipt_id:"rcpt_01h00000000000000000000000",outcome:"created"};
@@ -74,7 +74,7 @@ test("全report kindのstrict・byte上限・canary・受付上限を守る",asy
  let n=0;const call=(payload:unknown,extra:Record<string,unknown>={})=>({id:"rpc-"+n,method:"item/tool/call",params:{tool:workerReportTool.name,threadId:agent.thread_id,turnId:agent.turn_id,callId:"call-"+n++,arguments:{report_key:"report-"+n,payload,...extra}}});
  const accepted={message_id:"msg_01h00000000000000000000000",receipt_id:"rcpt_01h00000000000000000000000",outcome:"created"};
  for(const payload of [{kind:"checkpoint",summary:"確認しました"},{kind:"question",question:"続行できますか？"},{kind:"risk",summary:"確認が必要です",severity:"high"},{kind:"decision_request",question:"方式を選んでください",options:["方式A","方式B"]}]){const row=queue.accept(agent,call(payload));queue.resolve(row.request_id,accepted);queue.resolved(agent.name,agent.generation,JSON.parse(row.rpc_id_json));}
- for(const summary of ["/etc/private-token","relative/private.json","npm test","stdout: private-data","xoxb-canary-secret","-----BEGIN PRIVATE KEY-----","https://private.invalid/token","AKIA0123456789ABCDEF"]){assert.throws(()=>queue.accept(agent,call({kind:"checkpoint",summary})));}
+ for(const summary of ["/etc/private-token","relative/private.json","npm test","stdout: private-data","xoxb-canary-secret","-----BEGIN PRIVATE KEY-----","https://private.invalid/token","AKIA0123456789ABCDEF","sk-proj-canary-0123456789abcdef","sk-canary0123456789abcdef","hf_canary0123456789abcdef"]){assert.throws(()=>queue.accept(agent,call({kind:"checkpoint",summary})));}
  assert.throws(()=>queue.accept(agent,call({kind:"checkpoint",summary:"x".repeat(4001)})));
  assert.throws(()=>queue.accept(agent,call({kind:"decision_request",question:"界".repeat(3000),options:Array(8).fill("a".repeat(1000))})));
  assert.throws(()=>queue.accept(agent,call({kind:"checkpoint",summary:"確認",stdout:"raw"})));

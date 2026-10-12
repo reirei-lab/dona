@@ -1,3 +1,4 @@
+import {credentialShaped} from "../credential-shaped.js";
 import {randomUUID,createHash} from "node:crypto";
 import {z} from "zod";
 import type {RuntimeStore,AgentRecord} from "./store.js";
@@ -31,7 +32,7 @@ export class WorkerReportQueue {
   if(this.availableUntil<=Date.now()||agent.role!=="worker"||config.workerMessaging!==true||config.threadConfig?.config?.["features.default_mode_request_user_input"]===false||!/^job_[0-9a-hjkmnp-tv-z]{26}$/.test(config.attemptId??""))throw Error("runtime_worker_report_unavailable");
   if(p.tool!==workerReportTool.name||p.namespace!==null&&p.namespace!==undefined||typeof p.callId!=="string"||!p.callId||p.callId.length>128||p.threadId!==agent.thread_id||p.turnId!==agent.turn_id||message.id===undefined)throw Error("runtime_worker_report_identity_invalid");
   const value=input.parse(p.arguments),canonical=stableStringify(value),payloadHash=createHash("sha256").update(canonical).digest("hex"),wire=[value.report_key,...Object.values(value.payload).flatMap(v=>typeof v==="string"?[v]:Array.isArray(v)?v:[])].join("\n");
-  if(Buffer.byteLength(canonical)>16384||/(?:[/\\]|https?:\/\/|file:|\/Users\/|\/private\/|\/tmp\/|[A-Z]:\\|\bBearer\s|xox[baprs]-|github_pat_|gh[pousr]_|AKIA[0-9A-Z]{16}|-----BEGIN[^\n]*PRIVATE KEY-----|\b(?:password|passwd|api[_ -]?key|access[_ -]?token|stdout|stderr)\b|\$\(|`|\b(?:rm|curl|wget|bash|sh|eval|exec|npm|node|git|python|sudo|cp|mv|echo)\s)/i.test(wire))throw Error("runtime_worker_report_payload_denied");
+  if(credentialShaped.test(wire)||Buffer.byteLength(canonical)>16384||/(?:[/\\]|https?:\/\/|file:|\/Users\/|\/private\/|\/tmp\/|[A-Z]:\\|\bBearer\s|xox[baprs]-|github_pat_|gh[pousr]_|AKIA[0-9A-Z]{16}|-----BEGIN[^\n]*PRIVATE KEY-----|\b(?:password|passwd|api[_ -]?key|access[_ -]?token|stdout|stderr)\b|\$\(|`|\b(?:rm|curl|wget|bash|sh|eval|exec|npm|node|git|python|sudo|cp|mv|echo)\s)/i.test(wire))throw Error("runtime_worker_report_payload_denied");
   if([agent.name,agent.generation,agent.thread_id,agent.turn_id,agent.cwd,agent.release].some(v=>v&&canonical.includes(v)))throw Error("runtime_worker_report_payload_denied");
   return this.store.db.transaction(()=>{
    const prior=this.store.db.prepare("SELECT * FROM runtime_worker_reports WHERE attempt_id=? AND report_key=?").get(config.attemptId,value.report_key) as RuntimeWorkerReport|undefined;

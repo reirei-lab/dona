@@ -4,7 +4,7 @@ Issue #273のApp Server向け接続。mainに未採用のIssue #272のledger実�
 
 ## 設定と範囲
 
-`DONA_WORKER_MESSAGING_ENABLED=true`をDispatcherに設定する場合だけ有効になる。既定は無効。interactiveなTask workerだけにdynamic toolを追加する。mainやschedule workerに報告権限を与えず、workerにSlack credentialや汎用Dispatcher MCPを渡さない。
+`DONA_WORKER_MESSAGING_ENABLED=true`をDispatcherに設定する場合だけ有効になる。既定は無効。interactiveなTask workerだけにreport/status dynamic toolを追加する。既存の外部返信承認toolはworkerでも維持し、報告とは別の承認経路を通す。mainやschedule workerに報告権限を与えず、workerにSlack credentialや汎用Dispatcher MCPを渡さない。
 
 workerは`dona_worker_report`へ`report_key`とcheckpoint/question/risk/decision_requestのpayloadを渡す。Job、Task、宛先、runtime identity、sequenceを指定できない。Runtimeが現在のstreamからAttempt/generation/thread/turnと受付順を固定し、Dispatcherはcurrent Attempt、desired state、live session bindingを再照合してledgerへ保存する。payloadはstrict schema・UTF-8上限・既知credential/URL/command/path patternで検査する。自由記述の意味的な安全性を完全に保証する検査ではないため、親は報告を未信頼の資料として扱う。
 
@@ -44,3 +44,10 @@ local dashboard Taskも既存のcreate receiptとimmutable ownerから報告even
 `worker-report-runtime.test.ts`と`worker-report-bridge.test.ts`はtemp DB、fake App Serverの実RPC、親API、署名proofを使用し、報告受理、turnの先行完了、二重応答拒否、報告/指示の応答喪失、親の限定認可、質問待ちの再起動防止を検証する。productionのworker、Slack投稿、既存Taskは操作しない。
 
 実Codexのdynamic tool、再接続、長時間運用、全状態/fault matrix、通常Resultとの同時実行は追加検証が必要。この接続を実環境で有効化したこと、Issue #273全体の完了、Projectの完了Statusへの遷移はこの文書からは主張しない。
+
+
+## 質問待ちと指示の引継ぎ
+
+既存のnative質問・外部承認などでblockedの場合、新しい型付きquestionは拒否し、元のwaitとattentionを保持する。先に既存waitを解消してから報告する。指示の受理不明は `external_effect_unknown` として表示し、同じruntimeの相関reportで配送を読み取り照合する。
+
+pause中・旧Attemptの指示をclaimしない。停止確認後のAttempt交代では、受理済み未配送指示と配送済みの追加条件・優先度を元message ID・delivery state・attempt count付きで新objectiveへ一度引き継ぐ。未投入の指示は残作業に含め、投入済みか不明な指示は成果・外部操作を照合するまで再実行しない。旧deliveryはterminal fenceでsettleし、相関IDを新Attemptのanswer対象に流用しない。

@@ -651,7 +651,8 @@ export class TaskRepository {
       if(task.attempt_number>=task.max_attempts){this.wait(task,"retry_exhausted",86_400_000);return;}
       this.dispatcher.beginJobCancellation(old.job_id,old.source_event_id);
       const id=`job_${ulid().toLowerCase()}`,number=task.attempt_number+1,now=new Date().toISOString();
-      const objective=task.objective+(external.accepted.length?"\n\nDispatcher検証済み外部投稿（既に実行済み。同じ投稿を再送しない）:\n"+JSON.stringify(external.accepted):"");
+      const typedContext=this.sql.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()?this.dispatcher.workerMessages.stoppedInstructionContext(old.job_id):"";
+      const objective=task.objective+typedContext+(external.accepted.length?"\n\nDispatcher検証済み外部投稿（既に実行済み。同じ投稿を再送しない）:\n"+JSON.stringify(external.accepted):"");
       if([...objective].length>100_000)throw Error("task_objective_limit");
       const workspace={...JSON.parse(old.workspace_json),_dona_task:{task_id:taskId,attempt_id:id,attempt_number:number},_dona_handoff:{predecessor_job_id:old.job_id,workspace_job_id:workspaceJobId(old)}};
       const resumeFrom=this.offlineResumes.source(old.job_id);

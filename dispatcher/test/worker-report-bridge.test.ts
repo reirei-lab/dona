@@ -281,3 +281,17 @@ test("不明な指示は再送せず、現行runtimeの相関reportで配送を�
   assert.equal(db.tasks.get(task.task_id)?.state,"active");assert.equal(db.tasks.get(task.task_id)?.wait_reason,null);assert.equal(db.getJob(job.job_id)?.status,"running");
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+
+for(const code of ["runtime_question_pending","runtime_external_approval_pending"])test(`型付きquestionは既存waitを置き換えない（${code}）`,async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);
+ try{
+  const source=db.enqueue(eventEnvelope("existing-wait")).row;
+  const task=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"wait",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,job=db.getJob(task.current_attempt_id)!;
+  db.beginJobPreparation(job.job_id);db.setJobRuntime(job.job_id,"workspace","pane","runtime");db.beginJobDispatch(job.job_id);db.markJobRunning(job.job_id);db.markJobBlocked(job.job_id,"既存の待機",["running"],code);
+  assert.throws(()=>db.acceptTaskWorkerReport(job.job_id,"runtime",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"question",occurred_at:new Date().toISOString(),payload:{kind:"question",question:"続行できますか？"}}),/existing worker wait/);
+  assert.equal(db.getJob(job.job_id)?.last_error_code,code);assert.equal(db.workerMessages.hasUnansweredQuestion(job.job_id),false);
+  assert.throws(()=>db.acceptTaskWorkerReport(job.job_id,"runtime",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"secret",occurred_at:new Date().toISOString(),payload:{kind:"checkpoint",summary:"sk-proj-canary0123456789abcdef"}}),/credential-shaped/);
+  assert.equal(db.workerMessages.reports(job.job_id,source.event_id).length,0);
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});

@@ -1054,7 +1054,13 @@ function pendingHandoffSql(source: string): string {
 export class DispatcherDatabase {
   private workerMessageStore:WorkerMessageRepository|undefined;
   get workerMessages():WorkerMessageRepository {
-    if(!this.workerMessageStore){migrateWorkerMessaging(this.db);this.workerMessageStore=new WorkerMessageRepository(this.db,this.jobAdmissionLimits.jobObjectiveTotalMaxBytes);}
+    if(!this.workerMessageStore){
+      migrateWorkerMessaging(this.db);
+      const repository=new WorkerMessageRepository(this.db,this.jobAdmissionLimits.jobObjectiveTotalMaxBytes);
+      // An enclosing acceptance transaction can roll schema creation back on rejection.
+      if(!this.db.inTransaction)this.workerMessageStore=repository;
+      return repository;
+    }
     return this.workerMessageStore;
   }
 

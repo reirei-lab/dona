@@ -124,7 +124,7 @@ export class AppServerManager {
       this.bind(row,rpc);
       try {
         await rpc.initialize();
-        const params={...input.threadConfig,...(object(input.threadConfig.config)["features.default_mode_request_user_input"]!==false?{dynamicTools:[...(input.role==="main"?[externalReplyTool]:[]),...(input.role==="worker"&&input.workerMessaging===true?[workerReportTool,workerReportStatusTool]:[])]}:{}),cwd:input.cwd,...(row.thread_id?{threadId:row.thread_id,excludeTurns:true}:{})};
+        const params={...input.threadConfig,...(object(input.threadConfig.config)["features.default_mode_request_user_input"]!==false?{dynamicTools:[externalReplyTool,...(input.role==="worker"&&input.workerMessaging===true?[workerReportTool,workerReportStatusTool]:[])]}:{}),cwd:input.cwd,...(row.thread_id?{threadId:row.thread_id,excludeTurns:true}:{})};
         this.store.db.prepare("UPDATE startup_phases SET phase='sending' WHERE agent=? AND generation=?").run(row.name,row.generation);
         const result=object(await rpc.request(row.thread_id?"thread/resume":"thread/start",params,90_000));
         const thread=object(result.thread);if(typeof thread.id!=="string"||(row.thread_id&&thread.id!==row.thread_id))throw Error("runtime_thread_identity_missing");

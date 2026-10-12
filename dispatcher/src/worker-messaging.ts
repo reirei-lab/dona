@@ -1,3 +1,4 @@
+import {credentialShaped} from "./credential-shaped.js";
 import {workerMessageTerminalTrigger} from "./worker-message-schema.js";
 import { createHash, randomBytes } from "node:crypto";
 
@@ -395,6 +396,7 @@ export class WorkerMessageRepository {
     const producer = direction === "worker_to_dona" ? "worker" : "dona-main";
     const kind = direction === "worker_to_dona" ? reportKind(input as WorkerReportInput) : instructionKind(input as DonaInstructionInput);
     const payloadJson = stableStringify(input.payload);
+    if(direction==="worker_to_dona"&&credentialShaped.test(payloadJson))throw new WorkerMessageError("worker_report_payload_denied","report contains credential-shaped data");
     const payloadSha = sha256(payloadJson);
     const acceptedAt = at.toISOString();
     const keyExisting = this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND producer=? AND idempotency_key=?")
@@ -422,6 +424,7 @@ export class WorkerMessageRepository {
       if(reportCount.count>=workerReportMaxPerJob)
         throw new WorkerMessageError("worker_message_report_limit_exceeded",`worker report limit of ${workerReportMaxPerJob} has been reached`);
       if(["question","decision_request"].includes(kind)) {
+        if(job.status==="blocked"&&job.last_error_code!=="worker_message_question_pending")throw new WorkerMessageError("worker_message_existing_block","existing worker wait must be resolved before a typed question");
         const pending=this.db.prepare(`SELECT 1 FROM worker_messages question
           JOIN worker_message_deliveries question_delivery ON question_delivery.message_id=question.message_id
           WHERE question.job_id=? AND question.direction='worker_to_dona' AND question.kind IN ('question','decision_request')
@@ -594,6 +597,16 @@ export class WorkerMessageRepository {
       next_conversation_revision:row.next_conversation_revision} : undefined;
   }
 
+  stoppedInstructionContext(jobId:string):string {
+    const rows=this.db.prepare(`SELECT m.message_id,m.kind,m.payload_json,m.correlation_message_id,m.conversation_revision,d.state,d.attempt_count
+      FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
+      WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.consumer='worker' AND (d.state IN ('pending','leased') OR (d.state='delivered' AND m.kind IN ('add_condition','change_priority'))) ORDER BY m.producer_sequence LIMIT 257`).all(jobId) as Array<Record<string,unknown>>;
+    if(rows.length>256)throw Error("worker_instruction_handoff_limit");
+    if(!rows.length)return "";
+    return "\n\n前Attemptで受理済みの追加指示（同じ依頼・権限の範囲を維持）:\n"+stableStringify(rows.map(({payload_json,...row})=>({...row,payload:JSON.parse(payload_json as string)})))+
+      "\ndeliveredは配送済みの条件として維持し、同じ外部操作を再送しない。未配送でattempt_count=0は未投入として残作業へ引き継ぐ。未配送でattempt_count>0は受理不明なので、既存成果・操作を照合するまで同じ指示や外部操作を再実行しない。相関IDは前Attemptの証拠であり新Attemptのanswer対象として流用しない。";
+  }
+
   supersedeUndeliveredInstructions(jobId:string,at=new Date().toISOString()):number {
     return this.db.prepare(`UPDATE worker_message_deliveries SET state='superseded',lease_owner=NULL,lease_token_sha256=NULL,
       lease_expires_at=NULL,updated_at=? WHERE consumer='worker' AND state IN ('pending','leased')
@@ -623,6 +636,7 @@ export class WorkerMessageRepository {
     this.assertAuthorized(job,sourceEventId);
     return this.db.transaction(() => {
       const now = at.toISOString();
+      if(consumer==="worker"&&this.db.prepare("SELECT 1 FROM task_attempts a JOIN tasks t USING(task_id) WHERE a.attempt_id=? AND (t.current_attempt_id<>a.attempt_id OR t.desired_state<>'running')").get(jobId))return [];
       this.db.prepare(`UPDATE worker_message_deliveries SET state='pending',lease_owner=NULL,lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=?
         WHERE consumer=? AND state='leased' AND lease_expires_at<=?`).run(now, consumer, now);
       const candidates = this.db.prepare(`SELECT d.delivery_id FROM worker_message_deliveries d JOIN worker_messages m USING(message_id)
@@ -660,6 +674,7 @@ export class WorkerMessageRepository {
       JOIN worker_messages m USING(message_id) JOIN jobs j USING(job_id)
       WHERE d.consumer='worker' AND d.state='pending' AND d.available_at<=?
         AND j.status IN ('running','blocked')
+        AND NOT EXISTS (SELECT 1 FROM task_attempts a JOIN tasks t USING(task_id) WHERE a.attempt_id=j.job_id AND (t.current_attempt_id<>j.job_id OR t.desired_state<>'running'))
         AND NOT EXISTS (
           SELECT 1 FROM worker_messages prior JOIN worker_message_deliveries prior_delivery USING(message_id)
           WHERE prior.job_id=m.job_id AND prior.producer=m.producer AND prior.producer_sequence<m.producer_sequence
