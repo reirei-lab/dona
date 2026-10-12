@@ -259,19 +259,22 @@ export class SlackHealthServer {
     }
     if (method === "GET" && pathname === "/health/ready") {
       const dispatcherReady = await this.dispatcher.healthReady();
-      const ready = !this.adapter.isStopping() && this.adapter.isSocketReady() && dispatcherReady;
+      const runtimeCommandsReady = this.runtimeCommands ? await this.runtimeCommands.ready() : true;
+      const ready = !this.adapter.isStopping() && this.adapter.isSocketReady() && dispatcherReady && runtimeCommandsReady;
       send(response, ready ? 200 : 503, {
         schema_version: 1,
         status: ready ? "ready" : "not_ready",
         socket_mode: this.adapter.connectionStates(),
         dispatcher_ready: dispatcherReady,
+        runtime_commands: { configured: !!this.runtimeCommands, ready: runtimeCommandsReady },
       });
       return;
     }
     if (method === "GET" && pathname === "/health/version") {
       const dispatcherReady = await this.dispatcher.healthReady();
       const workspacesReady = !this.adapter.isStopping() && this.adapter.isSocketReady();
-      const ready = workspacesReady && dispatcherReady;
+      const runtimeCommandsReady = this.runtimeCommands ? await this.runtimeCommands.ready() : true;
+      const ready = workspacesReady && dispatcherReady && runtimeCommandsReady;
       const updateNotificationProtocolReady = this.updateNotifications !== undefined &&
         await this.internalTokenReady();
       send(response, ready ? 200 : 503, {
@@ -286,6 +289,8 @@ export class SlackHealthServer {
         app_schema_write: this.appSchemaWrite,
         config: 1,
         ...(updateNotificationProtocolReady ? { update_notification_protocol: 1 } : {}),
+        ...(this.runtimeCommands && runtimeCommandsReady ? { runtime_command_protocol: "runtime-control.v1" } : {}),
+        runtime_commands: { configured: !!this.runtimeCommands, ready: runtimeCommandsReady },
         workspaces_ready: workspacesReady,
         socket_mode: this.adapter.connectionStates(),
         dispatcher_ready: dispatcherReady,

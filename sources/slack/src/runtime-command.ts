@@ -86,9 +86,21 @@ export function verifyRuntimeCommandRequest(body: Buffer, timestamp: string, sig
     || !trigger || trigger.length > 256 || !/^[A-Za-z0-9_.-]+$/.test(trigger) || text === undefined)
     throw new RuntimeCommandError("invalid_request");
   const w = workspace[0]!;
-  // retry番号・署名timestamp・form順序は同じrequestのidentityを変更しない。
-  const request_id = createHash("sha256").update(JSON.stringify([w.team_id, w.app_id, trigger])).digest("hex");
+  // ADR 0002: 同じ署名済み配送だけを同じidentityへ束縛する。
+  const request_id = createHash("sha256").update("dona.slack-runtime-request.v1\0")
+    .update(JSON.stringify([w.team_id, w.app_id, timestamp])).update("\0").update(body).digest("hex");
   return { version: "runtime-control.v1", request_id, body_sha256: createHash("sha256").update(body).digest("hex"),
     workspace: w.alias, workspace_id: w.team_id, app_id: w.app_id, enterprise_id: w.enterprise_id,
     actor_id: actor, channel_id: channel, command: parseRuntimeCommand(text) };
+}
+
+/** internal typed requestのcodec。inboxのcanonical commitmentと照合する。 */
+export function runtimeCommandDigest(input: RuntimeCommandRequest): string {
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value !== null && typeof value === "object") return Object.fromEntries(Object.keys(value).sort()
+      .map(key => [key, canonical((value as Record<string, unknown>)[key])]));
+    return value;
+  };
+  return createHash("sha256").update(JSON.stringify(canonical(input))).digest("hex");
 }

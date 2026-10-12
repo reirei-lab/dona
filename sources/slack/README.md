@@ -17,7 +17,9 @@ Adapterの`SLACK_RUNTIME_INGRESS_CONFIG`に、同じMac user所有・mode 600・
 
 raw bodyは8 KiB、署名timestampは現在時刻から前後5分、decode後の命令はASCII 256 byteまでです。重複form field、不正percent escape/UTF-8、二重decodeを必要とする命令、余分な引数、未知command、別installationを拒否します。現在のworkspace所属、非bot本人状態、channelの共有・archive・membership・本人DMをSlack APIで確認します。全処理は2.5秒で打ち切り、durable receiptを確認できた場合だけ受付ACKを返します。`response_url`や旧verification tokenは取得先にも永続fieldにも使いません。[Slackの署名検証仕様](https://docs.slack.dev/authentication/verifying-requests-from-slack/)、[3秒ACK仕様](https://docs.slack.dev/interactivity/implementing-slash-commands/)を参照してください。
 
-Dispatcherでは`DONA_SLACK_RUNTIME_INGRESS_ENABLED=true`の場合だけ、internal token付き`POST /v1/internal/slack-runtime-commands`でtyped requestを受け付けます。SQLiteの同じrequest ID/同じ内容は同じreceiptへ収束し、異内容はconflictです。receiptのread-only照合は同じinternal認証で`GET /v1/internal/slack-runtime-commands/<request_id>`を使います。raw bodyや秘密URLを保存せず、inboxは1024件を上限に拒否し、履歴を自動削除しません。受付commitはFULL同期で行い、再起動してもreceiptを維持します。
+Dispatcherでは`DONA_SLACK_RUNTIME_INGRESS_ENABLED=true`の場合だけ、internal token付き`POST /v1/internal/slack-runtime-commands`でtyped requestを受け付けます。request IDは署名済みraw bytes・timestamp・app/teamへ束縛します。SQLiteの同じrequest ID/同じ内容は同じreceiptへ収束し、異内容はconflictです。再配送とPOST応答喪失では、同じinternal認証の`GET /v1/internal/slack-runtime-commands/<request_id>`でcanonical commitmentをread-only照合し、既存receiptがあればPOSTしません。確認不能な同じclientの要求は再POSTせず保留します。raw bodyや秘密URLを保存せず、inboxは1024件を上限に拒否し、履歴を自動削除しません。受付commitはFULL同期で行い、再起動してもreceiptを維持します。
+
+route登録時と継続readinessでは、private signing config、登録済みworkspace、internal token、Dispatcherの`runtime-control.v1`受付protocolを照合します。片側だけのenablement、config削除・破損、token不備では起動または`/health/ready`・`/health/version`を拒否します。これは受付だけのreadinessであり、control planeの実行能力を示しません。
 
 この受付は操作を実行せず、通常event queueやLLMへdispatchしません。ACKは`pending`だけを表します。本人DM rootの予約・外部投稿receipt、stable control planeへの接続、plan/approval/operationの状態遷移と最終通知、実Slackの隔離live検証は残作業です。両flagは開発用であり、これらのgateが揃うまで実workspaceへ公開しません。将来の公開ではTLS proxyをこのexact routeだけへ固定し、health/admin/internal routesを公開しないでください。Slack App設定と本番enablementはこの変更では実施しません。
 

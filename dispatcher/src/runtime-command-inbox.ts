@@ -23,6 +23,7 @@ export const runtimeCommandRequestSchema = z.strictObject({
 });
 export interface RuntimeCommandReceipt {
   request_id: string;
+  canonical_sha256: string;
   state: "pending";
   received_at: string;
 }
@@ -45,20 +46,20 @@ export class RuntimeCommandInbox {
         .get(request.request_id) as { canonical_sha256: string; received_at: string; state: "pending" } | undefined;
       if (prior) {
         if (prior.canonical_sha256 !== hash) throw Error("runtime_command_conflict");
-        return { request_id: request.request_id, state: prior.state, received_at: prior.received_at };
+        return { request_id: request.request_id, canonical_sha256: hash, state: prior.state, received_at: prior.received_at };
       }
       if ((this.db.prepare("SELECT count(*) FROM slack_runtime_command_inbox").pluck().get() as number) >= 1024)
         throw Error("runtime_command_capacity");
       const received_at = now.toISOString();
       this.db.prepare("INSERT INTO slack_runtime_command_inbox VALUES(?,?,?,?, 'pending')")
         .run(request.request_id, hash, canonical, received_at);
-      return { request_id: request.request_id, state: "pending" as const, received_at };
+      return { request_id: request.request_id, canonical_sha256: hash, state: "pending" as const, received_at };
     }).immediate();
   }
   receipt(requestId: string): RuntimeCommandReceipt | null {
     if (!digest.safeParse(requestId).success) return null;
     if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='slack_runtime_command_inbox'").get()) return null;
-    const row = this.db.prepare("SELECT request_id,state,received_at FROM slack_runtime_command_inbox WHERE request_id=?")
+    const row = this.db.prepare("SELECT request_id,canonical_sha256,state,received_at FROM slack_runtime_command_inbox WHERE request_id=?")
       .get(requestId) as RuntimeCommandReceipt | undefined;
     return row ?? null;
   }

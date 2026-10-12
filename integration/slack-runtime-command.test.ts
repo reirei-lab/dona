@@ -4,22 +4,23 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { test } from "node:test";
-import { DispatcherApi } from "../src/api.js";
-import { DispatcherDatabase } from "../src/database.js";
-import { tempConfig } from "./helpers.js";
-import { RuntimeCommandHttpIngress, readRuntimeIngressConfig } from "../../sources/slack/src/runtime-command-ingress.js";
-import { DispatcherClient } from "../../sources/slack/src/dispatcher-client.js";
-import { SlackHealthServer } from "../../sources/slack/src/health-server.js";
-import { verifyRuntimeCommandRequest } from "../../sources/slack/src/runtime-command.js";
+import { DispatcherApi } from "../dispatcher/src/api.js";
+import { DispatcherDatabase } from "../dispatcher/src/database.js";
+import { tempConfig } from "../dispatcher/test/helpers.js";
+import { RuntimeCommandHttpIngress, readRuntimeIngressConfig } from "../sources/slack/src/runtime-command-ingress.js";
+import { DispatcherClient } from "../sources/slack/src/dispatcher-client.js";
+import { SlackHealthServer } from "../sources/slack/src/health-server.js";
+import { verifyRuntimeCommandRequest } from "../sources/slack/src/runtime-command.js";
 
 const workspace = { alias: "test", team_id: "T1", app_id: "A1", enterprise_id: null,
   signing_secret: "fixture-signing-secret-not-live", actor_ids: ["U1"] };
+const deliveryTimestamp = String(Math.floor(Date.now() / 1000));
 function raw(text = "status", trigger = "123.456.fixture") {
   return Buffer.from(new URLSearchParams({ team_id: "T1", api_app_id: "A1", user_id: "U1", channel_id: "C1",
     command: "/dona", text, trigger_id: trigger, response_url: "https://private-canary.invalid/secret", token: "secret-canary" }).toString());
 }
 function headers(body: Buffer) {
-  const timestamp = String(Math.floor(Date.now() / 1000));
+  const timestamp = deliveryTimestamp;
   return { "content-type": "application/x-www-form-urlencoded", "x-slack-request-timestamp": timestamp,
     "x-slack-signature": "v0=" + createHmac("sha256", workspace.signing_secret).update(`v0:${timestamp}:`).update(body).digest("hex") };
 }
@@ -41,22 +42,25 @@ async function setup(t: { after(fn: () => Promise<void>): void }) {
   const makeApi = () => new DispatcherApi(database, { isRunning: () => true, wake() { wakeCount++; } },
     { isRunning: () => true, wake() { wakeCount++; }, async steer() { throw Error("forbidden"); }, async cancel() { throw Error("forbidden"); } }, config, logger);
   let api = makeApi(); await api.start();
+  const signingConfig = path.join(root, "signing.json");
+  await fs.writeFile(signingConfig, JSON.stringify({ version: 1, workspaces: [workspace] }), { mode: 0o600 });
   const client = new DispatcherClient({ socketPath: config.socketPath, internalTokenPath: config.updateInternalTokenPath, timeoutMs: 2000, connectTimeoutMs: 500 });
   let permitted = true, stopping = false, loseResponse = false, persists = 0, delayAuthorization = false, expireDuringAuthorization = false, clockOffset = 0;
-  const ingress = new RuntimeCommandHttpIngress({ configured: async () => ({ version: 1, workspaces: [workspace] }),
+  const ingress = new RuntimeCommandHttpIngress({ configured: () => readRuntimeIngressConfig(signingConfig),
     authorize: async (_request, signal) => {
       if (delayAuthorization) await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(Error("deadline")), { once: true }));
       if (expireDuringAuthorization) clockOffset = 301000;
       return permitted;
     }, stopping: () => stopping,
-    persist: async (input, signal) => { persists++; const receipt = await client.postRuntimeCommand(input, signal); if (loseResponse) throw Error("lost response"); return receipt; } }, () => Date.now() + clockOffset);
+    persist: async (input, signal) => { persists++; const receipt = await client.postRuntimeCommand(input, signal); if (loseResponse) throw Error("lost response"); return receipt; },
+    ready: signal => client.runtimeCommandIngressReady(signal) }, () => Date.now() + clockOffset);
   const socketPath = path.join(root, "ingress.sock");
   const server = new SlackHealthServer(socketPath, { isSocketReady: () => true, isStopping: () => stopping,
     connectionStates: () => ({}), async quiesce() { stopping = true; },
     drainStatus: () => ({ quiescing: stopping, drained: stopping, in_flight: 0, unsafe_states: [] }) }, client, logger);
   server.setRuntimeCommandIngress(ingress); await server.start();
   t.after(async () => { await server.stop(); await api.stop(); database.close(); await fs.rm(root, { recursive: true, force: true }); });
-  return { root, config, socketPath, client, get database() { return database; }, count: () => persists, wakes: () => wakeCount,
+  return { root, config, signingConfig, socketPath, client, get database() { return database; }, count: () => persists, wakes: () => wakeCount,
     deny: () => { permitted = false; }, stop: () => { stopping = true; }, lose: (value: boolean) => { loseResponse = value; },
     delay: () => { delayAuthorization = true; }, expire: () => { expireDuringAuthorization = true; },
     async restart() { await api.stop(); database.close(); database = new DispatcherDatabase(config.databasePath); api = makeApi(); await api.start(); } };
@@ -69,7 +73,8 @@ test("署名HTTP→internal UDS→SQLite durable intake、重複とrestartを通
   assert.equal((await post(f.socketPath, body)).status, 200);
   await f.restart(); assert.deepEqual(f.database.runtimeCommandReceipt(input.request_id), receipt);
   assert.equal((await post(f.socketPath, body)).status, 200);
-  assert.equal((await post(f.socketPath, raw("update plan"))).status, 503);
+  assert.equal((await post(f.socketPath, raw("update plan"))).status, 200);
+  await assert.rejects(f.client.postRuntimeCommand({ ...input, command: { operation: "runtime.update.plan.v1" } }, new AbortController().signal));
   assert.deepEqual(f.database.runtimeCommandReceipt(input.request_id), receipt);
   assert.equal(f.database.list().length, 0); assert.equal(f.wakes(), 0);
   assert.doesNotMatch(await fs.readFile(f.config.databasePath, "utf8"), /secret-canary|private-canary/);
@@ -122,4 +127,52 @@ test("signing configはowner-private通常fileを要求、symlinkと未知field�
   await fs.chmod(file, 0o644); await assert.rejects(readRuntimeIngressConfig(file));
   await fs.chmod(file, 0o600); await fs.writeFile(file, JSON.stringify({ version: 1, workspaces: [workspace], approved: true }));
   await assert.rejects(readRuntimeIngressConfig(file));
+});
+test("UDS応答の切断後はGETで照合し、再配送でもPOSTを繰り返さない", async t => {
+  const f = await setup(t), socket = path.join(f.root, "proxy.sock"); let posts = 0;
+  const proxy = http.createServer((request, response) => {
+    if (request.method === "POST") posts++;
+    const upstream = http.request({ socketPath: f.config.socketPath, path: request.url, method: request.method, headers: request.headers }, result => {
+      if (request.method === "POST") { result.resume(); result.once("end", () => response.destroy()); }
+      else { response.writeHead(result.statusCode!, result.headers); result.pipe(response); }
+    }); upstream.once("error", () => response.destroy()); request.pipe(upstream);
+  });
+  await new Promise<void>(resolve => proxy.listen(socket, resolve));
+  t.after(() => new Promise<void>(resolve => proxy.close(() => resolve())));
+  const client = new DispatcherClient({ socketPath: socket, internalTokenPath: f.config.updateInternalTokenPath, timeoutMs: 1000, connectTimeoutMs: 100 });
+  const body = raw(), signed = headers(body), input = verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]);
+  const first = await client.postRuntimeCommand(input, AbortSignal.timeout(2500));
+  assert.equal(first.state, "pending"); assert.equal(posts, 1);
+  assert.deepEqual(await client.postRuntimeCommand(input, AbortSignal.timeout(2500)), first); assert.equal(posts, 1);
+});
+test("POST受理不明かつGETで未確認なら同じclientの再配送をread-onlyに留める", async t => {
+  const f = await setup(t), socket = path.join(f.root, "unknown.sock"); let posts = 0;
+  const proxy = http.createServer((request, response) => {
+    if (request.method === "POST") { posts++; request.resume(); response.destroy(); return; }
+    const upstream = http.request({ socketPath: f.config.socketPath, path: request.url, method: request.method, headers: request.headers }, result => {
+      response.writeHead(result.statusCode!, result.headers); result.pipe(response);
+    }); upstream.once("error", () => response.destroy()); request.pipe(upstream);
+  });
+  await new Promise<void>(resolve => proxy.listen(socket, resolve));
+  t.after(() => new Promise<void>(resolve => proxy.close(() => resolve())));
+  const client = new DispatcherClient({ socketPath: socket, internalTokenPath: f.config.updateInternalTokenPath, timeoutMs: 1000, connectTimeoutMs: 100 });
+  const body = raw(), signed = headers(body), input = verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]);
+  await assert.rejects(client.postRuntimeCommand(input, AbortSignal.timeout(2500)), /acceptance_unknown/);
+  await assert.rejects(client.postRuntimeCommand(input, AbortSignal.timeout(2500)), /acceptance_unknown/);
+  assert.equal(posts, 1); assert.equal(f.database.runtimeCommandReceipt(input.request_id), null);
+});
+test("readinessは半端なenablement・config破損・token失効をreadyにしない", async t => {
+  const f = await setup(t);
+  const read = (route: string) => new Promise<number>((resolve, reject) => {
+    const request = http.get({ socketPath: f.socketPath, path: route }, response => { response.resume(); response.once("end", () => resolve(response.statusCode!)); });
+    request.once("error", reject);
+  });
+  assert.equal(await f.client.runtimeCommandIngressReady(), true);
+  assert.equal(await read("/health/ready"), 200); assert.equal(await read("/health/version"), 200);
+  f.config.slackRuntimeIngressEnabled = false;
+  assert.equal(await f.client.runtimeCommandIngressReady(), false); assert.equal(await read("/health/ready"), 503);
+  f.config.slackRuntimeIngressEnabled = true;
+  await fs.writeFile(f.signingConfig, "not-json"); assert.equal(await read("/health/version"), 503);
+  await fs.writeFile(f.signingConfig, JSON.stringify({ version: 1, workspaces: [workspace] }));
+  await fs.chmod(f.config.updateInternalTokenPath, 0o644); assert.equal(await read("/health/ready"), 503);
 });

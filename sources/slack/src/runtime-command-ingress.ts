@@ -14,10 +14,14 @@ export async function authorizeRuntimeCommand(registry: Pick<SlackWorkspaceRegis
       connection.client.getUser(request.actor_id, signal), connection.client.getChannel(request.channel_id, signal),
     ]);
     signal.throwIfAborted();
-    return user.stateKnown === true && user.id === request.actor_id && user.teamId === request.workspace_id
+    const principalValid = user.stateKnown === true && user.id === request.actor_id && user.teamId === request.workspace_id
       && !user.isBot && !user.isAppUser && !user.isDeleted && !user.isAgentforceBot && !user.isSuspended
       && channel.id === request.channel_id && !channel.isShared && !channel.isArchived
-      && (channel.isIm ? channel.userId === request.actor_id : channel.visibilityKnown === true && channel.isMember && !channel.isMpim);
+      && (channel.isIm ? channel.userId === request.actor_id : channel.visibilityKnown === true && !channel.isMpim);
+    if (!principalValid) return false;
+    const permitted = channel.isIm || !!connection.client.hasChannelMember
+      && await connection.client.hasChannelMember(request.channel_id, request.actor_id, signal);
+    signal.throwIfAborted(); return permitted;
   } catch { return false; }
 }
 
@@ -43,12 +47,13 @@ export async function readRuntimeIngressConfig(filename: string): Promise<Runtim
   } finally { await file.close(); }
 }
 
-interface Receipt { request_id: string; state: "pending"; received_at: string }
+interface Receipt { request_id: string; canonical_sha256: string; state: "pending"; received_at: string }
 export interface RuntimeIngressPorts {
   configured(): Promise<RuntimeIngressConfig>;
   authorize(request: RuntimeCommandRequest, signal: AbortSignal): Promise<boolean>;
   persist(request: RuntimeCommandRequest, signal: AbortSignal): Promise<Receipt>;
   stopping(): boolean;
+  ready(signal: AbortSignal): Promise<boolean>;
 }
 
 function readRaw(request: IncomingMessage, signal: AbortSignal): Promise<Buffer> {
@@ -77,6 +82,15 @@ function readRaw(request: IncomingMessage, signal: AbortSignal): Promise<Buffer>
 /** 2.5秒でACK/拒否。receiptを失ったwriteを再送せず同じrequestのdurable intakeで照合する。 */
 export class RuntimeCommandHttpIngress {
   constructor(private readonly ports: RuntimeIngressPorts, private readonly now = Date.now) {}
+  async ready(): Promise<boolean> {
+    const signal = AbortSignal.timeout(2500);
+    try {
+      const config = await this.ports.configured(); signal.throwIfAborted();
+      if (this.ports.stopping() || !await this.ports.ready(signal)) return false;
+      const current = await this.ports.configured(); signal.throwIfAborted();
+      return !this.ports.stopping() && JSON.stringify(current) === JSON.stringify(config);
+    } catch { return false; }
+  }
   async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -97,8 +111,10 @@ export class RuntimeCommandHttpIngress {
       if (typeof timestamp !== "string" || typeof signature !== "string") throw new RuntimeCommandError("unauthenticated");
       const config = await this.ports.configured(); controller.signal.throwIfAborted();
       const input = verifyRuntimeCommandRequest(body, timestamp, signature, config.workspaces, this.now());
-      if (!config.workspaces.find(w => w.alias === input.workspace)?.actor_ids.includes(input.actor_id)
-        || !await this.ports.authorize(input, controller.signal)) throw new RuntimeCommandError("unauthenticated");
+      if (!config.workspaces.find(w => w.alias === input.workspace)?.actor_ids.includes(input.actor_id))
+        throw new RuntimeCommandError("unauthenticated");
+      if (!await this.ports.ready(controller.signal)) throw new RuntimeCommandError("unavailable");
+      if (!await this.ports.authorize(input, controller.signal)) throw new RuntimeCommandError("unauthenticated");
       controller.signal.throwIfAborted();
       if (this.ports.stopping() || JSON.stringify(await this.ports.configured()) !== JSON.stringify(config))
         throw new RuntimeCommandError("unavailable");

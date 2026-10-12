@@ -71,12 +71,20 @@ async function main(): Promise<void> {
   const runtimeConfigPath = process.env.SLACK_RUNTIME_INGRESS_CONFIG;
   if (runtimeConfigPath) {
     await readRuntimeIngressConfig(runtimeConfigPath);
-    health.setRuntimeCommandIngress(new RuntimeCommandHttpIngress({
-      configured: () => readRuntimeIngressConfig(runtimeConfigPath),
+    const ingress = new RuntimeCommandHttpIngress({
+      configured: async () => {
+        const current = await readRuntimeIngressConfig(runtimeConfigPath);
+        for (const workspace of current.workspaces) if (registry.get(workspace.alias).teamId !== workspace.team_id)
+          throw Error("runtime_command_workspace_unverified");
+        return current;
+      },
       stopping: () => adapter.isStopping(),
       authorize: (request, signal) => authorizeRuntimeCommand(registry, request, signal),
       persist: (request, signal) => dispatcher.postRuntimeCommand(request, signal),
-    }));
+      ready: signal => dispatcher.runtimeCommandIngressReady(signal),
+    });
+    if (!await ingress.ready()) throw Error("runtime_command_ingress_not_ready");
+    health.setRuntimeCommandIngress(ingress);
   }
   await health.start();
   try {
