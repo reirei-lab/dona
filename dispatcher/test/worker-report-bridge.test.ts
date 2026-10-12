@@ -221,7 +221,10 @@ for(const local of [false,true])test(`report/silenceの親contextをownerと現�
   const silence=(sql.prepare("SELECT event_id FROM events WHERE source='dona_message' AND event_type='worker_message_silence' AND json_extract(payload_json,'$.job_id')=?").get(job) as {event_id:string}).event_id;
   assert.equal(envelopeFromRow(db.get(silence)!).type,"worker_message_silence");
   const issued=await contexts.issue(db.beginDispatch(silence,path.join(root,"silence-result.json")));assert.equal(issued.purpose,local?"worker_report_local":"worker_report");
-  assert.equal((await client.getTaskReports(task.task_id,silence)).attempt_id,job);
+  assert.equal((envelopeFromRow(db.get(silence)!).payload as {task_id:string}).task_id,task.task_id);
+  db.markWaiting(silence);
+  const silenceRead=await client.getTaskReports(task.task_id,silence) as {attempt_id:string;worker_message_silence:{current:boolean}};
+  assert.equal(silenceRead.attempt_id,job);assert.equal(silenceRead.worker_message_silence.current,true);
   await assert.rejects(client.instructTask(task.task_id,task.revision,{schema_version:1,source_event_id:silence,producer_sequence:2,idempotency_key:"unbound",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"scopeを変更"}}));
   // 新しいreportが来たら古いsilenceのcontextを再利用できない。
   db.acceptTaskWorkerReport(job,"identity",{schema_version:1,source_event_id:source,producer_sequence:2,idempotency_key:"newer",occurred_at:new Date().toISOString(),payload:{kind:"risk",summary:"確認が必要です",severity:"high"}});
@@ -449,5 +452,31 @@ for(const state of ["paused","completed"] as const)test(`停止済み同identity
   const oldAccept=db.acceptTaskWorkerReport;db.acceptTaskWorkerReport=()=>{throw Error("historical報告を新規受理してはいけない");};
   const bridge=new AppServerWorkerReportBridge(db,new Port());generation="other-generation";assert.equal(await bridge.runOnce(),0);assert.equal(reconciled,false);
   generation="generation";assert.equal(await bridge.runOnce(),1);assert.equal(reconciled,true);db.acceptTaskWorkerReport=oldAccept;
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+
+test("実行中の累積指示・未知受理解消・確定未送信leaseの境界を保つ",async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);
+ try{
+  const source=db.enqueue(eventEnvelope("instruction-boundaries")).row,task=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"boundaries",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,job=db.getJob(task.current_attempt_id)!;
+  db.beginJobPreparation(job.job_id);db.setJobRuntime(job.job_id,"w","p","runtime");db.beginJobDispatch(job.job_id);db.markJobRunning(job.job_id);
+  db.workerMessages.appendWorkerReport(job.job_id,"runtime",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"question",occurred_at:new Date().toISOString(),payload:{kind:"question",question:"継続できますか？"}});
+  const instruction=db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"condition",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"確認結果も残してください"}});
+  db.markWorkerInstructionUnknown(job.job_id,instruction.message.message_id);
+  await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();
+  assert.equal(db.getJob(job.job_id)?.last_error_code,"worker_message_question_pending");assert.equal(db.tasks.get(task.task_id)?.wait_reason,"human_input");
+  db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:2,idempotency_key:"second",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"根拠を残してください"}});
+  await assert.rejects(new WorkerInstructionBridge(db.workerMessages,{async steer(){throw new RuntimeResponseError("runtime_not_ready",409);}}).runOnce(),/runtime_not_ready/);
+  const receipt=db.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","second");assert.equal((receipt.delivery as {state:string}).state,"pending");
+  assert.equal(await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce(),true);
+  assert.equal(db.tasks.get(task.task_id)?.wait_reason,"human_input");
+  let sequence=3;
+  for(;sequence<40;sequence++){
+   try{db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:sequence,idempotency_key:"limit."+sequence,occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"a".repeat(4000)}});
+    await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();
+   }catch(error){assert.match(String(error),/handoff character limit/);break;}
+  }
+  assert.ok(sequence<40);assert.ok([...db.workerMessages.stoppedInstructionContext(job.job_id)].length<100000);
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });

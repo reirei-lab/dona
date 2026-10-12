@@ -653,6 +653,12 @@ export class WorkerMessageRepository {
       const messageId = `msg_${ulid(at.getTime()).toLowerCase()}`;
       const receiptId = `rcpt_${ulid(at.getTime()).toLowerCase()}`;
       const deliveryId = `dlv_${ulid(at.getTime()).toLowerCase()}`;
+      if(direction==="dona_to_worker"&&!["queued","retryable_failed"].includes(job.status)) {
+        const addition=stableStringify({message_id:messageId,kind,payload:input.payload,
+          correlation_message_id:input.correlation_message_id??null,conversation_revision:input.conversation_revision??null,state:"pending",attempt_count:0});
+        if([...job.objective,...this.stoppedInstructionContext(jobId),...addition].length>90_000)
+          throw new WorkerMessageError("worker_message_instruction_unavailable","instruction handoff character limit exceeded");
+      }
       if(direction==="dona_to_worker"&&["queued","retryable_failed"].includes(job.status)){
         const typed=typedInstructionText(messageId,kind,input.payload,input.correlation_message_id??null,input.conversation_revision??null);
         const addition=`\n\n[DONA_FOLLOW_UP]\n${typed}\n[/DONA_FOLLOW_UP]`;
@@ -877,6 +883,14 @@ export class WorkerMessageRepository {
     return candidate ? this.claim(candidate.job_id,candidate.source_event_id,"worker",leaseOwner,1,leaseMs,at)[0] : undefined;
   }
 
+  releaseUnsent(deliveryId:string,leaseOwner:string,leaseToken:string,fence:number,at=new Date()):void {
+    const changed=this.db.prepare(`UPDATE worker_message_deliveries SET state='pending',lease_owner=NULL,
+      lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=? WHERE delivery_id=? AND state='leased'
+      AND lease_owner=? AND lease_token_sha256=? AND fence=? AND lease_expires_at>?`)
+      .run(at.toISOString(),deliveryId,leaseOwner,sha256(leaseToken),fence,at.toISOString()).changes;
+    if(!changed)throw new WorkerMessageError("delivery_fence_mismatch","unsent release requires current lease proof");
+  }
+
   acknowledge(jobId: string, sourceEventId: string, deliveryId: string, leaseOwner: string, leaseToken: string, fence: number, at = new Date()) {
     return this.db.transaction(() => {
       const now = at.toISOString();
@@ -911,6 +925,15 @@ export class WorkerMessageRepository {
       if(row.consumer==="worker") {
         this.db.prepare(`UPDATE jobs SET status='running',last_error_code=NULL,last_error_message=NULL,updated_at=? WHERE job_id=? AND status='blocked' AND ((last_error_code='worker_message_question_pending' AND ?='answer') OR (last_error_code='worker_instruction_acceptance_unknown' AND last_error_message=?))
           AND EXISTS(SELECT 1 FROM tasks WHERE current_attempt_id=jobs.job_id AND desired_state='running')`).run(now,jobId,message.kind,message.message_id);
+        const unanswered=this.db.prepare(`SELECT 1 FROM worker_messages q JOIN worker_message_deliveries d USING(message_id)
+          WHERE q.job_id=? AND q.direction='worker_to_dona' AND q.kind IN ('question','decision_request')
+            AND d.consumer='dona-main' AND d.state!='superseded'
+            AND NOT EXISTS (SELECT 1 FROM worker_messages a JOIN worker_message_deliveries ad USING(message_id)
+              WHERE a.correlation_message_id=q.message_id AND a.kind='answer' AND ad.consumer='worker' AND ad.state='delivered') LIMIT 1`).get(jobId);
+        if(unanswered){
+          this.db.prepare("UPDATE jobs SET status='blocked',last_error_code='worker_message_question_pending',last_error_message=NULL,updated_at=? WHERE job_id=? AND status='running'").run(now,jobId);
+          this.db.prepare("UPDATE tasks SET state='waiting',wait_reason='human_input',next_check_at=NULL,revision=revision+1,updated_at=? WHERE current_attempt_id=? AND desired_state='running' AND state='waiting'").run(now,jobId);
+        }
         this.db.prepare(`UPDATE tasks SET state='active',wait_reason=NULL,next_check_at=NULL,revision=revision+1,
           project_state=CASE WHEN project_state IN ('attempting','unknown') THEN project_state ELSE 'pending' END,updated_at=?
           WHERE current_attempt_id=? AND desired_state='running' AND state='waiting' AND wait_reason IN ('human_input','external_effect_unknown','worker_instruction_delivery_pending')
@@ -1037,14 +1060,16 @@ export class WorkerMessageRepository {
           AND NOT (j.status='blocked' AND j.last_error_code='worker_message_question_pending')
         ORDER BY c.silence_due_at,c.job_id LIMIT ?`).all(now,limit) as Array<{job_id:string;generation:number;silence_interval_ms:number;source_event_id:string;workspace_id:string|null;channel_id:string|null;thread_ts:string|null}>;
       for(const row of rows){
+        const task=this.db.prepare("SELECT task_id FROM tasks WHERE current_attempt_id=?").get(row.job_id) as {task_id:string}|undefined;
+        const silencePayload={schema_version:1,job_id:row.job_id,source_event_id:row.source_event_id,generation:row.generation,...(task?{task_id:task.task_id}:{})};
         const externalId=`worker-message-silence:${row.job_id}:${row.generation}`;
         const eventId=`evt_${ulid(at.getTime())}`;
         const replyTarget=row.workspace_id&&row.channel_id&&row.thread_ts?stableStringify({kind:"slack_thread",workspace_id:row.workspace_id,channel_id:row.channel_id,thread_ts:row.thread_ts}):null;
         this.db.prepare(`INSERT OR IGNORE INTO events(event_id,schema_version,source,external_event_id,event_type,occurred_at,subject_json,payload_json,reply_target_json,trace_json,status,available_at,created_at,updated_at)
           VALUES(?,1,'dona_message',?,'worker_message_silence',?,?,?,?,?,'queued',?,?,?)`).run(eventId,externalId,now,
-          stableStringify({job_id:row.job_id,source_event_id:row.source_event_id,actor_id:(this.db.prepare("SELECT actor_id FROM jobs WHERE job_id=?").get(row.job_id) as {actor_id:string}).actor_id}),stableStringify({schema_version:1,job_id:row.job_id,source_event_id:row.source_event_id,generation:row.generation}),replyTarget,
+          stableStringify({job_id:row.job_id,source_event_id:row.source_event_id,actor_id:(this.db.prepare("SELECT actor_id FROM jobs WHERE job_id=?").get(row.job_id) as {actor_id:string}).actor_id}),stableStringify(silencePayload),replyTarget,
           stableStringify({job_id:row.job_id,generation:row.generation}),now,now,now);
-        const expectedPayload=stableStringify({schema_version:1,job_id:row.job_id,source_event_id:row.source_event_id,generation:row.generation});
+        const expectedPayload=stableStringify(silencePayload);
         const event=this.db.prepare("SELECT event_id,event_type,payload_json FROM events WHERE source='dona_message' AND external_event_id=?")
           .get(externalId) as {event_id:string;event_type:string;payload_json:string};
         if(event.event_type!=="worker_message_silence"||event.payload_json!==expectedPayload)
@@ -1224,8 +1249,14 @@ export class WorkerInstructionBridge {
     const claimed=this.repository.claimNextWorkerInstruction(this.leaseOwner,workerMessageLeaseMaxMs,at);
     if(!claimed)return false;
     const {delivery,lease_token}=claimed;
-    await this.controller.steer(delivery.job_id,delivery.source_event_id,
-      typedInstructionText(delivery.message_id,delivery.kind,delivery.payload,delivery.correlation_message_id,delivery.conversation_revision),delivery.message_id);
+    try {await this.controller.steer(delivery.job_id,delivery.source_event_id,
+      typedInstructionText(delivery.message_id,delivery.kind,delivery.payload,delivery.correlation_message_id,delivery.conversation_revision),delivery.message_id);}
+    catch(error){
+      const detail=error as {code?:string;acceptance?:string};
+      if(detail.code==="runtime_not_ready"||detail.acceptance==="not_sent"||detail.acceptance==="rejected")
+        this.repository.releaseUnsent(delivery.delivery_id,this.leaseOwner,lease_token,delivery.fence);
+      throw error;
+    }
     this.repository.acknowledge(delivery.job_id,delivery.source_event_id,delivery.delivery_id,this.leaseOwner,
       lease_token,delivery.fence,new Date());
     this.onDelivered();

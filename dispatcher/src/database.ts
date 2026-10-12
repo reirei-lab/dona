@@ -1109,7 +1109,7 @@ export class DispatcherDatabase {
       event_report:readable?this.workerMessages.eventReport(task.current_attempt_id,eventId):undefined,
       pending_question:readable?this.workerMessages.pendingQuestion(task.current_attempt_id):undefined,
       reports:readable?this.workerMessages.reports(task.current_attempt_id,eventId):[],
-      ...this.workerMessages.instructionReceipts(task.current_attempt_id,eventId),limit:20};
+      ...this.workerMessages.silenceEventState(task.current_attempt_id,eventId),...this.workerMessages.instructionReceipts(task.current_attempt_id,eventId),limit:20};
   }
   applyTaskProgressDecision(id:string,eventId:string,decisionId:string){
     const task=this.tasks.assertOwner(id,eventId,true);
