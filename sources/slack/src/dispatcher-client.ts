@@ -26,23 +26,40 @@ export class DispatcherClient {
     const parent = await fs.open(path.dirname(directory), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
     try {
       const info = await parent.stat();
-      if (info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0) throw Error("runtime_command_unavailable");
+      if (info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0 || (info.mode & 0o700) !== 0o700) throw Error("runtime_command_unavailable");
       await fs.mkdir(directory, { mode: 0o700 }).catch(error => { if (error.code !== "EEXIST") throw error; });
       await parent.sync();
     } finally { await parent.close(); }
     const dir = await fs.open(directory, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
     try {
       const info = await dir.stat();
-      if (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw Error("runtime_command_unavailable");
-      if ((await fs.readdir(directory)).length >= 1024) throw Error("runtime_command_acceptance_unknown");
-      signal.throwIfAborted();
-      // POST前のintentを永続化する。再起動後もreceipt GETだけで照合し、再POSTしない。
-      const file = await fs.open(path.join(directory, requestId), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
-        .catch(error => { if (error.code === "EEXIST") throw Error("runtime_command_acceptance_unknown"); throw error; });
-      try { await file.writeFile(JSON.stringify({ request_id: requestId, canonical_sha256: digest })); await file.sync(); }
-      finally { await file.close(); }
-      await dir.sync();
-      signal.throwIfAborted();
+      if (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0 || (info.mode & 0o700) !== 0o700) throw Error("runtime_command_unavailable");
+      const lockPath = path.join(directory, "reservation.lock");
+      const lock = await fs.open(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+        .catch(() => { throw Error("runtime_command_unavailable"); });
+      let lockIdentity: Awaited<ReturnType<typeof lock.stat>> | undefined;
+      try {
+        lockIdentity = await lock.stat();
+        // process間でも容量判定と予約を排他する。crashで残ったlockは自動回収しない。
+        await dir.sync();
+        const entries = (await fs.readdir(directory)).filter(name => name !== "reservation.lock");
+        if (entries.some(name => !/^[a-f0-9]{64}$/.test(name))) throw Error("runtime_command_unavailable");
+        if (entries.length >= 1024) throw Error("runtime_command_acceptance_unknown");
+        signal.throwIfAborted();
+        const file = await fs.open(path.join(directory, requestId), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+          .catch(error => { if (error.code === "EEXIST") throw Error("runtime_command_acceptance_unknown"); throw error; });
+        try { await file.writeFile(JSON.stringify({ request_id: requestId, canonical_sha256: digest })); await file.sync(); }
+        finally { await file.close(); }
+        await dir.sync();
+        signal.throwIfAborted();
+      } finally {
+        try {
+          const current = await fs.lstat(lockPath);
+          if (!lockIdentity || !current.isFile() || current.dev !== lockIdentity.dev || current.ino !== lockIdentity.ino || current.nlink !== 1)
+            throw Error("runtime_command_unavailable");
+          await fs.unlink(lockPath); await dir.sync();
+        } finally { await lock.close(); }
+      }
     } finally { await dir.close(); }
   }
 
@@ -67,15 +84,16 @@ export class DispatcherClient {
     const parent = await fs.open(path.dirname(directory), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
     try {
       const info = await parent.stat();
-      if (info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0) return false;
+      if (info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0 || (info.mode & 0o700) !== 0o700) return false;
     } finally { await parent.close(); }
     let dir;
     try { dir = await fs.open(directory, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return true; throw error; }
     try {
       const info = await dir.stat();
-      if (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) return false;
-      const available = (await fs.readdir(directory)).length < 1024;
+      if (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0 || (info.mode & 0o700) !== 0o700) return false;
+      const entries = await fs.readdir(directory);
+      const available = entries.length < 1024 && entries.every(name => /^[a-f0-9]{64}$/.test(name));
       signal.throwIfAborted(); return available;
     } finally { await dir.close(); }
   }

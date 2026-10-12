@@ -49,12 +49,12 @@ export async function readRuntimeIngressConfig(filename: string): Promise<Runtim
 }
 
 export async function verifyRuntimeIngressWorkspaces(registry: Pick<SlackWorkspaceRegistry, "get">,
-  config: RuntimeIngressConfig, signal: AbortSignal): Promise<Map<string, { teamId: string; appId: string }>> {
-  const identities = new Map<string, { teamId: string; appId: string }>();
+  config: RuntimeIngressConfig, signal: AbortSignal): Promise<Map<string, { teamId: string; appId: string; enterpriseId: string | null }>> {
+  const identities = new Map<string, { teamId: string; appId: string; enterpriseId: string | null }>();
   await Promise.all(config.workspaces.map(async workspace => {
     const connection = registry.get(workspace.alias);
     const identity = await connection.client.runtimeCommandIdentity?.(signal);
-    if (connection.teamId !== workspace.team_id || identity?.teamId !== workspace.team_id || identity.appId !== workspace.app_id)
+    if (connection.teamId !== workspace.team_id || identity?.teamId !== workspace.team_id || identity.appId !== workspace.app_id || identity.enterpriseId !== workspace.enterprise_id)
       throw Error("runtime_command_workspace_unverified");
     identities.set(workspace.alias, identity);
   }));

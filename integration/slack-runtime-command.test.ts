@@ -237,3 +237,28 @@ test("outbound intentだけの容量不足も受付healthをnot-readyにする",
   assert.equal(await request("/health/ready"), 503); assert.equal(await request("/health/version"), 503);
   assert.equal((await post(f.socketPath, body)).status, 200);
 });
+test("outbound directoryのowner書込不可と残存lockをnot-readyにする", async t => {
+  const f = await setup(t); assert.equal((await post(f.socketPath, raw())).status, 200);
+  const directory = path.join(path.dirname(f.config.updateInternalTokenPath), "runtime-command-outbound");
+  await fs.chmod(directory, 0o500); assert.equal(await f.client.runtimeCommandIngressReady(), false);
+  await fs.chmod(directory, 0o700); assert.equal(await f.client.runtimeCommandIngressReady(), true);
+  await fs.writeFile(path.join(directory, "reservation.lock"), "", { mode: 0o600 });
+  assert.equal(await f.client.runtimeCommandIngressReady(), false);
+  assert.equal((await post(f.socketPath, raw("status", "fresh.fixture"))).status, 503);
+});
+test("同時要求でもoutbound intentの1024件上限を超えない", async t => {
+  const f = await setup(t); assert.equal((await post(f.socketPath, raw())).status, 200);
+  const directory = path.join(path.dirname(f.config.updateInternalTokenPath), "runtime-command-outbound");
+  for (let i = 0; i < 1022; i++) await fs.writeFile(path.join(directory, String(i).padStart(64, "0")), "fixture", { mode: 0o600 });
+  const inputs = Array.from({ length: 12 }, (_, index) => {
+    const body = raw("status", `concurrent.${index}`), signed = headers(body);
+    return { ...verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]), channel_type: "public_channel" as const };
+  });
+  const outcomes = await Promise.allSettled(inputs.map(input => {
+    const client = new DispatcherClient({ socketPath: f.config.socketPath, internalTokenPath: f.config.updateInternalTokenPath, timeoutMs: 1000, connectTimeoutMs: 100 });
+    return client.postRuntimeCommand(input, AbortSignal.timeout(2500));
+  }));
+  assert.equal(outcomes.filter(result => result.status === "fulfilled").length, 1);
+  const entries = await fs.readdir(directory); assert.equal(entries.length, 1024); assert.equal(entries.includes("reservation.lock"), false);
+  assert.equal(await f.client.runtimeCommandIngressReady(), false);
+});

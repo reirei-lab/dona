@@ -85,18 +85,18 @@ test("runtime Bot identityはauth.testのBotとbots.infoのappを照合する", 
     ? { ok: true, team_id: "T1", bot_id: "B1" }
     : { ok: true, bot: { id: actualBot, app_id: "A1", deleted: false } }), { headers: { "content-type": "application/json" } }); });
   const client = new SlackWebApiClient("fixture-token", { debug() {}, info() {}, warn() {}, error() {} });
-  assert.deepEqual(await client.runtimeCommandIdentity(AbortSignal.timeout(2500)), { teamId: "T1", appId: "A1" });
+  assert.deepEqual(await client.runtimeCommandIdentity(AbortSignal.timeout(2500)), { teamId: "T1", appId: "A1", enterpriseId: null });
   actualBot = "B2";
   await assert.rejects(client.runtimeCommandIdentity(AbortSignal.timeout(2500)), /bot_unverified/);
 });
 
 test("同じteamの別App Botをruntime signing configへ結び付けない", async () => {
   let appId = "A2";
-  const registry = { get: () => ({ teamId: "T1", client: { runtimeCommandIdentity: async () => ({ teamId: "T1", appId }) } }) } as unknown as Pick<SlackWorkspaceRegistry, "get">;
+  const registry = { get: () => ({ teamId: "T1", client: { runtimeCommandIdentity: async () => ({ teamId: "T1", appId, enterpriseId: null }) } }) } as unknown as Pick<SlackWorkspaceRegistry, "get">;
   const config = { version: 1 as const, workspaces: [{ ...workspace, actor_ids: ["U1"] }] };
   await assert.rejects(verifyRuntimeIngressWorkspaces(registry, config, AbortSignal.timeout(2500)), /workspace_unverified/);
   appId = "A1";
-  assert.deepEqual((await verifyRuntimeIngressWorkspaces(registry, config, AbortSignal.timeout(2500))).get("test"), { teamId: "T1", appId: "A1" });
+  assert.deepEqual((await verifyRuntimeIngressWorkspaces(registry, config, AbortSignal.timeout(2500))).get("test"), { teamId: "T1", appId: "A1", enterpriseId: null });
 });
 test("private channelのBot未参加によるAPIエラーをfail-closedにする", async () => {
   const body = raw(), input = verifyRuntimeCommandRequest(body, timestamp, signature(body), [workspace], now);
@@ -123,4 +123,16 @@ test("runtime継続readinessは起動後のBot token失効を検知する", asyn
     authorize: async () => null, persist: async () => { throw Error("must_not_write"); } });
   assert.equal(await ingress.ready(), true);
   revoked = true; assert.equal(await ingress.ready(), false);
+});
+
+test("Enterprise IDの設定誤りを起動と継続readinessで拒否する", async t => {
+  t.mock.method(globalThis, "fetch", async (url: string | URL | Request) => new Response(JSON.stringify(String(url).endsWith("auth.test")
+    ? { ok: true, team_id: "T1", bot_id: "B1", enterprise_id: "E1" }
+    : { ok: true, bot: { id: "B1", app_id: "A1", deleted: false } }), { headers: { "content-type": "application/json" } }));
+  const client = new SlackWebApiClient("fixture-token", { debug() {}, info() {}, warn() {}, error() {} });
+  const registry = { get: () => ({ teamId: "T1", client }) } as unknown as Pick<SlackWorkspaceRegistry, "get">;
+  const config = { version: 1 as const, workspaces: [{ ...workspace, enterprise_id: "E2", actor_ids: ["U1"] }] };
+  await assert.rejects(verifyRuntimeIngressWorkspaces(registry, config, AbortSignal.timeout(2500)), /workspace_unverified/);
+  config.workspaces[0]!.enterprise_id = "E1";
+  assert.equal((await verifyRuntimeIngressWorkspaces(registry, config, AbortSignal.timeout(2500))).get("test")?.enterpriseId, "E1");
 });

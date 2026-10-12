@@ -79,7 +79,7 @@ async function main(): Promise<void> {
         // このregistryのBot tokenは起動後immutable。設定のapp/team変更は毎回拒否する。
         for (const workspace of current.workspaces) {
           const identity = identities.get(workspace.alias);
-          if (identity?.teamId !== workspace.team_id || identity.appId !== workspace.app_id)
+          if (identity?.teamId !== workspace.team_id || identity.appId !== workspace.app_id || identity.enterpriseId !== workspace.enterprise_id)
             throw Error("runtime_command_workspace_unverified");
         }
         return current;
