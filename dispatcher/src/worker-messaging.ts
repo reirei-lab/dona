@@ -250,6 +250,10 @@ export function migrateWorkerMessaging(db: Database.Database): void {
     ALTER TABLE worker_message_runtime_identities_v2 RENAME TO worker_message_runtime_identities;
   `);
   const deliveryColumns=new Set((db.pragma("table_info(worker_message_deliveries)") as Array<{name:string}>).map(row=>row.name));
+  if(!deliveryColumns.has("uncertain_attempt_count")){
+    db.exec("ALTER TABLE worker_message_deliveries ADD COLUMN uncertain_attempt_count INTEGER NOT NULL DEFAULT 0");
+    db.exec("UPDATE worker_message_deliveries SET uncertain_attempt_count=attempt_count");
+  }
   if(!deliveryColumns.has("event_id"))db.exec("ALTER TABLE worker_message_deliveries ADD COLUMN event_id TEXT REFERENCES events(event_id)");
   if(!deliveryColumns.has("delivered_lease_owner"))db.exec("ALTER TABLE worker_message_deliveries ADD COLUMN delivered_lease_owner TEXT");
   if(!deliveryColumns.has("delivered_lease_token_sha256"))db.exec("ALTER TABLE worker_message_deliveries ADD COLUMN delivered_lease_token_sha256 TEXT");
@@ -640,7 +644,7 @@ export class WorkerMessageRepository {
   }
 
   stoppedInstructionContext(jobId:string):string {
-    const rows=this.db.prepare(`SELECT m.message_id,m.kind,m.payload_json,m.correlation_message_id,m.conversation_revision,d.state,d.attempt_count,
+    const rows=this.db.prepare(`SELECT m.message_id,m.kind,m.payload_json,m.correlation_message_id,m.conversation_revision,d.state,d.attempt_count,d.uncertain_attempt_count,
         q.kind AS correlated_kind,q.payload_json AS correlated_payload_json
       FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
       LEFT JOIN worker_messages q ON q.message_id=m.correlation_message_id AND q.job_id=m.job_id AND m.kind='answer'
@@ -657,7 +661,7 @@ export class WorkerMessageRepository {
       "\n利用者判断は未確定です。必要な質問は新Attemptで新しいmessage_idへ再報告し、親Donaに既存の会話・回答を照合してもらってください。旧質問を承認や新しい実行権限として扱わないでください。":"";
     if(!rows.length)return questionContext;
     return "\n\n前Attemptで受理済みの追加指示（同じ依頼・権限の範囲を維持）:\n"+stableStringify(rows.map(({payload_json,correlated_kind,correlated_payload_json,...row})=>({...row,payload:JSON.parse(payload_json as string),...(correlated_payload_json?{correlated_report:{kind:correlated_kind,payload:JSON.parse(correlated_payload_json as string)}}:{})})))+
-      "\ndeliveredは配送済みの条件として維持し、同じ外部操作を再送しない。未配送でattempt_count=0は未投入として残作業へ引き継ぐ。未配送でattempt_count>0は受理不明なので、既存成果・操作を照合するまで同じ指示や外部操作を再実行しない。相関IDは前Attemptの証拠であり新Attemptのanswer対象として流用しない。"+questionContext;
+      "\ndeliveredは配送済みの条件として維持し、同じ外部操作を再送しない。未配送でuncertain_attempt_count=0は未投入として残作業へ引き継ぐ。未配送でuncertain_attempt_count>0は受理不明なので、既存成果・操作を照合するまで同じ指示や外部操作を再実行しない。相関IDは前Attemptの証拠であり新Attemptのanswer対象として流用しない。"+questionContext;
   }
 
   supersedeUndeliveredInstructions(jobId:string,at=new Date().toISOString()):number {
@@ -704,7 +708,7 @@ export class WorkerMessageRepository {
       return candidates.map(({ delivery_id }) => {
         const token = `lease_${ulid(at.getTime()).toLowerCase()}_${randomBytes(16).toString("hex")}`;
         const expires = new Date(at.getTime() + leaseMs).toISOString();
-        const changed = this.db.prepare(`UPDATE worker_message_deliveries SET state='leased',lease_owner=?,lease_token_sha256=?,lease_expires_at=?,fence=fence+1,attempt_count=attempt_count+1,updated_at=?
+        const changed = this.db.prepare(`UPDATE worker_message_deliveries SET state='leased',lease_owner=?,lease_token_sha256=?,lease_expires_at=?,fence=fence+1,attempt_count=attempt_count+1,uncertain_attempt_count=uncertain_attempt_count+1,updated_at=?
           WHERE delivery_id=? AND state='pending'`).run(leaseOwner, sha256(token), expires, now, delivery_id).changes;
         if (changed !== 1) throw new WorkerMessageError("delivery_claim_conflict", "delivery was concurrently claimed");
         const row = this.db.prepare(`SELECT d.*,m.job_id,m.source_event_id,m.kind,m.direction,m.producer_sequence,m.correlation_message_id,m.conversation_revision,m.occurred_at,m.payload_json
@@ -742,7 +746,7 @@ export class WorkerMessageRepository {
 
   releaseUnsent(deliveryId:string,leaseOwner:string,leaseToken:string,fence:number,at=new Date()):void {
     const changed=this.db.prepare(`UPDATE worker_message_deliveries SET state='pending',lease_owner=NULL,
-      lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=? WHERE delivery_id=? AND state='leased'
+      uncertain_attempt_count=MAX(0,uncertain_attempt_count-1),lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=? WHERE delivery_id=? AND state='leased'
       AND lease_owner=? AND lease_token_sha256=? AND fence=? AND lease_expires_at>?`)
       .run(at.toISOString(),deliveryId,leaseOwner,sha256(leaseToken),fence,at.toISOString()).changes;
     if(!changed)throw new WorkerMessageError("delivery_fence_mismatch","unsent release requires current lease proof");
@@ -880,7 +884,7 @@ export class WorkerMessageRepository {
           }
         }
         const leaseExpires = new Date(at.getTime()+30_000).toISOString();
-        const claimed=this.db.prepare(`UPDATE worker_message_deliveries SET state='leased',lease_owner='dispatcher-worker-message-publisher',lease_token_sha256=?,lease_expires_at=?,fence=fence+1,attempt_count=attempt_count+1,updated_at=?
+        const claimed=this.db.prepare(`UPDATE worker_message_deliveries SET state='leased',lease_owner='dispatcher-worker-message-publisher',lease_token_sha256=?,lease_expires_at=?,fence=fence+1,attempt_count=attempt_count+1,uncertain_attempt_count=uncertain_attempt_count+1,updated_at=?
           WHERE delivery_id=? AND state='pending'`).run(sha256(`${row.delivery_id}:${now}`),leaseExpires,now,row.delivery_id).changes;
         if(claimed!==1)continue;
         const eventId=`evt_${ulid(at.getTime())}`;
@@ -930,7 +934,8 @@ export class WorkerMessageRepository {
         ORDER BY c.silence_due_at,c.job_id LIMIT ?`).all(now,limit) as Array<{job_id:string;generation:number;silence_interval_ms:number;source_event_id:string;workspace_id:string|null;channel_id:string|null;thread_ts:string|null}>;
       for(const row of rows){
         const task=this.db.prepare("SELECT task_id FROM tasks WHERE current_attempt_id=?").get(row.job_id) as {task_id:string}|undefined;
-        const silencePayload={schema_version:1,job_id:row.job_id,source_event_id:row.source_event_id,generation:row.generation,...(task?{task_id:task.task_id}:{})};
+        const ownerBinding=readEventJobBinding(this.db,row.source_event_id);
+        const silencePayload={schema_version:1,job_id:row.job_id,source_event_id:row.source_event_id,owner_kind:ownerBinding?.owner.kind,generation:row.generation,...(task?{task_id:task.task_id}:{})};
         const externalId=`worker-message-silence:${row.job_id}:${row.generation}`;
         const eventId=`evt_${ulid(at.getTime())}`;
         const replyTarget=row.workspace_id&&row.channel_id&&row.thread_ts?stableStringify({kind:"slack_thread",workspace_id:row.workspace_id,channel_id:row.channel_id,thread_ts:row.thread_ts}):null;

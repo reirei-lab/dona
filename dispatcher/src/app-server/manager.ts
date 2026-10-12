@@ -304,6 +304,7 @@ export class AppServerManager {
     const prior=this.store.db.prepare("SELECT request_hash,state,result_json FROM operations WHERE agent=? AND operation_key=?").get(name,key) as {request_hash:string;state:string;result_json:string|null}|undefined;
     if(!prior)return {state:"not_found" as const};
     if(prior.request_hash!==hash({text}))throw Error("runtime_operation_conflict");
+    if(prior.state==="rejected"){const sent=prior.result_json?JSON.parse(prior.result_json):null;if(sent?.generation!==scope.generation||sent?.threadId!==scope.thread_id)throw Error("runtime_operation_generation_changed");return {state:"not_found" as const};}
     if(prior.state!=="accepted"){
       const sent=prior.result_json?JSON.parse(prior.result_json):null;
       if(prior.state!=="unknown"||sent?.generation!==scope.generation||sent?.threadId!==scope.thread_id||typeof sent?.sentAt!=="string")return {state:"unknown" as const};
@@ -338,7 +339,7 @@ export class AppServerManager {
       if(workerScope&&(row?.role!=="worker"||row.generation!==workerScope.generation||row.thread_id!==workerScope.thread_id||JSON.parse(row.config_json).attemptId!==workerScope.attempt_id))throw Error("runtime_worker_instruction_not_current");
       const requestHash=hash({text});
       const old=this.store.db.prepare("SELECT * FROM operations WHERE agent=? AND operation_key=?").get(name,key) as {request_hash:string;state:string;result_json:string|null}|undefined;
-      if(old){if(old.request_hash!==requestHash)throw Error("runtime_operation_conflict");if(old.state!=="accepted")throw Error("runtime_acceptance_unknown");const accepted=JSON.parse(old.result_json!);if(accepted.generation!==row?.generation||accepted.threadId!==row?.thread_id)throw Error("runtime_operation_generation_changed");return {turnId:accepted.turnId};}
+      if(old){if(old.request_hash!==requestHash)throw Error("runtime_operation_conflict");if(old.state==="rejected"&&workerScope){const sent=old.result_json?JSON.parse(old.result_json):null;if(sent?.generation!==row?.generation||sent?.threadId!==row?.thread_id)throw Error("runtime_operation_generation_changed");}else{if(old.state!=="accepted")throw Error("runtime_acceptance_unknown");const accepted=JSON.parse(old.result_json!);if(accepted.generation!==row?.generation||accepted.threadId!==row?.thread_id)throw Error("runtime_operation_generation_changed");return {turnId:accepted.turnId};}}
       if(workerScope&&row){
         const config=JSON.parse(row.config_json) as StartAgent;
         if(config.workerMessaging!==true||object(config.threadConfig.config)["features.default_mode_request_user_input"]===false)
@@ -346,7 +347,7 @@ export class AppServerManager {
       }
       if(!row||!rpc?.connected||!row.thread_id||!["idle","working","interrupted"].includes(row.state))throw new RpcFailure("runtime_not_ready","not_sent");
       this.store.db.prepare("DELETE FROM recovery_hints WHERE agent=? AND generation=?").run(name,row.generation);
-      this.store.db.prepare("INSERT INTO operations VALUES(?,?,?,'sending',?)").run(name,key,requestHash,workerScope?JSON.stringify({generation:row.generation,threadId:row.thread_id,turnId:row.turn_id,sentAt:new Date().toISOString()}):null);
+      this.store.db.prepare("INSERT INTO operations VALUES(?,?,?,'sending',?) ON CONFLICT(agent,operation_key) DO UPDATE SET state='sending',result_json=excluded.result_json WHERE operations.state='rejected'").run(name,key,requestHash,workerScope?JSON.stringify({generation:row.generation,threadId:row.thread_id,turnId:row.turn_id,sentAt:new Date().toISOString()}):null);
       try {
         const params={threadId:row.thread_id,input:[{type:"text",text}],...(row.turn_id?{expectedTurnId:row.turn_id}:{clientUserMessageId:key})};
         const result=object(await rpc.request(row.turn_id?"turn/steer":"turn/start",params));

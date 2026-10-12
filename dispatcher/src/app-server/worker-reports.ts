@@ -20,7 +20,7 @@ export const workerReportStatusTool={type:"function",name:"dona_worker_report_st
 export interface RuntimeWorkerReport {request_id:string;agent:string;generation:string;thread_id:string;turn_id:string;call_id:string;rpc_id_json:string;attempt_id:string;report_key:string;request_sequence:number;payload_json:string;payload_sha256:string;created_at:string;state:"pending"|"answering"|"resolved"|"expired";result_json:string|null}
 /** Runtime専用queue。callerのjob/role/宛先申告を受けず、現在のworker streamから固定する。 */
 export class WorkerReportQueue {
- private availableUntil=0;private nextRetention=0;
+ private availableUntil=0;private nextRetention=0;private recoveryCursor="";
  constructor(private readonly store:RuntimeStore){store.db.exec(`CREATE TABLE IF NOT EXISTS runtime_worker_reports(request_id TEXT PRIMARY KEY,agent TEXT NOT NULL,generation TEXT NOT NULL,thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,call_id TEXT NOT NULL,rpc_id_json TEXT NOT NULL,attempt_id TEXT NOT NULL,report_key TEXT NOT NULL,request_sequence INTEGER NOT NULL,payload_json TEXT NOT NULL,payload_sha256 TEXT NOT NULL,created_at TEXT NOT NULL,state TEXT NOT NULL,result_json TEXT,UNIQUE(attempt_id,report_key),UNIQUE(attempt_id,request_sequence));`);}
  retirePayloads(at=new Date()){return this.store.db.prepare("UPDATE runtime_worker_reports SET payload_json='' WHERE state IN ('resolved','expired') AND created_at<? AND payload_json<>''").run(new Date(at.getTime()-30*86400000).toISOString()).changes;}
  availability(enabled:boolean){if(enabled&&Date.now()>=this.nextRetention){this.retirePayloads();this.nextRetention=Date.now()+60000;}this.availableUntil=enabled?Date.now()+30000:0;return {enabled,ttl_ms:enabled?30000:0};}
@@ -62,7 +62,12 @@ export class WorkerReportQueue {
  }
  unavailablePending(){return this.availableUntil>Date.now()?[]:this.pending();}
  drainState():{protocol:1;recoverable_count:number}{const row=this.store.db.prepare("SELECT COUNT(*) n FROM runtime_worker_reports WHERE state IN ('pending','answering') OR (state='resolved' AND json_extract(result_json,'$.state')='unknown' AND payload_json<>'')").get() as {n:number};return {protocol:1,recoverable_count:row.n};}
- recoverable():RuntimeWorkerReport[]{return this.store.db.prepare("SELECT * FROM runtime_worker_reports WHERE state='pending' OR (state IN ('answering','resolved') AND json_extract(result_json,'$.state')='unknown' AND payload_json<>'') ORDER BY CASE WHEN state='pending' THEN 0 ELSE 1 END,CASE WHEN state<>'pending' THEN created_at ELSE '' END DESC,attempt_id,request_sequence LIMIT 64").all() as RuntimeWorkerReport[];}
+ recoverable():RuntimeWorkerReport[]{
+  // 未照合の先頭batchが残っても、次回はその後から全候補を巡回する。
+  const rows=this.store.db.prepare("SELECT * FROM runtime_worker_reports WHERE state='pending' OR (state IN ('answering','resolved') AND json_extract(result_json,'$.state')='unknown' AND payload_json<>'') ORDER BY CASE WHEN request_id>? THEN 0 ELSE 1 END,request_id LIMIT 64").all(this.recoveryCursor) as RuntimeWorkerReport[];
+  if(rows.length)this.recoveryCursor=rows[rows.length-1]!.request_id;
+  return rows;
+ }
  reconcileReceipt(id:string,result:unknown){const row=this.get(id),canonical=stableStringify(acceptanceReceipt.parse(result));if(!row||!row.result_json||JSON.parse(row.result_json).state!=="unknown")throw Error("runtime_worker_report_reconciliation_invalid");this.store.db.prepare("UPDATE runtime_worker_reports SET result_json=? WHERE request_id=? AND result_json=?").run(canonical,id,row.result_json);return this.get(id)!;}
  pending():RuntimeWorkerReport[]{return this.store.db.prepare("SELECT * FROM runtime_worker_reports WHERE state='pending' ORDER BY attempt_id,request_sequence LIMIT 64").all() as RuntimeWorkerReport[];}
  get(id:string){return this.store.db.prepare("SELECT * FROM runtime_worker_reports WHERE request_id=?").get(id) as RuntimeWorkerReport|undefined;}
