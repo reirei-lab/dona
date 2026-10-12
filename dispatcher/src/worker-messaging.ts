@@ -1,3 +1,4 @@
+import {evaluateProgress,type ProgressDecision} from "./worker-progress-policy.js";
 import {credentialShaped} from "./credential-shaped.js";
 import {workerMessageTerminalTrigger} from "./worker-message-schema.js";
 import { createHash, randomBytes } from "node:crypto";
@@ -220,6 +221,16 @@ export function migrateWorkerMessaging(db: Database.Database): void {
       updated_at             TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS worker_progress_decisions (
+      decision_key TEXT PRIMARY KEY,
+      job_id TEXT NOT NULL REFERENCES jobs(job_id),
+      event_id TEXT NOT NULL REFERENCES events(event_id),
+      snapshot_sha256 TEXT NOT NULL,
+      decision_json TEXT NOT NULL,
+      decided_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS worker_progress_decisions_job_idx ON worker_progress_decisions(job_id,decided_at);
+
     CREATE TABLE IF NOT EXISTS worker_message_workspace_cadence (
       workspace_id           TEXT PRIMARY KEY,
       minimum_interval_ms    INTEGER NOT NULL DEFAULT 60000 CHECK (minimum_interval_ms BETWEEN 0 AND 3600000),
@@ -351,6 +362,51 @@ export class WorkerMessageRepository {
     return !!this.db.prepare(`SELECT 1 FROM worker_messages m WHERE m.job_id=? AND m.direction='worker_to_dona' AND m.kind IN ('question','decision_request') AND NOT EXISTS (
       SELECT 1 FROM worker_messages a JOIN worker_message_deliveries d USING(message_id) WHERE a.correlation_message_id=m.message_id AND a.kind='answer' AND d.consumer='worker' AND d.state='delivered')`).get(jobId);
   }
+  progressDecisionCandidate(jobId:string,eventId:string,at=new Date()) {
+    const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow|undefined;
+    if(!job)throw Error("job_not_found");
+    this.assertAuthorized(job,eventId);
+    if(!this.ownsMessageEvent(jobId,eventId))return undefined;
+    return this.db.transaction(()=>{
+      const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow|undefined;
+      if(!job)throw Error("job_not_found");
+      this.assertAuthorized(job,eventId);
+      if(!this.ownsMessageEvent(jobId,eventId))return undefined;
+      const event=this.db.prepare("SELECT * FROM events WHERE event_id=?").get(eventId) as {payload_json:string;external_event_id:string};
+      const payload=JSON.parse(event.payload_json) as {message_id?:string};
+      const task=this.db.prepare("SELECT current_attempt_id,desired_state FROM tasks WHERE current_attempt_id=?").get(jobId) as {current_attempt_id:string;desired_state:string}|undefined;
+      const rows=this.db.prepare(`SELECT j.job_id,j.status FROM jobs j LEFT JOIN tasks t ON t.current_attempt_id=j.job_id
+        WHERE j.source_event_id=? AND (t.task_id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM task_attempts a WHERE a.attempt_id=j.job_id))
+        ORDER BY j.created_at,j.job_id LIMIT 33`).all(job.source_event_id) as Array<{job_id:string;status:string}>;
+      const project=(message:WorkerMessageRow)=>({message_id:message.message_id,payload:JSON.parse(message.payload_json),occurred_at:message.occurred_at});
+      const report=payload.message_id?this.db.prepare("SELECT * FROM worker_messages WHERE message_id=? AND job_id=? AND direction='worker_to_dona'").get(payload.message_id,jobId) as WorkerMessageRow|undefined:undefined;
+      const members=rows.slice(0,32).map(row=>{
+        const latest=this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND direction='worker_to_dona' ORDER BY producer_sequence DESC LIMIT 1").get(row.job_id) as WorkerMessageRow|undefined;
+        return {job_id:row.job_id,phase:row.status,...(latest?{report:project(latest)}:{})};
+      });
+      const group=this.db.prepare("SELECT attention_event_id,all_terminal_event_id FROM job_groups WHERE source_event_id=?").get(job.source_event_id) as {attention_event_id:string|null;all_terminal_event_id:string|null}|undefined;
+      const pending=this.db.prepare(`SELECT m.message_id,d.attempt_count FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
+        WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.state IN ('pending','leased') ORDER BY m.producer_sequence LIMIT 1`).get(jobId) as {message_id:string;attempt_count:number}|undefined;
+      const cadence=this.db.prepare("SELECT last_report_at FROM worker_message_cadence WHERE job_id=?").get(jobId) as {last_report_at:string|null}|undefined;
+      const identity={job_id:jobId,current:task?.current_attempt_id===jobId,desired_state:task?.desired_state??"cancelled",phase:job.status,
+        members:members.map(m=>({job_id:m.job_id,phase:m.phase,message_id:m.report?.message_id??null})),
+        group_attention:!!group?.attention_event_id,group_terminal:!!group?.all_terminal_event_id,context_complete:rows.length<=32,
+        ...(pending?{pending_instruction:{message_id:pending.message_id,state:pending.attempt_count>0?"unknown":"pending"}}:{})};
+      const snapshot=sha256(stableStringify(identity));
+      const key=sha256(stableStringify({version:1,job_id:jobId,report_id:report?.message_id??event.external_event_id}));
+      const saved=this.db.prepare("SELECT * FROM worker_progress_decisions WHERE decision_key=?").get(key) as {snapshot_sha256:string;decision_json:string;decided_at:string}|undefined;
+      if(saved)return {decision_id:key,decision:JSON.parse(saved.decision_json) as ProgressDecision,eligible_now:saved.snapshot_sha256===snapshot,replayed:true,decided_at:saved.decided_at,applied:false};
+      const prior=this.db.prepare("SELECT decision_json,decided_at FROM worker_progress_decisions WHERE job_id=? ORDER BY decided_at DESC,decision_key DESC LIMIT 1").get(jobId) as {decision_json:string;decided_at:string}|undefined;
+      const previous=prior?JSON.parse(prior.decision_json) as ProgressDecision:undefined;
+      const decision=evaluateProgress({event_id:eventId,...identity,context_complete:rows.length<=32,now:at.toISOString(),members,...(report?{report:project(report)}:{}),
+        ...(!report&&cadence?.last_report_at?{silence_since:cadence.last_report_at}:{}),
+        ...(pending?{pending_instruction:{message_id:pending.message_id,state:pending.attempt_count>0?"unknown":"pending"}}:{}),
+        ...(previous&&prior?{previous:{fingerprint:previous.fingerprint??"",action:previous.action,decided_at:prior.decided_at,...previous.observed,...(previous.target?.message_id?{message_id:previous.target.message_id}:{})}}:{})});
+      this.db.prepare("INSERT INTO worker_progress_decisions VALUES(?,?,?,?,?,?)").run(key,jobId,eventId,snapshot,stableStringify(decision),at.toISOString());
+      return {decision_id:key,decision,eligible_now:true,replayed:false,decided_at:at.toISOString(),applied:false};
+    }).immediate();
+  }
+
   instructionReceipts(jobId:string,sourceEventId:string){
     const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow|undefined;
     if(!job)throw Error("job_not_found");this.assertAuthorized(job,sourceEventId);

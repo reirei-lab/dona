@@ -111,10 +111,16 @@ test("親APIは永続report receiptから元ownerだけを継承し、対応す�
   const sqlite=(await import("better-sqlite3")).default;const sql=new sqlite(config.databasePath);const record=sql.prepare("SELECT event_id FROM worker_message_deliveries WHERE delivery_id=?").get(report.delivery.delivery_id) as {event_id:string};sql.close();const notification=db.get(record.event_id)!;
   const dispatch=db.beginDispatch(notification.event_id,path.join(root,"parent-result.json"));assert.equal((await contexts.issue(dispatch)).purpose,"worker_report");
   const read=await client.getTaskReports(task.task_id,notification.event_id);assert.equal(read.attempt_id,jobId);assert.equal(read.next_producer_sequence,1);assert.equal((read.pending_question as {message_id:string}).message_id,question.message.message_id);
+  const candidate=read.progress_decision_candidate as {decision_id:string;decision:{action:string};eligible_now:boolean;replayed:boolean};
+  assert.equal(candidate.decision.action,"ask_user");assert.equal(candidate.eligible_now,true);assert.equal(candidate.replayed,false);
+  const replay=(await client.getTaskReports(task.task_id,notification.event_id)).progress_decision_candidate as typeof candidate;
+  assert.equal(replay.decision_id,candidate.decision_id);assert.equal(replay.replayed,true);
+  const reopened=new DispatcherDatabase(config.databasePath);
+  try{assert.equal(reopened.workerMessages.progressDecisionCandidate(jobId,notification.event_id)?.decision_id,candidate.decision_id);}finally{reopened.close();}
   const message={schema_version:1,source_event_id:notification.event_id,producer_sequence:1,idempotency_key:"answer.one",occurred_at:new Date().toISOString(),correlation_message_id:question.message.message_id,conversation_revision:1,payload:{operation:"answer",text:"既存の依頼範囲で継続してください"}};
   await assert.rejects(client.instructTask(task.task_id,read.revision as number,{...message,payload:{operation:"add_condition",text:"別の条件"}}));
   const accepted=await client.instructTask(task.task_id,read.revision as number,message);assert.equal(accepted.outcome,"created");assert.equal((await client.instructTask(task.task_id,read.revision as number,message)).outcome,"reused");
-  const receipts=await client.getTaskReports(task.task_id,notification.event_id);assert.equal((receipts.instructions as unknown[]).length,1);
+  const receipts=await client.getTaskReports(task.task_id,notification.event_id);assert.equal((receipts.instructions as unknown[]).length,1);assert.equal((receipts.progress_decision_candidate as typeof candidate).eligible_now,false);
   await assert.rejects(client.createTask({source_event_id:notification.event_id,task_key:"new",objective:"別作業",workspace:{kind:"scratch"}}));
   assert.equal(db.tasks.get(task.task_id)?.state,"waiting");
   await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {accepted:true};}}).runOnce();
