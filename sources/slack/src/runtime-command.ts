@@ -9,14 +9,14 @@ export type RuntimeCommand =
 
 const opaque = /^rc_[A-Za-z0-9_-]{32}$/;
 export class RuntimeCommandError extends Error {
-  constructor(readonly code: "invalid_request" | "unauthenticated" | "unavailable" | "too_large") {
+  constructor(readonly code: "invalid_request" | "invalid_command" | "unauthenticated" | "unavailable" | "too_large") {
     super(code);
   }
 }
 
 /** ADR 0002のASCII完全一致grammar。互換正規化で別の命令を作らない。 */
 export function parseRuntimeCommand(text: string): RuntimeCommand {
-  if (Buffer.byteLength(text) > 256 || /[^\x20-\x7e]/.test(text)) throw new RuntimeCommandError("invalid_request");
+  if (Buffer.byteLength(text) > 256 || /[^\x20-\x7e]/.test(text)) throw new RuntimeCommandError("invalid_command");
   if (text === "status") return { operation: "runtime.status.read.v1" };
   if (text === "restart plan") return { operation: "runtime.restart.plan.v1" };
   if (text === "update plan") return { operation: "runtime.update.plan.v1" };
@@ -29,7 +29,7 @@ export function parseRuntimeCommand(text: string): RuntimeCommand {
     if (parts[0] === "operation") return { operation: "runtime.operation.read.v1", operation_id: parts[1]! };
     if (parts[0] === "cancel") return { operation: "runtime.operation.cancel.v1", operation_id: parts[1]! };
   }
-  throw new RuntimeCommandError("invalid_request");
+  throw new RuntimeCommandError("invalid_command");
 }
 
 export interface RuntimeCommandWorkspace {

@@ -264,7 +264,7 @@ export class DispatcherApi {
         if (!await this.authorizedUpdateRequest(request)) throw new ApiRequestError(403, "forbidden", "Internal authentication failed");
         if (url.search) throw new ApiRequestError(400, "invalid_request", "Unexpected query");
         if (request.method === "GET" && url.pathname === "/v1/internal/slack-runtime-commands/ready") {
-          const ready = this.readiness().ready;
+          const ready = this.readiness().ready && this.database.runtimeCommandCapacity();
           sendJson(response, ready ? 200 : 503, { protocol: "runtime-control.v1", ready, acceptance_only: true });
           return;
         }
@@ -340,7 +340,7 @@ export class DispatcherApi {
           app_schema_write: appSchema.write,
           config: 1,
           runtime_command_ingress: { configured: this.config.slackRuntimeIngressEnabled === true,
-            ready: this.config.slackRuntimeIngressEnabled === true && !this.shuttingDown && health.ready },
+            ready: this.config.slackRuntimeIngressEnabled === true && !this.shuttingDown && health.ready && this.database.runtimeCommandCapacity() },
           scheduler: health.scheduler,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
         });

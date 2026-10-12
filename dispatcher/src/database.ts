@@ -1064,6 +1064,10 @@ export class DispatcherDatabase {
     this.runtimeInbox ??= new RuntimeCommandInbox(this.db);
     return this.runtimeInbox.receipt(requestId);
   }
+  runtimeCommandCapacity(): boolean {
+    this.runtimeInbox ??= new RuntimeCommandInbox(this.db);
+    return this.runtimeInbox.available();
+  }
   readonly scheduler: SchedulerRepository;
   readonly tasks: TaskRepository;
   readonly operatorAuth: OperatorAuthRegistry;

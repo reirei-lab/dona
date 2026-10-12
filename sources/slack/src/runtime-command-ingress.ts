@@ -114,7 +114,6 @@ export class RuntimeCommandHttpIngress {
       const input = verifyRuntimeCommandRequest(body, timestamp, signature, config.workspaces, this.now());
       if (!config.workspaces.find(w => w.alias === input.workspace)?.actor_ids.includes(input.actor_id))
         throw new RuntimeCommandError("unauthenticated");
-      if (!await this.ports.ready(controller.signal)) throw new RuntimeCommandError("unavailable");
       const evidence = await this.ports.authorize(input, controller.signal);
       if (!evidence || !["im", "public_channel", "private_channel"].includes(evidence.channel_type))
         throw new RuntimeCommandError("unauthenticated");
@@ -130,7 +129,8 @@ export class RuntimeCommandHttpIngress {
       send(200, "要求を永続的に受け付けました。操作はまだ実行されていません。");
     } catch (error) {
       const code = error instanceof RuntimeCommandError ? error.code : "unavailable";
-      send(code === "too_large" ? 413 : code === "invalid_request" ? 400 : code === "unauthenticated" ? 403 : 503,
+      if (code === "invalid_command") send(200, "命令の形式を確認してください。status、restart plan、update planなどの完全一致形式を使います。この入力は受け付けていません。");
+      else send(code === "too_large" ? 413 : code === "invalid_request" ? 400 : code === "unauthenticated" ? 403 : 503,
         "要求を受け付けられません。操作成功は確認されていません。");
     } finally { clearTimeout(timer); }
   }

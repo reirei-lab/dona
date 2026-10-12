@@ -187,3 +187,24 @@ test("Adapter route未設定/Dispatcherだけ有効を両側無効と区別す�
   f.config.slackRuntimeIngressEnabled = false;
   assert.equal(await read("/health/ready"), 200); assert.equal(await read("/health/version"), 200);
 });
+test("署名・installation確認後の文法エラーはephemeral 200、未認証入力は非200", async t => {
+  const f = await setup(t);
+  for (const text of ["status ", "unknown", "status\n", "update apply"]) {
+    const response = await post(f.socketPath, raw(text));
+    assert.equal(response.status, 200); const payload = JSON.parse(response.text);
+    assert.equal(payload.response_type, "ephemeral"); assert.match(payload.text, /受け付けていません/);
+  }
+  assert.equal((await post(f.socketPath, raw("status "), { "x-slack-signature": "v0=" + "0".repeat(64) })).status, 403);
+  assert.equal(f.count(), 0); assert.equal(f.database.list().length, 0);
+});
+test("inbox満杯のreadinessはnot-ready、既存receiptはGETで再利用する", async t => {
+  const f = await setup(t), body = raw(), signed = headers(body), input = {
+    ...verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]),
+    channel_type: "public_channel" as const };
+  const receipt = await f.client.postRuntimeCommand(input, AbortSignal.timeout(2500));
+  for (let i = 1; i < 1024; i++) f.database.acceptRuntimeCommand({ ...input, request_id: i.toString(16).padStart(64, "0") });
+  assert.equal(await f.client.runtimeCommandIngressReady(), false);
+  assert.deepEqual(await f.client.postRuntimeCommand(input, AbortSignal.timeout(2500)), receipt);
+  assert.equal((await post(f.socketPath, body)).status, 200);
+  assert.equal((await post(f.socketPath, raw("status", "new.fixture"))).status, 503);
+});

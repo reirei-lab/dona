@@ -16,12 +16,14 @@ test("read-only照合とinvalid requestは空DBへschemaを書かない", t => {
 });
 test("quota到達後も既存receiptを再読し、異内容と新しい要求を拒否", t => {
   const db = new Database(":memory:"); t.after(() => db.close()); const inbox = new RuntimeCommandInbox(db);
+  assert.equal(inbox.available(), true);
   const first = inbox.accept(request());
   for (let i = 1; i < 1024; i++) inbox.accept(request(i));
   assert.deepEqual(inbox.accept(request()), first);
   assert.throws(() => inbox.accept({ ...request(), actor_id: "U2" }), /runtime_command_conflict/);
   assert.throws(() => inbox.accept(request(1024)), /runtime_command_capacity/);
   assert.equal(db.prepare("SELECT count(*) FROM slack_runtime_command_inbox").pluck().get(), 1024);
+  assert.equal(inbox.available(), false);
   assert.equal(db.pragma("synchronous", { simple: true }), 2);
 });
 test("受付のchannel種別をcanonical recordへ保存し欠落/改変を拒否", t => {

@@ -80,6 +80,7 @@ export class DispatcherClient {
     if (prior) { this.ambiguousRuntimeRequests.delete(input.request_id); return prior; }
     if (this.ambiguousRuntimeRequests.has(input.request_id) || this.ambiguousRuntimeRequests.size >= 1024)
       throw Error("runtime_command_acceptance_unknown");
+    if (!await this.runtimeCommandIngressReady(signal)) throw Error("runtime_command_unavailable");
     let response: DispatcherResponse;
     try {
       response = await this.request("POST", "/v1/internal/slack-runtime-commands", Buffer.from(JSON.stringify(input)), token, {}, signal);

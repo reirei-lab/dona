@@ -21,6 +21,8 @@ Dispatcherでは`DONA_SLACK_RUNTIME_INGRESS_ENABLED=true`の場合だけ、inter
 
 route登録時と継続readinessでは、private signing config、登録済みworkspace、internal token、Dispatcherの`runtime-control.v1`受付protocolを照合します。片側だけのenablement、config削除・破損、token不備では起動または`/health/ready`・`/health/version`を拒否します。これは受付だけのreadinessであり、control planeの実行能力を示しません。
 
+inbox満杯時は新規受付をnot-readyにしますが、既存receiptのGET照合は維持します。署名とinstallationを検証できた後の文法エラーは、操作未受付を明示するHTTP 200のephemeral本文で利用者へ伝えます。未認証・不正envelope・永続受付の未確認は非200とし、受付成功の本文を返しません。
+
 この受付は操作を実行せず、通常event queueやLLMへdispatchしません。ACKは`pending`だけを表します。本人DM rootの予約・外部投稿receipt、stable control planeへの接続、plan/approval/operationの状態遷移と最終通知、実Slackの隔離live検証は残作業です。両flagは開発用であり、これらのgateが揃うまで実workspaceへ公開しません。将来の公開ではTLS proxyをこのexact routeだけへ固定し、health/admin/internal routesを公開しないでください。Slack App設定と本番enablementはこの変更では実施しません。
 
 通常の`message`はDona宛とは限らないため、正規化時にSlackの`channel_type`（`channel` / `group` / `im` / `mpim`）を許可リストで検証し、存在する場合は`subject.channel_type`として渡します。Donaはこの値、イベント種別、本文、スレッド文脈から対応要否を判断します。

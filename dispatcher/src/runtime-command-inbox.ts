@@ -31,6 +31,12 @@ export interface RuntimeCommandReceipt {
 /** typed ingressだけのinbox。通常event/LLMへdispatchせず、受付を実行成功にしない。 */
 export class RuntimeCommandInbox {
   constructor(private readonly db: Database.Database) {}
+  available(): boolean {
+    const object = this.db.prepare("SELECT type FROM sqlite_master WHERE name='slack_runtime_command_inbox'").get() as { type: string } | undefined;
+    if (!object) return true;
+    if (object.type !== "table") return false;
+    return (this.db.prepare("SELECT count(*) FROM slack_runtime_command_inbox").pluck().get() as number) < 1024;
+  }
   private install(): void {
     this.db.pragma("synchronous = FULL");
     this.db.exec(`CREATE TABLE IF NOT EXISTS slack_runtime_command_inbox (
