@@ -1,3 +1,4 @@
+import {reportContainsPrivateValues} from "./worker-report-privacy.js";
 import {migrateWorkerMessaging,WorkerMessageRepository,parseDonaInstruction,parseWorkerReport,WorkerMessageError} from "./worker-messaging.js";
 import { envelopeFromRow } from "./prompt.js";
 import { migrateVerifiedPrincipalBindings, persistVerifiedPrincipalBinding, readVerifiedPrincipalBinding, readVerifiedPrincipalProofConsumption, PrincipalBindingConflictError } from "./principal-binding.js";
@@ -1076,7 +1077,10 @@ export class DispatcherDatabase {
     const policyPending=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_progress_applications'").get()
       ?this.db.prepare(`SELECT 1 FROM worker_progress_applications a LEFT JOIN events e ON e.event_id=a.followup_event_id
         WHERE a.next_check_at IS NOT NULL OR (a.followup_event_id IS NOT NULL AND e.status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review')) LIMIT 1`).get():undefined;
-    if(outstanding||policyPending)throw Error("worker_messaging_disable_requires_drain");
+    const silence=this.db.prepare(`SELECT 1 FROM events WHERE source='dona_message' AND event_type='worker_message_silence'
+      AND status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review') LIMIT 1`).get();
+    if(outstanding||silence||policyPending)throw Error("worker_messaging_disable_requires_drain");
+
   }
 
   acceptTaskWorkerReport(attemptId:string,identity:string,raw:unknown){
@@ -1084,8 +1088,7 @@ export class DispatcherDatabase {
     return this.db.transaction(()=>{
       const task=this.tasks.forAttempt(attemptId),job=this.getJob(attemptId);
       if(!job||!task||task.current_attempt_id!==attemptId||task.desired_state!=="running"||!["running","blocked"].includes(job.status)||input.source_event_id!==job.source_event_id)throw new WorkerMessageError("worker_report_attempt_not_current","current Attempt does not accept reports");
-      const canonical=stableStringify(input.payload);
-      if([job.objective,job.workspace_path,job.result_path].some(value=>value&&canonical.includes(value)))throw new WorkerMessageError("worker_report_payload_denied","report payload is denied");
+      if(reportContainsPrivateValues(input.payload,job.objective,[job.workspace_path,job.result_path]))throw new WorkerMessageError("worker_report_payload_denied","report payload is denied");
       return this.workerMessages.acceptRuntimeReport(attemptId,identity,input);
     }).immediate();
   }

@@ -1,7 +1,7 @@
+import {reportContainsPrivateValues} from "../worker-report-privacy.js";
 import {WorkerMessageError} from "../worker-messaging.js";
 import type {DispatcherDatabase} from "../database.js";
 import {RuntimeClient} from "./client.js";
-import {stableStringify} from "../validation.js";
 
 /** host queue→既存ledger。workerのidentity/宛先申告を受けず現在Attemptを再照合する。 */
 export class AppServerWorkerReportBridge {
@@ -31,8 +31,7 @@ export class AppServerWorkerReportBridge {
    const identity=JSON.stringify([request.generation,request.thread_id]);
    if(this.database.getJobLiveSessionIdentity(job.job_id)?.herdr_agent_session_id!==identity)continue;
    const input=JSON.parse(request.payload_json) as {payload:unknown;correlation_message_id?:string;conversation_revision?:number};
-   const canonical=stableStringify(input);
-   if([job.objective,job.workspace_path,job.result_path].some(value=>value&&canonical.includes(value))){await this.runtime.resolveWorkerReport(request.agent,request.request_id,{state:"denied",diagnostic:"payload_rejected"});continue;}
+   if(reportContainsPrivateValues(input.payload,job.objective,[job.workspace_path,job.result_path])){await this.runtime.resolveWorkerReport(request.agent,request.request_id,{state:"denied",diagnostic:"payload_rejected"});continue;}
    const report={schema_version:1,source_event_id:job.source_event_id,
      producer_sequence:request.request_sequence,idempotency_key:request.report_key,occurred_at:request.created_at,payload:input.payload,
      ...(input.correlation_message_id?{correlation_message_id:input.correlation_message_id}:{}),...(input.conversation_revision!==undefined?{conversation_revision:input.conversation_revision}:{})};

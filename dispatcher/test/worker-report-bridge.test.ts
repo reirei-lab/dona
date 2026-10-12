@@ -480,3 +480,37 @@ test("実行中の累積指示・未知受理解消・確定未送信leaseの境
   assert.ok(sequence<40);assert.ok([...db.workerMessages.stoppedInstructionContext(job.job_id)].length<100000);
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+
+for(const phase of ["preparing","dispatching"] as const)test(`起動途中の指示は保存してrunningまで配送を待つ（${phase}）`,async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);try{
+  const source=db.enqueue(eventEnvelope("startup-instruction-"+phase)).row,t=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"startup",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  db.beginJobPreparation(t.current_attempt_id);db.setJobRuntime(t.current_attempt_id,"w","p","runtime");if(phase==="dispatching")db.beginJobDispatch(t.current_attempt_id);
+  db.instructTask(t.task_id,db.tasks.get(t.task_id)!.revision,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"condition",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"根拠も残してください"}});
+  let sent=0;const bridge=new WorkerInstructionBridge(db.workerMessages,{async steer(){sent++;}});assert.equal(await bridge.runOnce(),false);
+  if(phase==="preparing")db.beginJobDispatch(t.current_attempt_id);db.markJobRunning(t.current_attempt_id);assert.equal(await bridge.runOnce(),true);assert.equal(sent,1);
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("delivery行のない未処理silence eventも無効化前にdrainする",async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);try{
+  const source=db.enqueue(eventEnvelope("silence-drain")).row,t=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"silence",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  db.beginJobPreparation(t.current_attempt_id);db.setJobRuntime(t.current_attempt_id,"w","p","runtime");db.beginJobDispatch(t.current_attempt_id);db.markJobRunning(t.current_attempt_id);
+  db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"checkpoint",occurred_at:new Date().toISOString(),payload:{kind:"checkpoint",summary:"確認が進みました"}});db.workerMessages.publishPendingReports();
+  const Sqlite=(await import("better-sqlite3")).default,sql=new Sqlite(config.databasePath);sql.prepare("UPDATE events SET status='completed' WHERE source='dona_message'").run();db.assertWorkerMessagingMode(false);
+  db.workerMessages.publishDueSilenceEvents(100,new Date(Date.now()+1000000));assert.throws(()=>db.assertWorkerMessagingMode(false),/disable_requires_drain/);
+  sql.prepare("UPDATE events SET status='completed' WHERE source='dona_message'").run();db.assertWorkerMessagingMode(false);sql.close();
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+for(const objective of ["a","question"])test(`短いobjectiveとJSON構造キーを機密漏洩として誤拒否しない（${objective}）`,async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);try{
+  const source=db.enqueue(eventEnvelope("short-"+objective)).row,t=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"short",objective,workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,j=db.getJob(t.current_attempt_id)!,identity=JSON.stringify(["generation","thread"]),created=new Date().toISOString();
+  db.beginJobPreparation(j.job_id);db.setJobRuntime(j.job_id,"w","p",identity);db.beginJobDispatch(j.job_id);db.markJobRunning(j.job_id);
+  let resolved:unknown;
+  class Port extends RuntimeClient{constructor(){super("unused");}override async workerReportAvailability(){return {enabled:true,ttl_ms:30000};}override async status(){return {name:j.agent_name,role:"worker",generation:"generation",thread_id:"thread",turn_id:"turn",state:"working"} as Awaited<ReturnType<RuntimeClient["status"]>>;}
+   override async workerReports(){return [{request_id:"request",agent:j.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"rpc"',attempt_id:j.job_id,report_key:"report",request_sequence:1,payload_json:stableStringify({payload:{kind:"question",question:"続行できますか？"}}),payload_sha256:"hash",created_at:created,state:"pending" as const,result_json:null}];}
+   override async resolveWorkerReport(_name:string,_id:string,result:unknown){resolved=result;return {};}}
+  assert.equal(await new AppServerWorkerReportBridge(db,new Port()).runOnce(),1);assert.ok((resolved as {message_id:string}).message_id);
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
