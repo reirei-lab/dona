@@ -1,3 +1,4 @@
+import {workerEnvironment} from "./worker-environment.js";
 import os from "node:os";
 import {createHash} from "node:crypto";
 import http from "node:http";
@@ -38,7 +39,7 @@ export async function serveRuntime(config:HostConfig):Promise<http.Server> {
   fs.mkdirSync(socketDirectory,{mode:0o700,recursive:true});
   const manager=new AppServerManager(store,(args,cwd,agent,attach)=>{
     if(!agent)throw Error("runtime_agent_identity_required");
-    return new AppServerRpc(config.codex,args,cwd,process.env,{socketPath:path.join(socketDirectory,createHash("sha256").update(agent.generation).digest("hex").slice(0,24)),...(attach?{attachPid:agent.pid!}:{})});
+    return new AppServerRpc(config.codex,args,cwd,agent.role==="worker"?workerEnvironment(process.env):process.env,{socketPath:path.join(socketDirectory,createHash("sha256").update(agent.generation).digest("hex").slice(0,24)),...(attach?{attachPid:agent.pid!}:{})});
   },true);
   const server=http.createServer(async(request,response)=>{
     const send=(status:number,value:unknown)=>{response.writeHead(status,{"content-type":"application/json"});response.end(JSON.stringify(value));};
@@ -47,7 +48,7 @@ export async function serveRuntime(config:HostConfig):Promise<http.Server> {
     try {
       let text="";for await(const chunk of request){text+=String(chunk);if(Buffer.byteLength(text)>1_048_576)throw Error("runtime_request_limit");}
       const p=JSON.parse(text) as Record<string,unknown>;if(typeof p.action!=="string")throw Error("runtime_action_invalid");
-      if(!["list","start","pendingQuestions","conversations","workerHandoffInventory","externalRequests","externalRequest","externalAvailability"].includes(p.action)&&typeof p.name!=="string")throw Error("runtime_name_required");
+      if(!["list","start","pendingQuestions","conversations","workerHandoffInventory","externalRequests","externalRequest","externalAvailability","workerReportAvailability","workerReports"].includes(p.action)&&typeof p.name!=="string")throw Error("runtime_name_required");
       const name=p.name as string;
       let result:unknown;
       switch(p.action) {
@@ -55,6 +56,9 @@ export async function serveRuntime(config:HostConfig):Promise<http.Server> {
           if(p.protocol!==workerHandoffProtocol)throw Error("runtime_worker_handoff_protocol_unsupported");
           if(p.after!==undefined&&typeof p.after!=="string")throw Error("runtime_worker_handoff_cursor_invalid");
           result=manager.workerHandoffInventory(p.after as string|undefined);break;
+        case "workerReportAvailability":if(typeof p.enabled!=="boolean")throw Error("runtime_worker_report_availability_invalid");result=manager.workerReports.availability(p.enabled);break;
+        case "workerReports":result=manager.workerReports.pending();break;
+        case "resolveWorkerReport":if(typeof p.id!=="string")throw Error("runtime_worker_report_id_invalid");result=manager.resolveWorkerReport(name,p.id,p.result);break;
         case "externalAvailability":if(typeof p.enabled!=="boolean")throw Error("runtime_external_availability_invalid");result=manager.external.availability(p.enabled);break;
         case "externalRequests":result=manager.externalRequests();break;
         case "externalRequest":if(typeof p.id!=="string")throw Error("runtime_external_id_invalid");result=manager.externalRequest(p.id);break;
@@ -69,6 +73,8 @@ export async function serveRuntime(config:HostConfig):Promise<http.Server> {
           if(!input||!["main","worker"].includes(input.role)||!Array.isArray(input.args)||input.args.some(v=>typeof v!=="string")||!input.threadConfig||typeof input.threadConfig!=="object")throw Error("runtime_start_invalid");
           result=await manager.start(input);break;
         }
+        case "workerInstructionReceipt":
+        case "workerInstruction":if(typeof p.key!=="string"||!/^worker-message:msg_[0-9a-hjkmnp-tv-z]{26}$/.test(p.key)||typeof p.text!=="string"||!p.scope||typeof p.scope!=="object"||Array.isArray(p.scope))throw Error("runtime_worker_instruction_invalid");result=p.action==="workerInstructionReceipt"?manager.workerInstructionReceipt(name,p.key,p.text,p.scope as {attempt_id:string;generation:string;thread_id:string}):await manager.prompt(name,p.key,p.text,p.scope as {attempt_id:string;generation:string;thread_id:string});break;
         case "prompt":if(typeof p.key!=="string"||typeof p.text!=="string"||p.key.length>256)throw Error("runtime_prompt_invalid");result=await manager.prompt(name,p.key,p.text);break;
         case "questions":result=p.includeResolved===true?store.db.prepare("SELECT q.* FROM questions q JOIN agents a ON a.name=q.agent AND a.generation=q.generation WHERE q.agent=? AND (q.state IN ('pending','answering') OR q.question_id IN (SELECT question_id FROM questions WHERE agent=q.agent AND generation=q.generation AND state NOT IN ('pending','answering') ORDER BY created_at DESC,question_id LIMIT 100)) ORDER BY q.created_at DESC,q.question_id").all(name):store.questions(name);break;
         case "pendingQuestions":

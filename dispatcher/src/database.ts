@@ -1,3 +1,4 @@
+import {migrateWorkerMessaging,WorkerMessageRepository,parseDonaInstruction,parseWorkerReport,WorkerMessageError} from "./worker-messaging.js";
 import { envelopeFromRow } from "./prompt.js";
 import { migrateVerifiedPrincipalBindings, persistVerifiedPrincipalBinding, readVerifiedPrincipalBinding, readVerifiedPrincipalProofConsumption, PrincipalBindingConflictError } from "./principal-binding.js";
 import type { VerifiedSlackPrincipalProof } from "./principal-proof.js";
@@ -1051,6 +1052,34 @@ function pendingHandoffSql(source: string): string {
 }
 
 export class DispatcherDatabase {
+  private workerMessageStore:WorkerMessageRepository|undefined;
+  get workerMessages():WorkerMessageRepository {
+    if(!this.workerMessageStore){migrateWorkerMessaging(this.db);this.workerMessageStore=new WorkerMessageRepository(this.db,this.jobAdmissionLimits.jobObjectiveTotalMaxBytes);}
+    return this.workerMessageStore;
+  }
+
+  acceptTaskWorkerReport(attemptId:string,identity:string,raw:unknown){
+    const input=parseWorkerReport(raw);
+    return this.db.transaction(()=>{
+      const task=this.tasks.forAttempt(attemptId),job=this.getJob(attemptId);
+      if(!job||!task||task.current_attempt_id!==attemptId||task.desired_state!=="running"||!["running","blocked"].includes(job.status)||input.source_event_id!==job.source_event_id)throw new WorkerMessageError("worker_report_attempt_not_current","current Attempt does not accept reports");
+      const canonical=stableStringify(input.payload);
+      if([job.objective,job.workspace_path,job.result_path].some(value=>value&&canonical.includes(value)))throw new WorkerMessageError("worker_report_payload_denied","report payload is denied");
+      return this.workerMessages.acceptRuntimeReport(attemptId,identity,input);
+    }).immediate();
+  }
+
+  taskReports(id:string,eventId:string){const task=this.tasks.assertOwner(id,eventId,true),job=this.getJob(task.current_attempt_id)!;return {schema_version:1,task_id:id,attempt_id:task.current_attempt_id,revision:task.revision,phase:job.status,desired_state:task.desired_state,reports:task.desired_state==="running"&&["running","blocked"].includes(job.status)?this.workerMessages.reports(task.current_attempt_id,eventId):[],...this.workerMessages.instructionReceipts(task.current_attempt_id,eventId),limit:20};}
+  instructTask(id:string,revision:number,raw:unknown){
+    const input=parseDonaInstruction(raw);
+    return this.db.transaction(()=>{
+      const task=this.tasks.assertOwner(id,input.source_event_id,true);
+      if(task.revision!==revision||task.desired_state!=="running")throw Error("worker_instruction_task_changed");
+      const result=this.workerMessages.appendInstruction(task.current_attempt_id,input);
+      return {schema_version:1,task_id:id,attempt_id:task.current_attempt_id,message:this.workerMessages.project(result.message),receipt_id:result.receipt_id,outcome:result.outcome};
+    }).immediate();
+  }
+
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
   readonly tasks: TaskRepository;
@@ -3652,6 +3681,11 @@ export class DispatcherDatabase {
 
   nextAvailable(at = new Date()): EventRow | undefined {
     this.suppressUnauthorizedScheduledNotifications(at);
+    this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='worker_report_superseded',last_error_message=NULL
+      WHERE source='dona_message' AND event_type='worker_message_report' AND status IN ('queued','retryable_failed') AND EXISTS(
+        SELECT 1 FROM jobs j JOIN tasks t ON t.task_id=(SELECT task_id FROM task_attempts WHERE attempt_id=j.job_id)
+        WHERE j.job_id=json_extract(events.payload_json,'$.job_id') AND
+          (j.status IN ('completed','failed','cancelled','cancelling') OR t.current_attempt_id<>j.job_id OR t.desired_state='cancelled'))`).run(at.toISOString(),at.toISOString());
     const head = this.db
       .prepare(`
         SELECT * FROM events

@@ -1,3 +1,5 @@
+import {AppServerWorkerReportBridge,AppServerWorkerInstructionController} from "./app-server/worker-report-bridge.js";
+import {WorkerMessagePublisher,WorkerInstructionBridge} from "./worker-messaging.js";
 import path from "node:path";
 import { AgentContextManager } from "./agent-context.js";
 import {RuntimeClient} from "./app-server/client.js";
@@ -68,6 +70,9 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     jobProgress,
   );
   if (!jobProgressStore) await jobSupervisor.disableProgress();
+  const messages=config.workerMessagingEnabled?new WorkerMessagePublisher(database.workerMessages,()=>worker.wake()):undefined;
+  const reportBridge=config.workerMessagingEnabled?new AppServerWorkerReportBridge(database,new RuntimeClient(runtimeSocket(config),5000),()=>apiLogger.warn("Worker report bridge failed",{error_code:"worker_report_bridge_failed"})):undefined;
+  const instructions=config.workerMessagingEnabled?new WorkerInstructionBridge(database.workerMessages,new AppServerWorkerInstructionController(database,new RuntimeClient(runtimeSocket(config),5000)),1000,()=>apiLogger.warn("Worker instruction bridge failed",{error_code:"worker_instruction_bridge_failed"}),()=>jobSupervisor.wake()):undefined;
   const updateNotificationWorker = new UpdateNotificationWorker(
     database,
     updateNotificationDatabase,
@@ -84,6 +89,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     new UpdaterClient(config.updaterSocketPath, config.jobCommandTimeoutMs),
     {
       async quiesce() {
+        await reportBridge?.stop();await instructions?.stop();messages?.stop();
         await external?.stop();
         await scheduler.stop();
         await reminderPublisher.stop();
@@ -136,6 +142,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     }
     if(external)await external.start();
     else await new RuntimeClient(runtimeSocket(config),5000).externalAvailability(false).catch(()=>{});
+    messages?.start();reportBridge?.start();instructions?.start();
     worker.start();
     scheduler.start();
     reminderPublisher.start();
@@ -146,6 +153,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     }));
   } catch (error) {
     stopWebJobProjectionMaintenance?.();
+    await reportBridge?.stop();await instructions?.stop();messages?.stop();
     if (updateNotificationWorker.isRunning()) await updateNotificationWorker.stop();
     if (jobSupervisor.isRunning()) await jobSupervisor.stop();
     if (scheduler.isRunning()) await scheduler.stop();

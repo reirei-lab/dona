@@ -6,7 +6,7 @@ import path from "node:path";
 import type { DispatcherDatabase } from "./database.js";
 import type { EventRow } from "./types.js";
 
-export type AgentPurpose = "human_command" | "job_completion" | "schedule_work" | "update_completion";
+export type AgentPurpose = "human_command" | "job_completion" | "schedule_work" | "update_completion" | "worker_report";
 
 export interface AgentExecutionContext {
   event_id: string;
@@ -31,14 +31,16 @@ export class AgentPrincipalUnavailableError extends Error {
 interface ActiveContext extends AgentExecutionContext { token_sha256: string; }
 
 export const agentPurposeOperations: Record<AgentPurpose, readonly string[]> = {
-  human_command: ["get_job_status_summary", "list_event_jobs", "get_job_status", "list_thread_jobs", "plan_self_update", "task_read", "task_delegate", "task_control"],
+  human_command: ["get_job_status_summary", "list_event_jobs", "get_job_status", "list_thread_jobs", "plan_self_update", "task_read", "task_delegate", "task_control", "task_instruction"],
   job_completion: ["list_event_jobs", "get_job_status", "plan_self_update", "task_read", "task_delegate"],
+  worker_report: ["task_read", "task_instruction"],
   schedule_work: [],
   update_completion: [],
 };
 
 function purpose(row: EventRow): AgentPurpose {
   if (row.source === "slack") return "human_command";
+  if (row.source === "dona_message" && row.event_type === "worker_message_report") return "worker_report";
   if (row.source === "dona_job") return "job_completion";
   if (row.source === "dona_schedule") return "schedule_work";
   if (row.source === "dona_update") return "update_completion";

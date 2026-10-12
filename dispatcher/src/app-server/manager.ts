@@ -1,3 +1,4 @@
+import {WorkerReportQueue,workerReportTool,workerReportStatusTool,reportResponseSucceeded} from "./worker-reports.js";
 import type {ResumeFrom} from "../offline-task-resume.js";
 import {ExternalToolQueue,externalReplyTool} from "./external-tools.js";
 import { createHash,randomUUID } from "node:crypto";
@@ -11,18 +12,20 @@ import { identity,processes,same,stopScope,type ProcessIdentity } from "./proces
 import {workerHandoffProtocol,workerHandoffContractBlockers,workerHandoffBlockers,type WorkerHandoffInventory,type WorkerHandoffObservation} from "./worker-handoff.js";
 
 export const hash=(value:unknown)=>createHash("sha256").update(stableStringify(value)).digest("hex");
-export interface StartAgent {resumeFrom?:ResumeFrom;attemptId?:string;name:string;role:"main"|"worker";cwd:string;release:string;args:string[];threadConfig:Record<string,unknown>}
+export interface StartAgent {workerMessaging?:boolean;resumeFrom?:ResumeFrom;attemptId?:string;name:string;role:"main"|"worker";cwd:string;release:string;args:string[];threadConfig:Record<string,unknown>}
 export type RpcFactory=(args:string[],cwd:string,agent?:AgentRecord,attach?:boolean)=>AppServerRpc;
 const object=(x:unknown):Record<string,unknown>=>x!==null&&typeof x==="object"&&!Array.isArray(x)?x as Record<string,unknown>:{};
 
 export class AppServerManager {
   readonly external:ExternalToolQueue;
+  readonly workerReports:WorkerReportQueue;
   private connections=new Map<string,AppServerRpc>();
   private resets=new Map<string,string>();
   private queues=new Map<string,Promise<unknown>>();
   private recoveryAfter=new Map<string,number>();
   constructor(readonly store:RuntimeStore,private readonly factory:RpcFactory,private readonly reconnect=false,private readonly processSample=processes) {
     this.external=new ExternalToolQueue(store);this.external.expireRestart();
+    this.workerReports=new WorkerReportQueue(store);this.workerReports.expireRestart();
     store.db.exec("CREATE TABLE IF NOT EXISTS thread_resume_claims(source_name TEXT NOT NULL,source_generation TEXT NOT NULL,target_name TEXT NOT NULL UNIQUE,PRIMARY KEY(source_name,source_generation))");
     store.db.exec("CREATE TABLE IF NOT EXISTS startup_phases(agent TEXT PRIMARY KEY,generation TEXT NOT NULL,phase TEXT NOT NULL)");
     store.db.exec("CREATE TABLE IF NOT EXISTS main_readiness(agent TEXT PRIMARY KEY,generation TEXT NOT NULL)");
@@ -73,7 +76,7 @@ export class AppServerManager {
     return this.serialized(input.name,()=>this.startAgent(input));
   }
   private async startAgent(input:StartAgent,recoveryGeneration?:string):Promise<AgentRecord> {
-      if(!/^[a-zA-Z0-9_-]{1,128}$/.test(input.name)||!path.isAbsolute(input.cwd)||!path.isAbsolute(input.release)||!fs.statSync(input.cwd).isDirectory())throw Error("runtime_start_scope");
+      if((input.workerMessaging!==undefined&&typeof input.workerMessaging!=="boolean")||!/^[a-zA-Z0-9_-]{1,128}$/.test(input.name)||!path.isAbsolute(input.cwd)||!path.isAbsolute(input.release)||!fs.statSync(input.cwd).isDirectory())throw Error("runtime_start_scope");
       const requestHash=hash(input),prior=this.store.agent(input.name);
       if(prior&&prior.state!=="stopped") {
         if(prior.request_hash!==requestHash)throw Error("runtime_agent_conflict");
@@ -121,7 +124,7 @@ export class AppServerManager {
       this.bind(row,rpc);
       try {
         await rpc.initialize();
-        const params={...input.threadConfig,...(object(input.threadConfig.config)["features.default_mode_request_user_input"]!==false?{dynamicTools:[externalReplyTool]}:{}),cwd:input.cwd,...(row.thread_id?{threadId:row.thread_id,excludeTurns:true}:{})};
+        const params={...input.threadConfig,...(object(input.threadConfig.config)["features.default_mode_request_user_input"]!==false?{dynamicTools:[...(input.role==="main"?[externalReplyTool]:[]),...(input.role==="worker"&&input.workerMessaging===true?[workerReportTool,workerReportStatusTool]:[])]}:{}),cwd:input.cwd,...(row.thread_id?{threadId:row.thread_id,excludeTurns:true}:{})};
         this.store.db.prepare("UPDATE startup_phases SET phase='sending' WHERE agent=? AND generation=?").run(row.name,row.generation);
         const result=object(await rpc.request(row.thread_id?"thread/resume":"thread/start",params,90_000));
         const thread=object(result.thread);if(typeof thread.id!=="string"||(row.thread_id&&thread.id!==row.thread_id))throw Error("runtime_thread_identity_missing");
@@ -148,7 +151,7 @@ export class AppServerManager {
       rpc.on("disconnect",()=>{
         if(!this.store.db.open||this.store.agent(row.name)?.generation!==row.generation)return;
         this.store.db.prepare("UPDATE questions SET state='expired' WHERE agent=? AND generation=? AND state IN ('pending','answering')").run(row.name,row.generation);
-        this.external.expireAgent(row.name,row.generation);
+        this.external.expireAgent(row.name,row.generation);this.workerReports.expireAgent(row.name,row.generation);
         this.store.observe(row.name,row.generation,{kind:"gap"});
         if(this.store.agent(row.name)?.state!=="stopped")this.store.change(row.name,row.generation,{state:"unknown"});
       });
@@ -223,6 +226,16 @@ export class AppServerManager {
       this.connections.get(agent.name)?.reject(message.id,"Request identity is not current");return;
     }
     if(message.method==="item/tool/call") {
+      if(p.tool===workerReportStatusTool.name){
+        try{this.connections.get(agent.name)?.respond(message.id,{success:true,contentItems:[{type:"inputText",text:stableStringify(this.workerReports.status(current,message))}]});}
+        catch{this.connections.get(agent.name)?.respond(message.id,{success:false,contentItems:[{type:"inputText",text:"worker_report_status_denied"}]});}
+        return;
+      }
+      if(p.tool===workerReportTool.name) {
+        try{const report=this.workerReports.accept(current,message);if(report.result_json)this.connections.get(agent.name)?.respond(message.id,{success:reportResponseSucceeded(report.result_json),contentItems:[{type:"inputText",text:report.result_json}]});else this.store.change(agent.name,agent.generation,{state:"waiting"});}
+        catch{this.connections.get(agent.name)?.respond(message.id,{success:false,contentItems:[{type:"inputText",text:"worker_report_denied"}]});}
+        return;
+      }
       try{this.external.accept(current,message);this.store.change(agent.name,agent.generation,{state:"waiting"});}
       catch{this.connections.get(agent.name)?.respond(message.id,{success:false,contentItems:[{type:"inputText",text:"external_approval_request_denied"}]});}
       return;
@@ -263,6 +276,7 @@ export class AppServerManager {
     if(["item/started","item/completed"].includes(message.method??"")&&typeof p.turnId==="string"){const item=projectItem(p.item,p.turnId);if(item)this.store.cacheItem(row.name,row.generation,item);}
     if(message.method==="turn/started") {
       const turn=object(p.turn);if(typeof turn.id==="string"){
+        this.workerReports.expireTurn(agent.name,agent.generation,turn.id);
         this.store.db.prepare("DELETE FROM turn_outcomes WHERE agent=? AND generation=?").run(agent.name,agent.generation);
         this.store.change(agent.name,agent.generation,{turn_id:turn.id,state:"working"});
       }
@@ -274,18 +288,31 @@ export class AppServerManager {
       if(reason)this.store.db.prepare("INSERT INTO recovery_hints VALUES(?,?,?,?) ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,reason=excluded.reason,retry_after=excluded.retry_after").run(agent.name,agent.generation,reason,reason==="capacity_wait"?(this.resets.get(agent.name)??new Date(Date.now()+900_000).toISOString()):null);
       this.store.db.prepare("INSERT INTO turn_outcomes VALUES(?,?,?) ON CONFLICT(agent) DO UPDATE SET generation=excluded.generation,state=excluded.state").run(agent.name,agent.generation,turn.status==="completed"?"idle":"interrupted");
       // 非同期質問はturnが完了しても未解決であり得る。serverRequest/resolvedを終端証拠にする。
-      this.store.change(agent.name,agent.generation,{turn_id:null,state:this.store.questions(agent.name).length||this.external.waiting(agent.name)?"waiting":turn.status==="completed"?"idle":"interrupted"});
+      this.store.change(agent.name,agent.generation,{turn_id:null,state:this.store.questions(agent.name).length||(this.external.waiting(agent.name)||this.workerReports.waiting(agent.name))?"waiting":turn.status==="completed"?"idle":"interrupted"});
     } else if(message.method==="serverRequest/resolved") {
       this.external.resolved(agent.name,agent.generation,p.requestId);
+      this.workerReports.resolved(agent.name,agent.generation,p.requestId);
       this.store.db.prepare("UPDATE questions SET state=CASE WHEN state='answering' THEN 'resolved' ELSE 'expired' END WHERE agent=? AND generation=? AND rpc_id_json=? AND state IN ('pending','answering')")
         .run(agent.name,agent.generation,JSON.stringify(p.requestId));
       const terminal=this.store.db.prepare("SELECT state FROM turn_outcomes WHERE agent=? AND generation=?").get(agent.name,agent.generation) as {state:"idle"|"interrupted"}|undefined;
-      if(this.store.questions(agent.name).length===0&&!this.external.waiting(agent.name))this.store.change(agent.name,agent.generation,{state:row.turn_id?"working":terminal?.state??"idle"});
+      if(this.store.questions(agent.name).length===0&&!this.external.waiting(agent.name)&&!this.workerReports.waiting(agent.name))this.store.change(agent.name,agent.generation,{state:row.turn_id?"working":terminal?.state??"idle"});
     }
   }
-  async prompt(name:string,key:string,text:string):Promise<unknown> {
+  workerInstructionReceipt(name:string,key:string,text:string,scope:{attempt_id:string;generation:string;thread_id:string}) {
+    const row=this.store.agent(name);
+    if(row?.role!=="worker"||row.generation!==scope.generation||row.thread_id!==scope.thread_id||JSON.parse(row.config_json).attemptId!==scope.attempt_id)throw Error("runtime_worker_instruction_not_current");
+    const prior=this.store.db.prepare("SELECT request_hash,state,result_json FROM operations WHERE agent=? AND operation_key=?").get(name,key) as {request_hash:string;state:string;result_json:string|null}|undefined;
+    if(!prior)return {state:"not_found" as const};
+    if(prior.request_hash!==hash({text}))throw Error("runtime_operation_conflict");
+    if(prior.state!=="accepted")return {state:"unknown" as const};
+    const accepted=JSON.parse(prior.result_json!);
+    if(accepted.generation!==scope.generation||accepted.threadId!==scope.thread_id)throw Error("runtime_operation_generation_changed");
+    return {state:"accepted" as const,turnId:accepted.turnId as string};
+  }
+  async prompt(name:string,key:string,text:string,workerScope?:{attempt_id:string;generation:string;thread_id:string}):Promise<unknown> {
     return this.serialized(name,async()=>{
       const row=this.status(name),rpc=this.connections.get(name);
+      if(workerScope&&(row?.role!=="worker"||row.generation!==workerScope.generation||row.thread_id!==workerScope.thread_id||JSON.parse(row.config_json).attemptId!==workerScope.attempt_id))throw Error("runtime_worker_instruction_not_current");
       const requestHash=hash({text});
       const old=this.store.db.prepare("SELECT * FROM operations WHERE agent=? AND operation_key=?").get(name,key) as {request_hash:string;state:string;result_json:string|null}|undefined;
       if(old){if(old.request_hash!==requestHash)throw Error("runtime_operation_conflict");if(old.state!=="accepted")throw Error("runtime_acceptance_unknown");const accepted=JSON.parse(old.result_json!);if(accepted.generation!==row?.generation||accepted.threadId!==row?.thread_id)throw Error("runtime_operation_generation_changed");return {turnId:accepted.turnId};}
@@ -316,6 +343,14 @@ export class AppServerManager {
     const resolved=this.external.resolve(id,result);
     if(row.state==="pending")rpc.respond(JSON.parse(row.rpc_id_json),{success:true,contentItems:[{type:"inputText",text:resolved.result_json!}]});
     if(!this.external.waiting(name)&&!this.store.questions(name).length)this.store.change(name,agent.generation,{state:agent.turn_id?"working":"idle"});
+    return {request_id:id,state:resolved.state};
+  }
+  resolveWorkerReport(name:string,id:string,result:unknown) {
+    const row=this.workerReports.get(id),agent=this.store.agent(name),rpc=this.connections.get(name);
+    if(!row||row.agent!==name||!agent||agent.generation!==row.generation||agent.thread_id!==row.thread_id||(agent.turn_id!==null&&agent.turn_id!==row.turn_id)||!rpc?.connected)throw Error("runtime_worker_report_not_current");
+    const resolved=this.workerReports.resolve(id,result);
+    if(row.state==="pending")rpc.respond(JSON.parse(row.rpc_id_json),{success:reportResponseSucceeded(resolved.result_json!),contentItems:[{type:"inputText",text:resolved.result_json!}]});
+    if(!this.workerReports.waiting(name)&&!this.external.waiting(name)&&!this.store.questions(name).length)this.store.change(name,agent.generation,{state:agent.turn_id?"working":"idle"});
     return {request_id:id,state:resolved.state};
   }
   async answer(name:string,id:string,answers:Record<string,{answers:string[]}>):Promise<QuestionRecord> {
@@ -379,7 +414,7 @@ export class AppServerManager {
     this.store.db.transaction(()=>{
       this.store.db.prepare("UPDATE stops SET state='stopped' WHERE agent=? AND generation=?").run(name,generation);
       this.store.db.prepare("UPDATE questions SET state='expired' WHERE agent=? AND generation=? AND state IN ('pending','answering')").run(name,generation);
-      this.external.expireAgent(name,generation);
+      this.external.expireAgent(name,generation);this.workerReports.expireAgent(name,generation);
       this.store.change(name,generation,{state:"stopped",turn_id:null});
     }).immediate();
     this.connections.delete(name);return this.store.agent(name)!;

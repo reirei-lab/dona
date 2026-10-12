@@ -192,8 +192,9 @@ export class TaskRepository {
       if(binding?.owner.kind!=="local_dashboard")throw new Error("task_owner_mismatch");
       return task;
     }
-    if(!event||!["slack","dona_job"].includes(event.source))throw new Error("task_owner_mismatch");
-    if(event.source==="dona_job"&&JSON.parse(event.subject_json).source_event_id!==task.source_event_id&&!this.continuations.canRead(id,eventId))throw new Error("task_owner_mismatch");
+    if(event?.source==="dona_message"&&!this.dispatcher.workerMessages.ownsReportEvent(task.current_attempt_id,eventId))throw new Error("task_owner_mismatch");
+    if(!event||!["slack","dona_job","dona_message"].includes(event.source))throw new Error("task_owner_mismatch");
+    if(["dona_job","dona_message"].includes(event.source)&&JSON.parse(event.subject_json).source_event_id!==task.source_event_id&&!this.continuations.canRead(id,eventId))throw new Error("task_owner_mismatch");
     const original=this.dispatcher.get(task.source_event_id)!;
     const target=original.reply_target_json?JSON.parse(original.reply_target_json):{},current=event.reply_target_json?JSON.parse(event.reply_target_json):{};
     if(typeof target.workspace_id!=="string"||target.workspace_id!==current.workspace_id)throw new Error("task_owner_mismatch");

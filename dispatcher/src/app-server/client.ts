@@ -1,3 +1,4 @@
+import type {RuntimeWorkerReport} from "./worker-reports.js";
 import type {ExternalToolRequest} from "./external-tools.js";
 import type {ConversationIdentity,ConversationSnapshot} from "./observation.js";
 import http from "node:http";
@@ -21,6 +22,11 @@ export class RuntimeClient {
       request.setTimeout(this.timeoutMs,()=>request.destroy(Error("runtime_response_unknown")));request.on("error",reject);request.end(body);
     });
   }
+  workerInstructionReceipt(name:string,messageId:string,text:string,scope:{attempt_id:string;generation:string;thread_id:string}):Promise<{state:"not_found"|"unknown"|"accepted";turnId?:string}>{return this.call("workerInstructionReceipt",{name,key:`worker-message:${messageId}`,text,scope});}
+  workerInstruction(name:string,messageId:string,text:string,scope:{attempt_id:string;generation:string;thread_id:string}):Promise<{turnId:string}>{return this.call("workerInstruction",{name,key:`worker-message:${messageId}`,text,scope});}
+  workerReportAvailability(enabled:boolean):Promise<{enabled:boolean;ttl_ms:number}>{return this.call("workerReportAvailability",{enabled});}
+  workerReports():Promise<RuntimeWorkerReport[]>{return this.call("workerReports");}
+  resolveWorkerReport(name:string,id:string,result:unknown):Promise<unknown>{return this.call("resolveWorkerReport",{name,id,result});}
   externalAvailability(enabled:boolean):Promise<{enabled:boolean;ttl_ms:number}>{return this.call("externalAvailability",{enabled});}
   externalRequest(id:string):Promise<ExternalToolRequest|null>{return this.call("externalRequest",{id});}
   externalRequests():Promise<ExternalToolRequest[]>{return this.call("externalRequests");}

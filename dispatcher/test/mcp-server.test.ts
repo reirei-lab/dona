@@ -15,6 +15,8 @@ describe("Dona Dispatcher MCP server", () => {
     const calls: Array<{ method: string; args: unknown[] }> = [];
     let planError: Error | undefined;
     const api: DispatcherJobClient = {
+      async getTaskReports(id,event){calls.push({method:"getTaskReports",args:[id,event]});return {schema_version:1,reports:[]};},
+      async instructTask(id,revision,message){calls.push({method:"instructTask",args:[id,revision,message]});return {schema_version:1,outcome:"created"};},
       async findIssueTask(eventId,repository,issueNumber) {calls.push({method:"findIssueTask",args:[eventId,repository,issueNumber]});return {task:{task_id:"existing"}};},
       async inspectWorker(jobId,sourceEventId) { calls.push({method:"inspectWorker",args:[jobId,sourceEventId]}); return {worker:{state:"inactive"}}; },
       async resumeJob(jobId,input) { calls.push({method:"resumeJob",args:[jobId,input]}); return {outcome:"created",job_id:"job_01m1es03xy5cf8d9pm5cwx4srv"}; },
@@ -89,6 +91,12 @@ describe("Dona Dispatcher MCP server", () => {
       const found=await client.callTool({name:"find_issue_task",arguments:{source_event_id:"evt_01K00000000000000000000000",repository:"org/repo",issue_number:24}});
       assert.notEqual(found.isError,true);
       assert.deepEqual(calls.pop(),{method:"findIssueTask",args:["evt_01K00000000000000000000000","org/repo",24]});
+      const task="task_01h00000000000000000000000",event="evt_01K00000000000000000000000";
+      assert.notEqual((await client.callTool({name:"get_task_reports",arguments:{task_id:task,source_event_id:event}})).isError,true);
+      assert.deepEqual(calls.pop(),{method:"getTaskReports",args:[task,event]});
+      const message={schema_version:1,source_event_id:event,producer_sequence:1,idempotency_key:"instruction.one",occurred_at:"2026-10-12T00:00:00Z",payload:{operation:"add_condition",text:"追加条件を確認する"}};
+      assert.notEqual((await client.callTool({name:"instruct_task",arguments:{task_id:task,revision:3,message}})).isError,true);
+      assert.deepEqual(calls.pop(),{method:"instructTask",args:[task,3,message]});
       const listed = await client.listTools();
       const approval=listed.tools.find(tool=>tool.name==="respond_task_approval")!.description!;
       assert.match(approval,/同じworkspaceの検証済み依頼者/);
@@ -97,7 +105,7 @@ describe("Dona Dispatcher MCP server", () => {
       assert.match(approval,/要求通知後/);
       assert.equal(listed.tools.find(tool=>tool.name==="authorize_job_notification")?.annotations?.idempotentHint,false);
       assert.deepEqual(listed.tools.map(({ name }) => name), [
-        "delegate_task", "control_task_continuation", "get_task", "inspect_task_recovery", "reconcile_task_result", "find_issue_task", "list_tasks", "get_task_questions", "answer_task_question", "respond_task_approval", "pause_task", "resume_task", "cancel_task", "steer_task", "retry_task",
+        "delegate_task", "control_task_continuation", "get_task", "inspect_task_recovery", "reconcile_task_result", "find_issue_task", "list_tasks", "get_task_reports", "instruct_task", "get_task_questions", "answer_task_question", "respond_task_approval", "pause_task", "resume_task", "cancel_task", "steer_task", "retry_task",
         "delegate_job",
         "delegate_scheduled_work",
         "list_event_jobs",
