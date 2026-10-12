@@ -498,10 +498,10 @@ export class WorkerMessageRepository {
         const reserved=candidate.decision.action==="report_to_user"&&this.db.prepare(`SELECT 1 FROM worker_progress_applications a
           JOIN worker_progress_decisions p USING(decision_key) JOIN jobs j ON j.job_id=p.job_id
           WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state') IN ('presentation_ready','presentation_delivered') AND json_extract(p.decision_json,'$.action')='report_to_user'
-            AND json_extract(p.decision_json,'$.observed.group_fingerprint')=?
-            AND (? IS NULL OR json_extract(p.decision_json,'$.fingerprint')=?) LIMIT 1`)
+            AND (json_extract(p.decision_json,'$.observed.group_fingerprint')=?
+              OR (? IS NOT NULL AND EXISTS(SELECT 1 FROM json_each(json_extract(p.decision_json,'$.observed.high_risk_message_ids')) r WHERE r.value=?))) LIMIT 1`)
           .get(job.source_event_id,candidate.decision.observed?.group_fingerprint??null,
-            candidate.decision.observed?.severity==="high"?candidate.decision.fingerprint:null,candidate.decision.fingerprint);
+            candidate.decision.observed?.severity==="high"?candidate.decision.target?.message_id:null,candidate.decision.target?.message_id??null);
         const undelivered=candidate.decision.action==="report_to_user"&&!candidate.decision.signals.risk_escalation&&!candidate.decision.signals.eta_changed&&this.db.prepare(`SELECT 1 FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key)
           JOIN jobs j ON j.job_id=p.job_id WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready' LIMIT 1`).get(job.source_event_id);
         if(reserved){result.action="ack_internal";result.state="presentation_duplicate";}
@@ -527,9 +527,10 @@ export class WorkerMessageRepository {
 
   presentationVerificationRequest(eventId:string,result:ResultEnvelope):JobNotificationVerificationRequest|undefined {
     const posts=(result.actions??[]).filter(a=>a&&typeof a==='object'&&!Array.isArray(a)&&(a as Record<string,unknown>).tool==='dona_slack.post_message') as Array<Record<string,unknown>>;
-    if(!posts.length)return undefined;
     const rows=this.db.prepare("SELECT decision_key,result_json FROM worker_progress_applications WHERE event_id=? AND json_extract(result_json,'$.state') IN ('presentation_ready','presentation_delivered','local_artifact_ready') LIMIT 2").all(eventId) as Array<{decision_key:string;result_json:string}>;
     if(!rows.length)return undefined;
+    if(rows.length===1&&!posts.length&&JSON.parse(rows[0]!.result_json).artifact?.destination?.kind==='none')return undefined;
+    if(!posts.length)throw Error("progress_presentation_action_missing");
     if(rows.length!==1||posts.length!==1)throw Error("progress_presentation_ambiguous");
     const artifact=JSON.parse(rows[0]!.result_json).artifact as {destination:{kind:string;workspace_id?:string;channel_id?:string;thread_ts?:string};rendered_body?:string;rendered_body_sha256?:string};
     const target=artifact.destination,post=posts[0]!;

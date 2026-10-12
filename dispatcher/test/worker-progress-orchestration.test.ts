@@ -231,16 +231,33 @@ test("providerの宛先・本文・identity receiptを確認した時だけ予�
 });
 
 
-for(const verified of [true,false])test(`親Resultの投稿actionをread-only verifierで照合する（成功=${verified}）`,async()=>{
+for(const verified of [true,false,"missing"] as const)test(`親Resultの投稿actionをread-only verifierで照合する（成功=${verified}）`,async()=>{
  const f=await fixture();let worker:DispatcherWorker|undefined;try{
   f.config.workerMessagingEnabled=true;const now=new Date(),m=f.report(0,"検証が進みました",now);f.report(1,"並行検証が進みました",now);f.db.workerMessages.publishPendingReports();f.db.workerMessages.publishPendingReports(100,new Date(now.getTime()+61000));
   const event=f.eventFor(m.message.message_id),t=f.tasks[0]!,c=f.db.prepareTaskProgressDecision(t.task_id,event)!;
   const a=f.db.applyTaskProgressDecision(t.task_id,event,c.decision_id),artifact=a.artifact as {destination:{workspace_id:string;channel_id:string;thread_ts:string}};
   const resultPath=path.join(f.root,"parent-progress-result.json");f.db.beginDispatch(event,resultPath);f.db.markWaiting(event);
-  const ts=(Date.now()/1000).toFixed(6);await fs.writeFile(resultPath,JSON.stringify({schema_version:1,event_id:event,status:"completed",summary:"進捗を報告しました",completed_at:new Date().toISOString(),actions:[{tool:"dona_slack.post_message",event_id:event,workspace_id:artifact.destination.workspace_id,channel_id:artifact.destination.channel_id,thread_ts:artifact.destination.thread_ts,message_ts:ts,reply_broadcast:false,mrkdwn:true,parse:"none"}]}));
+  const ts=(Date.now()/1000).toFixed(6);await fs.writeFile(resultPath,JSON.stringify({schema_version:1,event_id:event,status:"completed",summary:"進捗を報告しました",completed_at:new Date().toISOString(),actions:verified==="missing"?[]:[{tool:"dona_slack.post_message",event_id:event,workspace_id:artifact.destination.workspace_id,channel_id:artifact.destination.channel_id,thread_ts:artifact.destination.thread_ts,message_ts:ts,reply_broadcast:false,mrkdwn:true,parse:"none"}]}));
   let calls=0;const never=async()=>{throw Error("model再投入・session変更をしてはいけない");};
-  worker=new DispatcherWorker(f.db,{get:never,prompt:never,wait:never},f.config,{debug(){},info(){},warn(){},error(){}},{settle:never,async verify(request){calls++;worker!.quiesceAfterCurrent();if(!verified)throw Error("job_delivery_not_confirmed");return {event_id:request.event_id,workspace_id:request.workspace_id,channel_id:request.channel_id,thread_ts:request.thread_ts,message_ts:ts,body_sha256:request.body_sha256,posted_at:new Date(Number(ts)*1000).toISOString(),reply_broadcast:false,identity_block_verified:true,session_status:null};}});
-  worker.start();await waitFor(()=>f.db.get(event)?.status===(verified?"completed":"needs_review"));await worker.stop();
-  assert.equal(calls,1);const sql=new Database(f.config.databasePath),state=JSON.parse((sql.prepare("SELECT result_json FROM worker_progress_applications WHERE decision_key=?").get(c.decision_id) as {result_json:string}).result_json).state;sql.close();assert.equal(state,verified?"presentation_delivered":"presentation_ready");
+  worker=new DispatcherWorker(f.db,{get:never,prompt:never,wait:never},f.config,{debug(){},info(){},warn(){},error(){}},{settle:never,async verify(request){calls++;worker!.quiesceAfterCurrent();if(verified!==true)throw Error("job_delivery_not_confirmed");return {event_id:request.event_id,workspace_id:request.workspace_id,channel_id:request.channel_id,thread_ts:request.thread_ts,message_ts:ts,body_sha256:request.body_sha256,posted_at:new Date(Number(ts)*1000).toISOString(),reply_broadcast:false,identity_block_verified:true,session_status:null};}});
+  worker.start();await waitFor(()=>f.db.get(event)?.status===(verified===true?"completed":"needs_review"));await worker.stop();
+  assert.equal(calls,verified==="missing"?0:1);const sql=new Database(f.config.databasePath),state=JSON.parse((sql.prepare("SELECT result_json FROM worker_progress_applications WHERE decision_key=?").get(c.decision_id) as {result_json:string}).result_json).state;sql.close();assert.equal(state,verified===true?"presentation_delivered":"presentation_ready");
  }finally{await worker?.stop();await f.dispose();}
+});
+
+test("別siblingのcheckpointで予約したhigh riskは自身のeventでも重複しない",async()=>{
+ const f=await fixture();try{
+  const now=new Date(),a=f.report(0,"検証が進みました",now),b=f.db.workerMessages.appendWorkerReport(f.tasks[1]!.current_attempt_id,"runtime",{schema_version:1,source_event_id:f.source.event_id,producer_sequence:1,idempotency_key:"risk",occurred_at:now.toISOString(),payload:{kind:"risk",severity:"high",summary:"重要な確認が必要です"}},now);
+  f.db.workerMessages.publishPendingReports();f.db.workerMessages.publishPendingReports(100,new Date(now.getTime()+61000));
+  const ea=f.eventFor(a.message.message_id),eb=f.eventFor(b.message.message_id),ca=f.db.prepareTaskProgressDecision(f.tasks[0]!.task_id,ea)!;
+  const first=f.db.applyTaskProgressDecision(f.tasks[0]!.task_id,ea,ca.decision_id);assert.equal(first.state,"presentation_ready");
+  const artifact=first.artifact as {rendered_body_sha256:string;destination:{workspace_id:string;channel_id:string;thread_ts:string}},ts=(Date.now()/1000-120).toFixed(6);
+  const parentResult={schema_version:1 as const,event_id:ea,status:"completed" as const,summary:"報告しました",completed_at:now.toISOString(),actions:[{tool:"dona_slack.post_message",event_id:ea,...artifact.destination,message_ts:ts,reply_broadcast:false,mrkdwn:true,parse:"none"}]};
+  const request=f.db.workerMessages.presentationVerificationRequest(ea,parentResult)!;
+  f.db.workerMessages.confirmPresentation(ea,request,{event_id:ea,workspace_id:request.workspace_id,channel_id:request.channel_id,thread_ts:request.thread_ts,message_ts:ts,body_sha256:request.body_sha256,posted_at:new Date(Number(ts)*1000).toISOString(),reply_broadcast:false,identity_block_verified:true,session_status:null});
+  f.db.workerMessages.appendWorkerReport(f.tasks[0]!.current_attempt_id,"runtime",{schema_version:1,source_event_id:f.source.event_id,producer_sequence:2,idempotency_key:"later-checkpoint",occurred_at:now.toISOString(),payload:{kind:"checkpoint",summary:"追加の検証が進みました"}},now);
+  const cb=f.db.prepareTaskProgressDecision(f.tasks[1]!.task_id,eb)!;
+  assert.equal(cb.decision.action,"report_to_user");assert.notEqual(cb.decision.observed?.group_fingerprint,ca.decision.observed?.group_fingerprint);
+  const result=f.db.applyTaskProgressDecision(f.tasks[1]!.task_id,eb,cb.decision_id);assert.equal(result.state,"presentation_duplicate");assert.equal(result.artifact,undefined);
+ }finally{await f.dispose();}
 });

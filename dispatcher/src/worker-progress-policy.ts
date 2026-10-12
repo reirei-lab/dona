@@ -45,7 +45,12 @@ export function evaluateProgress(raw:unknown):ProgressDecision {
  const urgent=c.report&&(["question","decision_request"].includes(c.report.payload.kind)||(c.report.payload.kind==="risk"&&c.report.payload.severity==="high"));
  if(c.group_terminal||(c.group_attention&&!urgent)){result.reason="terminal_notification_priority";return result;}
  if(!c.context_complete||!c.members.some(m=>m.job_id===c.job_id&&m.phase===c.phase)||new Set(c.members.map(m=>m.job_id)).size!==c.members.length){result.reason="context_incomplete";return result;}
- if(denied(reportText(c.report))){result.reason="unsafe_projection";result.target=null;return result;}
+ if(!c.report_current){result.reason="stale_report";return result;}
+ if(denied(reportText(c.report))){
+  if(!urgent){result.reason="unsafe_projection";result.target=null;return result;}
+  const important=c.report!;
+  c.report={...important,payload:important.payload.kind==='risk'?{kind:'risk',severity:'high',summary:'重要な確認事項があります。安全に表示できない本文は伏せています。'}:{kind:'question',question:'作業が判断待ちです。安全に表示できない質問本文は伏せています。内容を確認して指示してください。'}};
+ }
  if(urgent){c.members=c.members.map(m=>denied(reportText(m.report))?{job_id:m.job_id,phase:m.phase}:m);}
  else if(c.members.some(m=>denied(reportText(m.report)))){result.reason="unsafe_projection";result.target=null;return result;}
  if(!c.report_current){result.reason="stale_report";return result;}

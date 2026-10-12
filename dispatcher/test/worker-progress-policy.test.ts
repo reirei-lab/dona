@@ -84,3 +84,10 @@ test("別workerのcheckpoint変化で同じhigh riskを再escalationしない",(
  const d=evaluateProgress(context({reserved_high_risk_ids:[risk.message_id],presentation_pending:true,members:[{job_id:"job-one",phase:"running",report},{job_id:"job-two",phase:"running",report:risk}]}));
  assert.equal(d.signals.risk_escalation,false);assert.equal(d.action,"aggregate_wait");
 });
+
+for(const kind of ['question','decision_request','risk'] as const)test(`安全に表示できない重要報告を伏せた通知として保持する（${kind}）`,()=>{
+ const unsafe={...report,payload:kind==='risk'?{kind,severity:'high' as const,summary:'src/a.ts を確認してください'}:kind==='decision_request'?{kind,question:'src/a.ts を確認してください',options:['curl private','確認する']}:{kind,question:'src/a.ts を確認してください'}};
+ const d=evaluateProgress(context({report:unsafe,members:[{job_id:'job-one',phase:'running',report:unsafe}]}));
+ assert.equal(d.action,kind==='risk'?'report_to_user':'ask_user');assert.equal(d.target?.message_id,unsafe.message_id);assert.ok(d.safe_projection);assert.ok(!JSON.stringify(d).includes('src/a.ts'));assert.ok(!JSON.stringify(d).includes('curl private'));
+ assert.equal(evaluateProgress(context({report:unsafe,report_current:false})).action,'ack_internal');
+});
