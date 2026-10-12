@@ -401,6 +401,7 @@ test("型付き質問中のResultはhuman_inputを保ち、native解消後に型
   await supervisor.reconcileTasks();assert.equal(db.getJob(job.job_id)?.last_error_code,"worker_message_question_pending");assert.equal(db.tasks.get(task.task_id)?.wait_reason,"human_input");
   db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"answer",occurred_at:new Date().toISOString(),correlation_message_id:question.message.message_id,conversation_revision:1,payload:{operation:"answer",text:"元の範囲で続行してください"}});
   await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();assert.equal(db.tasks.get(task.task_id)?.state,"active");
+  assert.ok(db.workerMessages.stoppedInstructionContext(job.job_id).includes("元の範囲で続行してください"));
   const future={schema_version:1 as const,job_id:job.job_id,status:"completed" as const,summary:"確認しました",completed_at:new Date(Date.now()+60000).toISOString()};
   assert.throws(()=>db.saveJobResult(job.job_id,future,job.result_path),/completed_at_is_in_the_future/);assert.notEqual(db.tasks.get(task.task_id)?.state,"completed");
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
@@ -500,5 +501,25 @@ for(const objective of ["a","question"])test(`短いobjectiveとJSON構造キー
    override async workerReports(){return [{request_id:"request",agent:j.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"rpc"',attempt_id:j.job_id,report_key:"report",request_sequence:1,payload_json:stableStringify({payload:{kind:"question",question:"続行できますか？"}}),payload_sha256:"hash",created_at:created,state:"pending" as const,result_json:null}];}
    override async resolveWorkerReport(_name:string,_id:string,result:unknown){resolved=result;return {};}}
   assert.equal(await new AppServerWorkerReportBridge(db,new Port()).runOnce(),1);assert.ok((resolved as {message_id:string}).message_id);
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+
+for(const code of ["runtime_question_pending","runtime_external_approval_pending"])test(`native入力待ちのsilence eventを抑止する（${code}）`,async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);try{
+  const source=db.enqueue(eventEnvelope("native-silence-"+code)).row,t=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"native",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  db.beginJobPreparation(t.current_attempt_id);db.setJobRuntime(t.current_attempt_id,"w","p","runtime");db.beginJobDispatch(t.current_attempt_id);db.markJobRunning(t.current_attempt_id);
+  db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"checkpoint",occurred_at:new Date().toISOString(),payload:{kind:"checkpoint",summary:"確認が進みました"}});
+  db.markJobBlocked(t.current_attempt_id,"native wait",["running"],code);assert.equal(db.workerMessages.publishDueSilenceEvents(100,new Date(Date.now()+1000000)),0);
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("短い指示も257件目を保存前に拒否し、既存receiptと引継ぎを保つ",async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);try{
+  const source=db.enqueue(eventEnvelope("instruction-count")).row,t=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"count",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  let first:unknown;
+  for(let i=1;i<=256;i++){const result=db.workerMessages.appendInstruction(t.current_attempt_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:i,idempotency_key:"condition."+i,occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"確認する"}});if(i===1)first=result;}
+  assert.throws(()=>db.workerMessages.appendInstruction(t.current_attempt_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:257,idempotency_key:"condition.257",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"確認する"}}),/count limit/);
+  assert.ok(db.workerMessages.stoppedInstructionContext(t.current_attempt_id));assert.equal(db.workerMessages.reconcile(t.current_attempt_id,source.event_id,"dona-main","condition.257").reconciliation,"not_found");assert.ok(first);
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
