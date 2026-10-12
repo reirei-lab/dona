@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import {test} from "node:test";
 import {evaluateProgress,progressActions,type ProgressContext} from "../src/worker-progress-policy.js";
 const now="2026-10-12T08:00:00.000Z";
-const report={message_id:"message-one",payload:{kind:"checkpoint" as const,summary:"検証が進みました"},occurred_at:now};
+const report={message_id:"message-one",payload:{kind:"checkpoint" as const,summary:"検証が進みました"},occurred_at:now,accepted_at:now};
 function context(patch:Partial<ProgressContext>={}):ProgressContext{return {event_id:"event-one",job_id:"job-one",report_current:true,current:true,desired_state:"running",phase:"running",now,report,
  members:[{job_id:"job-one",phase:"running",report}],group_attention:false,group_terminal:false,context_complete:true,silence_threshold_ms:900000,minimum_report_interval_ms:60000,...patch};}
 const first=evaluateProgress(context());

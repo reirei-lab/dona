@@ -152,3 +152,35 @@ test("別threadのeventとDB読取不能ではdecisionを作らずfail closedす
   assert.equal(f.db.workerMessages.progressDecisionCandidate(t.current_attempt_id,event)!.replayed,false);
  }finally{await f.dispose();}
 });
+
+test("同じsnapshotで先に作った並行candidateも適用時にgroup予約へ収束する",async()=>{
+ const f=await fixture();try{
+  const now=new Date(),a=f.report(0,"検証Aが進みました",now),b=f.report(1,"検証Bが進みました",now);f.db.workerMessages.publishPendingReports();f.db.workerMessages.publishPendingReports(100,new Date(now.getTime()+61000));
+  const candidates=[a,b].map((m,i)=>f.db.workerMessages.progressDecisionCandidate(f.tasks[i]!.current_attempt_id,f.eventFor(m.message.message_id),now)!);
+  assert.ok(candidates.every(c=>c.decision.action==="report_to_user"));
+  const first=f.db.applyTaskProgressDecision(f.tasks[0]!.task_id,f.eventFor(a.message.message_id),candidates[0]!.decision_id);
+  const second=f.db.applyTaskProgressDecision(f.tasks[1]!.task_id,f.eventFor(b.message.message_id),candidates[1]!.decision_id);
+  assert.equal(first.state,"presentation_ready");assert.equal(second.state,"presentation_duplicate");assert.equal(second.artifact,undefined);
+ }finally{await f.dispose();}
+});
+
+test("high riskの後続checkpointが先に届いても未提示riskを失わない",async()=>{
+ const f=await fixture();try{
+  const t=f.tasks[0]!,m=f.db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:f.source.event_id,producer_sequence:1,idempotency_key:"risk",occurred_at:new Date().toISOString(),payload:{kind:"risk",severity:"high",summary:"重要な確認が必要です"}});
+  f.db.workerMessages.publishPendingReports();const event=f.eventFor(m.message.message_id);
+  f.db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:f.source.event_id,producer_sequence:2,idempotency_key:"checkpoint",occurred_at:new Date().toISOString(),payload:{kind:"checkpoint",summary:"別の検証が進みました"}});
+  const c=f.db.workerMessages.progressDecisionCandidate(t.current_attempt_id,event)!;assert.equal(c.decision.action,"report_to_user");assert.equal(c.decision.signals.risk_escalation,true);
+  assert.equal(f.db.applyTaskProgressDecision(t.task_id,event,c.decision_id).state,"presentation_ready");
+ }finally{await f.dispose();}
+});
+
+test("未来のworker時刻でもserver受付から30秒で集約を進める",async()=>{
+ const f=await fixture();try{
+  const now=new Date(),t=f.tasks[0]!,m=f.db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:f.source.event_id,producer_sequence:1,idempotency_key:"future",occurred_at:new Date(now.getTime()+86400000).toISOString(),payload:{kind:"checkpoint",summary:"検証が進みました"}},now);
+  f.db.workerMessages.publishPendingReports(100,now);const event=f.eventFor(m.message.message_id),c=f.db.workerMessages.progressDecisionCandidate(t.current_attempt_id,event,now)!;
+  assert.equal(c.decision.action,"aggregate_wait");f.db.workerMessages.applyProgressDecision(t.current_attempt_id,event,c.decision_id,now);
+  const due=new Date(now.getTime()+31000);assert.equal(f.db.workerMessages.publishDueProgressDecisions(32,due),1);
+  const sql=new Database(f.config.databasePath),next=(sql.prepare("SELECT followup_event_id FROM worker_progress_applications WHERE decision_key=?").get(c.decision_id) as {followup_event_id:string}).followup_event_id;sql.close();
+  assert.equal(f.db.workerMessages.progressDecisionCandidate(t.current_attempt_id,next,due)!.decision.action,"report_to_user");
+ }finally{await f.dispose();}
+});

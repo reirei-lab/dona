@@ -391,7 +391,7 @@ export class WorkerMessageRepository {
       const rows=this.db.prepare(`SELECT j.job_id,j.status,j.last_error_code FROM jobs j LEFT JOIN tasks t ON t.current_attempt_id=j.job_id
         WHERE j.source_event_id=? AND (t.task_id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM task_attempts a WHERE a.attempt_id=j.job_id))
         ORDER BY j.created_at,j.job_id LIMIT 33`).all(job.source_event_id) as Array<{job_id:string;status:string;last_error_code:string|null}>;
-      const project=(message:WorkerMessageRow)=>({message_id:message.message_id,payload:JSON.parse(message.payload_json),occurred_at:message.occurred_at});
+      const project=(message:WorkerMessageRow)=>({message_id:message.message_id,payload:JSON.parse(message.payload_json),occurred_at:message.occurred_at,accepted_at:message.accepted_at});
       const report=payload.message_id?this.db.prepare("SELECT * FROM worker_messages WHERE message_id=? AND job_id=? AND direction='worker_to_dona'").get(payload.message_id,jobId) as WorkerMessageRow|undefined:undefined;
       const members=rows.slice(0,32).map(row=>{
         const latest=this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND direction='worker_to_dona' ORDER BY producer_sequence DESC LIMIT 1").get(row.job_id) as WorkerMessageRow|undefined;
@@ -410,7 +410,9 @@ export class WorkerMessageRepository {
       const pendingQuestion=report&&["question","decision_request"].includes(report.kind)&&!!this.db.prepare(`SELECT 1 FROM worker_messages q
         WHERE q.message_id=? AND NOT EXISTS (SELECT 1 FROM worker_messages a JOIN worker_message_deliveries d USING(message_id)
           WHERE a.correlation_message_id=q.message_id AND a.kind='answer' AND d.consumer='worker' AND d.state='delivered')`).get(report.message_id);
-      const identity={report_current:!report||latestForJob?.message_id===report.message_id||!!pendingQuestion,job_id:jobId,current:task?.current_attempt_id===jobId&&task.stop_state==="none"&&!task.steer_pending_event_id,desired_state:task?.desired_state??"cancelled",phase:job.status,
+      const pendingRisk=report?.kind==="risk"&&JSON.parse(report.payload_json).severity==="high"&&!this.db.prepare(`SELECT 1 FROM worker_progress_decisions p JOIN worker_progress_applications a USING(decision_key)
+        WHERE p.job_id=? AND json_extract(p.decision_json,'$.target.message_id')=? AND json_extract(a.result_json,'$.state')='presentation_ready' LIMIT 1`).get(jobId,report.message_id);
+      const identity={report_current:!report||latestForJob?.message_id===report.message_id||!!pendingQuestion||!!pendingRisk,job_id:jobId,current:task?.current_attempt_id===jobId&&task.stop_state==="none"&&!task.steer_pending_event_id,desired_state:task?.desired_state??"cancelled",phase:job.status,
         members:members.map(m=>({job_id:m.job_id,phase:m.phase,message_id:m.report?.message_id??null})),
         group_attention:liveAttention||attentionActive,group_terminal:!!group?.all_terminal_event_id,context_complete:rows.length<=32,
         ...(pending?{pending_instruction:{message_id:pending.message_id,state:pending.attempt_count>0?"unknown":"pending"}}:{})};
@@ -475,10 +477,16 @@ export class WorkerMessageRepository {
       }else if(["report_to_user","ask_user"].includes(candidate.decision.action)){
         const binding=readEventJobBinding(this.db,job.source_event_id);
         if(!binding)throw Error("progress_destination_unverified");
-        result.state="presentation_ready";
+        const reserved=candidate.decision.action==="report_to_user"&&this.db.prepare(`SELECT 1 FROM worker_progress_applications a
+          JOIN worker_progress_decisions p USING(decision_key) JOIN jobs j ON j.job_id=p.job_id
+          WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready'
+            AND json_extract(p.decision_json,'$.observed.group_fingerprint')=? LIMIT 1`)
+          .get(job.source_event_id,candidate.decision.observed?.group_fingerprint??null);
+        if(reserved){result.action="ack_internal";result.state="presentation_duplicate";}
+        else {result.state="presentation_ready";
         result.artifact={version:1,decision_id:decisionId,action:candidate.decision.action,
           source_event_id:job.source_event_id,destination:binding.destination,
-          operation_slot:decisionId,reply_broadcast:false,safe_projection:candidate.decision.safe_projection};
+          operation_slot:decisionId,reply_broadcast:false,safe_projection:candidate.decision.safe_projection};}
       }
       this.db.prepare("INSERT INTO worker_progress_applications VALUES(?,?,?,?,NULL,?)").run(decisionId,eventId,stableStringify(result),nextCheck,at.toISOString());
       return result;

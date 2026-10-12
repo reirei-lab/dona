@@ -8,7 +8,7 @@ import {stableStringify} from "./validation.js";
 export const progressActions=["ack_internal","ask_worker","instruct_worker","aggregate_wait","report_to_user","ask_user"] as const;
 const instant=z.string().datetime();
 const phase=z.enum(jobStatuses);
-const projection=z.strictObject({message_id:z.string().min(1).max(80),payload:z.lazy(()=>workerReportSchema.shape.payload),occurred_at:instant});
+const projection=z.strictObject({message_id:z.string().min(1).max(80),payload:z.lazy(()=>workerReportSchema.shape.payload),occurred_at:instant,accepted_at:instant});
 const member=z.strictObject({job_id:z.string().min(1).max(80),phase,report:projection.optional()});
 /** Only the server's owner-checked, transaction-consistent ledger projection may supply this context. */
 export const progressContextSchema=z.strictObject({event_id:z.string().min(1).max(80),job_id:z.string().min(1).max(80),
@@ -83,7 +83,7 @@ export function evaluateProgress(raw:unknown):ProgressDecision {
  if(payload.kind==="checkpoint"&&c.last_presentation_fingerprint===groupFingerprint){result.reason="group_progress_already_reserved";return result;}
  if(!result.signals.novelty&&!result.signals.risk_escalation&&!result.signals.eta_changed&&c.previous?.action!=="aggregate_wait"){result.reason="duplicate_report";return result;}
  const live=c.members.filter(m=>["running","blocked"].includes(m.phase));
- if(!result.signals.risk_escalation&&!result.signals.eta_changed&&live.length>1&&live.some(m=>!m.report)&&now-Date.parse(c.report.occurred_at)<30000){result.action="aggregate_wait";result.reason="sibling_reports_pending";return result;}
+ if(!result.signals.risk_escalation&&!result.signals.eta_changed&&live.length>1&&live.some(m=>!m.report)&&now-Date.parse(c.report.accepted_at)<30000){result.action="aggregate_wait";result.reason="sibling_reports_pending";return result;}
  const lastReport=Math.max(c.last_user_report_at?Date.parse(c.last_user_report_at):0,c.last_presentation_at?Date.parse(c.last_presentation_at):0);
  if(!result.signals.risk_escalation&&!result.signals.eta_changed&&lastReport&&now-lastReport<c.minimum_report_interval_ms){result.action="aggregate_wait";result.reason="report_cadence";return result;}
  result.action="report_to_user";result.reason=result.signals.risk_escalation?"risk_escalation":result.signals.eta_changed?"eta_drift":"new_progress";
