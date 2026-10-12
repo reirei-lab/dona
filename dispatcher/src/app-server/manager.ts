@@ -304,7 +304,19 @@ export class AppServerManager {
     const prior=this.store.db.prepare("SELECT request_hash,state,result_json FROM operations WHERE agent=? AND operation_key=?").get(name,key) as {request_hash:string;state:string;result_json:string|null}|undefined;
     if(!prior)return {state:"not_found" as const};
     if(prior.request_hash!==hash({text}))throw Error("runtime_operation_conflict");
-    if(prior.state!=="accepted")return {state:"unknown" as const};
+    if(prior.state!=="accepted"){
+      const sent=prior.result_json?JSON.parse(prior.result_json):null;
+      if(prior.state!=="unknown"||sent?.generation!==scope.generation||sent?.threadId!==scope.thread_id||typeof sent?.sentAt!=="string")return {state:"unknown" as const};
+      const reports=this.store.db.prepare(`SELECT turn_id,result_json FROM runtime_worker_reports
+        WHERE agent=? AND generation=? AND thread_id=? AND attempt_id=? AND created_at>=?
+        AND payload_json!='' AND json_extract(payload_json,'$.correlation_message_id')=?
+        AND result_json IS NOT NULL AND state IN ('answering','resolved')`).all(name,scope.generation,scope.thread_id,scope.attempt_id,sent.sentAt,key.slice("worker-message:".length)) as {turn_id:string;result_json:string}[];
+      const report=reports.find(report=>reportResponseSucceeded(report.result_json)&&(!sent.turnId||report.turn_id===sent.turnId));
+      if(!report)return {state:"unknown" as const};
+      const accepted={generation:scope.generation,threadId:scope.thread_id,turnId:report.turn_id};
+      this.store.db.prepare("UPDATE operations SET state='accepted',result_json=? WHERE agent=? AND operation_key=? AND state='unknown' AND request_hash=?").run(JSON.stringify(accepted),name,key,prior.request_hash);
+      return {state:"accepted" as const,turnId:report.turn_id};
+    }
     const accepted=JSON.parse(prior.result_json!);
     if(accepted.generation!==scope.generation||accepted.threadId!==scope.thread_id)throw Error("runtime_operation_generation_changed");
     return {state:"accepted" as const,turnId:accepted.turnId as string};
@@ -316,9 +328,14 @@ export class AppServerManager {
       const requestHash=hash({text});
       const old=this.store.db.prepare("SELECT * FROM operations WHERE agent=? AND operation_key=?").get(name,key) as {request_hash:string;state:string;result_json:string|null}|undefined;
       if(old){if(old.request_hash!==requestHash)throw Error("runtime_operation_conflict");if(old.state!=="accepted")throw Error("runtime_acceptance_unknown");const accepted=JSON.parse(old.result_json!);if(accepted.generation!==row?.generation||accepted.threadId!==row?.thread_id)throw Error("runtime_operation_generation_changed");return {turnId:accepted.turnId};}
+      if(workerScope&&row){
+        const config=JSON.parse(row.config_json) as StartAgent;
+        if(config.workerMessaging!==true||object(config.threadConfig.config)["features.default_mode_request_user_input"]===false)
+          throw new RpcFailure("runtime_worker_messaging_unsupported","not_sent");
+      }
       if(!row||!rpc?.connected||!row.thread_id||!["idle","working","interrupted"].includes(row.state))throw new RpcFailure("runtime_not_ready","not_sent");
       this.store.db.prepare("DELETE FROM recovery_hints WHERE agent=? AND generation=?").run(name,row.generation);
-      this.store.db.prepare("INSERT INTO operations VALUES(?,?,?,'sending',NULL)").run(name,key,requestHash);
+      this.store.db.prepare("INSERT INTO operations VALUES(?,?,?,'sending',?)").run(name,key,requestHash,workerScope?JSON.stringify({generation:row.generation,threadId:row.thread_id,turnId:row.turn_id,sentAt:new Date().toISOString()}):null);
       try {
         const params={threadId:row.thread_id,input:[{type:"text",text}],...(row.turn_id?{expectedTurnId:row.turn_id}:{clientUserMessageId:key})};
         const result=object(await rpc.request(row.turn_id?"turn/steer":"turn/start",params));
@@ -342,7 +359,7 @@ export class AppServerManager {
     if(!row||row.agent!==name||!agent||agent.generation!==row.generation||agent.thread_id!==row.thread_id||!rpc?.connected)throw Error("runtime_external_not_current");
     const resolved=this.external.resolve(id,result);
     if(row.state==="pending")rpc.respond(JSON.parse(row.rpc_id_json),{success:true,contentItems:[{type:"inputText",text:resolved.result_json!}]});
-    if(!this.external.waiting(name)&&!this.store.questions(name).length)this.store.change(name,agent.generation,{state:agent.turn_id?"working":"idle"});
+    if(!this.external.waiting(name)&&!this.workerReports.waiting(name)&&!this.store.questions(name).length)this.store.change(name,agent.generation,{state:agent.turn_id?"working":"idle"});
     return {request_id:id,state:resolved.state};
   }
   resolveWorkerReport(name:string,id:string,result:unknown) {

@@ -90,7 +90,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     new UpdaterClient(config.updaterSocketPath, config.jobCommandTimeoutMs),
     {
       async quiesce() {
-        await reportBridge?.stop();await instructions?.stop();messages?.stop();
+        await instructions?.stop();await reportBridge?.stop();messages?.stop();
         await external?.stop();
         await scheduler.stop();
         await reminderPublisher.stop();
@@ -156,7 +156,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     }));
   } catch (error) {
     stopWebJobProjectionMaintenance?.();
-    await reportBridge?.stop();await instructions?.stop();messages?.stop();
+    await instructions?.stop();await reportBridge?.stop();messages?.stop();
     if (updateNotificationWorker.isRunning()) await updateNotificationWorker.stop();
     if (jobSupervisor.isRunning()) await jobSupervisor.stop();
     if (scheduler.isRunning()) await scheduler.stop();
@@ -180,7 +180,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
         stopWebJobProjectionMaintenance?.();
         api.beginShutdown();
         messages?.stop();instructions?.beginShutdown();
-        await reportBridge?.stop();await instructions?.stop();
+        await instructions?.stop();await reportBridge?.stop();
         await external?.stop();
         await api.stop();
         await scheduler.stop();

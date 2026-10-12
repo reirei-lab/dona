@@ -1,3 +1,4 @@
+import { WorkerInstructionBridge } from "../src/worker-messaging.js";
 import { once } from "node:events";
 import Database from "better-sqlite3";
 import assert from "node:assert/strict";
@@ -804,5 +805,27 @@ test("外部承認待ちはRuntime停止を再照合し停止確認後だけ次A
   f.setObserved({state:"waiting"});await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)?.wait_reason,"external_approval");assert.equal(f.sends(),0);
   f.setObserved({state:"unknown"});f.due();await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)?.attempt_number,1);assert.equal(f.sends(),0);
   f.setObserved({state:"inactive"});f.due();await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)?.attempt_number,2);assert.equal(f.sends(),1);
+ }finally{await f.dispose();}
+});
+
+for(const boundary of ["claim", "replace"] as const)test(`指示別Resultが${boundary}直前に届いた場合はAttemptを交代しない`,async()=>{
+ const f=await fixture();try{
+  f.start();const job=f.db.getJob(f.task.current_attempt_id)!;
+  const instruction=f.db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:f.event.event_id,producer_sequence:1,idempotency_key:"result-fence",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"検証結果を含める"}});
+  await new WorkerInstructionBridge(f.db.workerMessages,{async steer(){return {};}}).runOnce();
+  f.interrupt();const task=f.db.tasks.get(f.task.task_id)!;
+  const evidence:WorkerObservation={state:"stopped",reason:"verified",observed_at:new Date().toISOString(),process_ids:[],process_groups:[]};
+  if(boundary==="replace"){
+   const claimed=f.db.tasks.claimStop(task,evidence);f.db.tasks.stopped(claimed,evidence);
+  }
+  const resultPath=f.db.workerMessages.instructionResultPath(job.job_id,instruction.message.message_id);
+  await fs.mkdir(path.dirname(resultPath),{recursive:true});
+  await fs.writeFile(resultPath,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString(),worker_instruction_message_ids:[instruction.message.message_id]}));
+  await assert.rejects(fs.stat(job.result_path),{code:"ENOENT"});
+  if(boundary==="claim")assert.throws(()=>f.db.tasks.claimStop(task,evidence),/task_reconciliation_required/);
+  else assert.throws(()=>f.db.tasks.replaceStopped(task.task_id,f.config.jobResultsDir),/task_result_requires_reconciliation/);
+  assert.equal(f.db.tasks.get(task.task_id)!.current_attempt_id,job.job_id);
+  assert.equal(f.db.tasks.get(task.task_id)!.attempt_number,1);
+  assert.equal(JSON.parse(await fs.readFile(resultPath,"utf8")).status,"completed");
  }finally{await f.dispose();}
 });

@@ -275,7 +275,7 @@ test("不明な指示は再送せず、現行runtimeの相関reportで配送を�
   const instruction=db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"answer",occurred_at:new Date().toISOString(),correlation_message_id:question.message.message_id,conversation_revision:1,payload:{operation:"answer",text:"元の範囲で継続してください"}});
   class UnknownRuntime extends RuntimeClient {
    constructor(){super("unused");}
-   override async workerInstructionReceipt(){return {state:"unknown" as const};}
+   override async workerInstructionReceipt(){return db.workerMessages.instructionReceived(job.job_id,instruction.message.message_id,identity)?{state:"accepted" as const,turnId:"turn"}:{state:"unknown" as const};}
    override async workerInstruction():Promise<never>{throw Error("不明な指示を再送してはいけない");}
   }
   const bridge=new WorkerInstructionBridge(db.workerMessages,new AppServerWorkerInstructionController(db,new UnknownRuntime()));
@@ -382,14 +382,19 @@ test("既存messageが未処理なら無効化を拒否し、再起動後にdrai
   await assert.rejects(runService({...config,workerMessagingEnabled:false}),/disable_requires_drain/);
   assert.equal(existsSync(config.socketPath),false);assert.equal(db.tasks.get(task.task_id)?.current_attempt_id,job.job_id);
   db.close();db=new DispatcherDatabase(config.databasePath);assert.throws(()=>db.assertWorkerMessagingMode(false),/disable_requires_drain/);
-  await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();db.assertWorkerMessagingMode(false);
+  await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();
+  assert.throws(()=>db.assertWorkerMessagingMode(false),/disable_requires_drain/);
+  db.close();db=new DispatcherDatabase(config.databasePath);
+  assert.throws(()=>db.assertWorkerMessagingMode(false),/disable_requires_drain/);
   const question=db.workerMessages.appendWorkerReport(job.job_id,"runtime",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"question",occurred_at:new Date().toISOString(),payload:{kind:"question",question:"続行できますか？"}});
   assert.throws(()=>db.assertWorkerMessagingMode(false),/disable_requires_drain/);
   db.workerMessages.publishPendingReports();assert.throws(()=>db.assertWorkerMessagingMode(false),/disable_requires_drain/);
   db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:2,idempotency_key:"answer",occurred_at:new Date().toISOString(),correlation_message_id:question.message.message_id,conversation_revision:1,payload:{operation:"answer",text:"元の範囲で続行してください"}});
   await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();
   const Sqlite=(await import("better-sqlite3")).default,sql=new Sqlite(config.databasePath);
-  sql.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=? WHERE source='dona_message'").run(new Date().toISOString(),new Date().toISOString());sql.close();
+  sql.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=? WHERE source='dona_message'").run(new Date().toISOString(),new Date().toISOString());
+  assert.throws(()=>db.assertWorkerMessagingMode(false),/disable_requires_drain/);
+  sql.prepare("UPDATE jobs SET status='completed' WHERE job_id=?").run(job.job_id);sql.close();
   db.assertWorkerMessagingMode(false);
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
