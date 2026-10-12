@@ -286,3 +286,23 @@ for (const cut of ["intent_sync", "lock_close"] as const) test(`POST前の${cut}
   assert.deepEqual(await fs.readdir(directory), []);
   assert.equal((await f.client.postRuntimeCommand(input, AbortSignal.timeout(2500))).state, "pending");
 });
+test("送信前abortでも同名置換された別inodeのintentを削除しない", async t => {
+  const f = await setup(t), body = raw(), signed = headers(body);
+  const input = { ...verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]), channel_type: "public_channel" as const };
+  const controller = new AbortController(), originalOpen = fs.open.bind(fs); let injectOnce = true;
+  const directory = path.join(path.dirname(f.config.updateInternalTokenPath), "runtime-command-outbound");
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const handle = await originalOpen(...args);
+    if (injectOnce && String(args[0]).endsWith(input.request_id)) {
+      injectOnce = false; const sync = handle.sync.bind(handle);
+      t.mock.method(handle, "sync", async () => {
+        await sync(); await fs.rename(String(args[0]), path.join(directory, "replaced.intent"));
+        await fs.writeFile(String(args[0]), "replacement", { mode: 0o600 }); controller.abort();
+      });
+    }
+    return handle;
+  });
+  await assert.rejects(f.client.postRuntimeCommand(input, controller.signal), /acceptance_unknown/);
+  assert.equal(await fs.readFile(path.join(directory, input.request_id), "utf8"), "replacement");
+  assert.equal(f.database.runtimeCommandReceipt(input.request_id), null);
+});
