@@ -79,6 +79,8 @@ export class AppServerWorkerInstructionController {
   const receipt=await this.runtime.workerInstructionReceipt(job.agent_name,messageId,text,scope);
   if(receipt.state==="accepted")return receipt;
   if(receipt.state!=="not_found"){
+   const evidence=this.database.workerInstructionResultEvidence(jobId,messageId,identity);
+   if(evidence){const reconciled=await this.runtime.reconcileWorkerInstructionResult(job.agent_name,messageId,text,scope,evidence);if(reconciled.state==="accepted")return reconciled;}
    this.database.markWorkerInstructionUnknown(jobId,messageId);throw Error("worker_instruction_acceptance_unknown");
   }
   const current=this.database.tasks.forAttempt(jobId),currentJob=this.database.getJob(jobId);

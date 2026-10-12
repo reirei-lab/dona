@@ -75,6 +75,9 @@ export async function serveRuntime(config:HostConfig):Promise<http.Server> {
           if(!input||!["main","worker"].includes(input.role)||!Array.isArray(input.args)||input.args.some(v=>typeof v!=="string")||!input.threadConfig||typeof input.threadConfig!=="object")throw Error("runtime_start_invalid");
           result=await manager.start(input);break;
         }
+        case "reconcileWorkerInstructionResult":
+          if(typeof p.key!=="string"||!/^worker-message:msg_[0-9a-hjkmnp-tv-z]{26}$/.test(p.key)||typeof p.text!=="string"||!p.scope||typeof p.scope!=="object"||Array.isArray(p.scope)||!p.evidence||typeof p.evidence!=="object"||Array.isArray(p.evidence))throw Error("runtime_worker_instruction_invalid");
+          result=manager.reconcileWorkerInstructionResult(name,p.key,p.text,p.scope as {attempt_id:string;generation:string;thread_id:string},p.evidence as {message_id:string;result_sha256:string});break;
         case "workerInstructionReceipt":
         case "workerInstruction":if(typeof p.key!=="string"||!/^worker-message:msg_[0-9a-hjkmnp-tv-z]{26}$/.test(p.key)||typeof p.text!=="string"||!p.scope||typeof p.scope!=="object"||Array.isArray(p.scope))throw Error("runtime_worker_instruction_invalid");result=p.action==="workerInstructionReceipt"?manager.workerInstructionReceipt(name,p.key,p.text,p.scope as {attempt_id:string;generation:string;thread_id:string}):await manager.prompt(name,p.key,p.text,p.scope as {attempt_id:string;generation:string;thread_id:string});break;
         case "prompt":if(typeof p.key!=="string"||typeof p.text!=="string"||p.key.length>256)throw Error("runtime_prompt_invalid");result=await manager.prompt(name,p.key,p.text);break;

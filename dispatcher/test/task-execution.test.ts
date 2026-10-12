@@ -808,11 +808,15 @@ test("外部承認待ちはRuntime停止を再照合し停止確認後だけ次A
  }finally{await f.dispose();}
 });
 
-for(const boundary of ["claim", "replace"] as const)test(`指示別Resultが${boundary}直前に届いた場合はAttemptを交代しない`,async()=>{
+for(const latestMissing of [false,true])for(const boundary of ["claim", "replace"] as const)test(`指示別Resultが${boundary}直前に届いた場合はAttemptを交代しない（最新未公開=${latestMissing}）`,async()=>{
  const f=await fixture();try{
   f.start();const job=f.db.getJob(f.task.current_attempt_id)!;
   const instruction=f.db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:f.event.event_id,producer_sequence:1,idempotency_key:"result-fence",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"検証結果を含める"}});
   await new WorkerInstructionBridge(f.db.workerMessages,{async steer(){return {};}}).runOnce();
+  if(latestMissing){
+   f.db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:f.event.event_id,producer_sequence:2,idempotency_key:"result-fence-next",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"追加の確認を含める"}});
+   await new WorkerInstructionBridge(f.db.workerMessages,{async steer(){return {};}}).runOnce();
+  }
   f.interrupt();const task=f.db.tasks.get(f.task.task_id)!;
   const evidence:WorkerObservation={state:"stopped",reason:"verified",observed_at:new Date().toISOString(),process_ids:[],process_groups:[]};
   if(boundary==="replace"){

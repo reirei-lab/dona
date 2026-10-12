@@ -23,6 +23,7 @@ export class RuntimeClient {
     });
   }
   workerInstructionReceipt(name:string,messageId:string,text:string,scope:{attempt_id:string;generation:string;thread_id:string}):Promise<{state:"not_found"|"unknown"|"accepted";turnId?:string}>{return this.call("workerInstructionReceipt",{name,key:`worker-message:${messageId}`,text,scope});}
+  reconcileWorkerInstructionResult(name:string,messageId:string,text:string,scope:{attempt_id:string;generation:string;thread_id:string},evidence:{message_id:string;result_sha256:string}):Promise<{state:"not_found"|"unknown"|"accepted";turnId?:string}>{return this.call("reconcileWorkerInstructionResult",{name,key:`worker-message:${messageId}`,text,scope,evidence});}
   workerInstruction(name:string,messageId:string,text:string,scope:{attempt_id:string;generation:string;thread_id:string}):Promise<{turnId:string}>{return this.call("workerInstruction",{name,key:`worker-message:${messageId}`,text,scope});}
   workerReportAvailability(enabled:boolean):Promise<{enabled:boolean;ttl_ms:number}>{return this.call("workerReportAvailability",{enabled});}
   workerReportDrainState():Promise<{protocol:1;recoverable_count:number}>{return this.call("workerReportDrainState");}

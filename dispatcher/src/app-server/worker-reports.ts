@@ -3,7 +3,7 @@ import {randomUUID,createHash} from "node:crypto";
 import {z} from "zod";
 import type {RuntimeStore,AgentRecord} from "./store.js";
 import type {RpcMessage} from "./rpc.js";
-import {workerReportSchema} from "../worker-messaging.js";
+import {workerReportSchema,parseWorkerReport} from "../worker-messaging.js";
 import {stableStringify} from "../validation.js";
 
 const input=z.strictObject({report_key:z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/),
@@ -33,6 +33,12 @@ export class WorkerReportQueue {
   if(p.tool!==workerReportTool.name||p.namespace!==null&&p.namespace!==undefined||typeof p.callId!=="string"||!p.callId||p.callId.length>128||p.threadId!==agent.thread_id||p.turnId!==agent.turn_id||message.id===undefined)throw Error("runtime_worker_report_identity_invalid");
   const value=input.parse(p.arguments),canonical=stableStringify(value),payloadHash=createHash("sha256").update(canonical).digest("hex"),wire=[value.report_key,...Object.values(value.payload).flatMap(v=>typeof v==="string"?[v]:Array.isArray(v)?v:[])].join("\n");
   if(credentialShaped.test(wire)||Buffer.byteLength(canonical)>16384||/(?:[/\\]|https?:\/\/|file:|\/Users\/|\/private\/|\/tmp\/|[A-Z]:\\|\bBearer\s|xox[baprs]-|github_pat_|gh[pousr]_|AKIA[0-9A-Z]{16}|-----BEGIN[^\n]*PRIVATE KEY-----|\b(?:password|passwd|api[_ -]?key|access[_ -]?token|stdout|stderr)\b|\$\(|`|\b(?:rm|curl|wget|bash|sh|eval|exec|npm|node|git|python|sudo|cp|mv|echo)\s)/i.test(wire))throw Error("runtime_worker_report_payload_denied");
+  // Dispatcherが追加するenvelopeの最大長を予約し、受付後の容量超過を防ぐ。
+  try{parseWorkerReport({schema_version:1,source_event_id:"e".repeat(128),producer_sequence:Number.MAX_SAFE_INTEGER,
+    idempotency_key:value.report_key,occurred_at:new Date().toISOString(),payload:value.payload,
+    ...(value.correlation_message_id?{correlation_message_id:value.correlation_message_id}:{}),
+    ...(value.conversation_revision!==undefined?{conversation_revision:value.conversation_revision}:{})});}
+  catch{throw Error("runtime_worker_report_payload_denied");}
   if([agent.name,agent.generation,agent.thread_id,agent.turn_id,agent.cwd,agent.release].some(v=>v&&canonical.includes(v)))throw Error("runtime_worker_report_payload_denied");
   return this.store.db.transaction(()=>{
    const prior=this.store.db.prepare("SELECT * FROM runtime_worker_reports WHERE attempt_id=? AND report_key=?").get(config.attemptId,value.report_key) as RuntimeWorkerReport|undefined;
