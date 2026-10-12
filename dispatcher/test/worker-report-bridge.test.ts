@@ -149,3 +149,21 @@ test("Job state matrixで受理・保留・拒否を分け、terminal報告を�
   const Sqlite=(await import("better-sqlite3")).default,sql=new Sqlite(config.databasePath);try{assert.equal((sql.prepare("SELECT status FROM events WHERE source='dona_message' AND json_extract(payload_json,'$.job_id')=?").get(job) as {status:string}).status,"completed");}finally{sql.close();}
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
+
+for(const failure of ["pre_dispatch","not_sent","unknown"] as const)test(`親への報告eventの${failure}失敗を照合し、未投入だけ再配信する`,async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);
+ const Sqlite=(await import("better-sqlite3")).default,sql=new Sqlite(config.databasePath);
+ try{
+  const source=db.enqueue(eventEnvelope("rearm-"+failure)).row,task=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"rearm",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,job=task.current_attempt_id;
+  db.beginJobPreparation(job);db.setJobRuntime(job,"workspace","pane","identity");db.beginJobDispatch(job);db.markJobRunning(job);
+  const message=db.acceptTaskWorkerReport(job,"identity",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"question",occurred_at:new Date().toISOString(),payload:{kind:"question",question:"継続できますか？"}});
+  assert.equal(db.workerMessages.publishPendingReports(),1);
+  const event=(sql.prepare("SELECT event_id FROM worker_message_deliveries WHERE message_id=?").get(message.message.message_id) as {event_id:string}).event_id;
+  if(failure==="pre_dispatch")db.recordPreDispatchFailure(event,"result_path_unavailable","未投入",1);
+  else {db.beginDispatch(event,path.join(root,"parent-result.json"));if(failure==="not_sent")db.recordSafePromptFailure(event,"runtime_not_ready","未投入",1);else db.markNeedsReview(event,"prompt_acceptance_unknown","受理不明");}
+  const future=new Date(Date.now()+86400000);
+  assert.equal(db.workerMessages.publishPendingReports(100,future),failure==="unknown"?0:1);
+  const after=sql.prepare("SELECT event_id FROM worker_message_deliveries WHERE message_id=?").get(message.message.message_id) as {event_id:string};
+  assert.equal(after.event_id===event,failure==="unknown");assert.equal(db.workerMessages.hasUnansweredQuestion(job),true);
+ }finally{sql.close();db.close();await fs.rm(root,{recursive:true,force:true});}
+});

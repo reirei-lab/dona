@@ -22,7 +22,7 @@ workerの`dona_worker_report_status`は自分のAttempt/generation/threadのkey�
 
 `instruct_task(task_id, revision, message)`はanswer/add_condition/change_priorityのstrict schemaを受ける。通常の指示には元threadのSlack eventが必要。内部のworker報告eventからは、そのeventが示すquestion/decision_requestへのanswerだけを許す。answerは元message IDと次のconversation revisionへ束縛する。内部eventは永続delivery、immutable owner、署名検証済み元Slack principalを辿り、Taskの新規委任権限を取得しない。
 
-質問待ちではTaskを`human_input`に保ち、新Attemptを自動起動しない。指示はworkerが起動するまでledgerに待機する。bridgeは同じcurrent Attempt/runtimeへ型付き入力を配送し、App Serverの既存operation journalを使用する。応答喪失後は同じoperationのreceiptをread-only照合し、`sending`/`unknown`を再送しない。workerへの受理が確定した後だけdelivery receiptを保存する。取消・停止・terminal stateが優先される。
+質問待ちではTaskを`human_input`に保ち、新Attemptを自動起動しない。指示はworkerが起動するまでledgerに待機する。bridgeは同じcurrent Attempt/runtimeへ型付き入力を配送し、App Serverの既存operation journalを使用する。応答喪失後は同じoperationのreceiptをread-only照合し、`sending`/`unknown`を再送しない。workerへの受理が確定した後だけdelivery receiptを保存する。親への投入前、またはnot-sentと確定した報告eventがdead-letterになった場合だけ、同じmessageのdeliveryをbackoff付きで再配信する。prompt受理不明や親の外部操作結果不明では再配信しない。取消・停止・terminal stateが優先される。
 
 ## 状態ごとの扱い
 
