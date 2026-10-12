@@ -328,7 +328,11 @@ test("未配送の追加指示と、その受理より古いResultではTaskを�
   // Exercise the same idle-worker completion path as monitor, before typed delivery.
   assert.equal(await (supervisor as unknown as {tryComplete(row:JobRow,terminal:boolean):Promise<boolean>}).tryComplete(job,true),false);
   assert.equal(db.getJob(job.job_id)?.status,"running");assert.equal(db.tasks.get(task.task_id)?.wait_reason,"worker_instruction_delivery_pending");
+  await new Promise(resolve=>setTimeout(resolve,5));
+  const between={...old,completed_at:new Date().toISOString()};
+  await new Promise(resolve=>setTimeout(resolve,5));
   await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();
+  assert.throws(()=>db.saveJobResult(job.job_id,between,job.result_path),/result_stale/);
   assert.throws(()=>db.saveJobResult(job.job_id,old,job.result_path),/result_stale/);
   assert.equal(await (supervisor as unknown as {tryComplete(row:JobRow,terminal:boolean):Promise<boolean>}).tryComplete(db.getJob(job.job_id)!,true),false);
   assert.equal(db.tasks.get(task.task_id)?.wait_reason,"worker_instruction_result_pending");
@@ -350,5 +354,27 @@ for(const code of ["runtime_question_pending","runtime_external_approval_pending
   const controller=new AppServerWorkerInstructionController(db,new WaitingRuntime());
   await assert.rejects(controller.steer(job.job_id,source.event_id,db.workerMessages.instructionForDelivery(job.job_id,source.event_id,instruction.message.message_id),instruction.message.message_id),/runtime_not_ready/);
   assert.equal(db.getJob(job.job_id)?.last_error_code,code);assert.equal(db.tasks.get(task.task_id)?.wait_reason,"human_input");
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+
+test("既存messageが未処理なら無効化を拒否し、再起動後にdrainしてから許可する",async()=>{
+ const {root,config}=await tempConfig();let db=new DispatcherDatabase(config.databasePath);
+ try{
+  db.assertWorkerMessagingMode(false);
+  const source=db.enqueue(eventEnvelope("disable-drain")).row,task=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"disable",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,job=db.getJob(task.current_attempt_id)!;
+  db.beginJobPreparation(job.job_id);db.setJobRuntime(job.job_id,"w","p","runtime");db.beginJobDispatch(job.job_id);db.markJobRunning(job.job_id);
+  db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"condition",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"検証を追加してください"}});
+  assert.throws(()=>db.assertWorkerMessagingMode(false),/disable_requires_drain/);db.assertWorkerMessagingMode(true);
+  db.close();db=new DispatcherDatabase(config.databasePath);assert.throws(()=>db.assertWorkerMessagingMode(false),/disable_requires_drain/);
+  await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();db.assertWorkerMessagingMode(false);
+  const question=db.workerMessages.appendWorkerReport(job.job_id,"runtime",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"question",occurred_at:new Date().toISOString(),payload:{kind:"question",question:"続行できますか？"}});
+  assert.throws(()=>db.assertWorkerMessagingMode(false),/disable_requires_drain/);
+  db.workerMessages.publishPendingReports();assert.throws(()=>db.assertWorkerMessagingMode(false),/disable_requires_drain/);
+  db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:2,idempotency_key:"answer",occurred_at:new Date().toISOString(),correlation_message_id:question.message.message_id,conversation_revision:1,payload:{operation:"answer",text:"元の範囲で続行してください"}});
+  await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();
+  const Sqlite=(await import("better-sqlite3")).default,sql=new Sqlite(config.databasePath);
+  sql.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=? WHERE source='dona_message'").run(new Date().toISOString(),new Date().toISOString());sql.close();
+  db.assertWorkerMessagingMode(false);
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });

@@ -1064,6 +1064,18 @@ export class DispatcherDatabase {
     return this.workerMessageStore;
   }
 
+  assertWorkerMessagingMode(enabled:boolean):void {
+    if(enabled||!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get())return;
+    const outstanding=this.db.prepare(`SELECT 1 FROM worker_message_deliveries d JOIN worker_messages m USING(message_id) JOIN jobs j USING(job_id)
+      LEFT JOIN events e ON e.event_id=d.event_id
+      WHERE d.state IN ('pending','leased') OR
+        (d.consumer='dona-main' AND e.status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review')) OR
+        (j.status NOT IN ('completed','failed','cancelled') AND m.direction='worker_to_dona' AND m.kind IN ('question','decision_request')
+          AND NOT EXISTS (SELECT 1 FROM worker_messages a JOIN worker_message_deliveries ad ON ad.message_id=a.message_id
+            WHERE a.correlation_message_id=m.message_id AND a.kind='answer' AND ad.consumer='worker' AND ad.state='delivered')) LIMIT 1`).get();
+    if(outstanding)throw Error("worker_messaging_disable_requires_drain");
+  }
+
   acceptTaskWorkerReport(attemptId:string,identity:string,raw:unknown){
     const input=parseWorkerReport(raw);
     return this.db.transaction(()=>{
@@ -3200,7 +3212,9 @@ export class DispatcherDatabase {
       if (job.result_json === stableStringify(result) && job.status === result.status) return;
       if(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()) {
         if(this.workerMessages.hasPendingInstructions(jobId))throw Error("worker_instruction_delivery_pending");
-        if(this.db.prepare("SELECT 1 FROM worker_messages WHERE job_id=? AND direction='dona_to_worker' AND julianday(accepted_at)>=julianday(?) LIMIT 1").get(jobId,result.completed_at))throw Error("worker_instruction_result_stale");
+        if(this.db.prepare(`SELECT 1 FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
+          WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.consumer='worker' AND d.state='delivered'
+            AND julianday(d.delivered_at)>=julianday(?) LIMIT 1`).get(jobId,result.completed_at))throw Error("worker_instruction_result_stale");
       }
       const binding = readEventJobBinding(this.db,job.source_event_id);
       if (binding?.owner.kind === "schedule") {
