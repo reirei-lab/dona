@@ -22,7 +22,7 @@ interface RuntimeIntent { directory: string; filePath: string; directoryDevice: 
 export class DispatcherClient {
   constructor(private readonly options: DispatcherClientOptions) {}
 
-  private async discardUnsentRuntimeIntent(intent: RuntimeIntent): Promise<void> {
+  private async discardUnacceptedRuntimeIntent(intent: RuntimeIntent): Promise<void> {
     const dir = await fs.open(intent.directory, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
     try {
       const info = await dir.stat(), current = await fs.lstat(intent.filePath);
@@ -84,7 +84,7 @@ export class DispatcherClient {
       return intent!;
     } catch (error) {
       // このmethod内ではPOSTを開始しない。取得済みの自分のinodeだけを回収する。
-      if (intent) await this.discardUnsentRuntimeIntent(intent);
+      if (intent) await this.discardUnacceptedRuntimeIntent(intent);
       throw error;
     }
   }
@@ -127,6 +127,12 @@ export class DispatcherClient {
   async runtimeCommandIngressReady(signal = AbortSignal.timeout(2500)): Promise<boolean> {
     try {
       const token = await this.runtimeCommandToken(signal);
+      return this.runtimeCommandIngressReadyWithToken(token, signal);
+    } catch { return false; }
+  }
+
+  private async runtimeCommandIngressReadyWithToken(token: string, signal: AbortSignal): Promise<boolean> {
+    try {
       if (!await this.runtimeCommandOutboundReady(signal)) return false;
       const response = await this.request("GET", "/v1/internal/slack-runtime-commands/ready", undefined, token, {}, signal);
       const body = JSON.parse(response.body) as Record<string, unknown>;
@@ -168,11 +174,11 @@ export class DispatcherClient {
     // 再配送でも最初に照合する。永続intentがある場合は再POSTで迂回しない。
     const prior = await lookup();
     if (prior) return prior;
-    if (!await this.runtimeCommandIngressReady(signal)) throw Error("runtime_command_unavailable");
+    if (!await this.runtimeCommandIngressReadyWithToken(token, signal)) throw Error("runtime_command_unavailable");
     const body = Buffer.from(JSON.stringify(input));
     const intent = await this.reserveRuntimeCommand(input.request_id, expected, signal);
     try { signal.throwIfAborted(); }
-    catch (error) { await this.discardUnsentRuntimeIntent(intent); throw error; }
+    catch (error) { await this.discardUnacceptedRuntimeIntent(intent); throw error; }
     let response: DispatcherResponse;
     try {
       response = await this.request("POST", "/v1/internal/slack-runtime-commands", body, token, {}, signal);
@@ -186,7 +192,14 @@ export class DispatcherClient {
       if (!receipt) throw Error("runtime_command_acceptance_unknown");
       return receipt;
     }
-    if (response.statusCode !== 200) throw Error("runtime_command_unavailable");
+    if (response.statusCode !== 200) {
+      const error = JSON.parse(response.body) as { error?: { code?: string } };
+      const rejections: Record<number, string[]> = { 400: ["invalid_request"], 403: ["forbidden"],
+        405: ["invalid_request"], 409: ["runtime_command_conflict"], 415: ["unsupported_media_type"] };
+      if (error.error?.code && rejections[response.statusCode]?.includes(error.error.code))
+        await this.discardUnacceptedRuntimeIntent(intent);
+      throw Error("runtime_command_unavailable");
+    }
     return verify(JSON.parse(response.body));
   }
 

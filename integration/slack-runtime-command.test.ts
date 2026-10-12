@@ -306,3 +306,40 @@ test("送信前abortでも同名置換された別inodeのintentを削除しな�
   assert.equal(await fs.readFile(path.join(directory, input.request_id), "utf8"), "replacement");
   assert.equal(f.database.runtimeCommandReceipt(input.request_id), null);
 });
+test("readiness後のtoken rotationで確定403ならintentを回収し再配送できる", async t => {
+  const f = await setup(t), socket = path.join(f.root, "rotation.sock"); let rotate = true;
+  const tokens: string[] = [];
+  const proxy = http.createServer((request, response) => {
+    if (request.method === "POST" || request.url?.endsWith("/ready")) tokens.push(String(request.headers["x-dona-update-token"]));
+    const upstream = http.request({ socketPath: f.config.socketPath, path: request.url, method: request.method, headers: request.headers }, result => {
+      if (rotate && request.url?.endsWith("/ready")) {
+        rotate = false; result.resume(); result.once("end", async () => {
+          await fs.writeFile(f.config.updateInternalTokenPath, "rotated-fixture-token-" + "x".repeat(32));
+          response.writeHead(result.statusCode!); response.end(JSON.stringify({ protocol: "runtime-control.v1", ready: true, acceptance_only: true }));
+        });
+      } else { response.writeHead(result.statusCode!, result.headers); result.pipe(response); }
+    }); upstream.once("error", () => response.destroy()); request.pipe(upstream);
+  });
+  await new Promise<void>(resolve => proxy.listen(socket, resolve)); t.after(() => new Promise<void>(resolve => proxy.close(() => resolve())));
+  const client = new DispatcherClient({ socketPath: socket, internalTokenPath: f.config.updateInternalTokenPath, timeoutMs: 1000, connectTimeoutMs: 100 });
+  const body = raw(), signed = headers(body), input = { ...verifyRuntimeCommandRequest(body, signed["x-slack-request-timestamp"], signed["x-slack-signature"], [workspace]), channel_type: "public_channel" as const };
+  await assert.rejects(client.postRuntimeCommand(input, AbortSignal.timeout(2500)), /unavailable/);
+  assert.equal(tokens[0], tokens[1]); assert.equal(f.database.runtimeCommandReceipt(input.request_id), null);
+  assert.deepEqual(await fs.readdir(path.join(path.dirname(f.config.updateInternalTokenPath), "runtime-command-outbound")), []);
+  assert.equal((await client.postRuntimeCommand(input, AbortSignal.timeout(2500))).state, "pending");
+});
+test("local health未準備の間はSlack identity probeを呼ばない", async t => {
+  const f = await setup(t), socket = path.join(f.root, "local-health.sock"); let socketReady = false, dispatcherReady = false, probes = 0;
+  const server = new SlackHealthServer(socket, { isSocketReady: () => socketReady, isStopping: () => false,
+    connectionStates: () => ({}), async quiesce() {}, drainStatus: () => ({ quiescing: false, drained: true, in_flight: 0, unsafe_states: [] }) },
+    { healthReady: async () => dispatcherReady }, { debug() {}, info() {}, warn() {}, error() {} });
+  server.setRuntimeCommandIngress(new RuntimeCommandHttpIngress({ configured: async () => ({ version: 1, workspaces: [workspace] }),
+    ready: async () => { probes++; return true; }, stopping: () => false, authorize: async () => null, persist: async () => { throw Error("no_write"); } }));
+  await server.start(); t.after(() => server.stop());
+  const read = (route: string) => new Promise<number>((resolve, reject) => {
+    const req = http.get({ socketPath: socket, path: route }, response => { response.resume(); response.once("end", () => resolve(response.statusCode!)); }); req.once("error", reject);
+  });
+  for (let i = 0; i < 5; i++) { assert.equal(await read("/health/ready"), 503); assert.equal(await read("/health/version"), 503); }
+  socketReady = true; assert.equal(await read("/health/version"), 503); assert.equal(probes, 0);
+  dispatcherReady = true; assert.equal(await read("/health/version"), 200); assert.equal(probes, 1);
+});

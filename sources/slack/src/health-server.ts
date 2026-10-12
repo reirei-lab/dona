@@ -259,8 +259,9 @@ export class SlackHealthServer {
     }
     if (method === "GET" && pathname === "/health/ready") {
       const dispatcherReady = await this.dispatcher.healthReady();
-      const runtimeCommandsReady = await this.runtimeCommandReady();
-      const ready = !this.adapter.isStopping() && this.adapter.isSocketReady() && dispatcherReady && runtimeCommandsReady;
+      const workspacesReady = !this.adapter.isStopping() && this.adapter.isSocketReady();
+      const runtimeCommandsReady = workspacesReady && dispatcherReady && await this.runtimeCommandReady();
+      const ready = workspacesReady && dispatcherReady && runtimeCommandsReady;
       send(response, ready ? 200 : 503, {
         schema_version: 1,
         status: ready ? "ready" : "not_ready",
@@ -273,7 +274,7 @@ export class SlackHealthServer {
     if (method === "GET" && pathname === "/health/version") {
       const dispatcherReady = await this.dispatcher.healthReady();
       const workspacesReady = !this.adapter.isStopping() && this.adapter.isSocketReady();
-      const runtimeCommandsReady = await this.runtimeCommandReady();
+      const runtimeCommandsReady = workspacesReady && dispatcherReady && await this.runtimeCommandReady();
       const ready = workspacesReady && dispatcherReady && runtimeCommandsReady;
       const updateNotificationProtocolReady = this.updateNotifications !== undefined &&
         await this.internalTokenReady();
