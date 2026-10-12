@@ -1611,9 +1611,10 @@ export class DispatcherDatabase {
         if(group?.notification_mode==="legacy"&&jobKey!==legacyJobKey) throw new JobCreationError("job_group_closed","Legacy job group does not accept additional keys");
         const admitted=this.db.prepare("SELECT COALESCE(t.objective,j.objective) AS objective,j.workspace_json FROM jobs j LEFT JOIN task_attempts a ON a.attempt_id=j.job_id LEFT JOIN tasks t ON t.task_id=a.task_id WHERE j.source_event_id=? AND (a.number IS NULL OR a.number=1)").all(sourceEvent.event_id) as Array<{objective:string;workspace_json:string}>;
         if(admitted.length>=this.jobAdmissionLimits.jobsPerEventMax) throw new JobCreationError("job_group_limit_exceeded","Job group jobs-per-event limit exceeded",{resource:"jobs_per_event",current:admitted.length,attempted:admitted.length+1,maximum:this.jobAdmissionLimits.jobsPerEventMax});
-        const currentBytes=admitted.reduce((sum,row)=>sum+(jobCreationObjectiveBytesFromWorkspace(JSON.parse(row.workspace_json))??Buffer.byteLength(row.objective,"utf8")),0);
+        const reserved=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()?this.workerMessages.reservedQueuedInstructionBytes(sourceEvent.event_id):0;
+        const currentBytes=reserved+admitted.reduce((sum,row)=>sum+(jobCreationObjectiveBytesFromWorkspace(JSON.parse(row.workspace_json))??Buffer.byteLength(row.objective,"utf8")),0);
         if(currentBytes+objectiveUtf8Bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Job group objective UTF-8 byte limit exceeded",{resource:"objective_utf8_bytes_per_event",current:currentBytes,attempted:currentBytes+objectiveUtf8Bytes,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
-        const effectiveBytes=admitted.reduce((sum,row)=>sum+Buffer.byteLength(row.objective,"utf8"),0);
+        const effectiveBytes=reserved+admitted.reduce((sum,row)=>sum+Buffer.byteLength(row.objective,"utf8"),0);
         if(effectiveBytes+objectiveUtf8Bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Effective job group objective limit exceeded",{resource:"objective_utf8_bytes_per_event",current:effectiveBytes,attempted:effectiveBytes+objectiveUtf8Bytes,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
         if(!group) this.db.prepare("INSERT INTO job_groups(source_event_id,sealed_at,notification_mode,attention_event_id,all_terminal_event_id,created_at,updated_at) VALUES(?,NULL,?,NULL,NULL,?,?)").run(sourceEvent.event_id,jobKey===legacyJobKey?"legacy":"grouped",at.toISOString(),at.toISOString());
       }
@@ -3225,6 +3226,7 @@ export class DispatcherDatabase {
       if (result.job_id !== jobId) throw new Error("job_result_identity_mismatch");
       if (job.result_json === stableStringify(result) && job.status === result.status) return;
       if(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()) {
+        if(this.workerMessages.hasUnansweredQuestion(jobId))throw Error("worker_message_question_pending");
         if(this.workerMessages.hasPendingInstructions(jobId))throw Error("worker_instruction_delivery_pending");
         if(this.db.prepare(`SELECT 1 FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
           WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.consumer='worker' AND d.state='delivered'
@@ -3242,7 +3244,7 @@ export class DispatcherDatabase {
       }
       const status: JobStatus = result.status === "completed" ? "completed" : "failed";
       const completedAt = new Date(result.completed_at);
-      if(binding?.owner.kind==="schedule"&&completedAt.getTime()>at.getTime()) throw new Error("completed_at_is_in_the_future");
+      if(completedAt.getTime()>at.getTime()) throw new Error("completed_at_is_in_the_future");
       const acceptedDeadline=job.prompt_accepted_at??job.dispatch_started_at;
       if(binding?.owner.kind==="schedule"&&acceptedDeadline&&at.getTime()>Date.parse(acceptedDeadline)+3_600_000)
         throw new Error("scheduled_work_result_deadline_exceeded");
@@ -3288,6 +3290,15 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
+  assertTaskSteerReservationBudget(jobId:string,objective:string):void {
+    const job=this.getJobRequired(jobId);
+    if(!["queued","retryable_failed"].includes(job.status)||!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get())return;
+    if([...objective].length+this.workerMessages.reservedQueuedInstructionCharacters(jobId)>jobObjectiveCharacterMax)throw Error("task_objective_limit");
+    const total=this.db.prepare(`SELECT COALESCE(t.objective,j.objective) AS objective FROM jobs j LEFT JOIN tasks t ON t.current_attempt_id=j.job_id WHERE j.source_event_id=? AND j.job_id!=?`).all(job.source_event_id,jobId) as Array<{objective:string}>;
+    const bytes=total.reduce((sum,row)=>sum+Buffer.byteLength(row.objective),0)+Buffer.byteLength(objective)+this.workerMessages.reservedQueuedInstructionBytes(job.source_event_id);
+    if(bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes)throw Error("task_objective_limit");
+  }
+
   appendQueuedJobInstruction(jobId: string, sourceEventId: string, instruction: string): { row: JobRow; duplicate: boolean } {
     return this.db.transaction(() => {
       const task=this.tasks.forAttempt(jobId);
@@ -3301,10 +3312,12 @@ export class DispatcherDatabase {
       if (!["queued", "retryable_failed"].includes(row.status)) throw new Error(`Job ${jobId} is not waiting to start`);
       const addition = `\n\n[DONA_FOLLOW_UP]\n${instruction}\n[/DONA_FOLLOW_UP]`;
       const objective = row.objective + addition;
-      if ([...objective].length > jobObjectiveCharacterMax) throw new Error("Effective job objective character limit exceeded");
+      const reserved=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()?this.workerMessages.reservedQueuedInstructionCharacters(jobId):0;
+      if ([...objective].length+reserved > jobObjectiveCharacterMax) throw new Error("Effective job objective character limit exceeded");
       const siblings = this.db.prepare("SELECT objective FROM jobs WHERE source_event_id=?").all(row.source_event_id) as Array<{objective:string}>;
       const current = siblings.reduce((sum,job)=>sum+Buffer.byteLength(job.objective,"utf8"),0);
-      const attempted = current + Buffer.byteLength(addition,"utf8");
+      const queuedBytes=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get()?this.workerMessages.reservedQueuedInstructionBytes(row.source_event_id):0;
+      const attempted = current + queuedBytes + Buffer.byteLength(addition,"utf8");
       const maximum = this.jobAdmissionLimits.jobObjectiveTotalMaxBytes;
       if (attempted > maximum) throw new JobCreationError("job_group_limit_exceeded","Effective job group objective limit exceeded",{resource:"objective_utf8_bytes_per_event",current,attempted,maximum});
       this.db.prepare(`UPDATE jobs SET objective=?,steer_event_id=?,steer_state='accepted',updated_at=? WHERE job_id=?`)

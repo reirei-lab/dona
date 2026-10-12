@@ -63,3 +63,11 @@ pause中・旧Attemptの指示をclaimしない。停止確認後のAttempt交�
 ## 機能を無効化するとき
 
 未配送・lease中のmessage、未処理の親event、未回答の型付き質問が残るDBでは、無効化しての起動を `worker_messaging_disable_requires_drain` で拒否する。既存機能を有効にしたままreceiptを照合してdrainし、質問・指示・親eventがsettleした後に無効化する。DBやclaimを手動で消して迂回しない。無効化拒否はTaskの失敗・完了を意味しない。
+
+## 質問・Result・再照合の境界
+
+未回答の型付き質問があるResultは `human_input` として保留する。native質問・承認が後から重なった場合はnative待機を先に照合・解消し、残った型付き質問へ戻る。質問への回答配送後は新しいResultを待つ。通常TaskもDispatcher時計より未来の `completed_at` を拒否する。
+
+受理済みreportの応答だけが不明な場合、Taskのpause・完了後も同じgeneration/threadに残るRuntime recordとhistorical ledger bindingを照合する。新しいreport受理やRPC応答の再送はしない。Runtimeのgeneration/thread一致検査は維持し、identityが異なる場合は照合しない。
+
+queuedの型付き指示予約は、後続のJob/Task steerと新しいJobのadmissionでも実効文字数・group UTF-8 byte上限へ加算する。Task steerはobjective・revisionを更新する前に検査する。
