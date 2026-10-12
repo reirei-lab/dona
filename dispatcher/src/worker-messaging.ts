@@ -640,6 +640,10 @@ export class WorkerMessageRepository {
         if(pending)throw new WorkerMessageError("worker_message_question_pending","job already has an unanswered question");
       }
     }
+    if(direction==="dona_to_worker"){
+      const count=this.db.prepare("SELECT COUNT(*) count FROM worker_messages WHERE job_id=? AND direction='dona_to_worker'").get(jobId) as {count:number};
+      if(count.count>=256)throw new WorkerMessageError("worker_message_instruction_limit_exceeded","instruction handoff count limit of 256 has been reached");
+    }
     let correlated:WorkerMessageRow|undefined;
     if (input.correlation_message_id) {
       correlated = this.db.prepare("SELECT * FROM worker_messages WHERE message_id=?").get(input.correlation_message_id) as WorkerMessageRow | undefined;
@@ -809,7 +813,7 @@ export class WorkerMessageRepository {
   stoppedInstructionContext(jobId:string):string {
     const rows=this.db.prepare(`SELECT m.message_id,m.kind,m.payload_json,m.correlation_message_id,m.conversation_revision,d.state,d.attempt_count
       FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
-      WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.consumer='worker' AND (d.state IN ('pending','leased') OR (d.state='delivered' AND m.kind IN ('add_condition','change_priority'))) ORDER BY m.producer_sequence LIMIT 257`).all(jobId) as Array<Record<string,unknown>>;
+      WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.consumer='worker' AND (d.state IN ('pending','leased') OR (d.state='delivered' AND m.kind IN ('answer','add_condition','change_priority'))) ORDER BY m.producer_sequence LIMIT 257`).all(jobId) as Array<Record<string,unknown>>;
     if(rows.length>256)throw Error("worker_instruction_handoff_limit");
     if(!rows.length)return "";
     return "\n\n前Attemptで受理済みの追加指示（同じ依頼・権限の範囲を維持）:\n"+stableStringify(rows.map(({payload_json,...row})=>({...row,payload:JSON.parse(payload_json as string)})))+
@@ -976,7 +980,7 @@ export class WorkerMessageRepository {
     const expired = this.db.prepare("SELECT COUNT(*) AS count FROM worker_message_deliveries WHERE state='leased' AND lease_expires_at<=?").get(at.toISOString()) as {count:number};
     const dueSilence = this.db.prepare(`SELECT COUNT(*) AS count FROM worker_message_cadence c JOIN jobs j USING(job_id)
       WHERE c.silence_due_at<=? AND j.status NOT IN ('completed','failed','cancelled','needs_review')
-        AND NOT (j.status='blocked' AND j.last_error_code='worker_message_question_pending')`).get(at.toISOString()) as {count:number};
+        AND NOT (j.status='blocked' AND j.last_error_code IN ('worker_message_question_pending','runtime_question_pending','runtime_external_approval_pending'))`).get(at.toISOString()) as {count:number};
     return { protocol_version: workerMessageProtocolVersion, pending_deliveries: pending.count, overdue_deliveries: overdue.count,
       expired_leases: expired.count, due_silence_deadlines: dueSilence.count, degraded: expired.count > 0 || overdue.count > 0 };
   }
@@ -1070,7 +1074,7 @@ export class WorkerMessageRepository {
       const now=at.toISOString();
       const rows=this.db.prepare(`SELECT c.job_id,c.generation,c.silence_interval_ms,j.source_event_id,j.workspace_id,j.channel_id,j.thread_ts
         FROM worker_message_cadence c JOIN jobs j USING(job_id) WHERE c.silence_due_at<=? AND j.status NOT IN ('completed','failed','cancelled','needs_review')
-          AND NOT (j.status='blocked' AND j.last_error_code='worker_message_question_pending')
+          AND NOT (j.status='blocked' AND j.last_error_code IN ('worker_message_question_pending','runtime_question_pending','runtime_external_approval_pending'))
         ORDER BY c.silence_due_at,c.job_id LIMIT ?`).all(now,limit) as Array<{job_id:string;generation:number;silence_interval_ms:number;source_event_id:string;workspace_id:string|null;channel_id:string|null;thread_ts:string|null}>;
       for(const row of rows){
         const task=this.db.prepare("SELECT task_id FROM tasks WHERE current_attempt_id=?").get(row.job_id) as {task_id:string}|undefined;
@@ -1110,7 +1114,7 @@ export class WorkerMessageRepository {
     const currentGeneration=cadence?.generation ?? 0,eventGeneration=projected.generation as number;
     return {worker_message_silence:{event_id:eventId,event_generation:eventGeneration,current_generation:currentGeneration,
       current:event.status==="waiting_agent"&&eventGeneration===currentGeneration&&!!job&&!terminal(job.status)&&job.status!=="needs_review"
-        &&!(job.status==="blocked"&&job.last_error_code==="worker_message_question_pending")}};
+        &&!(job.status==="blocked"&&["worker_message_question_pending","runtime_question_pending","runtime_external_approval_pending"].includes(job.last_error_code??""))}};
   }
 
   purge(at = new Date()): number {
