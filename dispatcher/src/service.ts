@@ -143,6 +143,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     }
     if(external)await external.start();
     else await new RuntimeClient(runtimeSocket(config),5000).externalAvailability(false).catch(()=>{});
+    if(!reportBridge)await new RuntimeClient(runtimeSocket(config),5000).workerReportAvailability(false).catch(()=>apiLogger.warn("Worker report ingress disable could not be confirmed",{error_code:"worker_report_disable_unavailable"}));
     messages?.start();reportBridge?.start();instructions?.start();
     worker.start();
     scheduler.start();

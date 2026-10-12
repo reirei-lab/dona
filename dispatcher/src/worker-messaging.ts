@@ -682,7 +682,8 @@ export class WorkerMessageRepository {
       const deliveryId = `dlv_${ulid(at.getTime()).toLowerCase()}`;
       if(direction==="dona_to_worker"&&!["queued","retryable_failed"].includes(job.status)) {
         const addition=stableStringify({message_id:messageId,kind,payload:input.payload,
-          correlation_message_id:input.correlation_message_id??null,conversation_revision:input.conversation_revision??null,state:"pending",attempt_count:0});
+          correlation_message_id:input.correlation_message_id??null,conversation_revision:input.conversation_revision??null,state:"pending",attempt_count:0,
+          ...(kind==="answer"&&correlated?{correlated_report:{kind:correlated.kind,payload:JSON.parse(correlated.payload_json)}}:{})});
         if([...job.objective,...this.stoppedInstructionContext(jobId),...addition].length>90_000)
           throw new WorkerMessageError("worker_message_instruction_unavailable","instruction handoff character limit exceeded");
       }
@@ -821,12 +822,14 @@ export class WorkerMessageRepository {
   }
 
   stoppedInstructionContext(jobId:string):string {
-    const rows=this.db.prepare(`SELECT m.message_id,m.kind,m.payload_json,m.correlation_message_id,m.conversation_revision,d.state,d.attempt_count
+    const rows=this.db.prepare(`SELECT m.message_id,m.kind,m.payload_json,m.correlation_message_id,m.conversation_revision,d.state,d.attempt_count,
+        q.kind AS correlated_kind,q.payload_json AS correlated_payload_json
       FROM worker_messages m JOIN worker_message_deliveries d USING(message_id)
+      LEFT JOIN worker_messages q ON q.message_id=m.correlation_message_id AND q.job_id=m.job_id AND m.kind='answer'
       WHERE m.job_id=? AND m.direction='dona_to_worker' AND d.consumer='worker' AND (d.state IN ('pending','leased') OR (d.state='delivered' AND m.kind IN ('answer','add_condition','change_priority'))) ORDER BY m.producer_sequence LIMIT 257`).all(jobId) as Array<Record<string,unknown>>;
     if(rows.length>256)throw Error("worker_instruction_handoff_limit");
     if(!rows.length)return "";
-    return "\n\n前Attemptで受理済みの追加指示（同じ依頼・権限の範囲を維持）:\n"+stableStringify(rows.map(({payload_json,...row})=>({...row,payload:JSON.parse(payload_json as string)})))+
+    return "\n\n前Attemptで受理済みの追加指示（同じ依頼・権限の範囲を維持）:\n"+stableStringify(rows.map(({payload_json,correlated_kind,correlated_payload_json,...row})=>({...row,payload:JSON.parse(payload_json as string),...(correlated_payload_json?{correlated_report:{kind:correlated_kind,payload:JSON.parse(correlated_payload_json as string)}}:{})})))+
       "\ndeliveredは配送済みの条件として維持し、同じ外部操作を再送しない。未配送でattempt_count=0は未投入として残作業へ引き継ぐ。未配送でattempt_count>0は受理不明なので、既存成果・操作を照合するまで同じ指示や外部操作を再実行しない。相関IDは前Attemptの証拠であり新Attemptのanswer対象として流用しない。";
   }
 

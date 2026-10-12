@@ -419,6 +419,7 @@ test("型付き質問中のResultはhuman_inputを保ち、native解消後に型
   db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"answer",occurred_at:new Date().toISOString(),correlation_message_id:question.message.message_id,conversation_revision:1,payload:{operation:"answer",text:"元の範囲で続行してください"}});
   await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();assert.equal(db.tasks.get(task.task_id)?.state,"active");
   assert.ok(db.workerMessages.stoppedInstructionContext(job.job_id).includes("元の範囲で続行してください"));
+  assert.ok(db.workerMessages.stoppedInstructionContext(job.job_id).includes("継続できますか？"));
   const future={schema_version:1 as const,job_id:job.job_id,status:"completed" as const,summary:"確認しました",completed_at:new Date(Date.now()+60000).toISOString()};
   assert.throws(()=>db.saveJobResult(job.job_id,future,job.result_path),/completed_at_is_in_the_future/);assert.notEqual(db.tasks.get(task.task_id)?.state,"completed");
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
@@ -538,5 +539,18 @@ test("短い指示も257件目を保存前に拒否し、既存receiptと引継�
   for(let i=1;i<=256;i++){const result=db.workerMessages.appendInstruction(t.current_attempt_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:i,idempotency_key:"condition."+i,occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"確認する"}});if(i===1)first=result;}
   assert.throws(()=>db.workerMessages.appendInstruction(t.current_attempt_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:257,idempotency_key:"condition.257",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"確認する"}}),/count limit/);
   assert.ok(db.workerMessages.stoppedInstructionContext(t.current_attempt_id));assert.equal(db.workerMessages.reconcile(t.current_attempt_id,source.event_id,"dona-main","condition.257").reconciliation,"not_found");assert.ok(first);
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+
+test("完了後のqueued silenceを親dispatch前にsettleする",async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);try{
+  const source=db.enqueue(eventEnvelope("terminal-silence")).row,t=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"silence",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,j=db.getJob(t.current_attempt_id)!;
+  db.beginJobPreparation(j.job_id);db.setJobRuntime(j.job_id,"w","p","runtime");db.beginJobDispatch(j.job_id);db.markJobRunning(j.job_id);
+  db.workerMessages.appendWorkerReport(j.job_id,"runtime",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"checkpoint",occurred_at:new Date().toISOString(),payload:{kind:"checkpoint",summary:"確認が進みました"}});
+  db.workerMessages.publishDueSilenceEvents(100,new Date(Date.now()+1000000));
+  const Sqlite=(await import("better-sqlite3")).default,sql=new Sqlite(config.databasePath),silence=(sql.prepare("SELECT event_id FROM events WHERE event_type='worker_message_silence'").get() as {event_id:string}).event_id;
+  db.saveJobResult(j.job_id,{schema_version:1,job_id:j.job_id,status:"completed",summary:"確認しました",completed_at:new Date().toISOString()},j.result_path);
+  db.nextAvailable();assert.equal(db.get(silence)?.status,"completed");assert.equal(db.get(silence)?.last_error_code,"worker_report_superseded");sql.close();
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });

@@ -3756,7 +3756,7 @@ export class DispatcherDatabase {
   nextAvailable(at = new Date()): EventRow | undefined {
     this.suppressUnauthorizedScheduledNotifications(at);
     this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='worker_report_superseded',last_error_message=NULL
-      WHERE source='dona_message' AND event_type='worker_message_report' AND status IN ('queued','retryable_failed') AND EXISTS(
+      WHERE source='dona_message' AND event_type IN ('worker_message_report','worker_message_silence') AND status IN ('queued','retryable_failed') AND EXISTS(
         SELECT 1 FROM jobs j JOIN tasks t ON t.task_id=(SELECT task_id FROM task_attempts WHERE attempt_id=j.job_id)
         WHERE j.job_id=json_extract(events.payload_json,'$.job_id') AND
           (j.status IN ('completed','failed','cancelled','cancelling') OR t.current_attempt_id<>j.job_id OR t.desired_state='cancelled'))`).run(at.toISOString(),at.toISOString());
