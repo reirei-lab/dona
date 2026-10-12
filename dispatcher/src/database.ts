@@ -1108,11 +1108,17 @@ export class DispatcherDatabase {
     const readable=task.desired_state==="running"&&["running","blocked"].includes(job.status);
     return {schema_version:1,task_id:id,attempt_id:task.current_attempt_id,revision:task.revision,phase:job.status,
       wait_reason:task.wait_reason,diagnostic:job.last_error_code,desired_state:task.desired_state,
-      progress_decision_candidate:this.workerMessages.progressDecisionCandidate(task.current_attempt_id,eventId),
+      progress_decision_candidate:this.workerMessages.progressDecisionCandidate(task.current_attempt_id,eventId,new Date(),false),
       event_report:readable?this.workerMessages.eventReport(task.current_attempt_id,eventId):undefined,
       pending_question:readable?this.workerMessages.pendingQuestion(task.current_attempt_id):undefined,
       reports:readable?this.workerMessages.reports(task.current_attempt_id,eventId):[],
       ...this.workerMessages.silenceEventState(task.current_attempt_id,eventId),...this.workerMessages.instructionReceipts(task.current_attempt_id,eventId),limit:20};
+  }
+  prepareTaskProgressDecision(id:string,eventId:string){
+    const task=this.tasks.assertOwner(id,eventId,true);
+    const candidate=this.workerMessages.progressDecisionCandidate(task.current_attempt_id,eventId);
+    if(!candidate)throw Error("progress_decision_not_current");
+    return candidate;
   }
   applyTaskProgressDecision(id:string,eventId:string,decisionId:string){
     const task=this.tasks.assertOwner(id,eventId,true);

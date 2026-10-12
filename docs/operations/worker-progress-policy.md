@@ -4,11 +4,13 @@
 
 ## 判断と適用の境界
 
-`get_task_reports.progress_decision_candidate`は、現在eventに対応する報告、現行Attempt/desired state、Task revision/停止/steer、最大32件のdurable group membership、直前の適用済みdecisionを同じtransactionで取得して作る。workerの自由文をjob、destination、tool名、操作引数へ転用しない。
+`prepare_task_report_decision`は、現在eventに対応する報告、現行Attempt/desired state、Task revision/停止/steer、最大32件のdurable group membership、直前の適用済みdecisionを同じtransactionで取得して作る。workerの自由文をjob、destination、tool名、操作引数へ転用しない。
 
 同じreportの読み直しは同じdecisionへ収束する。groupやTaskの状態が変わった場合は`eligible_now:false`となり、古いcandidateを新しい操作に適用しない。報告・質問・risk・見込み時間の入力は未信頼の資料。credential/path/URL/command-shaped内容はLLM入力候補から拒否する。意味的な秘密検査を完全に保証するものではない。
 
 actionは`ack_internal`、`ask_worker`、`instruct_worker`、`aggregate_wait`、`report_to_user`、`ask_user`の6種類。正規化した重複、severity上昇、見込み時間の変化、無音、group内の並行報告、terminal/attentionを評価する。失敗や不完全なcontextを「問題なし」とは扱わない。
+
+`get_task_reports`は保存済み候補とreceiptの読み取りだけを行い、decision行を作らない。候補の準備はwrite操作の`prepare_task_report_decision`へ分離する。
 
 `apply_task_report_decision`はcurrent event・owner・decisionとsnapshotを照合し、適用receiptを保存する。応答を失った場合は`get_task_reports.application_receipt`を読み取り、receipt欠落を未実行の証拠として再送しない。
 
@@ -35,3 +37,5 @@ policy、API/MCP、event projection、署名済みowner、DB再起動、timer重
 未処理aggregate timerまたは未処理のaggregate eventがある状態での機能無効化は、既存messageと同じdrain gateで拒否する。終端Taskのdecision/成果物本文は30日後にretireし、decision identity・fingerprint・receipt IDは監査用に残す。進行中Taskの本文はこの期限処理で消さない。`payload_retired:true`は投稿・操作成功の証拠ではない。
 
 集約窓はworkerのoccurred_atではなくserverのaccepted_atから計算する。同じgroup fingerprintのreport_to_userは適用transaction内で既存presentation予約を再照合し、並行candidateもpresentation_duplicate receiptへ収束させる。別質問のask_userはこの進捗重複抑止へ含めない。
+
+別siblingのattention中でも質問を内部受領で失わない。集約参加は過去に一度報告したかではなく、server受付時刻が今回の30秒窓に入るかで判断する。未配送presentationがある間は通常進捗の次artifactを作らず、timerも新eventを増やさず待機する。予約時刻を実投稿時刻として扱わない。provider受理の照合はpresentation consumerの統合で必要になる。

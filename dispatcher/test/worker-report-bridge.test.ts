@@ -113,7 +113,12 @@ test("親APIは永続report receiptから元ownerだけを継承し、対応す�
   const sqlite=(await import("better-sqlite3")).default;const sql=new sqlite(config.databasePath);const record=sql.prepare("SELECT event_id FROM worker_message_deliveries WHERE delivery_id=?").get(report.delivery.delivery_id) as {event_id:string};sql.close();const notification=db.get(record.event_id)!;
   const dispatch=db.beginDispatch(notification.event_id,path.join(root,"parent-result.json"));assert.equal((await contexts.issue(dispatch)).purpose,"worker_report");
   const read=await client.getTaskReports(task.task_id,notification.event_id);assert.equal(read.attempt_id,jobId);assert.equal(read.next_producer_sequence,1);assert.equal((read.pending_question as {message_id:string}).message_id,question.message.message_id);
-  const candidate=read.progress_decision_candidate as {decision_id:string;decision:{action:string};eligible_now:boolean;replayed:boolean};
+  assert.equal(read.progress_decision_candidate,undefined);
+  const readOnlySql=new sqlite(config.databasePath);
+  const before=(readOnlySql.prepare("SELECT COUNT(*) count FROM worker_progress_decisions").get() as {count:number}).count;
+  await client.getTaskReports(task.task_id,notification.event_id);
+  assert.equal((readOnlySql.prepare("SELECT COUNT(*) count FROM worker_progress_decisions").get() as {count:number}).count,before);readOnlySql.close();
+  const candidate=await client.prepareTaskProgressDecision(task.task_id,notification.event_id) as {decision_id:string;decision:{action:string};eligible_now:boolean;replayed:boolean};
   assert.equal(candidate.decision.action,"ask_user");assert.equal(candidate.eligible_now,true);assert.equal(candidate.replayed,false);
   const replay=(await client.getTaskReports(task.task_id,notification.event_id)).progress_decision_candidate as typeof candidate;
   assert.equal(replay.decision_id,candidate.decision_id);assert.equal(replay.replayed,true);

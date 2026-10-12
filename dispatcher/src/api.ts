@@ -743,7 +743,7 @@ export class DispatcherApi {
     if(this.shuttingDown&&request.method!=="GET")throw new ApiRequestError(503,"shutting_down","Dispatcher is shutting down");
     const body=request.method==="POST"?await this.readJson(request):undefined;
     const sourceEvent=request.method==="POST"?(body as Record<string,unknown>|undefined)?.source_event_id:url.searchParams.get("source_event_id");
-    const operation=url.pathname.endsWith("/progress-decision")?"worker_message_policy":url.pathname.endsWith("/reports")?"worker_message_read":url.pathname.endsWith("/instruction")?"worker_message_answer":request.method==="GET"?"task_read":url.pathname==="/v1/tasks"?"task_delegate":"task_control";
+    const operation=(url.pathname.endsWith("/progress-decision")||url.pathname.endsWith("/prepare-progress-decision"))?"worker_message_policy":url.pathname.endsWith("/reports")?"worker_message_read":url.pathname.endsWith("/instruction")?"worker_message_answer":request.method==="GET"?"task_read":url.pathname==="/v1/tasks"?"task_delegate":"task_control";
     const authorize=()=>{
       if(!this.agentContexts)return;
       const token=request.headers["x-dona-agent-token"],event=request.headers["x-dona-agent-event-id"];
@@ -779,11 +779,15 @@ export class DispatcherApi {
         catch(error){if(error instanceof Error&&error.message==="task_not_found")sendTaskJson(200,{schema_version:1,status:"not_found",task:null});else throw error;}
         return;
       }
-      const match=/^\/v1\/tasks\/([^/]+)(?:\/(pause|resume|cancel|steer|retry|questions|answer|approve|recovery|reconcile|continuation|reports|instruction|progress-decision))?$/.exec(url.pathname);
+      const match=/^\/v1\/tasks\/([^/]+)(?:\/(pause|resume|cancel|steer|retry|questions|answer|approve|recovery|reconcile|continuation|reports|instruction|progress-decision|prepare-progress-decision))?$/.exec(url.pathname);
       if(!match)throw new Error("task_route_not_found");
       const id=taskIdSchema.parse(match[1]),action=match[2];
-      if(action==="reports"||action==="instruction"||action==="progress-decision") {
+      if(action==="reports"||action==="instruction"||action==="progress-decision"||action==="prepare-progress-decision") {
         if(!this.config.workerMessagingEnabled)throw Error("worker_messaging_disabled");
+        if(request.method==="POST"&&action==="prepare-progress-decision"){
+          const input=z.strictObject({source_event_id:z.string()}).parse(body);
+          sendTaskJson(200,this.database.prepareTaskProgressDecision(id,input.source_event_id));return;
+        }
         if(request.method==="POST"&&action==="progress-decision"){
           const input=z.strictObject({source_event_id:z.string(),decision_id:z.string().regex(/^[0-9a-f]{64}$/)}).parse(body);
           sendTaskJson(200,this.database.applyTaskProgressDecision(id,input.source_event_id,input.decision_id));return;

@@ -3,7 +3,7 @@ import {test} from "node:test";
 import {evaluateProgress,progressActions,type ProgressContext} from "../src/worker-progress-policy.js";
 const now="2026-10-12T08:00:00.000Z";
 const report={message_id:"message-one",payload:{kind:"checkpoint" as const,summary:"検証が進みました"},occurred_at:now,accepted_at:now};
-function context(patch:Partial<ProgressContext>={}):ProgressContext{return {event_id:"event-one",job_id:"job-one",report_current:true,current:true,desired_state:"running",phase:"running",now,report,
+function context(patch:Partial<ProgressContext>={}):ProgressContext{return {event_id:"event-one",job_id:"job-one",presentation_pending:false,report_current:true,current:true,desired_state:"running",phase:"running",now,report,
  members:[{job_id:"job-one",phase:"running",report}],group_attention:false,group_terminal:false,context_complete:true,silence_threshold_ms:900000,minimum_report_interval_ms:60000,...patch};}
 const first=evaluateProgress(context());
 const previous={fingerprint:first.fingerprint!,action:first.action,decided_at:"2026-10-12T07:55:00.000Z"};
@@ -62,3 +62,8 @@ for(const state of ["pending","unknown"] as const){
   assert.equal(d.action,"report_to_user");assert.equal(d.signals.risk_escalation,true);
  });
 }
+
+
+test("attention中も利用者が答えるべき質問を保持する",()=>{const d=evaluateProgress(context({group_attention:true,report:{...report,payload:{kind:"question",question:"選択が必要です"}}}));assert.equal(d.action,"ask_user");});
+test("古いsibling報告を今回の集約参加済みとみなさない",()=>{const d=evaluateProgress(context({members:[{job_id:"job-one",phase:"running",report},{job_id:"job-two",phase:"running",report:{...report,message_id:"old",accepted_at:"2026-10-12T07:00:00.000Z"}}]}));assert.equal(d.action,"aggregate_wait");assert.equal(d.reason,"sibling_reports_pending");});
+test("未配送artifactは時間が経っても通常進捗の次予約を止める",()=>{const d=evaluateProgress(context({presentation_pending:true,last_presentation_at:"2026-10-12T07:00:00.000Z"}));assert.equal(d.action,"aggregate_wait");assert.equal(d.reason,"presentation_undelivered");});

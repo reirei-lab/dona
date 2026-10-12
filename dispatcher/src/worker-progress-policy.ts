@@ -12,7 +12,7 @@ const projection=z.strictObject({message_id:z.string().min(1).max(80),payload:z.
 const member=z.strictObject({job_id:z.string().min(1).max(80),phase,report:projection.optional()});
 /** Only the server's owner-checked, transaction-consistent ledger projection may supply this context. */
 export const progressContextSchema=z.strictObject({event_id:z.string().min(1).max(80),job_id:z.string().min(1).max(80),
- report_current:z.boolean().default(true),current:z.boolean(),desired_state:z.enum(["running","paused","cancelled"]),phase,now:instant,
+ presentation_pending:z.boolean().default(false),report_current:z.boolean().default(true),current:z.boolean(),desired_state:z.enum(["running","paused","cancelled"]),phase,now:instant,
  report:projection.optional(),silence_since:instant.optional(),members:z.array(member).min(1).max(32),
  group_attention:z.boolean(),group_terminal:z.boolean(),context_complete:z.boolean(),
  previous:z.strictObject({fingerprint:z.string(),group_fingerprint:z.string().optional(),severity:z.enum(["low","medium","high"]).optional(),eta_minutes:z.number().int().nonnegative().optional(),
@@ -42,7 +42,7 @@ export function evaluateProgress(raw:unknown):ProgressDecision {
  const target={job_id:c.job_id,...(c.report?{message_id:c.report.message_id}:{})};
  const result:ProgressDecision={version:1,action:"ack_internal",reason:"no_action",fingerprint:null,target,signals:emptySignals()};
  if(!c.current||c.desired_state!=="running"||!["running","blocked"].includes(c.phase)){result.reason="attempt_unavailable";return result;}
- if(c.group_attention||c.group_terminal){result.reason="terminal_notification_priority";return result;}
+ if(c.group_terminal||(c.group_attention&&!["question","decision_request"].includes(c.report?.payload.kind??""))){result.reason="terminal_notification_priority";return result;}
  if(!c.context_complete||!c.members.some(m=>m.job_id===c.job_id&&m.phase===c.phase)||new Set(c.members.map(m=>m.job_id)).size!==c.members.length){result.reason="context_incomplete";return result;}
  if([c.report,...c.members.map(m=>m.report)].some(r=>denied(reportText(r)))){result.reason="unsafe_projection";result.target=null;return result;}
  if(!c.report_current){result.reason="stale_report";return result;}
@@ -81,9 +81,10 @@ export function evaluateProgress(raw:unknown):ProgressDecision {
  const heartbeat=payload.kind==="checkpoint"&&/^(?:(?:作業|調査|確認)(?:を)?(?:継続(?:して|し)|続けて)います|(?:作業|調査|確認)中です)[。.!！]?$/u.test(normalized(payload.summary));
  if(heartbeat&&!result.signals.risk_escalation&&!result.signals.eta_changed){result.signals.novelty=false;result.reason="heartbeat_without_change";return result;}
  if(payload.kind==="checkpoint"&&c.last_presentation_fingerprint===groupFingerprint){result.reason="group_progress_already_reserved";return result;}
+ if(c.presentation_pending&&!result.signals.risk_escalation&&!result.signals.eta_changed){result.action="aggregate_wait";result.reason="presentation_undelivered";return result;}
  if(!result.signals.novelty&&!result.signals.risk_escalation&&!result.signals.eta_changed&&c.previous?.action!=="aggregate_wait"){result.reason="duplicate_report";return result;}
  const live=c.members.filter(m=>["running","blocked"].includes(m.phase));
- if(!result.signals.risk_escalation&&!result.signals.eta_changed&&live.length>1&&live.some(m=>!m.report)&&now-Date.parse(c.report.accepted_at)<30000){result.action="aggregate_wait";result.reason="sibling_reports_pending";return result;}
+ if(!result.signals.risk_escalation&&!result.signals.eta_changed&&live.length>1&&live.some(m=>!m.report||Date.parse(m.report.accepted_at)<Date.parse(c.report!.accepted_at)-30000)&&now-Date.parse(c.report.accepted_at)<30000){result.action="aggregate_wait";result.reason="sibling_reports_pending";return result;}
  const lastReport=Math.max(c.last_user_report_at?Date.parse(c.last_user_report_at):0,c.last_presentation_at?Date.parse(c.last_presentation_at):0);
  if(!result.signals.risk_escalation&&!result.signals.eta_changed&&lastReport&&now-lastReport<c.minimum_report_interval_ms){result.action="aggregate_wait";result.reason="report_cadence";return result;}
  result.action="report_to_user";result.reason=result.signals.risk_escalation?"risk_escalation":result.signals.eta_changed?"eta_drift":"new_progress";

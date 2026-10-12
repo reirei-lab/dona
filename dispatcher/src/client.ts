@@ -22,6 +22,7 @@ export class DispatcherApiClient {
 
   createTask(input:unknown):Promise<Record<string,unknown>> {return this.request("POST","/v1/tasks",input);}
   inspectTaskRecovery(id:string,eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/${encodeURIComponent(id)}/recovery?${new URLSearchParams({source_event_id:eventId})}`);}
+  prepareTaskProgressDecision(id:string,eventId:string):Promise<Record<string,unknown>>{return this.request("POST",`/v1/tasks/${encodeURIComponent(id)}/prepare-progress-decision`,{source_event_id:eventId});}
   applyTaskProgressDecision(id:string,sourceEventId:string,decisionId:string){return this.request("POST",`/v1/tasks/${encodeURIComponent(id)}/progress-decision`,{source_event_id:sourceEventId,decision_id:decisionId});}
   getTaskReports(id:string,eventId:string):Promise<Record<string,unknown>> {return this.request("GET",`/v1/tasks/${encodeURIComponent(id)}/reports?${new URLSearchParams({source_event_id:eventId})}`);}
   instructTask(id:string,revision:number,message:unknown):Promise<Record<string,unknown>> {return this.request("POST",`/v1/tasks/${encodeURIComponent(id)}/instruction`,{source_event_id:(message as Record<string,unknown>).source_event_id,revision,message});}

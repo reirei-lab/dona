@@ -108,7 +108,7 @@ describe("Dona Dispatcher MCP server", () => {
       assert.match(approval,/要求通知後/);
       assert.equal(listed.tools.find(tool=>tool.name==="authorize_job_notification")?.annotations?.idempotentHint,false);
       assert.deepEqual(listed.tools.map(({ name }) => name), [
-        "delegate_task", "control_task_continuation", "get_task", "inspect_task_recovery", "reconcile_task_result", "find_issue_task", "list_tasks", "apply_task_report_decision", "get_task_reports", "instruct_task", "get_task_questions", "answer_task_question", "respond_task_approval", "pause_task", "resume_task", "cancel_task", "steer_task", "retry_task",
+        "delegate_task", "control_task_continuation", "get_task", "inspect_task_recovery", "reconcile_task_result", "find_issue_task", "list_tasks", "prepare_task_report_decision", "apply_task_report_decision", "get_task_reports", "instruct_task", "get_task_questions", "answer_task_question", "respond_task_approval", "pause_task", "resume_task", "cancel_task", "steer_task", "retry_task",
         "delegate_job",
         "delegate_scheduled_work",
         "list_event_jobs",

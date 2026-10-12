@@ -375,12 +375,12 @@ export class WorkerMessageRepository {
     return !!this.db.prepare(`SELECT 1 FROM worker_messages m WHERE m.job_id=? AND m.direction='worker_to_dona' AND m.kind IN ('question','decision_request') AND NOT EXISTS (
       SELECT 1 FROM worker_messages a JOIN worker_message_deliveries d USING(message_id) WHERE a.correlation_message_id=m.message_id AND a.kind='answer' AND d.consumer='worker' AND d.state='delivered')`).get(jobId);
   }
-  progressDecisionCandidate(jobId:string,eventId:string,at=new Date()) {
+  progressDecisionCandidate(jobId:string,eventId:string,at=new Date(),persist=true) {
     const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow|undefined;
     if(!job)throw Error("job_not_found");
     this.assertAuthorized(job,eventId);
     if(!this.ownsMessageEvent(jobId,eventId))return undefined;
-    return this.db.transaction(()=>{
+    const operation=this.db.transaction(()=>{
       const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow|undefined;
       if(!job)throw Error("job_not_found");
       this.assertAuthorized(job,eventId);
@@ -424,18 +424,20 @@ export class WorkerMessageRepository {
         return {decision_id:key,decision:JSON.parse(saved.decision_json) as ProgressDecision,eligible_now:saved.snapshot_sha256===snapshot,replayed:true,
           decided_at:saved.decided_at,applied:!!application,...(application?{application_receipt:JSON.parse(application.result_json)}:{})};
       }
+      if(!persist)return undefined;
       const prior=this.db.prepare("SELECT p.decision_json,p.decided_at FROM worker_progress_decisions p JOIN worker_progress_applications a USING(decision_key) WHERE p.job_id=? ORDER BY p.decided_at DESC,p.decision_key DESC LIMIT 1").get(jobId) as {decision_json:string;decided_at:string}|undefined;
       const previous=prior?JSON.parse(prior.decision_json) as ProgressDecision:undefined;
       const presentation=this.db.prepare(`SELECT a.applied_at,p.decision_json FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key) JOIN jobs j ON j.job_id=p.job_id
         WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready' ORDER BY a.applied_at DESC,a.decision_key DESC LIMIT 1`).get(job.source_event_id) as {applied_at:string;decision_json:string}|undefined;
       const reserved=presentation?JSON.parse(presentation.decision_json) as ProgressDecision:undefined;
-      const decision=evaluateProgress({event_id:eventId,...identity,context_complete:rows.length<=32,now:at.toISOString(),members,...(presentation?{last_presentation_at:presentation.applied_at,last_presentation_fingerprint:reserved?.observed?.group_fingerprint}:{}),...(report?{report:project(report)}:{}),
+      const decision=evaluateProgress({event_id:eventId,...identity,context_complete:rows.length<=32,now:at.toISOString(),members,presentation_pending:!!presentation,...(presentation?{last_presentation_at:presentation.applied_at,last_presentation_fingerprint:reserved?.observed?.group_fingerprint}:{}),...(report?{report:project(report)}:{}),
         ...(!report&&cadence?.last_report_at?{silence_since:cadence.last_report_at}:{}),
         ...(pending?{pending_instruction:{message_id:pending.message_id,state:pending.attempt_count>0?"unknown":"pending"}}:{}),
         ...(previous&&prior?{previous:{fingerprint:previous.fingerprint??"",action:previous.action,decided_at:prior.decided_at,...previous.observed,...(previous.target?.message_id?{message_id:previous.target.message_id}:{})}}:{})});
       this.db.prepare("INSERT INTO worker_progress_decisions VALUES(?,?,?,?,?,?)").run(key,jobId,eventId,snapshot,stableStringify(decision),at.toISOString());
       return {decision_id:key,decision,eligible_now:true,replayed:false,decided_at:at.toISOString(),applied:false};
-    }).immediate();
+    });
+    return persist?operation.immediate():operation();
   }
 
   applyProgressDecision(jobId:string,eventId:string,decisionId:string,at=new Date()) {
@@ -480,9 +482,14 @@ export class WorkerMessageRepository {
         const reserved=candidate.decision.action==="report_to_user"&&this.db.prepare(`SELECT 1 FROM worker_progress_applications a
           JOIN worker_progress_decisions p USING(decision_key) JOIN jobs j ON j.job_id=p.job_id
           WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready'
-            AND json_extract(p.decision_json,'$.observed.group_fingerprint')=? LIMIT 1`)
-          .get(job.source_event_id,candidate.decision.observed?.group_fingerprint??null);
+            AND json_extract(p.decision_json,'$.observed.group_fingerprint')=?
+            AND (? IS NULL OR json_extract(p.decision_json,'$.fingerprint')=?) LIMIT 1`)
+          .get(job.source_event_id,candidate.decision.observed?.group_fingerprint??null,
+            candidate.decision.observed?.severity==="high"?candidate.decision.fingerprint:null,candidate.decision.fingerprint);
+        const undelivered=candidate.decision.action==="report_to_user"&&!candidate.decision.signals.risk_escalation&&!candidate.decision.signals.eta_changed&&this.db.prepare(`SELECT 1 FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key)
+          JOIN jobs j ON j.job_id=p.job_id WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready' LIMIT 1`).get(job.source_event_id);
         if(reserved){result.action="ack_internal";result.state="presentation_duplicate";}
+        else if(undelivered){result.action="aggregate_wait";result.state="aggregate_wait";nextCheck=new Date(at.getTime()+30000).toISOString();result.next_check_at=nextCheck;}
         else {result.state="presentation_ready";
         result.artifact={version:1,decision_id:decisionId,action:candidate.decision.action,
           source_event_id:job.source_event_id,destination:binding.destination,
@@ -505,6 +512,9 @@ export class WorkerMessageRepository {
         if(!task||task.desired_state!=="running"||!["running","blocked"].includes(job.status)){
           this.db.prepare("UPDATE worker_progress_applications SET next_check_at=NULL WHERE decision_key=?").run(row.decision_key);continue;
         }
+        const pendingPresentation=this.db.prepare(`SELECT 1 FROM worker_progress_applications a JOIN worker_progress_decisions p USING(decision_key)
+          JOIN jobs j ON j.job_id=p.job_id WHERE j.source_event_id=? AND json_extract(a.result_json,'$.state')='presentation_ready' LIMIT 1`).get(job.source_event_id);
+        if(pendingPresentation)continue;
         const message=this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND direction='worker_to_dona' ORDER BY producer_sequence DESC LIMIT 1").get(row.job_id) as WorkerMessageRow|undefined;
         if(!message){this.db.prepare("UPDATE worker_progress_applications SET next_check_at=NULL WHERE decision_key=?").run(row.decision_key);continue;}
         const original=this.db.prepare("SELECT subject_json FROM events WHERE event_id=?").get(job.source_event_id) as {subject_json:string};
