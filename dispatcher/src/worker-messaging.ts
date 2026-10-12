@@ -220,6 +220,9 @@ export function migrateWorkerMessaging(db: Database.Database): void {
       updated_at             TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS worker_message_activity (
+      job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,activity_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS worker_message_workspace_cadence (
       workspace_id           TEXT PRIMARY KEY,
       minimum_interval_ms    INTEGER NOT NULL DEFAULT 60000 CHECK (minimum_interval_ms BETWEEN 0 AND 3600000),
@@ -552,6 +555,7 @@ export class WorkerMessageRepository {
 
       let availableAt = acceptedAt;
       if (direction === "worker_to_dona") {
+        this.db.prepare("INSERT INTO worker_message_activity VALUES(?,?) ON CONFLICT(job_id) DO UPDATE SET activity_at=excluded.activity_at").run(jobId,acceptedAt);
         const silencePrefix=`worker-message-silence:${jobId}:`;
         this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,
           last_error_code='worker_message_silence_superseded',last_error_message=NULL
@@ -790,6 +794,10 @@ export class WorkerMessageRepository {
           WHERE current_attempt_id=? AND desired_state='running' AND state='waiting' AND wait_reason IN ('human_input','external_effect_unknown','worker_instruction_delivery_pending')
           AND EXISTS(SELECT 1 FROM jobs WHERE job_id=? AND status='running' AND last_error_code IS NULL)`).run(now,jobId,jobId);
       }
+      if(row.consumer==='worker'&&job.status==='blocked'){
+        const resumed=this.db.prepare("SELECT status,last_error_code FROM jobs WHERE job_id=?").get(jobId) as {status:string;last_error_code:string|null};
+        if(resumed.status==='running'&&resumed.last_error_code===null)this.resetSilenceAfterInput(jobId,at);
+      }
       return { delivery: this.db.prepare("SELECT * FROM worker_message_deliveries WHERE delivery_id=?").get(deliveryId), receipt_id: receiptId, outcome: "delivered" as const };
     }).immediate();
   }
@@ -901,6 +909,13 @@ export class WorkerMessageRepository {
       }
       return published;
     }).immediate();
+  }
+
+  resetSilenceAfterInput(jobId:string,at=new Date()):void {
+    const now=at.toISOString();
+    this.db.prepare("UPDATE worker_message_cadence SET silence_due_at=strftime('%Y-%m-%dT%H:%M:%fZ',?, '+'||(silence_interval_ms/1000)||' seconds'),generation=generation+1,updated_at=? WHERE job_id=?").run(now,now,jobId);
+    this.db.prepare("INSERT INTO worker_message_activity VALUES(?,?) ON CONFLICT(job_id) DO UPDATE SET activity_at=excluded.activity_at").run(jobId,now);
+    this.db.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='worker_message_input_resumed' WHERE source='dona_message' AND event_type='worker_message_silence' AND json_extract(payload_json,'$.job_id')=? AND status IN ('queued','retryable_failed')").run(now,now,jobId);
   }
 
   publishDueSilenceEvents(limit = 100, at = new Date()): number {

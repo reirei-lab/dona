@@ -79,6 +79,7 @@ export interface CancelJobRequest {
 }
 
 export interface JobResultEnvelope {
+  worker_instruction_message_ids?: string[];
   schema_version: 1;
   job_id: string;
   status: "completed" | "failed";

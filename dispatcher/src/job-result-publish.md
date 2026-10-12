@@ -13,7 +13,7 @@
 
 ## request と応答材料
 
-- request は `schema_version: 1`、`status`、`summary`、任意の `output`、object 配列の `artifacts`、`actions` だけ。未知 field は拒否する。job ID、時刻、path、owner は worker から受けない。
+- request は `schema_version: 1`、`status`、`summary`、任意の `output`、object 配列の `artifacts`、`actions`、受信済み型付き指示IDの `worker_instruction_message_ids` だけ。未知 field は拒否する。job ID、時刻、path、owner は worker から受けない。
 - 認可後、Dispatcher が取得した永続 job row から job ID を補い、Dispatcher 時計から `completed_at` を補う。最終 JSON の UTF-8 byte 数は既存 reader と共有する 1 MiB 上限以下とする。
 - `canonicalDigest` は domain prefix、job ID、field 名の Unicode code point 順に安定化した request JSON の SHA-256。Dispatcher 補完時刻は含めない。同じ job と同じ request の再送は同じ digest、異なる内容は異なる digest になる。#291 が永続 receipt と照合して同一再送・異内容競合を確定する。
 - terminal job の再送は、永続 `result_json` がある場合だけ受け入れ、`reconcileOnly` によって read-only callback へ分岐する。cleanup が live session や pane を削除していても、要求 session と grant 発行時 session の一致は必須とし、期限内の未失効 grant と永続 Result が一致対象になる。#291 は保存済み digest と比較して `reused` または `conflict` だけを返し、terminal Result を更新しない。

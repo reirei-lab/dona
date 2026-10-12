@@ -186,6 +186,7 @@ const cancelJobSchema = z.object({
 }).strip();
 
 const jobResultEnvelopeSchema = z.object({
+  worker_instruction_message_ids: z.array(z.string().regex(/^msg_[0-9a-hjkmnp-tv-z]{26}$/)).max(256).refine(ids=>new Set(ids).size===ids.length).optional(),
   schema_version: z.literal(1),
   job_id: z.string().min(1),
   status: z.enum(["completed", "failed"]),

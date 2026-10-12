@@ -521,7 +521,9 @@ export class TaskRepository {
   reconnect(task:TaskRow):void {
     this.sql.transaction(()=>{
       const fresh=this.get(task.task_id)!;if(fresh.revision!==task.revision||fresh.current_attempt_id!==task.current_attempt_id||fresh.desired_state!=="running"||! ["none","not_sent"].includes(fresh.stop_state))return;
+      const prior=this.dispatcher.getJob(task.current_attempt_id);
       this.sql.prepare("UPDATE jobs SET status='running',last_error_code=NULL,last_error_message=NULL WHERE job_id=? AND status IN ('needs_review','blocked')").run(task.current_attempt_id);
+      if(prior&&['runtime_question_pending','runtime_external_approval_pending'].includes(prior.last_error_code??'')&&this.sql.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_message_cadence'").get())this.dispatcher.workerMessages.resetSilenceAfterInput(task.current_attempt_id);
       this.sql.prepare("UPDATE tasks SET state='active',wait_reason=NULL,next_check_at=NULL,stop_state='none',stop_evidence_json=NULL,observation_failures=0 WHERE task_id=?").run(task.task_id);
     }).immediate();
   }
