@@ -338,7 +338,8 @@ export class JobSupervisor {
     }
     // A result is evidence belonging to this attempt, never to its successor.
     try {
-      const result=await readJobResultEnvelope(job.result_path,job.job_id);
+      const resultPath=this.instructionResultPath(job);
+      const result=await readJobResultEnvelope(resultPath,job.job_id);
       if(result.status==="failed"&&job.last_error_code==="steer_acceptance_unknown") {
         const prior=this.database.tasks.resultRecovery(job.job_id);
         if(prior&&task.wait_reason==="retry_exhausted")return;
@@ -355,7 +356,7 @@ export class JobSupervisor {
           return;
         }
       }
-      try { this.database.saveJobResult(job.job_id,result,job.result_path); }
+      try { this.database.saveJobResult(job.job_id,result,resultPath); }
       catch(error) { if(!this.holdInstructionResult(job,error))this.database.tasks.wait(task,"result_reconciliation_required"); }
       return;
     } catch(error) {
@@ -968,8 +969,9 @@ export class JobSupervisor {
     const stopped=this.database.getJob(jobId);
     if(stopped?.last_error_code!=="invalid_result_agent_stopped") return;
     try {
-      const result=await readJobResultEnvelope(stopped.result_path,stopped.job_id);
-      this.database.saveJobResult(stopped.job_id,result,stopped.result_path);
+      const resultPath=this.instructionResultPath(stopped);
+      const result=await readJobResultEnvelope(resultPath,stopped.job_id);
+      this.database.saveJobResult(stopped.job_id,result,resultPath);
     } catch {
       // The invalid/missing Result remains fenced for operator review after the worker is stopped.
     }
@@ -1379,6 +1381,10 @@ export class JobSupervisor {
     );
   }
 
+  private instructionResultPath(job:JobRow):string {
+    return this.config.workerMessagingEnabled?this.database.jobResultReadPath(job.job_id):job.result_path;
+  }
+
   private holdInstructionResult(job:JobRow,error:unknown):boolean {
     if(!(error instanceof Error)||!["worker_instruction_delivery_pending","worker_instruction_result_stale","worker_message_question_pending"].includes(error.message))return false;
     const task=this.database.tasks.forAttempt(job.job_id);
@@ -1388,9 +1394,10 @@ export class JobSupervisor {
 
   private async tryCompleteAfterUnknownAcceptance(row: JobRow): Promise<boolean> {
     try {
-      const result = await this.readResult(row.result_path, row.job_id);
+      const resultPath=this.instructionResultPath(row);
+      const result = await this.readResult(resultPath, row.job_id);
       this.database.markJobRunning(row.job_id);
-      this.database.saveJobResult(row.job_id, result, row.result_path);
+      this.database.saveJobResult(row.job_id, result, resultPath);
       return true;
     } catch (error) {
       if(this.holdInstructionResult(row,error))return false;
@@ -1470,8 +1477,9 @@ export class JobSupervisor {
   private async tryComplete(row: JobRow, terminalAgentState: boolean): Promise<boolean> {
     let completed: JobRow;
     try {
-      const result = await this.readResult(row.result_path, row.job_id);
-      this.database.saveJobResult(row.job_id, result, row.result_path);
+      const resultPath=this.instructionResultPath(row);
+      const result = await this.readResult(resultPath, row.job_id);
+      this.database.saveJobResult(row.job_id, result, resultPath);
       completed = this.database.getJob(row.job_id)!;
     } catch (error) {
       if(this.holdInstructionResult(row,error))return false;

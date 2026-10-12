@@ -107,6 +107,11 @@ for(const deliveryState of ["pending","leased","delivered"] as const)test(`pause
     assert.ok(f.db.getJob(next.current_attempt_id)!.objective.includes(`"attempt_count":${deliveryState==="pending"?0:1}`));
     const receipt=f.db.workerMessages.reconcile(f.task.current_attempt_id,follow.event_id,"dona-main","condition") as {delivery:{state:string}};
     assert.equal(receipt.delivery.state,deliveryState==="delivered"?"delivered":"superseded");
+    f.start(next.current_attempt_id);f.setStopped(false);f.interrupt(next.current_attempt_id);await f.supervisor().reconcileTasks();
+    const third=f.db.tasks.get(next.task_id)!;assert.equal(third.attempt_number,3);
+    assert.match(f.db.getJob(third.current_attempt_id)!.objective,/既存の要件を保って検証結果を残してください/);
+    assert.ok(f.db.getJob(third.current_attempt_id)!.objective.includes(instruction.message.message_id));
+
   }finally{await f.dispose();}
 });
 

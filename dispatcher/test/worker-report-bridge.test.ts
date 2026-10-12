@@ -32,8 +32,8 @@ if(r.method==='thread/start')send({id:r.id,result:{thread:{id:'worker-thread'}}}
 if(r.method==='turn/start'){send({method:'turn/started',params:{threadId:'worker-thread',turn:{id:'worker-turn'}}});send({id:r.id,result:{turn:{id:'worker-turn'}}});${denyFirst?"send({id:'denied-report',method:'item/tool/call',params:{threadId:'worker-thread',turnId:'worker-turn',callId:'denied-call',tool:'dona_worker_report',namespace:null,arguments:{report_key:'denied.one',payload:{kind:'checkpoint',summary:'調査する'}}}});":"report();"}}
 if(r.id==='denied-report'&&r.result){fs.writeFileSync('denial.json',JSON.stringify(r.result));send({method:'serverRequest/resolved',params:{threadId:'worker-thread',requestId:'denied-report'}});report();}
 if(r.id==='rpc-report'&&r.result)send({method:'serverRequest/resolved',params:{threadId:'worker-thread',requestId:'rpc-report'}});
-if(r.method==='turn/steer'){fs.appendFileSync('steers.jsonl',JSON.stringify(r.params)+'\\n');send({id:r.id,result:{turnId:'worker-turn'}});const typed=JSON.parse(r.params.input[0].text.split('\\n').slice(1,-1).join('\\n'));globalThis.lastInstruction=typed.message_id;send({id:'correlated-report',method:'item/tool/call',params:{threadId:'worker-thread',turnId:'worker-turn',callId:'correlated-call',tool:'dona_worker_report',namespace:null,arguments:{report_key:'checkpoint.after-answer',correlation_message_id:typed.message_id,conversation_revision:typed.conversation_revision,payload:{kind:'checkpoint',summary:'回答に対応しました'}}}});}
-if(r.id==='correlated-report'&&r.result){send({method:'serverRequest/resolved',params:{threadId:'worker-thread',requestId:'correlated-report'}});const target=${JSON.stringify(job.result_path)};fs.writeFileSync(target+'.tmp',JSON.stringify({schema_version:1,job_id:${JSON.stringify(job.job_id)},status:'completed',summary:'確認が完了しました',worker_instruction_message_ids:[globalThis.lastInstruction],completed_at:new Date().toISOString()}));fs.renameSync(target+'.tmp',target);}
+if(r.method==='turn/steer'){fs.appendFileSync('steers.jsonl',JSON.stringify(r.params)+'\\n');send({id:r.id,result:{turnId:'worker-turn'}});const typed=JSON.parse(r.params.input[0].text.split('\\n').slice(1,-1).join('\\n'));globalThis.lastInstruction=typed.message_id;globalThis.resultFile=typed.result_file;send({id:'correlated-report',method:'item/tool/call',params:{threadId:'worker-thread',turnId:'worker-turn',callId:'correlated-call',tool:'dona_worker_report',namespace:null,arguments:{report_key:'checkpoint.after-answer',correlation_message_id:typed.message_id,conversation_revision:typed.conversation_revision,payload:{kind:'checkpoint',summary:'回答に対応しました'}}}});}
+if(r.id==='correlated-report'&&r.result){send({method:'serverRequest/resolved',params:{threadId:'worker-thread',requestId:'correlated-report'}});const original=${JSON.stringify(job.result_path)};const target=original.slice(0,original.lastIndexOf('/')+1)+globalThis.resultFile;fs.writeFileSync(target+'.tmp',JSON.stringify({schema_version:1,job_id:${JSON.stringify(job.job_id)},status:'completed',summary:'確認が完了しました',worker_instruction_message_ids:[globalThis.lastInstruction],completed_at:new Date().toISOString()}));fs.renameSync(target+'.tmp',target);}
 });`);
  const manager=new AppServerManager(store,(_args,cwd)=>new AppServerRpc(process.execPath,[script],cwd));
  let dropReport=true,dropInstruction=true;
@@ -73,9 +73,9 @@ if(r.id==='correlated-report'&&r.result){send({method:'serverRequest/resolved',p
   const sends=(await fs.readFile(path.join(root,"steers.jsonl"),"utf8")).trim().split("\n");assert.equal(sends.length,1);assert.ok(sends[0]!.includes(instruction.message.message_id));
   const receipt=database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","condition.one") as {receipts:Array<{receipt_kind:string;consumer:string}>};assert.ok(receipt.receipts.some(row=>row.receipt_kind==="delivered"&&row.consumer==="worker"));
   await until(()=>manager.workerReports.pending().some(row=>row.report_key==="checkpoint.after-answer"));assert.equal(await bridge.runOnce(),1);
-  await until(()=>existsSync(job.result_path));
+  const revised=database.workerMessages.instructionResultPath(job.job_id,instruction.message.message_id);await until(()=>existsSync(revised));
   const correlated=database.workerMessages.reports(job.job_id,source.event_id)[0]!;assert.equal(correlated.producer_sequence,2);assert.equal(correlated.correlation_message_id,instruction.message.message_id);
-  const final=await readJobResultEnvelope(job.result_path,job.job_id);database.saveJobResult(job.job_id,final,job.result_path);assert.equal(database.tasks.get(task.task_id)?.state,"completed");
+  const final=await readJobResultEnvelope(revised,job.job_id);database.saveJobResult(job.job_id,final,revised);assert.equal(database.tasks.get(task.task_id)?.state,"completed");
   await assert.rejects(manager.prompt(job.agent_name,"worker-message:other","wrong",{attempt_id:"other-attempt",generation:agent.generation,thread_id:agent.thread_id!}),/not_current/);
  }finally{if(generation&&store.agent(job.agent_name)?.state!=="stopped")await manager.stop(job.agent_name,generation);store.close();database.close();await fs.rm(root,{recursive:true,force:true});}
 });
@@ -336,7 +336,7 @@ test("最新20件から外れたevent対象riskの本文を必ず返す",async()
 });
 
 for(const precision of ["same-millisecond","seconds"])test(`未配送・未確認の追加指示では完了せず、確認済みResultは時刻精度によらず受理する（${precision}）`,async()=>{
- const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);
+ const {root,config}=await tempConfig();config.workerMessagingEnabled=true;const db=new DispatcherDatabase(config.databasePath);
  try{
   const source=db.enqueue(eventEnvelope("result-fence")).row,task=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"result-fence",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,job=db.getJob(task.current_attempt_id)!;
   db.beginJobPreparation(job.job_id);db.setJobRuntime(job.job_id,"w","p","runtime");db.beginJobDispatch(job.job_id);db.markJobRunning(job.job_id);
@@ -363,7 +363,10 @@ for(const precision of ["same-millisecond","seconds"])test(`未配送・未確�
   const completedAt=precision==="seconds"?deliveredAt.replace(/\.\d+Z$/,"Z"):deliveredAt;
   for(const ids of [[],["msg_01h00000000000000000000000"],[instruction.message.message_id,instruction.message.message_id]])assert.throws(()=>db.saveJobResult(job.job_id,{...old,worker_instruction_message_ids:ids,completed_at:completedAt},job.result_path),/result_stale/);
   assert.throws(()=>db.saveJobResult(job.job_id,{...old,completed_at:new Date().toISOString()},job.result_path),/result_stale/);
-  await fs.writeFile(job.result_path,JSON.stringify({...old,worker_instruction_message_ids:[instruction.message.message_id],completed_at:completedAt}));
+  await fs.writeFile(db.workerMessages.instructionResultPath(job.job_id,instruction.message.message_id),JSON.stringify({...old,worker_instruction_message_ids:[instruction.message.message_id],completed_at:completedAt}));
+  assert.deepEqual(JSON.parse(await fs.readFile(job.result_path,'utf8')),old);
+  assert.deepEqual(db.readTaskRecoveryResult(job.job_id).result.worker_instruction_message_ids,[instruction.message.message_id]);
+  assert.equal(db.inspectOperatorAssertionRecovery(job.job_id).result_class,'valid');
   db.tasks.wait(db.tasks.get(task.task_id)!,"worker_instruction_result_pending",-1);await supervisor.reconcileTasks();assert.equal(db.tasks.get(task.task_id)?.state,"completed");
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
@@ -520,11 +523,11 @@ for(const objective of ["a","question"])test(`短いobjectiveとJSON構造キー
  const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);try{
   const source=db.enqueue(eventEnvelope("short-"+objective)).row,t=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"short",objective,workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,j=db.getJob(t.current_attempt_id)!,identity=JSON.stringify(["generation","thread"]),created=new Date().toISOString();
   db.beginJobPreparation(j.job_id);db.setJobRuntime(j.job_id,"w","p",identity);db.beginJobDispatch(j.job_id);db.markJobRunning(j.job_id);
-  let resolved:unknown;
-  class Port extends RuntimeClient{constructor(){super("unused");}override async workerReportAvailability(){return {enabled:true,ttl_ms:30000};}override async status(){return {name:j.agent_name,role:"worker",generation:"generation",thread_id:"thread",turn_id:"turn",state:"working"} as Awaited<ReturnType<RuntimeClient["status"]>>;}
+  let resolved:unknown,heartbeats=0;
+  class Port extends RuntimeClient{constructor(){super("unused");}override async workerReportAvailability(){heartbeats++;return {enabled:true,ttl_ms:30000};}override async status(){await new Promise(resolve=>setTimeout(resolve,60));assert.ok(heartbeats>=3,"status RPC待機中もheartbeatを更新する");return {name:j.agent_name,role:"worker",generation:"generation",thread_id:"thread",turn_id:"turn",state:"working"} as Awaited<ReturnType<RuntimeClient["status"]>>;}
    override async workerReports(){return [{request_id:"request",agent:j.agent_name,generation:"generation",thread_id:"thread",turn_id:"turn",call_id:"call",rpc_id_json:'"rpc"',attempt_id:j.job_id,report_key:"report",request_sequence:1,payload_json:stableStringify({payload:{kind:"question",question:"続行できますか？"}}),payload_sha256:"hash",created_at:created,state:"pending" as const,result_json:null}];}
    override async resolveWorkerReport(_name:string,_id:string,result:unknown){resolved=result;return {};}}
-  assert.equal(await new AppServerWorkerReportBridge(db,new Port()).runOnce(),1);assert.ok((resolved as {message_id:string}).message_id);
+  assert.equal(await new AppServerWorkerReportBridge(db,new Port(),()=>{},10).runOnce(),1);assert.ok((resolved as {message_id:string}).message_id);
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
 
@@ -581,5 +584,16 @@ test("長い質問待ち後の回答配送からsilence intervalを数え直す"
   db.workerMessages.appendInstruction(t.current_attempt_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"answer",occurred_at:new Date().toISOString(),correlation_message_id:q.message.message_id,conversation_revision:1,payload:{operation:"answer",text:"元の範囲で続行してください"}});
   await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();
   assert.equal(db.workerMessages.publishDueSilenceEvents(),0);assert.equal(db.workerMessages.publishDueSilenceEvents(100,new Date(Date.now()+901000)),1);
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test("Runtime receipt照合中のpauseで送信前拒否されたleaseを即座に戻す",async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);try{
+  const source=db.enqueue(eventEnvelope("preflight-pause")).row,t=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"pause",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,j=db.getJob(t.current_attempt_id)!,identity=JSON.stringify(['generation','thread']);
+  db.beginJobPreparation(j.job_id);db.setJobRuntime(j.job_id,'w','p',identity);db.beginJobDispatch(j.job_id);db.markJobRunning(j.job_id);
+  const m=db.workerMessages.appendInstruction(j.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:'condition',occurred_at:new Date().toISOString(),payload:{operation:'add_condition',text:'根拠を確認してください'}});
+  class Port extends RuntimeClient{constructor(){super('unused');}override async workerInstructionReceipt(){db.tasks.control(t.task_id,source.event_id,db.tasks.get(t.task_id)!.revision,'pause');return {state:'not_found' as const};}override async workerInstruction():Promise<never>{throw Error('pause後に送信してはいけない');}}
+  await assert.rejects(new WorkerInstructionBridge(db.workerMessages,new AppServerWorkerInstructionController(db,new Port())).runOnce(),/attempt_not_current/);
+  const delivery=db.workerMessages.reconcile(j.job_id,source.event_id,'dona-main','condition').delivery as {state:string;lease_owner:string|null};assert.equal(delivery.state,'pending');const Sqlite=(await import('better-sqlite3')).default,sql=new Sqlite(config.databasePath);assert.equal((sql.prepare("SELECT lease_owner FROM worker_message_deliveries WHERE message_id=? AND consumer='worker'").get(m.message.message_id) as {lease_owner:string|null}).lease_owner,null);sql.close();assert.equal(m.message.job_id,j.job_id);
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
