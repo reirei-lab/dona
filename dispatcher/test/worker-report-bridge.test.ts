@@ -233,6 +233,7 @@ for(const local of [false,true])test(`report/silenceの親contextをownerと現�
   await assert.rejects(client.instructTask(task.task_id,task.revision,{schema_version:1,source_event_id:silence,producer_sequence:2,idempotency_key:"unbound",occurred_at:new Date().toISOString(),payload:{operation:"add_condition",text:"scopeを変更"}}));
   // 新しいreportが来たら古いsilenceのcontextを再利用できない。
   db.acceptTaskWorkerReport(job,"identity",{schema_version:1,source_event_id:source,producer_sequence:2,idempotency_key:"newer",occurred_at:new Date().toISOString(),payload:{kind:"risk",summary:"確認が必要です",severity:"high"}});
+  assert.equal(db.get(silence)?.status,"waiting_agent");
   await assert.rejects(client.getTaskReports(task.task_id,silence));
   if(local){
    const question=db.acceptTaskWorkerReport(job,"identity",{schema_version:1,source_event_id:source,producer_sequence:3,idempotency_key:"question",occurred_at:new Date().toISOString(),payload:{kind:"question",question:"継続できますか？"}});
@@ -403,7 +404,7 @@ test("既存messageが未処理なら無効化を拒否し、再起動後にdrai
 });
 
 
-test("型付き質問中のResultはhuman_inputを保ち、native解消後に型付き回答を配送できる",async()=>{
+for(const nativeCode of ["runtime_question_pending","runtime_external_approval_pending"])test(`型付き質問中のResultはhuman_inputを保ち、${nativeCode}解消後に型付き回答を配送できる`,async()=>{
  const {root,config}=await tempConfig();config.workerMessagingEnabled=true;const db=new DispatcherDatabase(config.databasePath);
  try{
   const source=db.enqueue(eventEnvelope("both-waits")).row,task=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"waits",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task,job=db.getJob(task.current_attempt_id)!;
@@ -414,7 +415,7 @@ test("型付き質問中のResultはhuman_inputを保ち、native解消後に型
   const runtime:JobAgentRuntime={prepare:never,prompt:never,wait:never,cancel:never,observeWorker:never,retireWorker:never,async get(){return {ok:true,exitCode:0,stdout:"",stderr:"",agentStatus:"working",timedOut:false,aborted:false};},async questions(){return [];}};
   const supervisor=new JobSupervisor(db,runtime,config,{debug(){},info(){},warn(){},error(){}},()=>{});
   await supervisor.reconcileTasks();assert.equal(db.tasks.get(task.task_id)?.wait_reason,"human_input");
-  db.markJobBlocked(job.job_id,"native wait",["blocked"],"runtime_question_pending");db.tasks.wait(db.tasks.get(task.task_id)!,"human_input",-1);
+  db.markJobBlocked(job.job_id,"native wait",["blocked"],nativeCode);db.tasks.wait(db.tasks.get(task.task_id)!,"human_input",-1);
   await supervisor.reconcileTasks();assert.equal(db.getJob(job.job_id)?.last_error_code,"worker_message_question_pending");assert.equal(db.tasks.get(task.task_id)?.wait_reason,"human_input");
   db.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"answer",occurred_at:new Date().toISOString(),correlation_message_id:question.message.message_id,conversation_revision:1,payload:{operation:"answer",text:"元の範囲で続行してください"}});
   await new WorkerInstructionBridge(db.workerMessages,{async steer(){return {};}}).runOnce();assert.equal(db.tasks.get(task.task_id)?.state,"active");
@@ -552,5 +553,16 @@ test("完了後のqueued silenceを親dispatch前にsettleする",async()=>{
   const Sqlite=(await import("better-sqlite3")).default,sql=new Sqlite(config.databasePath),silence=(sql.prepare("SELECT event_id FROM events WHERE event_type='worker_message_silence'").get() as {event_id:string}).event_id;
   db.saveJobResult(j.job_id,{schema_version:1,job_id:j.job_id,status:"completed",summary:"確認しました",completed_at:new Date().toISOString()},j.result_path);
   db.nextAvailable();assert.equal(db.get(silence)?.status,"completed");assert.equal(db.get(silence)?.last_error_code,"worker_report_superseded");sql.close();
+ }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+
+test("未回答の前Attempt質問と選択肢をpause後も引き継ぐ",async()=>{
+ const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);try{
+  const source=db.enqueue(eventEnvelope("pending-question-handoff")).row,t=db.tasks.create(taskRequestSchema.parse({source_event_id:source.event_id,task_key:"question",objective:"調査する",workspace:{kind:"scratch"}}),config.jobsWorkspaceRoot,config.jobResultsDir).task;
+  db.beginJobPreparation(t.current_attempt_id);db.setJobRuntime(t.current_attempt_id,"w","p","runtime");db.beginJobDispatch(t.current_attempt_id);db.markJobRunning(t.current_attempt_id);
+  const question=db.workerMessages.appendWorkerReport(t.current_attempt_id,"runtime",{schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"question",occurred_at:new Date().toISOString(),payload:{kind:"decision_request",question:"方式を選んでください",options:["方式A","方式B"]}});
+  db.tasks.control(t.task_id,source.event_id,db.tasks.get(t.task_id)!.revision,"pause");const context=db.workerMessages.stoppedInstructionContext(t.current_attempt_id);
+  assert.ok(context.includes("方式を選んでください"));assert.ok(context.includes("方式A"));assert.ok(context.includes(question.message.message_id));assert.ok(context.includes("新しいmessage_id"));
  }finally{db.close();await fs.rm(root,{recursive:true,force:true});}
 });
